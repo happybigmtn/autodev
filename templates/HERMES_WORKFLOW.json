@@ -1,0 +1,52 @@
+{
+  "review": {
+    "lanes": {{LANE_JSON}},
+    "product_lanes": {{LANE_JSON}},
+    "states": {
+      "active": [
+        "review_due",
+        "recon_running",
+        "bug_sweep_running",
+        "skeptic_running",
+        "nemesis_feynman_running",
+        "nemesis_state_running",
+        "product_truth_running",
+        "synthesizing",
+        "execution_ready"
+      ],
+      "terminal": [
+        "reviewed_changed",
+        "reviewed_no_change",
+        "blocked_review"
+      ]
+    },
+    "lane_modes": {
+      "maintenance_review": {
+        "passes": [
+          "maintenance_synthesis"
+        ],
+        "max_attempts": 2
+      },
+      "expansive_audit_review": {
+        "passes": [
+          "recon",
+          "bugs_finder",
+          "bugs_skeptic",
+          "nemesis_feynman",
+          "nemesis_state",
+          "product_truth",
+          "synthesis"
+        ],
+        "max_attempts": 2
+      }
+    },
+    "portfolio": {
+      "passes": [
+        "portfolio_synthesis"
+      ],
+      "max_attempts": 2
+    },
+    "lane_scope": {{LANE_SCOPE_JSON}}
+  }
+}
+

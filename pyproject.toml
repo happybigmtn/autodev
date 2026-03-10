@@ -1,0 +1,11 @@
+[project]
+name = "hermes-autodev-framework"
+version = "0.1.0"
+description = "Reusable Hermes/Codex autonomous development framework scaffold."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "scripts/hermes_autodev",
+]
+
