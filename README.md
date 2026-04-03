@@ -6,7 +6,7 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` only owns five commands:
+`auto` only owns six commands:
 
 - `auto corpus`
 - `auto gen`
