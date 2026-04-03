@@ -1,11 +1,14 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
 
+use crate::codex_stream::{capture_codex_output, capture_pi_output};
+use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{atomic_write, copy_tree, ensure_repo_layout, git_repo_root, timestamp_slug};
 use crate::NemesisArgs;
 
@@ -70,9 +73,35 @@ const DEFAULT_NEMESIS_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific 
 99999. Important: this is not a generic security scan. Use the Nemesis back-and-forth method.
 999999. Important: do not invent findings that you cannot support with repo evidence.
 9999999. Important: write the two required files completely into `nemesis/` and stop."#;
+const DEFAULT_NEMESIS_REVIEW_PROMPT: &str = r#"You are the final Nemesis synthesis pass.
+
+Review the draft Nemesis audit outputs below, then re-check the live repository before you keep any item.
+
+Draft inputs:
+- `{draft_audit_path}`
+- `{draft_plan_path}`
+
+Rules:
+- Treat the live codebase as truth.
+- Treat the draft outputs as suspect until they survive your own review.
+- Remove weak, duplicated, stale, or unsupported findings instead of carrying them forward.
+- Tighten tasks so they are execution-ready and bounded.
+
+{final_prompt}
+
+Additional requirements:
+- Only keep evidence-backed findings and tasks in the final outputs.
+- Prefer fewer stronger findings over a longer noisy report.
+- If a draft item is directionally right but over-scoped, narrow it before keeping it.
+"#;
 
 const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
+const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
+    "## Priority Work",
+    "## Follow-On Work",
+    "## Completed / Already Satisfied",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlanSection {
@@ -89,58 +118,10 @@ struct PlanTaskBlock {
     markdown: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OpencodeProvider {
-    Kimi,
-    Minimax,
-}
-
-impl OpencodeProvider {
-    fn provider_label(self) -> &'static str {
-        match self {
-            Self::Kimi => "opencode-kimi",
-            Self::Minimax => "opencode-minimax",
-        }
-    }
-
-    fn default_model(self) -> &'static str {
-        match self {
-            Self::Kimi => "kimi-for-coding/k2p5",
-            Self::Minimax => "minimax/MiniMax-M2.5",
-        }
-    }
-
-    fn detect(model: &str) -> Option<Self> {
-        let normalized = model.trim().to_ascii_lowercase();
-        if normalized.contains("kimi") {
-            return Some(Self::Kimi);
-        }
-        if normalized.contains("minimax") {
-            return Some(Self::Minimax);
-        }
-        None
-    }
-
-    fn resolve_model(self, requested_model: &str) -> String {
-        let normalized = requested_model.trim();
-        if normalized.is_empty() || normalized == DEFAULT_CODEX_NEMESIS_MODEL {
-            return self.default_model().to_string();
-        }
-        if normalized.contains('/') {
-            return normalized.to_string();
-        }
-        match self {
-            Self::Kimi => {
-                let model = match normalized {
-                    "kimi" | "kimi-k2.5" | "kimi-2.5" | "kimi-for-coding" => "k2p5",
-                    "kimi-k2-thinking" => "kimi-k2-thinking",
-                    other => other,
-                };
-                format!("kimi-for-coding/{model}")
-            }
-            Self::Minimax => format!("minimax/{}", map_minimax_model_name(normalized)),
-        }
-    }
+#[derive(Clone, Debug)]
+struct PhaseConfig {
+    model: String,
+    effort: String,
 }
 
 enum NemesisBackend {
@@ -149,11 +130,11 @@ enum NemesisBackend {
         reasoning_effort: String,
         codex_bin: PathBuf,
     },
-    Opencode {
+    Pi {
         provider_label: &'static str,
         model: String,
-        variant: String,
-        opencode_bin: PathBuf,
+        thinking: String,
+        pi_bin: PathBuf,
     },
 }
 
@@ -161,14 +142,14 @@ impl NemesisBackend {
     fn label(&self) -> &'static str {
         match self {
             Self::Codex { .. } => "codex",
-            Self::Opencode { provider_label, .. } => provider_label,
+            Self::Pi { provider_label, .. } => provider_label,
         }
     }
 
     fn model(&self) -> &str {
         match self {
             Self::Codex { model, .. } => model,
-            Self::Opencode { model, .. } => model,
+            Self::Pi { model, .. } => model,
         }
     }
 
@@ -177,7 +158,7 @@ impl NemesisBackend {
             Self::Codex {
                 reasoning_effort, ..
             } => reasoning_effort,
-            Self::Opencode { variant, .. } => variant,
+            Self::Pi { thinking, .. } => thinking,
         }
     }
 }
@@ -190,7 +171,34 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         .output_dir
         .clone()
         .unwrap_or_else(|| repo_root.join("nemesis"));
-    let backend = select_backend(&args);
+    let auditor = PhaseConfig {
+        model: if args.kimi {
+            "kimi".to_string()
+        } else if args.minimax {
+            "minimax".to_string()
+        } else {
+            args.model.clone()
+        },
+        effort: args.reasoning_effort.clone(),
+    };
+    let reviewer = PhaseConfig {
+        model: args.reviewer_model.clone(),
+        effort: args.reviewer_effort.clone(),
+    };
+    ensure_pi_phase_config("auto nemesis audit pass", &auditor)?;
+    ensure_pi_phase_config("auto nemesis synthesis pass", &reviewer)?;
+    let audit_backend = select_backend(
+        &auditor.model,
+        &auditor.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+    );
+    let review_backend = select_backend(
+        &reviewer.model,
+        &reviewer.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+    );
     let previous_snapshot = if args.dry_run {
         None
     } else {
@@ -202,20 +210,44 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             .with_context(|| format!("failed to read prompt file {}", path.display()))?,
         None => DEFAULT_NEMESIS_PROMPT.to_string(),
     };
-    let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
-    let prompt_path = repo_root
+    let draft_audit_path = output_dir.join("draft-nemesis-audit.md");
+    let draft_plan_path = output_dir.join("draft-IMPLEMENTATION_PLAN.md");
+    let final_audit_path = output_dir.join("nemesis-audit.md");
+    let final_plan_path = output_dir.join("IMPLEMENTATION_PLAN.md");
+    let audit_prompt = build_audit_prompt(&prompt_template, &draft_audit_path, &draft_plan_path);
+    let review_prompt = build_review_prompt(
+        &prompt_template,
+        &draft_audit_path,
+        &draft_plan_path,
+        &final_audit_path,
+        &final_plan_path,
+    );
+    let audit_prompt_path = repo_root
         .join(".auto")
         .join("logs")
-        .join(format!("nemesis-{}-prompt.md", timestamp_slug()));
-    atomic_write(&prompt_path, full_prompt.as_bytes())
-        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        .join(format!("nemesis-{}-audit-prompt.md", timestamp_slug()));
+    atomic_write(&audit_prompt_path, audit_prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", audit_prompt_path.display()))?;
+    let review_prompt_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("nemesis-{}-review-prompt.md", timestamp_slug()));
+    atomic_write(&review_prompt_path, review_prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", review_prompt_path.display()))?;
 
     println!("auto nemesis");
     println!("repo root:   {}", repo_root.display());
     println!("output dir:  {}", output_dir.display());
-    println!("backend:     {}", backend.label());
-    println!("model:       {}", backend.model());
-    println!("variant:     {}", backend.variant());
+    println!(
+        "auditor:     {} ({})",
+        audit_backend.model(),
+        audit_backend.variant()
+    );
+    println!(
+        "reviewer:    {} ({})",
+        review_backend.model(),
+        review_backend.variant()
+    );
     if let Some(previous) = &previous_snapshot {
         println!("prior input: {}", previous.display());
     }
@@ -224,14 +256,26 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         return Ok(());
     }
 
-    let raw_response = run_nemesis_backend(&repo_root, &full_prompt, &backend)?;
-    let response_path = repo_root
+    print_phase_header("auditor", &audit_backend);
+    let audit_response = run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend).await?;
+    let audit_response_path = repo_root
         .join(".auto")
         .join("logs")
-        .join(format!("nemesis-{}-response.log", timestamp_slug()));
-    if !raw_response.trim().is_empty() {
-        atomic_write(&response_path, raw_response.as_bytes())
-            .with_context(|| format!("failed to write {}", response_path.display()))?;
+        .join(format!("nemesis-{}-audit-response.log", timestamp_slug()));
+    if !audit_response.trim().is_empty() {
+        atomic_write(&audit_response_path, audit_response.as_bytes())
+            .with_context(|| format!("failed to write {}", audit_response_path.display()))?;
+    }
+
+    print_phase_header("reviewer", &review_backend);
+    let review_response = run_nemesis_backend(&repo_root, &review_prompt, &review_backend).await?;
+    let review_response_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("nemesis-{}-review-response.log", timestamp_slug()));
+    if !review_response.trim().is_empty() {
+        atomic_write(&review_response_path, review_response.as_bytes())
+            .with_context(|| format!("failed to write {}", review_response_path.display()))?;
     }
 
     let spec_path = verify_nemesis_spec(&output_dir)?;
@@ -245,37 +289,88 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     println!("plan:        {}", plan_path.display());
     println!("root spec:   {}", root_spec.display());
     println!("root tasks:  {} appended", appended);
-    println!("prompt log:  {}", prompt_path.display());
-    if response_path.exists() {
-        println!("model log:   {}", response_path.display());
+    println!("audit prompt: {}", audit_prompt_path.display());
+    println!("review prompt: {}", review_prompt_path.display());
+    if audit_response_path.exists() {
+        println!("audit log:   {}", audit_response_path.display());
+    }
+    if review_response_path.exists() {
+        println!("review log:  {}", review_response_path.display());
     }
 
     Ok(())
 }
 
-fn select_backend(args: &NemesisArgs) -> NemesisBackend {
-    let opencode_provider = if args.kimi {
-        Some(OpencodeProvider::Kimi)
-    } else if args.minimax {
-        Some(OpencodeProvider::Minimax)
-    } else {
-        OpencodeProvider::detect(&args.model)
-    };
-
-    if let Some(provider) = opencode_provider {
-        return NemesisBackend::Opencode {
+fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) -> NemesisBackend {
+    let pi_provider = PiProvider::detect(model);
+    if let Some(provider) = pi_provider {
+        return NemesisBackend::Pi {
             provider_label: provider.provider_label(),
-            model: provider.resolve_model(&args.model),
-            variant: args.reasoning_effort.clone(),
-            opencode_bin: resolve_opencode_bin(&args.opencode_bin),
+            model: provider.resolve_model(model, DEFAULT_CODEX_NEMESIS_MODEL),
+            thinking: effort.to_string(),
+            pi_bin: resolve_pi_bin(pi_bin),
         };
     }
 
     NemesisBackend::Codex {
-        model: args.model.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        codex_bin: args.codex_bin.clone(),
+        model: model.to_string(),
+        reasoning_effort: effort.to_string(),
+        codex_bin: codex_bin.to_path_buf(),
     }
+}
+
+fn ensure_pi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
+    if PiProvider::detect(&config.model).is_none() {
+        bail!(
+            "{label} must use a MiniMax or Kimi PI model; got `{}`",
+            config.model
+        );
+    }
+    Ok(())
+}
+
+fn build_audit_prompt(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
+    let prompt = render_prompt_outputs(prompt_template, audit_path, plan_path);
+    format!(
+        "You are the initial Nemesis audit pass.\n\n{prompt}\n\nAdditional requirements:\n- This pass should maximize useful recall while staying grounded in evidence.\n- Treat these outputs as draft artifacts that will be challenged by a second-stage review.\n"
+    )
+}
+
+fn build_review_prompt(
+    prompt_template: &str,
+    draft_audit_path: &Path,
+    draft_plan_path: &Path,
+    final_audit_path: &Path,
+    final_plan_path: &Path,
+) -> String {
+    let final_prompt = render_prompt_outputs(prompt_template, final_audit_path, final_plan_path);
+    DEFAULT_NEMESIS_REVIEW_PROMPT
+        .replace(
+            "{draft_audit_path}",
+            &draft_audit_path.display().to_string(),
+        )
+        .replace("{draft_plan_path}", &draft_plan_path.display().to_string())
+        .replace("{final_prompt}", &final_prompt)
+}
+
+fn render_prompt_outputs(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
+    prompt_template
+        .replace(
+            "nemesis/nemesis-audit.md",
+            &audit_path.display().to_string(),
+        )
+        .replace(
+            "nemesis/IMPLEMENTATION_PLAN.md",
+            &plan_path.display().to_string(),
+        )
+}
+
+fn print_phase_header(phase: &str, backend: &NemesisBackend) {
+    println!();
+    println!("phase:       {phase}");
+    println!("backend:     {}", backend.label());
+    println!("model:       {}", backend.model());
+    println!("variant:     {}", backend.variant());
 }
 
 fn prepare_output_dir(repo_root: &Path, output_dir: &Path) -> Result<Option<PathBuf>> {
@@ -324,30 +419,34 @@ fn prepare_output_dir(repo_root: &Path, output_dir: &Path) -> Result<Option<Path
     Ok(archived)
 }
 
-fn run_nemesis_backend(repo_root: &Path, prompt: &str, backend: &NemesisBackend) -> Result<String> {
+async fn run_nemesis_backend(
+    repo_root: &Path,
+    prompt: &str,
+    backend: &NemesisBackend,
+) -> Result<String> {
     match backend {
         NemesisBackend::Codex {
             model,
             reasoning_effort,
             codex_bin,
-        } => run_codex(repo_root, prompt, model, reasoning_effort, codex_bin),
-        NemesisBackend::Opencode {
+        } => run_codex(repo_root, prompt, model, reasoning_effort, codex_bin).await,
+        NemesisBackend::Pi {
             model,
-            variant,
-            opencode_bin,
+            thinking,
+            pi_bin,
             ..
-        } => run_opencode(repo_root, prompt, model, variant, opencode_bin),
+        } => run_pi(repo_root, prompt, model, thinking, pi_bin).await,
     }
 }
 
-fn run_codex(
+async fn run_codex(
     repo_root: &Path,
     prompt: &str,
     model: &str,
     reasoning_effort: &str,
     codex_bin: &Path,
 ) -> Result<String> {
-    let mut child = Command::new(codex_bin)
+    let mut child = TokioCommand::new(codex_bin)
         .arg("exec")
         .arg("--json")
         .arg("--dangerously-bypass-approvals-and-sandbox")
@@ -371,19 +470,39 @@ fn run_codex(
             )
         })?;
 
-    child
+    let mut stdin = child
         .stdin
-        .as_mut()
-        .context("Codex stdin missing for Nemesis run")?
+        .take()
+        .context("Codex stdin missing for Nemesis run")?;
+    stdin
         .write_all(prompt.as_bytes())
+        .await
         .context("failed to write Nemesis prompt to Codex")?;
+    drop(stdin);
 
-    let output = child
-        .wait_with_output()
+    let stdout = child
+        .stdout
+        .take()
+        .context("Codex stdout missing for Nemesis run")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Codex stderr missing for Nemesis run")?;
+
+    let stdout_task = tokio::spawn(async move { capture_codex_output(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+
+    let status = child
+        .wait()
+        .await
         .context("failed waiting for Codex Nemesis run")?;
-    let stdout = String::from_utf8(output.stdout).context("Codex stdout was not valid UTF-8")?;
-    let stderr = String::from_utf8(output.stderr).context("Codex stderr was not valid UTF-8")?;
-    if output.status.success() {
+    let stdout = stdout_task
+        .await
+        .context("Codex stdout capture task panicked")??;
+    let stderr = stderr_task
+        .await
+        .context("Codex stderr capture task panicked")??;
+    if status.success() {
         return Ok(stdout);
     }
     bail!(
@@ -392,113 +511,87 @@ fn run_codex(
     );
 }
 
-fn run_opencode(
+async fn run_pi(
     repo_root: &Path,
     prompt: &str,
     model: &str,
-    variant: &str,
-    opencode_bin: &Path,
+    thinking: &str,
+    pi_bin: &Path,
 ) -> Result<String> {
-    let opencode_data_home = repo_root.join(".auto").join("opencode-data");
-    fs::create_dir_all(&opencode_data_home)
-        .with_context(|| format!("failed to create {}", opencode_data_home.display()))?;
-
-    let output = Command::new(opencode_bin)
-        .arg("run")
-        .arg("--format")
-        .arg("json")
-        .arg("--dir")
-        .arg(repo_root)
+    let mut child = TokioCommand::new(pi_bin)
         .arg("--model")
         .arg(model)
-        .arg("--variant")
-        .arg(variant)
+        .arg("--thinking")
+        .arg(thinking)
+        .arg("--mode")
+        .arg("json")
+        .arg("-p")
+        .arg("--no-session")
+        .arg("--tools")
+        .arg("read,bash,edit,write,grep,find,ls")
         .arg(prompt)
-        .env("XDG_DATA_HOME", &opencode_data_home)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(repo_root)
-        .output()
+        .spawn()
         .with_context(|| {
             format!(
-                "failed to launch OpenCode at {} from {}",
-                opencode_bin.display(),
+                "failed to launch PI at {} from {}",
+                pi_bin.display(),
                 repo_root.display()
             )
         })?;
 
-    let stdout = String::from_utf8(output.stdout).context("OpenCode stdout was not valid UTF-8")?;
-    let stderr = String::from_utf8(output.stderr).context("OpenCode stderr was not valid UTF-8")?;
-    if output.status.success() {
-        if let Some(detail) = parse_opencode_error(&stdout) {
-            bail!("OpenCode Nemesis run failed: {detail}");
+    let stdout = child
+        .stdout
+        .take()
+        .context("PI stdout missing for Nemesis run")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("PI stderr missing for Nemesis run")?;
+
+    let stream_label = "nemesis".to_string();
+    let stdout_task =
+        tokio::spawn(async move { capture_pi_output(stdout, &stream_label, 15).await });
+    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+
+    let status = child
+        .wait()
+        .await
+        .context("failed waiting for PI Nemesis run")?;
+    let stdout = stdout_task
+        .await
+        .context("PI stdout capture task panicked")??;
+    let stderr = stderr_task
+        .await
+        .context("PI stderr capture task panicked")??;
+    if status.success() {
+        if let Some(detail) = parse_pi_error(&stdout) {
+            bail!("PI Nemesis run failed: {detail}");
         }
         return Ok(stdout);
     }
     bail!(
-        "OpenCode Nemesis run failed: {}",
-        stderr.trim().if_empty_then(
-            parse_opencode_error(&stdout)
-                .as_deref()
-                .unwrap_or(stdout.trim())
-        )
+        "PI Nemesis run failed: {}",
+        stderr
+            .trim()
+            .if_empty_then(parse_pi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
     );
 }
 
-fn resolve_opencode_bin(configured: &Path) -> PathBuf {
-    if configured != Path::new("opencode") {
-        return configured.to_path_buf();
-    }
-    if let Some(path) = std::env::var_os("FABRO_OPENCODE_BIN").map(PathBuf::from) {
-        return path;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let bundled = PathBuf::from(home)
-            .join(".opencode")
-            .join("bin")
-            .join("opencode");
-        if bundled.exists() {
-            return bundled;
-        }
-    }
-    PathBuf::from("opencode")
-}
-
-fn map_minimax_model_name(model: &str) -> String {
-    match model {
-        "minimax" | "minimax-m2.5" => "MiniMax-M2.5".to_string(),
-        "minimax-m2" => "MiniMax-M2".to_string(),
-        "minimax-m2.1" => "MiniMax-M2.1".to_string(),
-        "minimax-m2.5-highspeed" => "MiniMax-M2.5-highspeed".to_string(),
-        "minimax-m2.7" => "MiniMax-M2.7".to_string(),
-        "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed".to_string(),
-        other if other.starts_with("MiniMax-") => other.to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn parse_opencode_error(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if event.get("type").and_then(serde_json::Value::as_str) != Some("error") {
-            continue;
-        }
-        if let Some(message) = event
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-        {
-            return Some(message.to_string());
-        }
-        let fallback = line.trim();
-        if !fallback.is_empty() {
-            return Some(fallback.to_string());
-        }
-    }
-    None
+async fn read_stream<R>(stream: R) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .await
+        .context("failed to read child stream")?;
+    Ok(text)
 }
 
 fn verify_nemesis_spec(output_dir: &Path) -> Result<PathBuf> {
@@ -593,7 +686,8 @@ fn append_nemesis_plan_to_root(repo_root: &Path, nemesis_plan_path: &Path) -> Re
 }
 
 fn append_new_open_tasks(existing: &str, nemesis_plan: &str) -> Result<(String, usize)> {
-    let existing_blocks = extract_plan_task_blocks(existing)?;
+    let normalized_existing = normalize_root_plan(existing);
+    let existing_blocks = extract_plan_task_blocks(&normalized_existing)?;
     let existing_ids = existing_blocks
         .iter()
         .map(|block| block.task_id.as_str())
@@ -606,13 +700,45 @@ fn append_new_open_tasks(existing: &str, nemesis_plan: &str) -> Result<(String, 
         .collect::<Vec<_>>();
 
     if new_blocks.is_empty() {
-        return Ok((existing.to_string(), 0));
+        return Ok((normalized_existing, 0));
     }
 
-    let mut merged = existing.to_string();
+    let mut merged = normalized_existing;
     append_blocks_to_section(&mut merged, PlanSection::Priority, &new_blocks)?;
     append_blocks_to_section(&mut merged, PlanSection::FollowOn, &new_blocks)?;
     Ok((merged, new_blocks.len()))
+}
+
+fn normalize_root_plan(markdown: &str) -> String {
+    if markdown.trim().is_empty() {
+        return EMPTY_PLAN.to_string();
+    }
+
+    let mut normalized = markdown.to_string();
+    let mut changed = false;
+    for section in REQUIRED_PLAN_SECTIONS {
+        if markdown_has_line(&normalized, section) {
+            continue;
+        }
+        if !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if !normalized.ends_with("\n\n") {
+            normalized.push('\n');
+        }
+        normalized.push_str(section);
+        normalized.push('\n');
+        changed = true;
+    }
+
+    if changed && !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn markdown_has_line(markdown: &str, expected: &str) -> bool {
+    markdown.lines().any(|line| line.trim() == expected)
 }
 
 fn append_blocks_to_section(
@@ -751,9 +877,9 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{append_new_open_tasks, select_backend};
+    use super::{append_new_open_tasks, ensure_pi_phase_config, select_backend, PhaseConfig};
     use crate::NemesisArgs;
 
     #[test]
@@ -799,40 +925,102 @@ Spec: specs/020426-nemesis-audit.md
         assert!(!merged.contains("`NEM-003`"));
     }
 
+    #[test]
+    fn appends_nemesis_tasks_when_existing_plan_is_missing_sections() {
+        let existing = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `VAL-001` Validate query
+Spec: specs/020426-query.md
+"#;
+
+        let nemesis = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `NEM-001` Harden cross-surface invariant
+Spec: specs/020426-nemesis-audit.md
+
+## Follow-On Work
+
+- [ ] `NEM-002` Add state-sync regression coverage
+Spec: specs/020426-nemesis-audit.md
+
+## Completed / Already Satisfied
+"#;
+
+        let (merged, appended) = append_new_open_tasks(existing, nemesis).unwrap();
+        assert_eq!(appended, 2);
+        assert!(merged.contains("## Follow-On Work"));
+        assert!(merged.contains("## Completed / Already Satisfied"));
+        assert!(merged.contains("`NEM-001`"));
+        assert!(merged.contains("`NEM-002`"));
+    }
+
     fn sample_args(model: &str) -> NemesisArgs {
         NemesisArgs {
             prompt_file: None,
             output_dir: None,
             model: model.to_string(),
             reasoning_effort: "high".to_string(),
+            reviewer_model: "kimi".to_string(),
+            reviewer_effort: "high".to_string(),
             kimi: false,
             minimax: false,
             dry_run: true,
             codex_bin: PathBuf::from("codex"),
-            opencode_bin: PathBuf::from("opencode"),
+            pi_bin: PathBuf::from("pi"),
         }
     }
 
     #[test]
-    fn select_backend_treats_minimax_model_alias_as_opencode() {
-        let backend = select_backend(&sample_args("minimax"));
-        assert_eq!(backend.label(), "opencode-minimax");
-        assert_eq!(backend.model(), "minimax/MiniMax-M2.5");
+    fn select_backend_treats_minimax_model_alias_as_pi() {
+        let args = sample_args("minimax");
+        let backend = select_backend(
+            &args.model,
+            &args.reasoning_effort,
+            Path::new("codex"),
+            Path::new("pi"),
+        );
+        assert_eq!(backend.label(), "pi-minimax");
+        assert_eq!(backend.model(), "minimax/MiniMax-M2.7-highspeed");
         assert_eq!(backend.variant(), "high");
     }
 
     #[test]
-    fn select_backend_treats_kimi_model_alias_as_opencode() {
-        let backend = select_backend(&sample_args("kimi"));
-        assert_eq!(backend.label(), "opencode-kimi");
-        assert_eq!(backend.model(), "kimi-for-coding/k2p5");
+    fn select_backend_treats_kimi_model_alias_as_pi() {
+        let args = sample_args("kimi");
+        let backend = select_backend(
+            &args.model,
+            &args.reasoning_effort,
+            Path::new("codex"),
+            Path::new("pi"),
+        );
+        assert_eq!(backend.label(), "pi-kimi");
+        assert_eq!(backend.model(), "kimi-coding/k2p5");
         assert_eq!(backend.variant(), "high");
     }
 
     #[test]
     fn select_backend_normalizes_explicit_minimax_model_override() {
-        let backend = select_backend(&sample_args("minimax-m2.7-highspeed"));
-        assert_eq!(backend.label(), "opencode-minimax");
+        let args = sample_args("minimax-m2.7-highspeed");
+        let backend = select_backend(
+            &args.model,
+            &args.reasoning_effort,
+            Path::new("codex"),
+            Path::new("pi"),
+        );
+        assert_eq!(backend.label(), "pi-minimax");
         assert_eq!(backend.model(), "minimax/MiniMax-M2.7-highspeed");
+    }
+
+    #[test]
+    fn nemesis_phase_rejects_non_pi_models() {
+        let config = PhaseConfig {
+            model: "gpt-5.4".to_string(),
+            effort: "xhigh".to_string(),
+        };
+        assert!(ensure_pi_phase_config("nemesis", &config).is_err());
     }
 }

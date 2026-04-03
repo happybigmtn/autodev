@@ -27,9 +27,9 @@ All commands resolve the git repo root automatically from the current working di
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs MiniMax finder/fixer passes and Kimi skeptic/reviewer passes by default
-- `auto loop` runs on `main` by default with `gpt-5.4` and `xhigh`
-- `auto nemesis` runs on `gpt-5.4` with `high` by default, and `--model minimax` / `--model kimi` automatically use OpenCode
+- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `xhigh` implementation pass by default
+- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
+- `auto nemesis` runs a PI-only two-stage audit by default: MiniMax draft pass, then Kimi synthesis pass
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
 
 ## Command Contract
@@ -65,6 +65,7 @@ Behavior:
 - Writes a fresh `gen-<timestamp>/specs/`
 - Appends new snapshot specs into root `specs/`
 - Does not modify root `IMPLEMENTATION_PLAN.md`
+- Requires each generated spec to include a `## Acceptance Criteria` section with concrete bullets
 
 Root spec filenames use this format:
 
@@ -83,6 +84,7 @@ Behavior:
 - Writes `gen-<timestamp>/IMPLEMENTATION_PLAN.md`
 - Appends new generated spec snapshots into root `specs/`
 - Merges the latest generated plan into root `IMPLEMENTATION_PLAN.md`
+- Requires each generated spec to include a `## Acceptance Criteria` section with concrete bullets
 
 Root plan merge rule:
 
@@ -99,24 +101,32 @@ This keeps the root implementation plan non-destructive for unfinished work whil
 Behavior:
 
 - Uses a Nemesis-style iterative audit:
-  - Feynman-style logic pass
-  - state inconsistency pass
-  - targeted back-and-forth re-passes until convergence
+  - initial draft pass to maximize evidence-backed recall
+  - final synthesis pass to discard weak claims and tighten the surviving work
+  - each pass still performs the internal Feynman/state back-and-forth method from the prompt
 - Writes disposable outputs into `nemesis/`
 - Produces:
   - `nemesis/nemesis-audit.md`
   - `nemesis/IMPLEMENTATION_PLAN.md`
+  - `nemesis/draft-nemesis-audit.md`
+  - `nemesis/draft-IMPLEMENTATION_PLAN.md`
 - Appends the generated audit spec into root `specs/`
 - Appends new unchecked Nemesis tasks into root `IMPLEMENTATION_PLAN.md`
 - Treats `nemesis/` as disposable and archives the previous folder under `.auto/fresh-input/` before refresh
 
 Backend selection:
 
-- Default: Codex with `gpt-5.4` and reasoning effort `high`
-- `auto nemesis --kimi`: OpenCode with `kimi-for-coding/k2p5`
-- `auto nemesis --minimax`: OpenCode with `minimax/MiniMax-M2.5`
+- Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
+- Final reviewer default: PI with `kimi-coding/k2p5` and `high`
+- `auto nemesis --kimi`: uses Kimi for the draft auditor pass
+- `auto nemesis --minimax`: uses MiniMax for the draft auditor pass
 - `auto nemesis --model kimi`: same as `--kimi`
 - `auto nemesis --model minimax`: same as `--minimax`
+- `--reviewer-model <model>` and `--reviewer-effort <level>` override the final synthesis pass
+
+Code-writing rule:
+
+- `auto nemesis` is audit-docs only. The model passes are not used for repo code edits.
 
 Unlike `auto gen`, Nemesis does not replace the root implementation plan structure. It only appends new unchecked audit tasks that are not already present.
 
@@ -127,41 +137,43 @@ Unlike `auto gen`, Nemesis does not replace the root implementation plan structu
 Behavior:
 
 - Splits tracked repo files into manageable chunks by top-level scope
-- Runs four passes per chunk by default:
+- Runs three per-chunk audit passes plus one repo-wide implementation pass by default:
   - MiniMax finder
   - Kimi skeptic
-  - MiniMax remediation
-  - Kimi remediation review
-- Streams parsed model output live for both Codex and OpenCode backends
+  - Kimi verification review
+  - final `gpt-5.4` `xhigh` implementation over all verified findings
+- Streams parsed model output live for both Codex and PI backends
 - Writes durable artifacts under `bug/`:
   - per-chunk prompts, raw model responses, JSON verdicts, and markdown summaries
   - `bug/BUG_REPORT.md`
   - `bug/verified-findings.json`
+  - `bug/implementation-results.json`
 - Archives the previous `bug/` folder under `.auto/fresh-input/` before refresh
 
 Safety:
 
-- Full remediation mode checkpoints and pushes pre-existing dirty changes on the current branch before the bug pipeline starts
-- Use `--report-only` to stop after finder + skeptic + aggregation
-- Use `--allow-dirty` if you intentionally want remediation to layer on top of an already-dirty tree without the startup checkpoint
+- Full implementation mode checkpoints and pushes pre-existing dirty changes on the current branch before the bug pipeline starts
+- Use `--report-only` to stop after verification and summary generation
+- Use `--allow-dirty` if you intentionally want the final implementation pass to layer on top of an already-dirty tree without the startup checkpoint
 
 Default pass layout:
 
 - finder: `minimax/MiniMax-M2.7-highspeed` with `high`
 - skeptic: `kimi` with `high`
-- fixer: `minimax/MiniMax-M2.7-highspeed` with `high`
 - reviewer: `kimi` with `high`
+- implementer: `gpt-5.4` with `xhigh`
 
 Model routing:
 
-- MiniMax aliases resolve to `minimax/MiniMax-M2.7-highspeed` and Kimi aliases resolve to `kimi-for-coding/k2p5`
+- MiniMax aliases resolve to `minimax/MiniMax-M2.7-highspeed` and Kimi aliases resolve to `kimi-coding/k2p5`
 - Any other model name uses Codex
+- The implementation pass is pinned to `gpt-5.4` with `xhigh`
 
 Useful flags:
 
 - `--chunk-size <n>` to change the per-chunk file budget
 - `--max-chunks <n>` to cap the run
-- `--report-only` to skip remediation
+- `--report-only` to skip the final implementation pass
 - `--dry-run` to preview the chunk plan
 
 ### `auto loop`
@@ -170,16 +182,23 @@ Useful flags:
 
 Behavior:
 
-- Runs Codex on `main`
+- Runs Codex on the checked-out primary branch alias: `main`, `master`, or `trunk`
 - Reads `AGENTS.md`, `specs/*`, and `IMPLEMENTATION_PLAN.md`
 - Takes the next unchecked task from the top of the plan
 - Implements it fully
 - Runs the required validations
 - Removes completed items from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
-- Commits and pushes truthful increments to `origin/main`
+- Commits and pushes truthful increments to the repo's primary branch
 - Creates a git tag after a green increment
 - Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
+
+Default branch:
+
+- If the current branch is `main`, `master`, or `trunk`, `auto loop` runs there
+- Otherwise it tries `origin/HEAD`
+- Then it falls back to any available branch named `main`, `master`, or `trunk`
+- Use `--branch <name>` to override explicitly
 
 Default model:
 
@@ -231,8 +250,8 @@ Only some are required at startup. The command will create missing files when ap
 - Git repository with a valid `origin`
 - `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
 - `codex` on `PATH` for `auto nemesis`, `auto loop`, and `auto review`
-- `codex` on `PATH` for any `auto bug` phase using a non-OpenCode model
-- `opencode` on `PATH` for `auto bug` MiniMax/Kimi passes and `auto nemesis --kimi` / `--minimax`
+- `codex` on `PATH` for any `auto bug` phase using a non-PI model
+- `pi` on `PATH` for `auto bug` MiniMax/Kimi passes and both default `auto nemesis` audit passes
 
 Recommended environment:
 
@@ -286,7 +305,7 @@ auto bug --dry-run
 auto bug --report-only
 ```
 
-Use OpenCode instead:
+Use PI instead:
 
 ```bash
 auto nemesis --kimi

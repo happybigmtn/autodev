@@ -62,6 +62,12 @@ struct PlanTaskBlock {
 }
 
 const IMPLEMENTATION_PLAN_HEADER: &str = "# IMPLEMENTATION_PLAN";
+const SPEC_ACCEPTANCE_CRITERIA_HEADER: &str = "## Acceptance Criteria";
+const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
+    "## Priority Work",
+    "## Follow-On Work",
+    "## Completed / Already Satisfied",
+];
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
@@ -662,6 +668,9 @@ Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
 - Filenames must use `ddmmyy-topic-slug.md`
 - Each file must start with `# Specification: ...`
+- Each file must include a `## Acceptance Criteria` section
+- Acceptance criteria must be concrete, testable, and phrased as truthful observable outcomes
+- Acceptance criteria should use flat bullet points, not prose paragraphs
 - Specs must be concrete, file-grounded, and implementation-oriented
 - Avoid placeholders and abstract framework prose
 - Preserve proven current behavior in reverse mode
@@ -781,8 +790,40 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
                 spec.display()
             );
         }
+        if !generated_spec_has_acceptance_criteria(&text) {
+            bail!(
+                "generated spec {} must include `{}` with at least one bullet",
+                spec.display(),
+                SPEC_ACCEPTANCE_CRITERIA_HEADER
+            );
+        }
     }
     Ok(specs)
+}
+
+fn generated_spec_has_acceptance_criteria(markdown: &str) -> bool {
+    let Some((_, section_body)) = split_markdown_section(markdown, SPEC_ACCEPTANCE_CRITERIA_HEADER)
+    else {
+        return false;
+    };
+
+    section_body.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- ") || trimmed.starts_with("* ")
+    })
+}
+
+fn split_markdown_section<'a>(markdown: &'a str, header: &str) -> Option<(&'a str, &'a str)> {
+    let start = markdown.find(header)?;
+    let after_header = &markdown[start + header.len()..];
+    let section_end = after_header
+        .find("\n## ")
+        .map(|offset| start + header.len() + offset)
+        .unwrap_or(markdown.len());
+    Some((
+        &markdown[start..section_end],
+        &markdown[start + header.len()..section_end],
+    ))
 }
 
 fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
@@ -793,12 +834,10 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
     let markdown = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
     let normalized = normalize_generated_implementation_plan(&markdown);
-    for required in [
-        IMPLEMENTATION_PLAN_HEADER,
-        "## Priority Work",
-        "## Follow-On Work",
-        "## Completed / Already Satisfied",
-    ] {
+    for required in [IMPLEMENTATION_PLAN_HEADER]
+        .into_iter()
+        .chain(REQUIRED_PLAN_SECTIONS)
+    {
         if !normalized.contains(required) {
             bail!("generated implementation plan is missing `{required}`");
         }
@@ -817,20 +856,23 @@ fn normalize_generated_implementation_plan(markdown: &str) -> String {
     };
 
     let first_line = lines[first_non_empty].trim();
+    let mut changed = false;
     if first_line == IMPLEMENTATION_PLAN_HEADER {
-        return markdown.to_string();
+    } else if first_line.starts_with("# ") {
+        lines[first_non_empty] = IMPLEMENTATION_PLAN_HEADER.to_string();
+        changed = true;
     }
 
-    if first_line.starts_with("# ") {
-        lines[first_non_empty] = IMPLEMENTATION_PLAN_HEADER.to_string();
+    let candidate = if changed {
         let mut normalized = lines.join("\n");
         if markdown.ends_with('\n') {
             normalized.push('\n');
         }
-        return normalized;
-    }
-
-    markdown.to_string()
+        normalized
+    } else {
+        markdown.to_string()
+    };
+    ensure_required_plan_sections(&candidate)
 }
 
 fn sync_generated_specs_to_root(
@@ -906,7 +948,8 @@ fn merge_generated_plan_with_existing_open_tasks(
     generated: &str,
     existing: &str,
 ) -> Result<String> {
-    let generated_blocks = extract_plan_task_blocks(generated)?;
+    let generated = ensure_required_plan_sections(generated);
+    let generated_blocks = extract_plan_task_blocks(&generated)?;
     let existing_blocks = extract_plan_task_blocks(existing)?;
     let generated_ids = generated_blocks
         .iter()
@@ -917,12 +960,44 @@ fn merge_generated_plan_with_existing_open_tasks(
         .filter(|block| !block.checked && !generated_ids.contains(block.task_id.as_str()))
         .collect::<Vec<_>>();
     if preserved_blocks.is_empty() {
-        return Ok(generated.to_string());
+        return Ok(generated);
     }
-    let mut merged = generated.to_string();
+    let mut merged = generated;
     append_blocks_to_section(&mut merged, PlanSection::Priority, &preserved_blocks)?;
     append_blocks_to_section(&mut merged, PlanSection::FollowOn, &preserved_blocks)?;
     Ok(merged)
+}
+
+fn ensure_required_plan_sections(markdown: &str) -> String {
+    if markdown.trim().is_empty() {
+        return markdown.to_string();
+    }
+
+    let mut normalized = markdown.to_string();
+    let mut changed = false;
+    for section in REQUIRED_PLAN_SECTIONS {
+        if markdown_has_line(&normalized, section) {
+            continue;
+        }
+        if !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if !normalized.ends_with("\n\n") {
+            normalized.push('\n');
+        }
+        normalized.push_str(section);
+        normalized.push('\n');
+        changed = true;
+    }
+
+    if changed && !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn markdown_has_line(markdown: &str, expected: &str) -> bool {
+    markdown.lines().any(|line| line.trim() == expected)
 }
 
 fn append_blocks_to_section(
@@ -1076,8 +1151,8 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        IMPLEMENTATION_PLAN_HEADER,
+        generated_spec_has_acceptance_criteria, merge_generated_plan_with_existing_open_tasks,
+        normalize_generated_implementation_plan, IMPLEMENTATION_PLAN_HEADER,
     };
 
     #[test]
@@ -1114,6 +1189,22 @@ Generated: 2026-04-02
             normalize_generated_implementation_plan(generated),
             generated.to_string()
         );
+    }
+
+    #[test]
+    fn normalizes_missing_required_sections() {
+        let generated = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `VAL-001` Validate user query input
+Spec: specs/020426-query-validation.md
+"#;
+
+        let normalized = normalize_generated_implementation_plan(generated);
+
+        assert!(normalized.contains("## Follow-On Work"));
+        assert!(normalized.contains("## Completed / Already Satisfied"));
     }
 
     #[test]
@@ -1154,5 +1245,34 @@ Spec: specs/310326-finished.md
         assert!(merged.contains("`SEC-001`"));
         assert!(merged.contains("`OPS-001`"));
         assert!(!merged.contains("`OLD-001`"));
+    }
+
+    #[test]
+    fn detects_acceptance_criteria_section_with_bullets() {
+        let spec = r#"# Specification: Example
+
+## Overview
+
+Something.
+
+## Acceptance Criteria
+
+- One
+- Two
+"#;
+
+        assert!(generated_spec_has_acceptance_criteria(spec));
+    }
+
+    #[test]
+    fn rejects_acceptance_criteria_section_without_bullets() {
+        let spec = r#"# Specification: Example
+
+## Acceptance Criteria
+
+This should be bulletized.
+"#;
+
+        assert!(!generated_spec_has_acceptance_criteria(spec));
     }
 }

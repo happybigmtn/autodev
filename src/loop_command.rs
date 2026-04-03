@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -13,7 +13,9 @@ use crate::util::{
 };
 use crate::LoopArgs;
 
-pub(crate) const DEFAULT_LOOP_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
+const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
+
+pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*` with full repo context to understand the application specifications.
 0c. Study `IMPLEMENTATION_PLAN.md`.
 
@@ -36,7 +38,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-s
    - Do not sweep unrelated pre-existing churn into the commit.
    - Commit with a message like `repo-name: TASK-ID short description` using this repository's actual name.
    - After committing, run `git status` to verify no implementation files were left unstaged. If any were, amend the commit.
-   - Push directly to `origin/main` after the commit.
+   - Push directly to `origin/{branch}` after the commit.
 
 5. If you hit a real blocker after genuine debugging:
    - Record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
@@ -49,7 +51,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-s
    - If the current task is already satisfied, remove it from `IMPLEMENTATION_PLAN.md`, append a truthful note to `COMPLETED.md`, and continue downward.
 
 7. Branch rule:
-   - Work only on branch `main`.
+   - Work only on branch `{branch}`.
    - Do not create or push feature branches, lane branches, or topic branches.
 
 99999. Important: keep `AGENTS.md` operational only.
@@ -65,18 +67,20 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     ensure_repo_layout(&repo_root)?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
-    if current_branch.trim() != args.branch {
+    let current_branch = current_branch.trim().to_string();
+    let target_branch = resolve_loop_branch(&repo_root, args.branch.as_deref(), &current_branch)?;
+    if current_branch != target_branch {
         bail!(
             "auto loop must run on branch `{}` (current: `{}`)",
-            args.branch,
-            current_branch.trim()
+            target_branch,
+            current_branch
         );
     }
 
     let prompt_template = match &args.prompt_file {
         Some(path) => fs::read_to_string(path)
             .with_context(|| format!("failed to read prompt file {}", path.display()))?,
-        None => DEFAULT_LOOP_PROMPT.to_string(),
+        None => render_default_loop_prompt(&target_branch),
     };
     let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
 
@@ -89,7 +93,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
 
     println!("auto loop");
     println!("repo root:   {}", repo_root.display());
-    println!("branch:      {}", args.branch);
+    println!("branch:      {}", target_branch);
     println!("model:       {}", args.model);
     println!("reasoning:   {}", args.reasoning_effort);
     println!("run root:    {}", run_root.display());
@@ -102,7 +106,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     );
 
     if let Some(commit) =
-        auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
+        auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
     {
         println!("checkpoint:  committed pre-existing changes at {commit}");
     }
@@ -154,9 +158,11 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         if commit_before.trim() == commit_after.trim() {
-            if let Some(commit) =
-                auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
-            {
+            if let Some(commit) = auto_checkpoint_if_needed(
+                &repo_root,
+                target_branch.as_str(),
+                "auto loop checkpoint",
+            )? {
                 iteration += 1;
                 println!("checkpoint:  committed iteration changes at {commit}");
                 println!();
@@ -167,9 +173,9 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             break;
         }
 
-        run_git(&repo_root, ["push", "origin", args.branch.as_str()])?;
+        run_git(&repo_root, ["push", "origin", target_branch.as_str()])?;
         if let Some(commit) =
-            auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
+            auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
         {
             println!("checkpoint:  committed trailing changes at {commit}");
         }
@@ -179,6 +185,95 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_default_loop_prompt(branch: &str) -> String {
+    DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch)
+}
+
+fn resolve_loop_branch(
+    repo_root: &Path,
+    requested_branch: Option<&str>,
+    current_branch: &str,
+) -> Result<String> {
+    let origin_head = git_stdout(
+        repo_root,
+        [
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok();
+    let available = KNOWN_PRIMARY_BRANCHES
+        .into_iter()
+        .filter(|candidate| git_branch_exists(repo_root, candidate))
+        .collect::<Vec<_>>();
+    pick_loop_branch(
+        requested_branch,
+        current_branch,
+        origin_head.as_deref(),
+        &available,
+    )
+}
+
+fn pick_loop_branch(
+    requested_branch: Option<&str>,
+    current_branch: &str,
+    origin_head: Option<&str>,
+    available_primary_branches: &[&str],
+) -> Result<String> {
+    if let Some(branch) = requested_branch
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        return Ok(branch.to_string());
+    }
+
+    if is_primary_branch_name(current_branch) {
+        return Ok(current_branch.to_string());
+    }
+
+    if let Some(branch) = origin_head.and_then(parse_origin_head_branch) {
+        return Ok(branch);
+    }
+
+    if let Some(branch) = KNOWN_PRIMARY_BRANCHES
+        .into_iter()
+        .find(|candidate| available_primary_branches.contains(candidate))
+    {
+        return Ok(branch.to_string());
+    }
+
+    bail!(
+        "auto loop could not resolve the repo's primary branch; pass `--branch <name>` explicitly"
+    );
+}
+
+fn parse_origin_head_branch(origin_head: &str) -> Option<String> {
+    let trimmed = origin_head.trim();
+    let branch = trimmed.strip_prefix("origin/").unwrap_or(trimmed).trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+fn is_primary_branch_name(branch: &str) -> bool {
+    KNOWN_PRIMARY_BRANCHES.contains(&branch.trim())
+}
+
+fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
+    git_ref_exists(repo_root, &format!("refs/heads/{branch}"))
+        || git_ref_exists(repo_root, &format!("refs/remotes/origin/{branch}"))
+}
+
+fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--verify", "--quiet", git_ref])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 async fn run_codex_iteration(
@@ -271,4 +366,57 @@ where
         .await
         .context("failed to read child stream")?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt};
+
+    #[test]
+    fn default_prompt_uses_resolved_branch() {
+        let prompt = render_default_loop_prompt("trunk");
+        assert!(prompt.contains("origin/trunk"));
+        assert!(prompt.contains("branch `trunk`"));
+        assert!(!prompt.contains("origin/main"));
+    }
+
+    #[test]
+    fn branch_picker_prefers_explicit_branch() {
+        let branch =
+            pick_loop_branch(Some("release"), "main", Some("origin/trunk"), &["trunk"]).unwrap();
+        assert_eq!(branch, "release");
+    }
+
+    #[test]
+    fn branch_picker_uses_origin_head_when_available() {
+        let branch = pick_loop_branch(None, "feature/test", Some("origin/master"), &[]).unwrap();
+        assert_eq!(branch, "master");
+    }
+
+    #[test]
+    fn branch_picker_prefers_current_primary_branch_over_origin_head() {
+        let branch =
+            pick_loop_branch(None, "main", Some("origin/master"), &["main", "master"]).unwrap();
+        assert_eq!(branch, "main");
+    }
+
+    #[test]
+    fn branch_picker_falls_back_to_current_primary_branch() {
+        let branch = pick_loop_branch(None, "trunk", None, &[]).unwrap();
+        assert_eq!(branch, "trunk");
+    }
+
+    #[test]
+    fn branch_picker_falls_back_to_known_available_branch() {
+        let branch = pick_loop_branch(None, "feature/test", None, &["master"]).unwrap();
+        assert_eq!(branch, "master");
+    }
+
+    #[test]
+    fn parses_origin_head_branch() {
+        assert_eq!(
+            parse_origin_head_branch("origin/trunk"),
+            Some("trunk".to_string())
+        );
+    }
 }

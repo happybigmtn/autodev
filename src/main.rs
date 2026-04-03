@@ -4,6 +4,7 @@ mod corpus;
 mod generation;
 mod loop_command;
 mod nemesis;
+mod pi_backend;
 mod review_command;
 mod state;
 mod util;
@@ -32,11 +33,11 @@ enum Command {
     Gen(GenerationArgs),
     /// Reverse-engineer specs from code reality using genesis/ as supporting context
     Reverse(GenerationArgs),
-    /// Run a chunked multi-pass bug-finding, invalidation, remediation, and review pipeline
+    /// Run a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline
     Bug(BugArgs),
-    /// Run the single-worker implementation loop on main
+    /// Run the single-worker implementation loop on the repo's primary branch
     Loop(LoopArgs),
-    /// Review completed work on main
+    /// Review completed work on the current branch
     Review(ReviewArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
     Nemesis(NemesisArgs),
@@ -106,11 +107,11 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     max_chunks: Option<usize>,
 
-    /// Stop after skeptical validation and summary generation
+    /// Stop after the verification review and summary generation
     #[arg(long)]
     report_only: bool,
 
-    /// Allow remediation to run on a dirty worktree
+    /// Allow the final implementation pass to run on a dirty worktree
     #[arg(long)]
     allow_dirty: bool,
 
@@ -134,29 +135,29 @@ pub(crate) struct BugArgs {
     #[arg(long, default_value = "high")]
     skeptic_effort: String,
 
-    /// Model for the remediation pass
-    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
+    /// Model for the final implementation pass. This stays pinned to gpt-5.4.
+    #[arg(long, default_value = "gpt-5.4")]
     fixer_model: String,
 
-    /// Effort / variant for the remediation pass
-    #[arg(long, default_value = "high")]
+    /// Effort / variant for the final implementation pass. This stays pinned to xhigh.
+    #[arg(long, default_value = "xhigh")]
     fixer_effort: String,
 
-    /// Model for the remediation review pass
+    /// Model for the verification review pass
     #[arg(long, default_value = "kimi")]
     reviewer_model: String,
 
-    /// Effort / variant for the remediation review pass
+    /// Effort / variant for the verification review pass
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
 
-    /// Codex executable to invoke for non-OpenCode models
+    /// Codex executable to invoke for non-PI models
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// OpenCode executable to invoke for MiniMax/Kimi models
-    #[arg(long, default_value = "opencode")]
-    opencode_bin: PathBuf,
+    /// PI executable to invoke for MiniMax/Kimi models
+    #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
+    pi_bin: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -177,9 +178,9 @@ pub(crate) struct LoopArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Branch that the loop is allowed to run on
-    #[arg(long, default_value = "main")]
-    branch: String,
+    /// Branch that the loop is allowed to run on. Defaults to the repo's primary branch.
+    #[arg(long)]
+    branch: Option<String>,
 
     /// Directory for loop logs. Defaults to <repo>/.auto/loop
     #[arg(long)]
@@ -231,19 +232,27 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// Model to use for the Nemesis run. Values like `minimax` or `kimi` automatically use OpenCode.
-    #[arg(long, default_value = "gpt-5.4")]
+    /// Model to use for the initial Nemesis audit pass. Values like `minimax` or `kimi` automatically use PI.
+    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
     model: String,
 
-    /// Reasoning effort / variant for the Nemesis backend
+    /// Reasoning effort / variant for the initial Nemesis audit pass
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
-    /// Use OpenCode with the Kimi 2.5 model instead of Codex
+    /// Model to use for the final Nemesis synthesis pass. Values like `minimax` or `kimi` automatically use PI.
+    #[arg(long, default_value = "kimi")]
+    reviewer_model: String,
+
+    /// Reasoning effort / variant for the final Nemesis synthesis pass
+    #[arg(long, default_value = "high")]
+    reviewer_effort: String,
+
+    /// Use PI with the Kimi 2.5 model for the initial Nemesis audit pass
     #[arg(long, conflicts_with = "minimax")]
     kimi: bool,
 
-    /// Use OpenCode with the MiniMax M2.5 model instead of Codex
+    /// Use PI with the MiniMax M2.7-highspeed model for the initial Nemesis audit pass
     #[arg(long, conflicts_with = "kimi")]
     minimax: bool,
 
@@ -255,9 +264,9 @@ pub(crate) struct NemesisArgs {
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// OpenCode executable to invoke for the Kimi/MiniMax backends
-    #[arg(long, default_value = "opencode")]
-    opencode_bin: PathBuf,
+    /// PI executable to invoke for the Kimi/MiniMax backends
+    #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
+    pi_bin: PathBuf,
 }
 
 #[tokio::main]
