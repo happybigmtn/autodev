@@ -61,6 +61,8 @@ struct PlanTaskBlock {
     markdown: String,
 }
 
+const IMPLEMENTATION_PLAN_HEADER: &str = "# IMPLEMENTATION_PLAN";
+
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
@@ -188,15 +190,18 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             );
         }
     } else {
+        print_stage("prepare output dir");
         prepare_generation_output_dir(&output_dir)?;
     }
 
+    print_stage("load planning corpus");
     let corpus = load_planning_corpus(&planning_root).with_context(|| {
         format!(
             "failed to load planning corpus from {}",
             planning_root.display()
         )
     })?;
+    print_stage("snapshot corpus into output dir");
     emit_corpus_snapshot(&corpus, &output_dir).with_context(|| {
         format!(
             "failed to copy planning corpus into {}",
@@ -205,8 +210,10 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     })?;
 
     let generated_specs = if args.plan_only {
+        print_stage("reuse existing generated specs");
         verify_generated_specs(&output_dir)?
     } else {
+        print_stage("generate specs");
         let prompt = build_spec_generation_prompt(
             mode,
             &repo_root,
@@ -230,21 +237,53 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         specs
     };
 
-    let plan_prompt = build_implementation_plan_prompt(
-        mode,
-        &repo_root,
-        &output_dir,
-        &generated_specs,
-        args.parallelism.clamp(1, 10),
-    );
-    let plan_phase = run_logged_claude_phase(
-        &repo_root,
-        mode.plan_phase_slug(),
-        &plan_prompt,
-        &args.model,
-        args.max_turns,
-    )?;
-    let implementation_plan = verify_generated_implementation_plan(&output_dir)?;
+    let (implementation_plan, plan_phase) = if args.plan_only {
+        if output_dir.join("IMPLEMENTATION_PLAN.md").exists() {
+            print_stage("reuse existing generated plan");
+            (verify_generated_implementation_plan(&output_dir)?, None)
+        } else {
+            print_stage("generate implementation plan");
+            let plan_prompt = build_implementation_plan_prompt(
+                mode,
+                &repo_root,
+                &output_dir,
+                &generated_specs,
+                args.parallelism.clamp(1, 10),
+            );
+            let plan_phase = run_logged_claude_phase(
+                &repo_root,
+                mode.plan_phase_slug(),
+                &plan_prompt,
+                &args.model,
+                args.max_turns,
+            )?;
+            (
+                verify_generated_implementation_plan(&output_dir)?,
+                Some(plan_phase),
+            )
+        }
+    } else {
+        print_stage("generate implementation plan");
+        let plan_prompt = build_implementation_plan_prompt(
+            mode,
+            &repo_root,
+            &output_dir,
+            &generated_specs,
+            args.parallelism.clamp(1, 10),
+        );
+        let plan_phase = run_logged_claude_phase(
+            &repo_root,
+            mode.plan_phase_slug(),
+            &plan_prompt,
+            &args.model,
+            args.max_turns,
+        )?;
+        (
+            verify_generated_implementation_plan(&output_dir)?,
+            Some(plan_phase),
+        )
+    };
+    print_stage("sync generated specs to root");
     let root_specs = sync_generated_specs_to_root(&repo_root, &generated_specs)?;
     let root_plan = match mode {
         GenerationMode::Gen => Some(sync_generated_plan_to_root_preserving_open_tasks(
@@ -254,6 +293,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         GenerationMode::Reverse => None,
     };
 
+    print_stage("save generator state");
     state.planning_root = Some(planning_root.clone());
     state.latest_output_dir = Some(output_dir.clone());
     save_state(&repo_root, &state)?;
@@ -276,11 +316,19 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     } else {
         println!("root plan:   unchanged");
     }
-    println!("plan prompt: {}", plan_phase.prompt_path.display());
-    if let Some(response_path) = plan_phase.response_path {
-        println!("plan log:    {}", response_path.display());
+    if let Some(plan_phase) = plan_phase {
+        println!("plan prompt: {}", plan_phase.prompt_path.display());
+        if let Some(response_path) = plan_phase.response_path {
+            println!("plan log:    {}", response_path.display());
+        }
+    } else {
+        println!("plan prompt: reused existing generated plan");
     }
     Ok(())
+}
+
+fn print_stage(stage: &str) {
+    println!("stage:       {stage}");
 }
 
 fn ensure_planning_root_exists(planning_root: &Path) -> Result<()> {
@@ -428,6 +476,7 @@ fn run_claude_prompt(
         .context("Claude stdin missing")?
         .write_all(prompt.as_bytes())
         .with_context(|| format!("failed to write prompt for {phase_label}"))?;
+    child.stdin.take();
 
     let output = child
         .wait_with_output()
@@ -674,6 +723,7 @@ Generated specs for this run:
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
+- The first non-empty line must be exactly `{IMPLEMENTATION_PLAN_HEADER}`
 - Use these top-level sections:
   - `## Priority Work`
   - `## Follow-On Work`
@@ -699,6 +749,7 @@ Output requirements:
 The goal is a truthful, execution-ready implementation queue."#,
         repo_root = repo_root.display(),
         output_dir = output_dir.display(),
+        IMPLEMENTATION_PLAN_HEADER = IMPLEMENTATION_PLAN_HEADER,
         mode_clause = mode_clause,
         parallelism = parallelism.max(1),
         spec_listing = if spec_listing.is_empty() {
@@ -741,17 +792,45 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
     }
     let markdown = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let normalized = normalize_generated_implementation_plan(&markdown);
     for required in [
-        "# IMPLEMENTATION_PLAN",
+        IMPLEMENTATION_PLAN_HEADER,
         "## Priority Work",
         "## Follow-On Work",
         "## Completed / Already Satisfied",
     ] {
-        if !markdown.contains(required) {
+        if !normalized.contains(required) {
             bail!("generated implementation plan is missing `{required}`");
         }
     }
+    if normalized != markdown {
+        atomic_write(&plan_path, normalized.as_bytes())
+            .with_context(|| format!("failed to normalize {}", plan_path.display()))?;
+    }
     Ok(plan_path)
+}
+
+fn normalize_generated_implementation_plan(markdown: &str) -> String {
+    let mut lines = markdown.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(first_non_empty) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return markdown.to_string();
+    };
+
+    let first_line = lines[first_non_empty].trim();
+    if first_line == IMPLEMENTATION_PLAN_HEADER {
+        return markdown.to_string();
+    }
+
+    if first_line.starts_with("# ") {
+        lines[first_non_empty] = IMPLEMENTATION_PLAN_HEADER.to_string();
+        let mut normalized = lines.join("\n");
+        if markdown.ends_with('\n') {
+            normalized.push('\n');
+        }
+        return normalized;
+    }
+
+    markdown.to_string()
 }
 
 fn sync_generated_specs_to_root(
@@ -996,7 +1075,46 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_generated_plan_with_existing_open_tasks;
+    use super::{
+        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
+        IMPLEMENTATION_PLAN_HEADER,
+    };
+
+    #[test]
+    fn normalizes_noncanonical_plan_heading() {
+        let generated = r#"# Bitino Implementation Plan
+
+Generated: 2026-04-02
+
+## Priority Work
+
+## Follow-On Work
+
+## Completed / Already Satisfied
+"#;
+
+        let normalized = normalize_generated_implementation_plan(generated);
+
+        assert!(normalized.starts_with(&format!("{IMPLEMENTATION_PLAN_HEADER}\n")));
+        assert!(normalized.contains("Generated: 2026-04-02"));
+    }
+
+    #[test]
+    fn preserves_canonical_plan_heading() {
+        let generated = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+## Follow-On Work
+
+## Completed / Already Satisfied
+"#;
+
+        assert_eq!(
+            normalize_generated_implementation_plan(generated),
+            generated.to_string()
+        );
+    }
 
     #[test]
     fn merges_existing_open_tasks_not_present_in_new_plan() {
