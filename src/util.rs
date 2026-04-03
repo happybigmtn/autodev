@@ -57,6 +57,24 @@ pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a s
     );
 }
 
+pub(crate) fn git_tracked_status(repo_root: &Path) -> Result<String> {
+    git_stdout(
+        repo_root,
+        ["status", "--short", "--untracked-files=no", "--ignored=no"],
+    )
+}
+
+pub(crate) fn ensure_tracked_worktree_clean(repo_root: &Path, command_name: &str) -> Result<()> {
+    let status = git_tracked_status(repo_root)?;
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{command_name}` requires a clean tracked worktree before it starts:\n{}",
+        status.trim_end()
+    );
+}
+
 pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {
     for rel in [
         ".auto",

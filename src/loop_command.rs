@@ -3,14 +3,13 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use console::Style;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
+use crate::codex_stream;
 use crate::util::{
-    atomic_write, clip_line_for_display, ensure_repo_layout, git_repo_root, git_stdout, run_git,
-    timestamp_slug,
+    atomic_write, ensure_repo_layout, ensure_tracked_worktree_clean, git_repo_root,
+    git_stdout, git_tracked_status, run_git, timestamp_slug,
 };
 use crate::LoopArgs;
 
@@ -61,14 +60,10 @@ pub(crate) const DEFAULT_LOOP_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-s
 9999999999. When you learn something new about how to build, run, or validate the repo, update `AGENTS.md` — but keep it brief and operational only.
 99999999999. As soon as there are no build or test errors, create a git tag. If no git tags exist start at 0.0.0 and increment patch by 1 (e.g. 0.0.1)."#;
 
-#[derive(Default)]
-struct LoopRenderState {
-    tool_count: usize,
-}
-
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    ensure_tracked_worktree_clean(&repo_root, "auto loop")?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     if current_branch.trim() != args.branch {
@@ -125,6 +120,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        let tracked_status_before = git_tracked_status(&repo_root)?;
         println!();
         println!("running Codex iteration {}", iteration + 1);
 
@@ -153,12 +149,26 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         println!("Codex iteration complete");
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        let tracked_status_after = git_tracked_status(&repo_root)?;
         if commit_before.trim() == commit_after.trim() {
+            if tracked_status_before.trim() != tracked_status_after.trim() {
+                bail!(
+                    "Codex changed tracked files without creating a commit during auto loop:\n{}",
+                    tracked_status_after.trim_end()
+                );
+            }
             println!("no new commit detected; stopping.");
             break;
         }
 
         run_git(&repo_root, ["push", "origin", args.branch.as_str()])?;
+        if tracked_status_before.trim() != tracked_status_after.trim() {
+            bail!(
+                "auto loop iteration created commit {} but left tracked changes behind:\n{}",
+                commit_after.trim(),
+                tracked_status_after.trim_end()
+            );
+        }
         iteration += 1;
         println!();
         println!("================ LOOP {} ================", iteration);
@@ -220,7 +230,7 @@ async fn run_codex_iteration(
         .take()
         .context("Codex stderr should be piped for auto loop")?;
 
-    let stdout_task = tokio::spawn(async move { stream_codex_output(stdout).await });
+    let stdout_task = tokio::spawn(async move { codex_stream::stream_codex_output(stdout).await });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for Codex")?;
@@ -257,127 +267,4 @@ where
         .await
         .context("failed to read child stream")?;
     Ok(text)
-}
-
-async fn stream_codex_output<R>(stream: R) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(stream).lines();
-    let mut state = LoopRenderState::default();
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .context("failed reading Codex JSON stream")?
-    {
-        render_codex_stream_line(&line, &mut state);
-    }
-    Ok(())
-}
-
-fn render_codex_stream_line(line: &str, state: &mut LoopRenderState) {
-    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-        if !line.trim().is_empty() {
-            eprintln!("{line}");
-        }
-        return;
-    };
-
-    let green = Style::new().green();
-    let yellow = Style::new().yellow();
-    let red = Style::new().red();
-    let cyan = Style::new().cyan();
-    let dim = Style::new().dim();
-
-    let event = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match event {
-        "item.started" | "task_started" => println!("{}", cyan.apply_to("* task_started")),
-        "item.completed" => println!("{}", cyan.apply_to("* task_completed")),
-        "agent_reasoning" | "reasoning" => {
-            print_block("thinking: ", json_string(&value, "text"), &dim, 3);
-        }
-        "tool.call" | "tool_use" => {
-            state.tool_count += 1;
-            let name = value.get("name").and_then(Value::as_str).unwrap_or("tool");
-            println!("{}", yellow.apply_to(format!("  > {name}")));
-            print_block("   ", json_string(&value, "command"), &dim, 2);
-        }
-        "message" | "agent_message" => {
-            let text = json_string(&value, "text").or_else(|| {
-                value
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-            print_block("", text, &Style::new(), 6);
-        }
-        "completed" | "turn.completed" => {
-            let usage = value.get("usage").cloned().unwrap_or(Value::Null);
-            let input = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            println!();
-            println!("========================================");
-            println!(
-                "{} | Tokens: in {} out {} | Tools: {}",
-                green.apply_to("done"),
-                input,
-                output,
-                state.tool_count
-            );
-        }
-        "error" => {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string());
-            println!("{}", red.apply_to(format!("error: {message}")));
-        }
-        _ => {}
-    }
-}
-
-fn print_block(prefix: &str, text: Option<String>, style: &Style, limit: usize) {
-    let Some(text) = text else {
-        return;
-    };
-    let mut shown = 0usize;
-    let lines = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    for line in &lines {
-        if shown >= limit {
-            break;
-        }
-        let clipped = if line.chars().count() > 140 {
-            format!("{}...", clip_line_for_display(line, 137))
-        } else {
-            (*line).to_string()
-        };
-        println!("{}", style.apply_to(format!("{prefix}{clipped}")));
-        shown += 1;
-    }
-    if lines.len() > limit {
-        println!(
-            "{}",
-            Style::new()
-                .dim()
-                .apply_to(format!("{prefix}... +{} more lines", lines.len() - limit))
-        );
-    }
-}
-
-fn json_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
 }

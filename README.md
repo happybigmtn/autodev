@@ -26,8 +26,8 @@ All commands resolve the git repo root automatically from the current working di
 - Internal state and logs live under `<repo>/.auto/`
 - Nemesis audit output defaults to `<repo>/nemesis`
 - `auto loop` runs on `main` by default with `gpt-5.4` and `xhigh`
-- `auto nemesis` runs on `gpt-5.4` with `high` by default
-- `auto review` runs on `main` by default with `gpt-5.4` and `xhigh`
+- `auto nemesis` runs on `gpt-5.4` with `high` by default, and `--model minimax` / `--model kimi` automatically use OpenCode
+- `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
 
 ## Command Contract
 
@@ -112,6 +112,8 @@ Backend selection:
 - Default: Codex with `gpt-5.4` and reasoning effort `high`
 - `auto nemesis --kimi`: OpenCode with `kimi-for-coding/k2p5`
 - `auto nemesis --minimax`: OpenCode with `minimax/MiniMax-M2.5`
+- `auto nemesis --model kimi`: same as `--kimi`
+- `auto nemesis --model minimax`: same as `--minimax`
 
 Unlike `auto gen`, Nemesis does not replace the root implementation plan structure. It only appends new unchecked audit tasks that are not already present.
 
@@ -130,6 +132,8 @@ Behavior:
 - Appends a completion record to `COMPLETED.md`
 - Commits and pushes truthful increments to `origin/main`
 - Creates a git tag after a green increment
+- Refuses to start on a dirty tracked worktree
+- Fails loudly if the worker changes tracked files without creating a commit
 
 Default model:
 
@@ -150,7 +154,9 @@ Behavior:
 - Uses `/ce:compound` to record durable learnings in `LEARNINGS.md`
 - Writes unresolved findings to `WORKLIST.md`
 - Moves only truly cleared review items from `REVIEW.md` to `ARCHIVED.md`
-- Commits and pushes truthful review increments to `origin/main`
+- Commits and pushes truthful review increments back to the current branch
+- Refuses to start on a dirty tracked worktree
+- Fails loudly if the worker changes tracked files without creating a commit
 
 Default model:
 
@@ -226,6 +232,8 @@ Use OpenCode instead:
 ```bash
 auto nemesis --kimi
 auto nemesis --minimax
+auto nemesis --model kimi
+auto nemesis --model minimax
 ```
 
 Execute implementation work:

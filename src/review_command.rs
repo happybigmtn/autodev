@@ -3,14 +3,13 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use console::Style;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
+use crate::codex_stream;
 use crate::util::{
-    atomic_write, clip_line_for_display, ensure_repo_layout, git_repo_root, git_stdout, run_git,
-    timestamp_slug,
+    atomic_write, ensure_repo_layout, ensure_tracked_worktree_clean, git_repo_root,
+    git_stdout, git_tracked_status, run_git, timestamp_slug,
 };
 use crate::ReviewArgs;
 
@@ -41,10 +40,11 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
    - Only archive items that are genuinely complete after review and any follow-up fixes.
 
 5. Commit and push only truthful review increments:
-   - Work only on branch `main`.
+   - Stay on the branch that is already checked out when `auto review` starts.
+   - Do not create or switch branches during the review pass.
    - Stage only the files relevant to the review fixes plus `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, `LEARNINGS.md`, and `AGENTS.md` when they changed.
    - Commit with a message like `repo-name: review completed items`.
-   - Push directly to `origin/main` after each successful commit-producing pass.
+   - Push back to that same branch after each successful commit-producing pass.
 
 6. If `REVIEW.md` is empty or has no reviewable items:
    - Do not invent work.
@@ -57,14 +57,10 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";
 const REVIEW_HEADER: &str = "# REVIEW";
 
-#[derive(Default)]
-struct ReviewRenderState {
-    tool_count: usize,
-}
-
 pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    ensure_tracked_worktree_clean(&repo_root, "auto review")?;
 
     let completed_path = repo_root.join("COMPLETED.md");
     let review_path = repo_root.join("REVIEW.md");
@@ -77,12 +73,19 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
-    if current_branch.trim() != args.branch {
-        bail!(
-            "auto review must run on branch `{}` (current: `{}`)",
-            args.branch,
-            current_branch.trim()
-        );
+    let current_branch = current_branch.trim().to_string();
+    let push_branch = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| current_branch.clone());
+    if let Some(required_branch) = args.branch.as_deref() {
+        if current_branch != required_branch {
+            bail!(
+                "auto review must run on branch `{}` (current: `{}`)",
+                required_branch,
+                current_branch
+            );
+        }
     }
 
     let prompt_template = match &args.prompt_file {
@@ -101,7 +104,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
 
     println!("auto review");
     println!("repo root:   {}", repo_root.display());
-    println!("branch:      {}", args.branch);
+    println!("branch:      {}", push_branch);
     println!("model:       {}", args.model);
     println!("reasoning:   {}", args.reasoning_effort);
     println!("review doc:  {}", review_path.display());
@@ -123,6 +126,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        let tracked_status_before = git_tracked_status(&repo_root)?;
         println!();
         println!("running review iteration {}", iteration + 1);
 
@@ -150,12 +154,26 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!("review iteration complete");
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        let tracked_status_after = git_tracked_status(&repo_root)?;
         if commit_before.trim() == commit_after.trim() {
+            if tracked_status_before.trim() != tracked_status_after.trim() {
+                bail!(
+                    "Codex changed tracked files without creating a commit during auto review:\n{}",
+                    tracked_status_after.trim_end()
+                );
+            }
             println!("no new commit detected; stopping.");
             break;
         }
 
-        run_git(&repo_root, ["push", "origin", args.branch.as_str()])?;
+        run_git(&repo_root, ["push", "origin", push_branch.as_str()])?;
+        if tracked_status_before.trim() != tracked_status_after.trim() {
+            bail!(
+                "auto review iteration created commit {} but left tracked changes behind:\n{}",
+                commit_after.trim(),
+                tracked_status_after.trim_end()
+            );
+        }
         iteration += 1;
         println!();
         println!("================ REVIEW {} ================", iteration);
@@ -216,7 +234,7 @@ async fn run_codex_iteration(
         .take()
         .context("Codex stderr should be piped for auto review")?;
 
-    let stdout_task = tokio::spawn(async move { stream_codex_output(stdout).await });
+    let stdout_task = tokio::spawn(async move { codex_stream::stream_codex_output(stdout).await });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for Codex")?;
@@ -252,129 +270,6 @@ where
         .await
         .context("failed to read child stream")?;
     Ok(text)
-}
-
-async fn stream_codex_output<R>(stream: R) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(stream).lines();
-    let mut state = ReviewRenderState::default();
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .context("failed reading Codex JSON stream")?
-    {
-        render_codex_stream_line(&line, &mut state);
-    }
-    Ok(())
-}
-
-fn render_codex_stream_line(line: &str, state: &mut ReviewRenderState) {
-    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-        if !line.trim().is_empty() {
-            eprintln!("{line}");
-        }
-        return;
-    };
-    let green = Style::new().green();
-    let blue = Style::new().blue();
-    let yellow = Style::new().yellow();
-    let red = Style::new().red();
-    let dim = Style::new().dim();
-
-    let event = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match event {
-        "item.started" | "task_started" => println!("{}", blue.apply_to("* task_started")),
-        "item.completed" => println!("{}", blue.apply_to("* task_completed")),
-        "agent_reasoning" | "reasoning" => {
-            print_block("thinking: ", json_string(&value, "text"), &dim, 3);
-        }
-        "tool_use" | "tool.call" => {
-            state.tool_count += 1;
-            let name = value.get("name").and_then(Value::as_str).unwrap_or("tool");
-            println!("{}", yellow.apply_to(format!("  > {name}")));
-        }
-        "message" | "agent_message" | "assistant" => {
-            let text = json_string(&value, "text").or_else(|| {
-                value
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-            print_block("", text, &Style::new(), 8);
-        }
-        "task_progress" | "task_notification" | "init" | "hook_started" | "hook_response" => {
-            println!("{}", blue.apply_to(line.trim()));
-        }
-        "completed" | "turn.completed" => {
-            let usage = value.get("usage").cloned().unwrap_or(Value::Null);
-            let input = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            println!();
-            println!(
-                "{} | Tokens: in {} out {} | Tools: {}",
-                green.apply_to("done"),
-                input,
-                output,
-                state.tool_count
-            );
-        }
-        "error" => {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string());
-            println!("{}", red.apply_to(format!("error: {message}")));
-        }
-        _ => {}
-    }
-}
-
-fn print_block(prefix: &str, text: Option<String>, style: &Style, limit: usize) {
-    let Some(text) = text else {
-        return;
-    };
-    let lines = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    for line in lines.iter().take(limit) {
-        let clipped = if line.chars().count() > 140 {
-            format!("{}...", clip_line_for_display(line, 137))
-        } else {
-            (*line).to_string()
-        };
-        println!("{}", style.apply_to(format!("{prefix}{clipped}")));
-    }
-    if lines.len() > limit {
-        println!(
-            "{}",
-            Style::new()
-                .dim()
-                .apply_to(format!("{prefix}... +{} more lines", lines.len() - limit))
-        );
-    }
-}
-
-fn json_string(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
 }
 
 pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {

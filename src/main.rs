@@ -1,3 +1,4 @@
+mod codex_stream;
 mod corpus;
 mod generation;
 mod loop_command;
@@ -137,9 +138,9 @@ pub(crate) struct ReviewArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Branch that the review loop is allowed to run on
-    #[arg(long, default_value = "main")]
-    branch: String,
+    /// Optional branch to require for the review loop; defaults to the currently checked-out branch
+    #[arg(long)]
+    branch: Option<String>,
 
     /// Directory for review logs. Defaults to <repo>/.auto/review
     #[arg(long)]
@@ -160,11 +161,11 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// Model to use for the default Codex-backed Nemesis run
+    /// Model to use for the Nemesis run. Values like `minimax` or `kimi` automatically use OpenCode.
     #[arg(long, default_value = "gpt-5.4")]
     model: String,
 
-    /// Reasoning effort to pass through to the Codex-backed Nemesis run
+    /// Reasoning effort / variant for the Nemesis backend
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
