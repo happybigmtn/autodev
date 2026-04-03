@@ -6,11 +6,12 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` only owns six commands:
+`auto` only owns seven commands:
 
 - `auto corpus`
 - `auto gen`
 - `auto reverse`
+- `auto bug`
 - `auto nemesis`
 - `auto loop`
 - `auto review`
@@ -24,7 +25,9 @@ All commands resolve the git repo root automatically from the current working di
 - Planning root defaults to `<repo>/genesis`
 - Generated output defaults to `<repo>/gen-<timestamp>`
 - Internal state and logs live under `<repo>/.auto/`
+- Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
+- `auto bug` runs MiniMax finder/fixer passes and Kimi skeptic/reviewer passes by default
 - `auto loop` runs on `main` by default with `gpt-5.4` and `xhigh`
 - `auto nemesis` runs on `gpt-5.4` with `high` by default, and `--model minimax` / `--model kimi` automatically use OpenCode
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
@@ -117,6 +120,50 @@ Backend selection:
 
 Unlike `auto gen`, Nemesis does not replace the root implementation plan structure. It only appends new unchecked audit tasks that are not already present.
 
+### `auto bug`
+
+`auto bug` runs a single chunked multi-pass bug pipeline over the repo.
+
+Behavior:
+
+- Splits tracked repo files into manageable chunks by top-level scope
+- Runs four passes per chunk by default:
+  - MiniMax finder
+  - Kimi skeptic
+  - MiniMax remediation
+  - Kimi remediation review
+- Streams parsed model output live for both Codex and OpenCode backends
+- Writes durable artifacts under `bug/`:
+  - per-chunk prompts, raw model responses, JSON verdicts, and markdown summaries
+  - `bug/BUG_REPORT.md`
+  - `bug/verified-findings.json`
+- Archives the previous `bug/` folder under `.auto/fresh-input/` before refresh
+
+Safety:
+
+- Full remediation mode checkpoints and pushes pre-existing dirty changes on the current branch before the bug pipeline starts
+- Use `--report-only` to stop after finder + skeptic + aggregation
+- Use `--allow-dirty` if you intentionally want remediation to layer on top of an already-dirty tree without the startup checkpoint
+
+Default pass layout:
+
+- finder: `minimax/MiniMax-M2.7-highspeed` with `high`
+- skeptic: `kimi` with `high`
+- fixer: `minimax/MiniMax-M2.7-highspeed` with `high`
+- reviewer: `kimi` with `high`
+
+Model routing:
+
+- MiniMax aliases resolve to `minimax/MiniMax-M2.7-highspeed` and Kimi aliases resolve to `kimi-for-coding/k2p5`
+- Any other model name uses Codex
+
+Useful flags:
+
+- `--chunk-size <n>` to change the per-chunk file budget
+- `--max-chunks <n>` to cap the run
+- `--report-only` to skip remediation
+- `--dry-run` to preview the chunk plan
+
 ### `auto loop`
 
 `auto loop` is the single-worker implementation loop.
@@ -184,7 +231,8 @@ Only some are required at startup. The command will create missing files when ap
 - Git repository with a valid `origin`
 - `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
 - `codex` on `PATH` for `auto nemesis`, `auto loop`, and `auto review`
-- `opencode` on `PATH` for `auto nemesis --kimi` and `auto nemesis --minimax`
+- `codex` on `PATH` for any `auto bug` phase using a non-OpenCode model
+- `opencode` on `PATH` for `auto bug` MiniMax/Kimi passes and `auto nemesis --kimi` / `--minimax`
 
 Recommended environment:
 
@@ -223,6 +271,19 @@ Run a disposable Nemesis audit:
 
 ```bash
 auto nemesis
+```
+
+Run the multi-pass bug pipeline:
+
+```bash
+auto bug
+```
+
+Preview chunking or run report-only:
+
+```bash
+auto bug --dry-run
+auto bug --report-only
 ```
 
 Use OpenCode instead:

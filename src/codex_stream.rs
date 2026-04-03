@@ -29,24 +29,57 @@ struct UsageSummary {
     output_tokens: u64,
 }
 
-pub(crate) async fn stream_codex_output<R>(stream: R) -> Result<()>
+pub(crate) async fn capture_codex_output<R>(stream: R) -> Result<String>
 where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream).lines();
+    let mut raw = String::new();
     let mut state = CodexRenderState::default();
     while let Some(line) = reader
         .next_line()
         .await
         .context("failed reading Codex JSON stream")?
     {
+        raw.push_str(&line);
+        raw.push('\n');
         let rendered = render_codex_stream_line(&line, &mut state);
         if !rendered.is_empty() {
             print!("{rendered}");
             let _ = io::stdout().flush();
         }
     }
+    Ok(raw)
+}
+
+pub(crate) async fn stream_codex_output<R>(stream: R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    capture_codex_output(stream).await?;
     Ok(())
+}
+
+pub(crate) async fn capture_opencode_output<R>(stream: R) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream).lines();
+    let mut raw = String::new();
+    while let Some(line) = reader
+        .next_line()
+        .await
+        .context("failed reading OpenCode JSON stream")?
+    {
+        raw.push_str(&line);
+        raw.push('\n');
+        let rendered = render_opencode_stream_line(&line);
+        if !rendered.is_empty() {
+            print!("{rendered}");
+            let _ = io::stdout().flush();
+        }
+    }
+    Ok(raw)
 }
 
 fn render_codex_stream_line(line: &str, state: &mut CodexRenderState) -> String {
@@ -320,6 +353,90 @@ fn render_codex_stream_line(line: &str, state: &mut CodexRenderState) -> String 
         "error" | "turn_aborted" | "stream_error" => {
             let message = json_string(&value, "message").unwrap_or_else(|| value.to_string());
             push_styled_line(&mut out, &red, format!("error: {message}"));
+        }
+        _ => {}
+    }
+
+    out
+}
+
+fn render_opencode_stream_line(line: &str) -> String {
+    let mut out = String::new();
+    let trimmed = line.trim();
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        if !trimmed.is_empty() {
+            push_plain_line(&mut out, trimmed);
+        }
+        return out;
+    };
+
+    let blue = Style::new().blue();
+    let red = Style::new().red();
+    let dim = Style::new().dim();
+
+    match value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "text" => {
+            let text = value
+                .get("part")
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            write_block(&mut out, "", text, &Style::new(), 8);
+        }
+        "step_start" => {
+            let label = json_string(&value, "message")
+                .or_else(|| {
+                    value
+                        .get("part")
+                        .and_then(|part| part.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    value
+                        .get("part")
+                        .and_then(|part| part.get("type"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty() && *text != "step-start")
+                        .map(str::to_string)
+                });
+            if let Some(label) = label {
+                push_styled_line(&mut out, &blue, format!("[step] {label}"));
+            }
+        }
+        "step_finish" => {
+            if let Some(message) = json_string(&value, "message") {
+                push_styled_line(&mut out, &dim, format!("done: {message}"));
+            }
+        }
+        "error" => {
+            let detail = value
+                .get("error")
+                .and_then(|error| error.get("data"))
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+                .or_else(|| compact_json(&value))
+                .unwrap_or_else(|| "unknown OpenCode error".to_string());
+            push_styled_line(&mut out, &red, format!("error: {detail}"));
         }
         _ => {}
     }
@@ -712,7 +829,10 @@ fn pop_last_inline_char(out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_codex_stream_line, sanitize_terminal_text, CodexRenderState};
+    use super::{
+        render_codex_stream_line, render_opencode_stream_line, sanitize_terminal_text,
+        CodexRenderState,
+    };
 
     #[test]
     fn renders_exec_commands_with_result_lines() {
@@ -795,5 +915,23 @@ mod tests {
         assert!(rendered.contains("   -> result: ok green"));
         assert!(rendered.contains("   -> result: next"));
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_opencode_text_events() {
+        console::set_colors_enabled(false);
+        let rendered = render_opencode_stream_line(
+            r#"{"type":"text","part":{"text":"\n\nChunk audit complete"}}"#,
+        );
+        assert!(rendered.contains("Chunk audit complete"));
+    }
+
+    #[test]
+    fn suppresses_unlabeled_opencode_step_start_json_noise() {
+        console::set_colors_enabled(false);
+        let rendered = render_opencode_stream_line(
+            r#"{"type":"step_start","part":{"id":"abc","type":"step-start"},"timestamp":1}"#,
+        );
+        assert!(rendered.is_empty());
     }
 }

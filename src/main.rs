@@ -1,3 +1,4 @@
+mod bug_command;
 mod codex_stream;
 mod corpus;
 mod generation;
@@ -31,6 +32,8 @@ enum Command {
     Gen(GenerationArgs),
     /// Reverse-engineer specs from code reality using genesis/ as supporting context
     Reverse(GenerationArgs),
+    /// Run a chunked multi-pass bug-finding, invalidation, remediation, and review pipeline
+    Bug(BugArgs),
     /// Run the single-worker implementation loop on main
     Loop(LoopArgs),
     /// Review completed work on main
@@ -87,6 +90,73 @@ pub(crate) struct GenerationArgs {
     /// Skip spec regeneration and only refresh the plan inside an existing gen-* dir
     #[arg(long)]
     plan_only: bool,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct BugArgs {
+    /// Output directory for bug pipeline artifacts. Defaults to <repo>/bug
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Maximum files per audit chunk
+    #[arg(long, default_value_t = 24)]
+    chunk_size: usize,
+
+    /// Optional cap on how many chunks to process
+    #[arg(long)]
+    max_chunks: Option<usize>,
+
+    /// Stop after skeptical validation and summary generation
+    #[arg(long)]
+    report_only: bool,
+
+    /// Allow remediation to run on a dirty worktree
+    #[arg(long)]
+    allow_dirty: bool,
+
+    /// Preview the chunk plan without invoking any models
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Model for the initial finder pass
+    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
+    finder_model: String,
+
+    /// Effort / variant for the initial finder pass
+    #[arg(long, default_value = "high")]
+    finder_effort: String,
+
+    /// Model for the adversarial skeptic pass
+    #[arg(long, default_value = "kimi")]
+    skeptic_model: String,
+
+    /// Effort / variant for the skeptic pass
+    #[arg(long, default_value = "high")]
+    skeptic_effort: String,
+
+    /// Model for the remediation pass
+    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
+    fixer_model: String,
+
+    /// Effort / variant for the remediation pass
+    #[arg(long, default_value = "high")]
+    fixer_effort: String,
+
+    /// Model for the remediation review pass
+    #[arg(long, default_value = "kimi")]
+    reviewer_model: String,
+
+    /// Effort / variant for the remediation review pass
+    #[arg(long, default_value = "high")]
+    reviewer_effort: String,
+
+    /// Codex executable to invoke for non-OpenCode models
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// OpenCode executable to invoke for MiniMax/Kimi models
+    #[arg(long, default_value = "opencode")]
+    opencode_bin: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -196,6 +266,7 @@ async fn main() -> Result<()> {
         Command::Corpus(args) => generation::run_corpus(args).await,
         Command::Gen(args) => generation::run_gen(args).await,
         Command::Reverse(args) => generation::run_reverse(args).await,
+        Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
         Command::Review(args) => review_command::run_review(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
