@@ -8,8 +8,8 @@ use tokio::process::Command as TokioCommand;
 
 use crate::codex_stream;
 use crate::util::{
-    atomic_write, ensure_repo_layout, ensure_tracked_worktree_clean, git_repo_root,
-    git_stdout, git_tracked_status, run_git, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
+    run_git, timestamp_slug,
 };
 use crate::LoopArgs;
 
@@ -63,7 +63,6 @@ pub(crate) const DEFAULT_LOOP_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-s
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
-    ensure_tracked_worktree_clean(&repo_root, "auto loop")?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     if current_branch.trim() != args.branch {
@@ -102,6 +101,12 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .unwrap_or_else(|| "built-in Ralph worker".to_string())
     );
 
+    if let Some(commit) =
+        auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
+    {
+        println!("checkpoint:  committed pre-existing changes at {commit}");
+    }
+
     let mut iteration = 0usize;
     loop {
         if args.max_iterations.is_some_and(|limit| iteration >= limit) {
@@ -120,7 +125,6 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        let tracked_status_before = git_tracked_status(&repo_root)?;
         println!();
         println!("running Codex iteration {}", iteration + 1);
 
@@ -149,25 +153,25 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         println!("Codex iteration complete");
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        let tracked_status_after = git_tracked_status(&repo_root)?;
         if commit_before.trim() == commit_after.trim() {
-            if tracked_status_before.trim() != tracked_status_after.trim() {
-                bail!(
-                    "Codex changed tracked files without creating a commit during auto loop:\n{}",
-                    tracked_status_after.trim_end()
-                );
+            if let Some(commit) =
+                auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
+            {
+                iteration += 1;
+                println!("checkpoint:  committed iteration changes at {commit}");
+                println!();
+                println!("================ LOOP {} ================", iteration);
+                continue;
             }
             println!("no new commit detected; stopping.");
             break;
         }
 
         run_git(&repo_root, ["push", "origin", args.branch.as_str()])?;
-        if tracked_status_before.trim() != tracked_status_after.trim() {
-            bail!(
-                "auto loop iteration created commit {} but left tracked changes behind:\n{}",
-                commit_after.trim(),
-                tracked_status_after.trim_end()
-            );
+        if let Some(commit) =
+            auto_checkpoint_if_needed(&repo_root, args.branch.as_str(), "auto loop checkpoint")?
+        {
+            println!("checkpoint:  committed trailing changes at {commit}");
         }
         iteration += 1;
         println!();

@@ -132,8 +132,7 @@ Behavior:
 - Appends a completion record to `COMPLETED.md`
 - Commits and pushes truthful increments to `origin/main`
 - Creates a git tag after a green increment
-- Refuses to start on a dirty tracked worktree
-- Fails loudly if the worker changes tracked files without creating a commit
+- Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
 
 Default model:
 
@@ -155,8 +154,7 @@ Behavior:
 - Writes unresolved findings to `WORKLIST.md`
 - Moves only truly cleared review items from `REVIEW.md` to `ARCHIVED.md`
 - Commits and pushes truthful review increments back to the current branch
-- Refuses to start on a dirty tracked worktree
-- Fails loudly if the worker changes tracked files without creating a commit
+- Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
 
 Default model:
 

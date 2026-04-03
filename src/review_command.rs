@@ -8,8 +8,8 @@ use tokio::process::Command as TokioCommand;
 
 use crate::codex_stream;
 use crate::util::{
-    atomic_write, ensure_repo_layout, ensure_tracked_worktree_clean, git_repo_root,
-    git_stdout, git_tracked_status, run_git, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
+    run_git, timestamp_slug,
 };
 use crate::ReviewArgs;
 
@@ -60,7 +60,6 @@ const REVIEW_HEADER: &str = "# REVIEW";
 pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
-    ensure_tracked_worktree_clean(&repo_root, "auto review")?;
 
     let completed_path = repo_root.join("COMPLETED.md");
     let review_path = repo_root.join("REVIEW.md");
@@ -116,6 +115,12 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
     println!("run root:    {}", run_root.display());
 
+    if let Some(commit) =
+        auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
+    {
+        println!("checkpoint:  committed pre-existing review changes at {commit}");
+    }
+
     let mut iteration = 0usize;
     while iteration < args.max_iterations {
         let prompt_path = repo_root
@@ -126,7 +131,6 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        let tracked_status_before = git_tracked_status(&repo_root)?;
         println!();
         println!("running review iteration {}", iteration + 1);
 
@@ -154,25 +158,25 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!("review iteration complete");
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        let tracked_status_after = git_tracked_status(&repo_root)?;
         if commit_before.trim() == commit_after.trim() {
-            if tracked_status_before.trim() != tracked_status_after.trim() {
-                bail!(
-                    "Codex changed tracked files without creating a commit during auto review:\n{}",
-                    tracked_status_after.trim_end()
-                );
+            if let Some(commit) =
+                auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
+            {
+                iteration += 1;
+                println!("checkpoint:  committed iteration changes at {commit}");
+                println!();
+                println!("================ REVIEW {} ================", iteration);
+                continue;
             }
             println!("no new commit detected; stopping.");
             break;
         }
 
         run_git(&repo_root, ["push", "origin", push_branch.as_str()])?;
-        if tracked_status_before.trim() != tracked_status_after.trim() {
-            bail!(
-                "auto review iteration created commit {} but left tracked changes behind:\n{}",
-                commit_after.trim(),
-                tracked_status_after.trim_end()
-            );
+        if let Some(commit) =
+            auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
+        {
+            println!("checkpoint:  committed trailing changes at {commit}");
         }
         iteration += 1;
         println!();

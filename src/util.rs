@@ -57,22 +57,34 @@ pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a s
     );
 }
 
-pub(crate) fn git_tracked_status(repo_root: &Path) -> Result<String> {
-    git_stdout(
-        repo_root,
-        ["status", "--short", "--untracked-files=no", "--ignored=no"],
-    )
+pub(crate) fn git_status(repo_root: &Path) -> Result<String> {
+    git_stdout(repo_root, ["status", "--short"])
 }
 
-pub(crate) fn ensure_tracked_worktree_clean(repo_root: &Path, command_name: &str) -> Result<()> {
-    let status = git_tracked_status(repo_root)?;
+pub(crate) fn repo_name(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo")
+        .to_string()
+}
+
+pub(crate) fn auto_checkpoint_if_needed(
+    repo_root: &Path,
+    branch: &str,
+    message_suffix: &str,
+) -> Result<Option<String>> {
+    let status = git_status(repo_root)?;
     if status.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    bail!(
-        "`{command_name}` requires a clean tracked worktree before it starts:\n{}",
-        status.trim_end()
-    );
+
+    run_git(repo_root, ["add", "-A"])?;
+    let message = format!("{}: {message_suffix}", repo_name(repo_root));
+    run_git(repo_root, ["commit", "-m", &message])?;
+    run_git(repo_root, ["push", "origin", branch])?;
+    let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    Ok(Some(commit.trim().to_string()))
 }
 
 pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {

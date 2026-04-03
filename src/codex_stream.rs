@@ -563,18 +563,21 @@ fn update_usage_from_value(value: &Value, state: &mut CodexRenderState) {
 }
 
 fn push_plain_line(out: &mut String, line: &str) {
-    let _ = writeln!(out, "{line}");
+    let sanitized = sanitize_terminal_text(line);
+    let _ = writeln!(out, "{sanitized}");
 }
 
 fn push_styled_line(out: &mut String, style: &Style, line: impl AsRef<str>) {
-    let _ = writeln!(out, "{}", style.apply_to(line.as_ref()));
+    let sanitized = sanitize_terminal_text(line.as_ref());
+    let _ = writeln!(out, "{}", style.apply_to(sanitized));
 }
 
 fn write_block(out: &mut String, prefix: &str, text: Option<String>, style: &Style, limit: usize) {
     let Some(text) = text else {
         return;
     };
-    let lines = text
+    let sanitized = sanitize_terminal_text(&text);
+    let lines = sanitized
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
@@ -615,9 +618,101 @@ fn compact_json(value: &Value) -> Option<String> {
         .filter(|text| !text.is_empty() && text != "null")
 }
 
+fn sanitize_terminal_text(input: &str) -> String {
+    let mut chars = input.chars().peekable();
+    let mut out = String::with_capacity(input.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => skip_escape_sequence(&mut chars),
+            '\u{009b}' => skip_csi_sequence(&mut chars),
+            '\u{009d}' => skip_osc_sequence(&mut chars),
+            '\u{08}' => pop_last_inline_char(&mut out),
+            '\r' => {
+                if chars.peek() != Some(&'\n') && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            '\n' | '\t' => out.push(ch),
+            '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            skip_csi_sequence(chars);
+        }
+        Some(']') => {
+            chars.next();
+            skip_osc_sequence(chars);
+        }
+        Some('P' | 'X' | '^' | '_') => {
+            chars.next();
+            skip_st_sequence(chars);
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
+}
+
+fn skip_csi_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        if ('@'..='~').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn skip_osc_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{07}' => break,
+            '\u{1b}' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_st_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'\\') {
+            chars.next();
+            break;
+        }
+    }
+}
+
+fn pop_last_inline_char(out: &mut String) {
+    if out.ends_with('\n') {
+        return;
+    }
+    out.pop();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_codex_stream_line, CodexRenderState};
+    use super::{render_codex_stream_line, sanitize_terminal_text, CodexRenderState};
 
     #[test]
     fn renders_exec_commands_with_result_lines() {
@@ -670,5 +765,35 @@ mod tests {
         assert!(rendered.contains("completed: Inspect renderer"));
         assert!(rendered.contains("in_progress: Add shared module"));
         assert!(rendered.contains("pending: Run tests"));
+    }
+
+    #[test]
+    fn sanitizes_escape_sequences_for_plain_selection() {
+        let text = "alpha\u{1b}[31m red\u{1b}[0m\u{1b}]8;;https://example.com\u{07} link\u{1b}]8;;\u{07}\rbravo";
+        assert_eq!(sanitize_terminal_text(text), "alpha red link\nbravo");
+    }
+
+    #[test]
+    fn sanitizes_backspaces_from_command_output() {
+        let text = "buildin\u{08}g ok";
+        assert_eq!(sanitize_terminal_text(text), "buildig ok");
+    }
+
+    #[test]
+    fn renders_exec_results_without_terminal_control_sequences() {
+        console::set_colors_enabled(false);
+        let mut state = CodexRenderState::default();
+        let begin = r#"{"type":"exec_command_begin","call_id":"1","command":["printf","demo"],"cwd":"/tmp"}"#;
+        let end = "{\"type\":\"exec_command_end\",\"call_id\":\"1\",\"status\":\"completed\",\"exit_code\":0,\"formatted_output\":\"ok\\u001b[32m green\\u001b[0m\\rnext\"}";
+
+        let rendered = format!(
+            "{}{}",
+            render_codex_stream_line(begin, &mut state),
+            render_codex_stream_line(end, &mut state)
+        );
+
+        assert!(rendered.contains("   -> result: ok green"));
+        assert!(rendered.contains("   -> result: next"));
+        assert!(!rendered.contains('\u{1b}'));
     }
 }

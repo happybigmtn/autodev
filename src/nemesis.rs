@@ -71,6 +71,7 @@ const DEFAULT_NEMESIS_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific 
 999999. Important: do not invent findings that you cannot support with repo evidence.
 9999999. Important: write the two required files completely into `nemesis/` and stop."#;
 
+const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,21 +89,75 @@ struct PlanTaskBlock {
     markdown: String,
 }
 
-enum NemesisBackend<'a> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpencodeProvider {
+    Kimi,
+    Minimax,
+}
+
+impl OpencodeProvider {
+    fn provider_label(self) -> &'static str {
+        match self {
+            Self::Kimi => "opencode-kimi",
+            Self::Minimax => "opencode-minimax",
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::Kimi => "kimi-for-coding/k2p5",
+            Self::Minimax => "minimax/MiniMax-M2.5",
+        }
+    }
+
+    fn detect(model: &str) -> Option<Self> {
+        let normalized = model.trim().to_ascii_lowercase();
+        if normalized.contains("kimi") {
+            return Some(Self::Kimi);
+        }
+        if normalized.contains("minimax") {
+            return Some(Self::Minimax);
+        }
+        None
+    }
+
+    fn resolve_model(self, requested_model: &str) -> String {
+        let normalized = requested_model.trim();
+        if normalized.is_empty() || normalized == DEFAULT_CODEX_NEMESIS_MODEL {
+            return self.default_model().to_string();
+        }
+        if normalized.contains('/') {
+            return normalized.to_string();
+        }
+        match self {
+            Self::Kimi => {
+                let model = match normalized {
+                    "kimi" | "kimi-k2.5" | "kimi-2.5" | "kimi-for-coding" => "k2p5",
+                    "kimi-k2-thinking" => "kimi-k2-thinking",
+                    other => other,
+                };
+                format!("kimi-for-coding/{model}")
+            }
+            Self::Minimax => format!("minimax/{}", map_minimax_model_name(normalized)),
+        }
+    }
+}
+
+enum NemesisBackend {
     Codex {
-        model: &'a str,
-        reasoning_effort: &'a str,
-        codex_bin: &'a Path,
+        model: String,
+        reasoning_effort: String,
+        codex_bin: PathBuf,
     },
     Opencode {
         provider_label: &'static str,
-        model: &'static str,
-        variant: &'static str,
-        opencode_bin: &'a Path,
+        model: String,
+        variant: String,
+        opencode_bin: PathBuf,
     },
 }
 
-impl<'a> NemesisBackend<'a> {
+impl NemesisBackend {
     fn label(&self) -> &'static str {
         match self {
             Self::Codex { .. } => "codex",
@@ -198,27 +253,28 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     Ok(())
 }
 
-fn select_backend(args: &NemesisArgs) -> NemesisBackend<'_> {
-    if args.kimi {
+fn select_backend(args: &NemesisArgs) -> NemesisBackend {
+    let opencode_provider = if args.kimi {
+        Some(OpencodeProvider::Kimi)
+    } else if args.minimax {
+        Some(OpencodeProvider::Minimax)
+    } else {
+        OpencodeProvider::detect(&args.model)
+    };
+
+    if let Some(provider) = opencode_provider {
         return NemesisBackend::Opencode {
-            provider_label: "opencode-kimi",
-            model: "kimi-for-coding/k2p5",
-            variant: "high",
-            opencode_bin: &args.opencode_bin,
+            provider_label: provider.provider_label(),
+            model: provider.resolve_model(&args.model),
+            variant: args.reasoning_effort.clone(),
+            opencode_bin: resolve_opencode_bin(&args.opencode_bin),
         };
     }
-    if args.minimax {
-        return NemesisBackend::Opencode {
-            provider_label: "opencode-minimax",
-            model: "minimax/MiniMax-M2.5",
-            variant: "high",
-            opencode_bin: &args.opencode_bin,
-        };
-    }
+
     NemesisBackend::Codex {
-        model: &args.model,
-        reasoning_effort: &args.reasoning_effort,
-        codex_bin: &args.codex_bin,
+        model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
+        codex_bin: args.codex_bin.clone(),
     }
 }
 
@@ -268,11 +324,7 @@ fn prepare_output_dir(repo_root: &Path, output_dir: &Path) -> Result<Option<Path
     Ok(archived)
 }
 
-fn run_nemesis_backend(
-    repo_root: &Path,
-    prompt: &str,
-    backend: &NemesisBackend<'_>,
-) -> Result<String> {
+fn run_nemesis_backend(repo_root: &Path, prompt: &str, backend: &NemesisBackend) -> Result<String> {
     match backend {
         NemesisBackend::Codex {
             model,
@@ -347,15 +399,22 @@ fn run_opencode(
     variant: &str,
     opencode_bin: &Path,
 ) -> Result<String> {
+    let opencode_data_home = repo_root.join(".auto").join("opencode-data");
+    fs::create_dir_all(&opencode_data_home)
+        .with_context(|| format!("failed to create {}", opencode_data_home.display()))?;
+
     let output = Command::new(opencode_bin)
         .arg("run")
         .arg("--format")
         .arg("json")
+        .arg("--dir")
+        .arg(repo_root)
         .arg("--model")
         .arg(model)
         .arg("--variant")
         .arg(variant)
         .arg(prompt)
+        .env("XDG_DATA_HOME", &opencode_data_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(repo_root)
@@ -371,12 +430,75 @@ fn run_opencode(
     let stdout = String::from_utf8(output.stdout).context("OpenCode stdout was not valid UTF-8")?;
     let stderr = String::from_utf8(output.stderr).context("OpenCode stderr was not valid UTF-8")?;
     if output.status.success() {
+        if let Some(detail) = parse_opencode_error(&stdout) {
+            bail!("OpenCode Nemesis run failed: {detail}");
+        }
         return Ok(stdout);
     }
     bail!(
         "OpenCode Nemesis run failed: {}",
-        stderr.trim().if_empty_then(stdout.trim())
+        stderr.trim().if_empty_then(
+            parse_opencode_error(&stdout)
+                .as_deref()
+                .unwrap_or(stdout.trim())
+        )
     );
+}
+
+fn resolve_opencode_bin(configured: &Path) -> PathBuf {
+    if configured != Path::new("opencode") {
+        return configured.to_path_buf();
+    }
+    if let Some(path) = std::env::var_os("FABRO_OPENCODE_BIN").map(PathBuf::from) {
+        return path;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let bundled = PathBuf::from(home)
+            .join(".opencode")
+            .join("bin")
+            .join("opencode");
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    PathBuf::from("opencode")
+}
+
+fn map_minimax_model_name(model: &str) -> String {
+    match model {
+        "minimax" | "minimax-m2.5" => "MiniMax-M2.5".to_string(),
+        "minimax-m2" => "MiniMax-M2".to_string(),
+        "minimax-m2.1" => "MiniMax-M2.1".to_string(),
+        "minimax-m2.5-highspeed" => "MiniMax-M2.5-highspeed".to_string(),
+        "minimax-m2.7" => "MiniMax-M2.7".to_string(),
+        "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed".to_string(),
+        other if other.starts_with("MiniMax-") => other.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_opencode_error(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+            continue;
+        }
+        if let Some(message) = event
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return Some(message.to_string());
+        }
+        let fallback = line.trim();
+        if !fallback.is_empty() {
+            return Some(fallback.to_string());
+        }
+    }
+    None
 }
 
 fn verify_nemesis_spec(output_dir: &Path) -> Result<PathBuf> {
@@ -629,7 +751,10 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
-    use super::append_new_open_tasks;
+    use std::path::PathBuf;
+
+    use super::{append_new_open_tasks, select_backend};
+    use crate::NemesisArgs;
 
     #[test]
     fn appends_only_new_unchecked_nemesis_tasks() {
@@ -672,5 +797,42 @@ Spec: specs/020426-nemesis-audit.md
         assert!(merged.contains("`NEM-002`"));
         assert_eq!(merged.matches("`VAL-001`").count(), 1);
         assert!(!merged.contains("`NEM-003`"));
+    }
+
+    fn sample_args(model: &str) -> NemesisArgs {
+        NemesisArgs {
+            prompt_file: None,
+            output_dir: None,
+            model: model.to_string(),
+            reasoning_effort: "high".to_string(),
+            kimi: false,
+            minimax: false,
+            dry_run: true,
+            codex_bin: PathBuf::from("codex"),
+            opencode_bin: PathBuf::from("opencode"),
+        }
+    }
+
+    #[test]
+    fn select_backend_treats_minimax_model_alias_as_opencode() {
+        let backend = select_backend(&sample_args("minimax"));
+        assert_eq!(backend.label(), "opencode-minimax");
+        assert_eq!(backend.model(), "minimax/MiniMax-M2.5");
+        assert_eq!(backend.variant(), "high");
+    }
+
+    #[test]
+    fn select_backend_treats_kimi_model_alias_as_opencode() {
+        let backend = select_backend(&sample_args("kimi"));
+        assert_eq!(backend.label(), "opencode-kimi");
+        assert_eq!(backend.model(), "kimi-for-coding/k2p5");
+        assert_eq!(backend.variant(), "high");
+    }
+
+    #[test]
+    fn select_backend_normalizes_explicit_minimax_model_override() {
+        let backend = select_backend(&sample_args("minimax-m2.7-highspeed"));
+        assert_eq!(backend.label(), "opencode-minimax");
+        assert_eq!(backend.model(), "minimax/MiniMax-M2.7-highspeed");
     }
 }
