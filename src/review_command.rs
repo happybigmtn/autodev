@@ -9,13 +9,14 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::Command as TokioCommand;
 
 use crate::util::{
-    atomic_write, ensure_repo_layout, git_repo_root, git_stdout, run_git, timestamp_slug,
+    atomic_write, clip_line_for_display, ensure_repo_layout, git_repo_root, git_stdout, run_git,
+    timestamp_slug,
 };
 use crate::ReviewArgs;
 
 pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` if they exist.
-0c. Use the installed `/ce:review` workflow as your primary review process if it is available in this Claude Code environment. If `/ce:review` is unavailable, fall back to `/review`. Use `/ce:work` when you need to turn concrete review findings into follow-up implementation work. Use `/ce:compound` to capture durable learnings in `LEARNINGS.md`.
+0c. Use the installed `/ce:review` workflow as your primary review process if it is available in this Codex environment. If `/ce:review` is unavailable, fall back to `/review`. Use `/ce:work` when you need to turn concrete review findings into follow-up implementation work. Use `/ce:compound` to capture durable learnings in `LEARNINGS.md`.
 
 1. Your task is to review the items currently listed in `REVIEW.md`.
    - Treat each review item as a claim that must be verified against the codebase, the specs, and the implementation plan.
@@ -96,12 +97,13 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         .unwrap_or_else(|| repo_root.join(".auto").join("review"));
     fs::create_dir_all(&run_root)
         .with_context(|| format!("failed to create {}", run_root.display()))?;
-    let stderr_log_path = run_root.join("claude.stderr.log");
+    let stderr_log_path = run_root.join("codex.stderr.log");
 
     println!("auto review");
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", args.branch);
     println!("model:       {}", args.model);
+    println!("reasoning:   {}", args.reasoning_effort);
     println!("review doc:  {}", review_path.display());
     if moved_items > 0 {
         println!(
@@ -124,17 +126,18 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!();
         println!("running review iteration {}", iteration + 1);
 
-        let exit_status = run_claude_iteration(
+        let exit_status = run_codex_iteration(
             &repo_root,
             &full_prompt,
             &args.model,
-            &args.claude_bin,
+            &args.reasoning_effort,
+            &args.codex_bin,
             &stderr_log_path,
         )
         .await?;
         if !exit_status.success() {
             bail!(
-                "Claude exited with status {}; see {}",
+                "Codex exited with status {}; see {}",
                 exit_status
                     .code()
                     .map(|code| code.to_string())
@@ -161,22 +164,26 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_claude_iteration(
+async fn run_codex_iteration(
     repo_root: &Path,
     full_prompt: &str,
     model: &str,
-    claude_bin: &Path,
+    reasoning_effort: &str,
+    codex_bin: &Path,
     stderr_log_path: &Path,
 ) -> Result<std::process::ExitStatus> {
-    let mut command = TokioCommand::new(claude_bin);
+    let mut command = TokioCommand::new(codex_bin);
     command
-        .arg("-p")
-        .arg("--verbose")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--dangerously-skip-permissions")
-        .arg("--model")
+        .arg("exec")
+        .arg("--json")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("--skip-git-repo-check")
+        .arg("--cd")
+        .arg(repo_root)
+        .arg("-m")
         .arg(model)
+        .arg("-c")
+        .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -184,8 +191,8 @@ async fn run_claude_iteration(
 
     let mut child = command.spawn().with_context(|| {
         format!(
-            "failed to launch Claude at {} from {}",
-            claude_bin.display(),
+            "failed to launch Codex at {} from {}",
+            codex_bin.display(),
             repo_root.display()
         )
     })?;
@@ -193,32 +200,32 @@ async fn run_claude_iteration(
     let mut stdin = child
         .stdin
         .take()
-        .context("Claude stdin should be piped for auto review")?;
+        .context("Codex stdin should be piped for auto review")?;
     stdin
         .write_all(full_prompt.as_bytes())
         .await
-        .context("failed to write Claude review prompt")?;
+        .context("failed to write Codex review prompt")?;
     drop(stdin);
 
     let stdout = child
         .stdout
         .take()
-        .context("Claude stdout should be piped for auto review")?;
+        .context("Codex stdout should be piped for auto review")?;
     let stderr = child
         .stderr
         .take()
-        .context("Claude stderr should be piped for auto review")?;
+        .context("Codex stderr should be piped for auto review")?;
 
-    let stdout_task = tokio::spawn(async move { stream_claude_output(stdout).await });
+    let stdout_task = tokio::spawn(async move { stream_codex_output(stdout).await });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
-    let status = child.wait().await.context("failed waiting for Claude")?;
+    let status = child.wait().await.context("failed waiting for Codex")?;
     stdout_task
         .await
-        .context("Claude stdout streaming task panicked")??;
+        .context("Codex stdout streaming task panicked")??;
     let stderr_text = stderr_task
         .await
-        .context("Claude stderr capture task panicked")??;
+        .context("Codex stderr capture task panicked")??;
     if !stderr_text.trim().is_empty() {
         let entry = format!("\n===== {} =====\n{stderr_text}\n", timestamp_slug());
         let mut existing = if stderr_log_path.exists() {
@@ -247,7 +254,7 @@ where
     Ok(text)
 }
 
-async fn stream_claude_output<R>(stream: R) -> Result<()>
+async fn stream_codex_output<R>(stream: R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -256,22 +263,24 @@ where
     while let Some(line) = reader
         .next_line()
         .await
-        .context("failed reading Claude JSON stream")?
+        .context("failed reading Codex JSON stream")?
     {
-        render_claude_stream_line(&line, &mut state);
+        render_codex_stream_line(&line, &mut state);
     }
     Ok(())
 }
 
-fn render_claude_stream_line(line: &str, state: &mut ReviewRenderState) {
+fn render_codex_stream_line(line: &str, state: &mut ReviewRenderState) {
     let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
         if !line.trim().is_empty() {
             eprintln!("{line}");
         }
         return;
     };
+    let green = Style::new().green();
     let blue = Style::new().blue();
     let yellow = Style::new().yellow();
+    let red = Style::new().red();
     let dim = Style::new().dim();
 
     let event = value
@@ -279,21 +288,55 @@ fn render_claude_stream_line(line: &str, state: &mut ReviewRenderState) {
         .and_then(Value::as_str)
         .unwrap_or_default();
     match event {
-        "assistant" | "message" => {
-            if let Some(text) = value.get("text").and_then(Value::as_str) {
-                print_block("", Some(text.to_string()), &Style::new(), 8);
-            }
+        "item.started" | "task_started" => println!("{}", blue.apply_to("* task_started")),
+        "item.completed" => println!("{}", blue.apply_to("* task_completed")),
+        "agent_reasoning" | "reasoning" => {
+            print_block("thinking: ", json_string(&value, "text"), &dim, 3);
         }
         "tool_use" | "tool.call" => {
             state.tool_count += 1;
             let name = value.get("name").and_then(Value::as_str).unwrap_or("tool");
             println!("{}", yellow.apply_to(format!("  > {name}")));
         }
-        "task_started" | "task_progress" | "task_notification" | "init" | "hook_started"
-        | "hook_response" => {
+        "message" | "agent_message" | "assistant" => {
+            let text = json_string(&value, "text").or_else(|| {
+                value
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            print_block("", text, &Style::new(), 8);
+        }
+        "task_progress" | "task_notification" | "init" | "hook_started" | "hook_response" => {
             println!("{}", blue.apply_to(line.trim()));
         }
-        "completed" => println!("{}", dim.apply_to("done")),
+        "completed" | "turn.completed" => {
+            let usage = value.get("usage").cloned().unwrap_or(Value::Null);
+            let input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!();
+            println!(
+                "{} | Tokens: in {} out {} | Tools: {}",
+                green.apply_to("done"),
+                input,
+                output,
+                state.tool_count
+            );
+        }
+        "error" => {
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            println!("{}", red.apply_to(format!("error: {message}")));
+        }
         _ => {}
     }
 }
@@ -308,7 +351,12 @@ fn print_block(prefix: &str, text: Option<String>, style: &Style, limit: usize) 
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
     for line in lines.iter().take(limit) {
-        println!("{}", style.apply_to(format!("{prefix}{line}")));
+        let clipped = if line.chars().count() > 140 {
+            format!("{}...", clip_line_for_display(line, 137))
+        } else {
+            (*line).to_string()
+        };
+        println!("{}", style.apply_to(format!("{prefix}{clipped}")));
     }
     if lines.len() > limit {
         println!(
@@ -318,6 +366,15 @@ fn print_block(prefix: &str, text: Option<String>, style: &Style, limit: usize) 
                 .apply_to(format!("{prefix}... +{} more lines", lines.len() - limit))
         );
     }
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {

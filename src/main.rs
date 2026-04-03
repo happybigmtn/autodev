@@ -1,6 +1,7 @@
 mod corpus;
 mod generation;
 mod loop_command;
+mod nemesis;
 mod review_command;
 mod state;
 mod util;
@@ -33,6 +34,8 @@ enum Command {
     Loop(LoopArgs),
     /// Review completed work on main
     Review(ReviewArgs),
+    /// Run a disposable Nemesis audit and append its outputs into root specs and plan
+    Nemesis(NemesisArgs),
 }
 
 #[derive(Args, Clone)]
@@ -127,8 +130,12 @@ pub(crate) struct ReviewArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the review worker
-    #[arg(long, default_value = "claude-opus-4-6")]
+    #[arg(long, default_value = "gpt-5.4")]
     model: String,
+
+    /// Reasoning effort to pass through to the Codex review worker
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
 
     /// Branch that the review loop is allowed to run on
     #[arg(long, default_value = "main")]
@@ -138,9 +145,48 @@ pub(crate) struct ReviewArgs {
     #[arg(long)]
     run_root: Option<PathBuf>,
 
-    /// Claude executable to invoke
-    #[arg(long, default_value = "claude")]
-    claude_bin: PathBuf,
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct NemesisArgs {
+    /// Optional override for the Nemesis prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Output directory for disposable Nemesis artifacts. Defaults to <repo>/nemesis
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Model to use for the default Codex-backed Nemesis run
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex-backed Nemesis run
+    #[arg(long, default_value = "high")]
+    reasoning_effort: String,
+
+    /// Use OpenCode with the Kimi 2.5 model instead of Codex
+    #[arg(long, conflicts_with = "minimax")]
+    kimi: bool,
+
+    /// Use OpenCode with the MiniMax M2.5 model instead of Codex
+    #[arg(long, conflicts_with = "kimi")]
+    minimax: bool,
+
+    /// Preview the Nemesis run without invoking a model
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Codex executable to invoke for the default backend
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// OpenCode executable to invoke for the Kimi/MiniMax backends
+    #[arg(long, default_value = "opencode")]
+    opencode_bin: PathBuf,
 }
 
 #[tokio::main]
@@ -151,5 +197,6 @@ async fn main() -> Result<()> {
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
         Command::Review(args) => review_command::run_review(args).await,
+        Command::Nemesis(args) => nemesis::run_nemesis(args).await,
     }
 }

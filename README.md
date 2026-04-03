@@ -11,6 +11,7 @@ The local CLI command is `auto`.
 - `auto corpus`
 - `auto gen`
 - `auto reverse`
+- `auto nemesis`
 - `auto loop`
 - `auto review`
 
@@ -23,8 +24,10 @@ All commands resolve the git repo root automatically from the current working di
 - Planning root defaults to `<repo>/genesis`
 - Generated output defaults to `<repo>/gen-<timestamp>`
 - Internal state and logs live under `<repo>/.auto/`
+- Nemesis audit output defaults to `<repo>/nemesis`
 - `auto loop` runs on `main` by default with `gpt-5.4` and `xhigh`
-- `auto review` runs on `main` by default with `claude-opus-4-6`
+- `auto nemesis` runs on `gpt-5.4` with `high` by default
+- `auto review` runs on `main` by default with `gpt-5.4` and `xhigh`
 
 ## Command Contract
 
@@ -86,6 +89,32 @@ Root plan merge rule:
 
 This keeps the root implementation plan non-destructive for unfinished work while still letting each generation pass replace stale planning structure.
 
+### `auto nemesis`
+
+`auto nemesis` runs a disposable deep audit inspired by the upstream Nemesis auditor.
+
+Behavior:
+
+- Uses a Nemesis-style iterative audit:
+  - Feynman-style logic pass
+  - state inconsistency pass
+  - targeted back-and-forth re-passes until convergence
+- Writes disposable outputs into `nemesis/`
+- Produces:
+  - `nemesis/nemesis-audit.md`
+  - `nemesis/IMPLEMENTATION_PLAN.md`
+- Appends the generated audit spec into root `specs/`
+- Appends new unchecked Nemesis tasks into root `IMPLEMENTATION_PLAN.md`
+- Treats `nemesis/` as disposable and archives the previous folder under `.auto/fresh-input/` before refresh
+
+Backend selection:
+
+- Default: Codex with `gpt-5.4` and reasoning effort `high`
+- `auto nemesis --kimi`: OpenCode with `kimi-for-coding/k2p5`
+- `auto nemesis --minimax`: OpenCode with `minimax/MiniMax-M2.5`
+
+Unlike `auto gen`, Nemesis does not replace the root implementation plan structure. It only appends new unchecked audit tasks that are not already present.
+
 ### `auto loop`
 
 `auto loop` is the single-worker implementation loop.
@@ -123,6 +152,11 @@ Behavior:
 - Moves only truly cleared review items from `REVIEW.md` to `ARCHIVED.md`
 - Commits and pushes truthful review increments to `origin/main`
 
+Default model:
+
+- `gpt-5.4`
+- reasoning effort `xhigh`
+
 `auto review` does not reopen work in `IMPLEMENTATION_PLAN.md`. Review findings become worklist items instead.
 
 ## Repo Files
@@ -137,14 +171,16 @@ Behavior:
 - `ARCHIVED.md`
 - `WORKLIST.md`
 - `LEARNINGS.md`
+- `nemesis/`
 
 Only some are required at startup. The command will create missing files when appropriate for its workflow.
 
 ## Runtime Requirements
 
 - Git repository with a valid `origin`
-- `claude` on `PATH` for `auto corpus`, `auto gen`, `auto reverse`, and `auto review`
-- `codex` on `PATH` for `auto loop`
+- `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
+- `codex` on `PATH` for `auto nemesis`, `auto loop`, and `auto review`
+- `opencode` on `PATH` for `auto nemesis --kimi` and `auto nemesis --minimax`
 
 Recommended environment:
 
@@ -179,6 +215,19 @@ Refresh durable specs from current code:
 auto reverse
 ```
 
+Run a disposable Nemesis audit:
+
+```bash
+auto nemesis
+```
+
+Use OpenCode instead:
+
+```bash
+auto nemesis --kimi
+auto nemesis --minimax
+```
+
 Execute implementation work:
 
 ```bash
@@ -193,4 +242,4 @@ auto review
 
 ## Design Goal
 
-This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`, `loop`, or `review`, it probably does not belong here.
+This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`, `nemesis`, `loop`, or `review`, it probably does not belong here.
