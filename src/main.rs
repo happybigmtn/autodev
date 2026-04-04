@@ -5,6 +5,7 @@ mod generation;
 mod loop_command;
 mod nemesis;
 mod pi_backend;
+mod qa_command;
 mod review_command;
 mod state;
 mod util;
@@ -37,6 +38,8 @@ enum Command {
     Bug(BugArgs),
     /// Run the single-worker implementation loop on the repo's primary branch
     Loop(LoopArgs),
+    /// Run a runtime QA and ship-readiness pass on the current branch
+    Qa(QaArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
@@ -227,6 +230,37 @@ pub(crate) struct ReviewArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct QaArgs {
+    /// Stop after this many successful QA iterations. Default is 1.
+    #[arg(long, default_value_t = 1)]
+    max_iterations: usize,
+
+    /// Optional override for the QA prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Model to use for the QA worker
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex QA worker
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Optional branch to require for the QA loop; defaults to the currently checked-out branch
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Directory for QA logs. Defaults to <repo>/.auto/qa
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct NemesisArgs {
     /// Optional override for the Nemesis prompt template
     #[arg(long)]
@@ -281,6 +315,7 @@ async fn main() -> Result<()> {
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
+        Command::Qa(args) => qa_command::run_qa(args).await,
         Command::Review(args) => review_command::run_review(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
     }

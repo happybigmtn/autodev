@@ -6,7 +6,7 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` only owns seven commands:
+`auto` only owns eight commands:
 
 - `auto corpus`
 - `auto gen`
@@ -14,6 +14,7 @@ The local CLI command is `auto`.
 - `auto bug`
 - `auto nemesis`
 - `auto loop`
+- `auto qa`
 - `auto review`
 
 It does not own the old parallel `malina run` workflow.
@@ -29,6 +30,7 @@ All commands resolve the git repo root automatically from the current working di
 - Nemesis audit output defaults to `<repo>/nemesis`
 - `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `xhigh` implementation pass by default
 - `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
+- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
 - `auto nemesis` runs a PI-only two-stage audit by default: MiniMax draft pass, then Kimi synthesis pass
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
 
@@ -44,6 +46,8 @@ Behavior:
 - Treats any existing `genesis/` as optional historical context
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Destructively refreshes `genesis/`
+- Folds strategic ideation directly into the corpus pass instead of relying on a separate ideation command
+- Surfaces target users, success criteria, assumptions, candidate directions, and a clear "Not Doing" list inside the generated corpus
 
 Expected outputs:
 
@@ -65,7 +69,8 @@ Behavior:
 - Writes a fresh `gen-<timestamp>/specs/`
 - Appends new snapshot specs into root `specs/`
 - Does not modify root `IMPLEMENTATION_PLAN.md`
-- Requires each generated spec to include a `## Acceptance Criteria` section with concrete bullets
+- Requires each generated spec to include `## Objective`, `## Acceptance Criteria`, and `## Verification`
+- Surfaces important assumptions and spec/code conflicts explicitly instead of smoothing them over
 
 Root spec filenames use this format:
 
@@ -84,7 +89,9 @@ Behavior:
 - Writes `gen-<timestamp>/IMPLEMENTATION_PLAN.md`
 - Appends new generated spec snapshots into root `specs/`
 - Merges the latest generated plan into root `IMPLEMENTATION_PLAN.md`
-- Requires each generated spec to include a `## Acceptance Criteria` section with concrete bullets
+- Requires each generated spec to include `## Objective`, `## Acceptance Criteria`, and `## Verification`
+- Builds the implementation plan with dependency order, bounded task size, explicit acceptance criteria, and concrete verification commands
+- Validates task contracts for substance rather than only top-level markdown shape
 
 Root plan merge rule:
 
@@ -189,12 +196,14 @@ Behavior:
 - Runs Codex on the checked-out primary branch alias: `main`, `master`, or `trunk`
 - Reads `AGENTS.md`, `specs/*`, and `IMPLEMENTATION_PLAN.md`
 - Takes the next unchecked task from the top of the plan
-- Implements it fully
-- Runs the required validations
+- Builds a task brief from the plan contract before editing
+- Implements it fully in the smallest truthful slice
+- Uses reproduce-first and root-cause debugging patterns when behavior changes or failures appear
+- Runs the required validations and runtime checks when applicable
 - Removes completed items from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
+- Appends out-of-scope but worthwhile follow-ups to `WORKLIST.md`
 - Commits and pushes truthful increments to the repo's primary branch
-- Creates a git tag after a green increment
 - Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
 
 Default branch:
@@ -209,6 +218,27 @@ Default model:
 - `gpt-5.4`
 - reasoning effort `xhigh`
 
+### `auto qa`
+
+`auto qa` is the runtime QA and ship-readiness hardening loop.
+
+Behavior:
+
+- Runs Codex on the currently checked-out branch by default
+- Reads `AGENTS.md`, `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `WORKLIST.md`, `LEARNINGS.md`, and `QA.md` when present
+- Builds a QA charter from recent work, open review items, and the actual runnable surfaces in the repo
+- Prefers real runtime verification over static inspection
+- Uses browser/devtools/runtime tools when available for user-facing flows
+- Writes a durable branch-level report to `QA.md`
+- Appends unresolved actionable findings to `WORKLIST.md`
+- Records durable lessons in `LEARNINGS.md`
+- Fixes bounded high-signal issues directly and commits/pushes truthful QA increments back to the current branch
+
+Default model:
+
+- `gpt-5.4`
+- reasoning effort `xhigh`
+
 ### `auto review`
 
 `auto review` is the completed-work hardening and archival loop.
@@ -217,10 +247,8 @@ Behavior:
 
 - Moves current `COMPLETED.md` items into `REVIEW.md` before review starts
 - Leaves `COMPLETED.md` free for new implementation completions while review is running
-- Uses `/ce:review` as the primary review workflow when available
-- Falls back to `/review` if `/ce:review` is unavailable
-- Uses `/ce:work` for follow-up implementation work
-- Uses `/ce:compound` to record durable learnings in `LEARNINGS.md`
+- Vendors the full review rubric directly into the review prompt: tests-first reading, five-axis review, severity-tagged findings, and verification-of-verification
+- May use `/ce:review` or other helper workflows as accelerators when they are available
 - Writes unresolved findings to `WORKLIST.md`
 - Moves only truly cleared review items from `REVIEW.md` to `ARCHIVED.md`
 - Commits and pushes truthful review increments back to the current branch
@@ -245,6 +273,8 @@ Default model:
 - `ARCHIVED.md`
 - `WORKLIST.md`
 - `LEARNINGS.md`
+- `QA.md`
+- `bug/`
 - `nemesis/`
 
 Only some are required at startup. The command will create missing files when appropriate for its workflow.
@@ -253,13 +283,13 @@ Only some are required at startup. The command will create missing files when ap
 
 - Git repository with a valid `origin`
 - `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
-- `codex` on `PATH` for `auto nemesis`, `auto loop`, and `auto review`
+- `codex` on `PATH` for `auto nemesis`, `auto loop`, `auto qa`, and `auto review`
 - `codex` on `PATH` for any `auto bug` phase using a non-PI model
 - `pi` on `PATH` for `auto bug` MiniMax/Kimi passes and both default `auto nemesis` audit passes
 
 Recommended environment:
 
-- Claude Code with Compound Engineering installed for `/ce:review`, `/ce:work`, and `/ce:compound`
+- Claude Code with Compound Engineering installed if you want optional helpers such as `/ce:review`, `/ce:work`, and `/ce:compound`
 
 ## Install
 
@@ -324,6 +354,12 @@ Execute implementation work:
 auto loop
 ```
 
+Run runtime QA and hardening:
+
+```bash
+auto qa
+```
+
 Review completed work:
 
 ```bash
@@ -332,4 +368,4 @@ auto review
 
 ## Design Goal
 
-This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`, `nemesis`, `loop`, or `review`, it probably does not belong here.
+This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`, `bug`, `nemesis`, `loop`, `qa`, or `review`, it probably does not belong here.

@@ -15,44 +15,58 @@ use crate::ReviewArgs;
 
 pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` if they exist.
-0c. Use the installed `/ce:review` workflow as your primary review process if it is available in this Codex environment. If `/ce:review` is unavailable, fall back to `/review`. Use `/ce:work` when you need to turn concrete review findings into follow-up implementation work. Use `/ce:compound` to capture durable learnings in `LEARNINGS.md`.
+0c. You may use installed helper workflows like `/ce:review`, `/review`, `/ce:work`, or `/ce:compound` if they are available, but you must still satisfy the full review contract below even if those helpers are missing.
 
 1. Your task is to review the items currently listed in `REVIEW.md`.
    - Treat each review item as a claim that must be verified against the codebase, the specs, and the implementation plan.
    - Re-read the owned surfaces, integration touchpoints, and validation evidence for those items before trusting the claim.
    - Run a broad engineering review, not a status recap: look for regressions, weak assumptions, missing edge cases, security issues, integration gaps, and test blind spots.
 
-2. Respect the queue split:
+2. Use this review workflow for every item:
+   - Understand the intended behavior and expected change first.
+   - Review the tests and verification evidence before reviewing the implementation details.
+   - Review the implementation across these five axes:
+     - correctness
+     - readability and simplicity
+     - architecture and boundaries
+     - security and trust boundaries
+     - performance and scalability
+   - For browser-facing or runtime-sensitive items, use browser/runtime verification when available instead of static review alone.
+   - Verify the verification story itself: commands actually run, outputs believable, screenshots or runtime evidence consistent with the code.
+   - Categorize any findings as `Critical`, required, `Optional`, or `FYI`.
+
+3. Respect the queue split:
    - `REVIEW.md` is the in-flight review queue.
    - `COMPLETED.md` is free to keep receiving new implementation completions while review is running.
    - Do not move items back into `IMPLEMENTATION_PLAN.md`.
 
-3. If you find problems:
-   - Append concrete follow-up items to `WORKLIST.md`. Create it if missing.
-   - Use `/ce:work` to address the worklist items and review findings directly when the next best action is implementation.
-   - Record durable learnings in `LEARNINGS.md` via `/ce:compound`.
+4. If you find problems:
+   - Append concrete, severity-tagged follow-up items to `WORKLIST.md`. Create it if missing.
+   - Fix review findings directly when the root cause is clear and the work is bounded.
+   - Record durable learnings in `LEARNINGS.md`.
    - Leave any not-yet-cleared entries in `REVIEW.md` until the fixes are actually landed and supported by the codebase.
    - Keep `AGENTS.md` operational only.
 
-4. If a review item passes review:
+5. If a review item passes review:
    - Move its entry from `REVIEW.md` into `ARCHIVED.md`.
    - `ARCHIVED.md` should be append-only history.
    - Only archive items that are genuinely complete after review and any follow-up fixes.
 
-5. Commit and push only truthful review increments:
+6. Commit and push only truthful review increments:
    - Stay on the branch that is already checked out when `auto review` starts.
    - Do not create or switch branches during the review pass.
    - Stage only the files relevant to the review fixes plus `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, `LEARNINGS.md`, and `AGENTS.md` when they changed.
    - Commit with a message like `repo-name: review completed items`.
    - Push back to that same branch after each successful commit-producing pass.
 
-6. If `REVIEW.md` is empty or has no reviewable items:
+7. If `REVIEW.md` is empty or has no reviewable items:
    - Do not invent work.
    - Say so briefly and stop without making changes.
 
 99999. Important: prefer fixing findings over explaining them.
 999999. Important: do not archive an item until the code and review evidence support it.
-9999999. Important: use `/ce:review` aggressively, use `/ce:work` for concrete fixes, and use `/ce:compound` to make future work easier. This is a bug-finding and hardening pass, not a feature pass."#;
+9999999. Important: this is a bug-finding and hardening pass, not a feature pass.
+99999999. Important: if the tests do not prove the claim, the implementation does not get a free pass."#;
 
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";
 const REVIEW_HEADER: &str = "# REVIEW";

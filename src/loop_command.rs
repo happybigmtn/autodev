@@ -18,39 +18,54 @@ const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*` with full repo context to understand the application specifications.
 0c. Study `IMPLEMENTATION_PLAN.md`.
+0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and specs as evidence, record the conflict truthfully, and do not bluff your way through it.
 
-1. Your task is to implement functionality per the specifications using the full repository context. Follow `IMPLEMENTATION_PLAN.md` in order and take the next unchecked task from top to bottom. Do not reprioritize the queue yourself. Before making changes, search the codebase and existing planning artifacts. Do not assume a surface is missing until you verify it.
+1. Your task is to implement functionality per the specifications using the full repository context.
+   - Follow `IMPLEMENTATION_PLAN.md` in order and take the next unchecked task from top to bottom.
+   - Do not reprioritize the queue yourself.
+   - Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.
+   - Build a short task brief for yourself before editing: task id, spec refs, owned surfaces, integration touchpoints, scope boundary, acceptance criteria, verification, and any assumptions you are relying on.
 
-2. Implement the task completely:
+2. Implement the task in the smallest truthful slice that fully closes it:
    - Stay within the task contract's owned surfaces plus the minimum adjacent integration edits needed to make the code work.
-   - Run the relevant proof commands for the task and debug until they pass.
+   - Prefer the simplest solution that matches the existing codebase patterns. Do not add abstractions that are not earning their complexity.
+   - Keep the codebase compilable while you work. Do not leave placeholders, TODOs, or half-wired scaffolding.
    - If the repo is still greenfield, perform the bootstrap work the plan requires instead of pretending later tasks are ready.
-   - Do not leave placeholders, TODOs, or half-wired scaffolding.
+   - If the task changes behavior or fixes a bug, add or update a failing test or equivalent executable proof first when practical, then make it pass.
+   - For browser-facing or runtime-sensitive changes, use browser/runtime verification when available instead of relying on static reasoning alone.
 
-3. Keep the planning artifacts current:
-   - When you discover important implementation facts or blockers, update `IMPLEMENTATION_PLAN.md`.
+3. When anything breaks, stop the line and debug systematically:
+   - Preserve the failing command, output, repro step, or screenshot evidence.
+   - Reproduce the failure as narrowly as you can.
+   - Fix the root cause, not the nearest symptom.
+   - Guard against recurrence with tests or tighter validation when practical.
+   - Resume feature work only after the task's verification story is truthful again.
+
+4. Keep the planning artifacts current:
+   - When you discover important implementation facts, blockers, or scope corrections, update `IMPLEMENTATION_PLAN.md`.
    - When you finish a task, remove its entry from `IMPLEMENTATION_PLAN.md` so the plan remains an active queue of unfinished work only.
-   - Append a concise record to `COMPLETED.md` with task id, validation command, and commit sha.
+   - Append a concise record to `COMPLETED.md` with task id, what was completed, the validation command(s), and commit sha.
+   - If you notice worthwhile out-of-scope work, append a concise item to `WORKLIST.md` instead of quietly broadening scope.
    - Update `AGENTS.md` only when you learn something operational that will help future loops run or validate the repo correctly.
 
-4. When validation passes, commit the increment:
-   - Stage only the files relevant to the completed task plus `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, and `AGENTS.md`.
+5. When validation passes, commit the increment:
+   - Stage only the files relevant to the completed task plus `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, and `AGENTS.md` when they changed.
    - Do not sweep unrelated pre-existing churn into the commit.
    - Commit with a message like `repo-name: TASK-ID short description` using this repository's actual name.
    - After committing, run `git status` to verify no implementation files were left unstaged. If any were, amend the commit.
    - Push directly to `origin/{branch}` after the commit.
 
-5. If you hit a real blocker after genuine debugging:
+6. If you hit a real blocker after genuine debugging:
    - Record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
    - Commit the planning update if it materially changes the execution record.
    - Move to the next ready task instead of repeating the same failed attempt.
 
-6. Task-order rule:
+7. Task-order rule:
    - Treat the order in `IMPLEMENTATION_PLAN.md` as authoritative.
    - Work on the first unchecked task unless its explicit dependencies are still unchecked.
    - If the current task is already satisfied, remove it from `IMPLEMENTATION_PLAN.md`, append a truthful note to `COMPLETED.md`, and continue downward.
 
-7. Branch rule:
+8. Branch rule:
    - Work only on branch `{branch}`.
    - Do not create or push feature branches, lane branches, or topic branches.
 
@@ -60,7 +75,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 99999999. CRITICAL: Do not assume functionality is missing — search the codebase to confirm before implementing anything new.
 999999999. Every new module must be importable and wired into the package. Dead code that isn't reachable from any entry point is an island — wire it before committing.
 9999999999. When you learn something new about how to build, run, or validate the repo, update `AGENTS.md` — but keep it brief and operational only.
-99999999999. As soon as there are no build or test errors, create a git tag. If no git tags exist start at 0.0.0 and increment patch by 1 (e.g. 0.0.1)."#;
+99999999999. A task is not done because the code looks right. It is done when the acceptance criteria are satisfied and the verification evidence is real."#;
 
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;

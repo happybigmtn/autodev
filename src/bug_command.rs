@@ -1124,6 +1124,8 @@ Each JSON item must use exactly this schema:
 
 Requirements:
 - Maximize recall, but every finding must name a concrete failure mode and at least one falsification check.
+- Prefer findings with a believable reproduction path, violated invariant, and plausible root-cause region over vague smell reports.
+- Cover correctness, state consistency, security, performance, and runtime behavior when the code supports them.
 - Use bug IDs with prefix `BUG-{ordinal:03}-`.
 - Match `points` to `impact` exactly.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
@@ -1173,6 +1175,8 @@ Each JSON item must use exactly this schema:
 
 Requirements:
 - Be aggressive about disproving weak claims.
+- Challenge whether the claim identifies a real root-cause bug instead of a symptom, style issue, or speculative concern.
+- Prefer discarding findings that cannot be grounded in a runnable falsification path or direct code evidence.
 - Only `accepted` findings should survive to verification.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
 - `{verdicts_md}` should summarize disproved vs accepted findings and call out the hardest borderline decisions.
@@ -1202,6 +1206,9 @@ Input verified findings file:
 
 Rules:
 - Modify code only as needed to address the verified findings plus the minimum adjacent integration surfaces.
+- Reproduce each bug with a failing test, failing command, or other executable proof first when practical. If that is truly not practical, document the best direct evidence you used instead of pretending.
+- Fix root causes, not cosmetic symptoms.
+- Add or update regression coverage for every `fixed` result when the repo has a real test surface for that behavior.
 - Run validation commands that honestly support your changes.
 - Stay on the currently checked-out branch `{branch}`.
 - Commit only truthful fix increments with a message like `repo-name: bug fixes`.
@@ -1226,8 +1233,9 @@ Each JSON item must use exactly this schema:
 
 Requirements:
 - Treat verified findings as the contract; do not widen scope into unrelated cleanup.
+- For browser-facing or runtime-sensitive bugs, use runtime/browser verification when available.
+- `{results_md}` should summarize proof-before-fix, root cause, fix, validation, and any deferred items.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- `{results_md}` should summarize the fixes, validation, and any deferred items.
 "#,
         verified_json = verified_json.display(),
         results_json = results_json.display(),
@@ -1271,6 +1279,8 @@ Each JSON item must use exactly this schema:
 Requirements:
 - `verified` means the finding should be implemented in the final GPT-5.4 implementation pass.
 - `discarded` means the finding is too weak, duplicated, or insufficiently supported to implement.
+- Prefer `verified` only when the bug is concrete enough to justify a reproduce-first/root-cause fix workflow.
+- Call out missing regression coverage, missing runtime proof, or suspiciously broad scope in `follow_up`.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
 - `{results_md}` should summarize what survived to implementation and what was discarded.
 "#,

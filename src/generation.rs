@@ -62,11 +62,27 @@ struct PlanTaskBlock {
 }
 
 const IMPLEMENTATION_PLAN_HEADER: &str = "# IMPLEMENTATION_PLAN";
+const SPEC_OBJECTIVE_HEADER: &str = "## Objective";
 const SPEC_ACCEPTANCE_CRITERIA_HEADER: &str = "## Acceptance Criteria";
+const SPEC_VERIFICATION_HEADER: &str = "## Verification";
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Priority Work",
     "## Follow-On Work",
     "## Completed / Already Satisfied",
+];
+const REQUIRED_PLAN_TASK_FIELDS: [&str; 12] = [
+    "Spec:",
+    "Why now:",
+    "Codebase evidence:",
+    "Owns:",
+    "Integration touchpoints:",
+    "Scope boundary:",
+    "Acceptance criteria:",
+    "Verification:",
+    "Required tests:",
+    "Dependencies:",
+    "Estimated scope:",
+    "Completion signal:",
 ];
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
@@ -593,6 +609,12 @@ Review the actual codebase first, not just docs:
 - Review security boundaries, input validation, observability, tests, CI, and git history
 - Treat completed docs and plans as claims that must be verified against code
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
+- Start by framing the repo as a real product/system:
+  - write a crisp "How Might We" style problem statement grounded in the current code reality
+  - identify the primary users/operators and what success should look like for them
+  - surface the biggest constraints, hidden assumptions, and trade-offs
+  - consider 2-3 plausible future directions before choosing the recommended one
+  - make a clear "Not Doing" list so the corpus reflects focus, not wishful scope
 
 ASSESSMENT.md must include:
 - what the project says it is vs what the code shows it is
@@ -603,14 +625,17 @@ ASSESSMENT.md must include:
 - documentation staleness
 - implementation-status table for prior claims and plans
 - code-review coverage list proving which source files were actually read
+- target users, success criteria, and repo constraints
+- assumption ledger: what seems true, what is verified, and what still needs proof
+- opportunity framing: strongest direction, rejected directions, and why they were rejected
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
-PLANS.md must index the plan set and explain sequencing.
+PLANS.md must index the plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives.
 
-GENESIS-REPORT.md must summarize the corpus refresh, major findings, and top next priorities.
+GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 
-Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, and scoped to a concrete deliverable.
+Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, vertically sliced where possible, and scoped to a concrete deliverable that a single focused worker can close truthfully.
 
 Never trust docs over code. If docs claim something the code does not support, say so clearly."#,
         target_repo = repo_root.display(),
@@ -668,11 +693,15 @@ Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
 - Filenames must use `ddmmyy-topic-slug.md`
 - Each file must start with `# Specification: ...`
+- Each file must include `## Objective`
 - Each file must include a `## Acceptance Criteria` section
+- Each file must include a `## Verification` section
 - Acceptance criteria must be concrete, testable, and phrased as truthful observable outcomes
 - Acceptance criteria should use flat bullet points, not prose paragraphs
 - Specs must be concrete, file-grounded, and implementation-oriented
 - Avoid placeholders and abstract framework prose
+- Surface important assumptions or spec/code conflicts explicitly instead of smoothing them over
+- Include commands, boundaries, or open questions when they materially affect implementation or verification
 - Preserve proven current behavior in reverse mode
 - Preserve intended future behavior from the corpus in gen mode when the code has not caught up yet
 
@@ -730,6 +759,14 @@ Use up to {parallelism} parallel subagents where helpful.
 Generated specs for this run:
 {spec_listing}
 
+Before writing the plan, do the real planning work:
+- operate in read-only planning mode first
+- map dependency order and existing code patterns
+- identify the highest-risk unknowns
+- prefer vertical slices over horizontal layer dumps
+- keep tasks small enough for one focused worker session
+- do not hide ambiguity; encode real blockers and assumptions in the task contracts
+
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
 - The first non-empty line must be exactly `{IMPLEMENTATION_PLAN_HEADER}`
@@ -746,12 +783,20 @@ Output requirements:
   - `Owns:`
   - `Integration touchpoints:`
   - `Scope boundary:`
+  - `Acceptance criteria:`
+  - `Verification:`
   - `Required tests:`
   - `Dependencies:`
+  - `Estimated scope:`
   - `Completion signal:`
 - `Spec:` values must point to `specs/*.md`
 - Keep the plan concrete, file-grounded, and executable
 - Do not include lane prose, staffing prose, or meta commentary
+- Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
+- Front-load risk where practical, but never at the cost of violating dependency order
+- `Acceptance criteria:` must be specific, testable, and truthful
+- `Verification:` must name the concrete commands or runtime checks a worker should run
+- `Estimated scope:` should be `XS`, `S`, `M`, or `L`; avoid `L` unless the codebase reality truly leaves no smaller slice
 - Put only unfinished work in the unchecked queue sections
 - Put already-satisfied items only in `## Completed / Already Satisfied`
 
@@ -790,6 +835,19 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
                 spec.display()
             );
         }
+        for section in [
+            SPEC_OBJECTIVE_HEADER,
+            SPEC_ACCEPTANCE_CRITERIA_HEADER,
+            SPEC_VERIFICATION_HEADER,
+        ] {
+            if !generated_spec_has_section(&text, section) {
+                bail!(
+                    "generated spec {} must include `{}`",
+                    spec.display(),
+                    section
+                );
+            }
+        }
         if !generated_spec_has_acceptance_criteria(&text) {
             bail!(
                 "generated spec {} must include `{}` with at least one bullet",
@@ -799,6 +857,12 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(specs)
+}
+
+fn generated_spec_has_section(markdown: &str, header: &str) -> bool {
+    split_markdown_section(markdown, header)
+        .map(|(_, body)| !body.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn generated_spec_has_acceptance_criteria(markdown: &str) -> bool {
@@ -840,6 +904,21 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
     {
         if !normalized.contains(required) {
             bail!("generated implementation plan is missing `{required}`");
+        }
+    }
+    let blocks = extract_plan_task_blocks(&normalized)?;
+    for block in &blocks {
+        if block.checked {
+            continue;
+        }
+        for field in REQUIRED_PLAN_TASK_FIELDS {
+            if !block.markdown.contains(field) {
+                bail!(
+                    "generated implementation plan task `{}` is missing `{}`",
+                    block.task_id,
+                    field
+                );
+            }
         }
     }
     if normalized != markdown {
