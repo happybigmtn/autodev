@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,7 +13,7 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, timestamp_slug,
+    git_stdout, run_git, timestamp_slug,
 };
 use crate::BugArgs;
 
@@ -148,20 +148,20 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     let current_branch = current_branch.trim().to_string();
-    if !args.dry_run && !args.report_only && !args.allow_dirty {
-        if current_branch.is_empty() {
-            bail!("auto bug could not determine the current branch for its startup checkpoint");
-        }
+    if !args.dry_run && !args.report_only && current_branch.is_empty() {
+        bail!(
+            "auto bug requires a checked-out branch so implementation commits can push to origin"
+        );
     }
 
     let output_dir = args
         .output_dir
         .clone()
         .unwrap_or_else(|| repo_root.join("bug"));
-    let previous_snapshot = if args.dry_run {
-        None
+    let (previous_snapshot, resumed_existing_output) = if args.dry_run {
+        (None, args.resume && output_dir.exists())
     } else {
-        prepare_output_dir(&repo_root, &output_dir)?
+        prepare_bug_output_dir(&repo_root, &output_dir, args.resume)?
     };
 
     let chunks = collect_repo_chunks(&repo_root, args.chunk_size, args.max_chunks)?;
@@ -202,6 +202,16 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     if let Some(previous) = &previous_snapshot {
         println!("prior input: {}", previous.display());
     }
+    if args.resume {
+        println!(
+            "resume:      {}",
+            if resumed_existing_output {
+                "reusing existing bug artifacts"
+            } else {
+                "no existing bug artifacts found; starting fresh in-place"
+            }
+        );
+    }
     if args.report_only {
         println!("mode:        report-only");
     }
@@ -235,7 +245,7 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
             .with_context(|| format!("failed to create {}", chunk_dir.display()))?;
         write_chunk_manifest(&chunk_dir, &chunk)?;
 
-        let findings = run_finder_phase(
+        let findings = load_or_run_finder_phase(
             &repo_root,
             &chunk,
             &chunk_dir,
@@ -246,10 +256,13 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         .await?;
 
         let (disproved_count, accepted) = if findings.is_empty() {
-            atomic_write(&chunk_dir.join("accepted-findings.json"), b"[]")?;
+            let accepted_path = chunk_dir.join("accepted-findings.json");
+            if !accepted_path.exists() {
+                atomic_write(&accepted_path, b"[]")?;
+            }
             (0, Vec::new())
         } else {
-            run_skeptic_phase(
+            load_or_run_skeptic_phase(
                 &repo_root,
                 &chunk,
                 &chunk_dir,
@@ -264,7 +277,7 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         let reviews = if accepted.is_empty() {
             Vec::new()
         } else {
-            run_review_phase(
+            load_or_run_review_phase(
                 &repo_root,
                 &chunk,
                 &chunk_dir,
@@ -307,11 +320,55 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         serde_json::to_string_pretty(&all_verified)?.as_bytes(),
     )?;
 
+    let resumed_fix_results = if args.report_only || all_verified.is_empty() {
+        None
+    } else {
+        try_resume_fix_results(&output_dir, &all_verified, args.resume)?
+    };
+    let fix_commit_before =
+        if args.report_only || all_verified.is_empty() || resumed_fix_results.is_some() {
+            None
+        } else {
+            Some(git_stdout(&repo_root, ["rev-parse", "HEAD"])?)
+        };
     let fixes = if args.report_only || all_verified.is_empty() {
         Vec::new()
+    } else if let Some(results) = resumed_fix_results {
+        results
     } else {
-        run_fix_phase(&repo_root, &output_dir, &fixer, &args, &stderr_log_path).await?
+        run_fix_phase(
+            &repo_root,
+            &output_dir,
+            &fixer,
+            &current_branch,
+            &args,
+            &stderr_log_path,
+        )
+        .await?
     };
+    if let Some(commit_before) = fix_commit_before {
+        let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        if commit_before.trim() != commit_after.trim() {
+            run_git(&repo_root, ["push", "origin", current_branch.as_str()])?;
+            if !args.allow_dirty {
+                if let Some(commit) = auto_checkpoint_if_needed(
+                    &repo_root,
+                    current_branch.as_str(),
+                    "auto bug implementation checkpoint",
+                )? {
+                    println!("checkpoint:  committed trailing implementation changes at {commit}");
+                }
+            }
+        } else if !args.allow_dirty {
+            if let Some(commit) = auto_checkpoint_if_needed(
+                &repo_root,
+                current_branch.as_str(),
+                "auto bug implementation checkpoint",
+            )? {
+                println!("checkpoint:  committed implementation changes at {commit}");
+            }
+        }
+    }
 
     if !fixes.is_empty() {
         println!();
@@ -372,6 +429,24 @@ async fn run_finder_phase(
     Ok(findings)
 }
 
+async fn load_or_run_finder_phase(
+    repo_root: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    config: &PhaseConfig,
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<Vec<BugFinding>> {
+    if args.resume {
+        let findings_json_path = chunk_dir.join("finder-findings.json");
+        if let Some(findings) = try_resume_finder_findings(chunk, &findings_json_path)? {
+            return Ok(findings);
+        }
+    }
+
+    run_finder_phase(repo_root, chunk, chunk_dir, config, args, stderr_log_path).await
+}
+
 async fn run_skeptic_phase(
     repo_root: &Path,
     chunk: &RepoChunk,
@@ -415,10 +490,39 @@ async fn run_skeptic_phase(
     Ok((disproved_count, accepted))
 }
 
+async fn load_or_run_skeptic_phase(
+    repo_root: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    config: &PhaseConfig,
+    findings: &[BugFinding],
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<(usize, Vec<AcceptedFinding>)> {
+    if args.resume {
+        let accepted_json_path = chunk_dir.join("accepted-findings.json");
+        if let Some(outcome) = try_resume_skeptic_outcome(chunk, findings, &accepted_json_path)? {
+            return Ok(outcome);
+        }
+    }
+
+    run_skeptic_phase(
+        repo_root,
+        chunk,
+        chunk_dir,
+        config,
+        findings,
+        args,
+        stderr_log_path,
+    )
+    .await
+}
+
 async fn run_fix_phase(
     repo_root: &Path,
     output_dir: &Path,
     config: &PhaseConfig,
+    branch: &str,
     args: &BugArgs,
     stderr_log_path: &Path,
 ) -> Result<Vec<FixResult>> {
@@ -427,7 +531,12 @@ async fn run_fix_phase(
     let results_json_path = output_dir.join("implementation-results.json");
     let results_md_path = output_dir.join("implementation-results.md");
     let verified_json_path = output_dir.join("verified-findings.json");
-    let prompt = build_fix_prompt(&verified_json_path, &results_json_path, &results_md_path);
+    let prompt = build_fix_prompt(
+        &verified_json_path,
+        &results_json_path,
+        &results_md_path,
+        branch,
+    );
     atomic_write(&prompt_path, prompt.as_bytes())?;
 
     let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
@@ -446,6 +555,37 @@ async fn run_fix_phase(
     let verified: Vec<AcceptedFinding> = load_json_file(&verified_json_path)?;
     validate_fix_results(&verified, &results)?;
     Ok(results)
+}
+
+fn try_resume_fix_results(
+    output_dir: &Path,
+    verified: &[AcceptedFinding],
+    resume: bool,
+) -> Result<Option<Vec<FixResult>>> {
+    if !resume {
+        return Ok(None);
+    }
+
+    let results_json_path = output_dir.join("implementation-results.json");
+    let Some(results) =
+        try_load_existing_json::<Vec<FixResult>>(&results_json_path, "implementation results")?
+    else {
+        return Ok(None);
+    };
+
+    match validate_fix_results(verified, &results) {
+        Ok(()) => {
+            println!("resume:      reusing implementation results");
+            Ok(Some(results))
+        }
+        Err(err) => {
+            println!(
+                "warning: ignoring invalid implementation results in {}: {err}",
+                results_json_path.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn run_review_phase(
@@ -485,6 +625,132 @@ async fn run_review_phase(
     let results: Vec<ReviewResult> = load_json_file(&results_json_path)?;
     validate_review_results(accepted, &results)?;
     Ok(results)
+}
+
+async fn load_or_run_review_phase(
+    repo_root: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    config: &PhaseConfig,
+    accepted: &[AcceptedFinding],
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<Vec<ReviewResult>> {
+    if args.resume {
+        let results_json_path = chunk_dir.join("review-results.json");
+        if let Some(results) = try_resume_review_results(chunk, accepted, &results_json_path)? {
+            return Ok(results);
+        }
+    }
+
+    run_review_phase(
+        repo_root,
+        chunk,
+        chunk_dir,
+        config,
+        accepted,
+        args,
+        stderr_log_path,
+    )
+    .await
+}
+
+fn try_resume_finder_findings(
+    chunk: &RepoChunk,
+    findings_json_path: &Path,
+) -> Result<Option<Vec<BugFinding>>> {
+    let Some(findings) =
+        try_load_existing_json::<Vec<BugFinding>>(findings_json_path, "finder findings")?
+    else {
+        return Ok(None);
+    };
+
+    match validate_findings(chunk, &findings) {
+        Ok(()) => {
+            println!("resume:      {} finder findings", chunk.id);
+            Ok(Some(findings))
+        }
+        Err(err) => {
+            println!(
+                "warning: ignoring invalid finder findings in {}: {err}",
+                findings_json_path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_resume_skeptic_outcome(
+    chunk: &RepoChunk,
+    findings: &[BugFinding],
+    accepted_json_path: &Path,
+) -> Result<Option<(usize, Vec<AcceptedFinding>)>> {
+    let Some(accepted) =
+        try_load_existing_json::<Vec<AcceptedFinding>>(accepted_json_path, "accepted findings")?
+    else {
+        return Ok(None);
+    };
+
+    match validate_accepted_findings(findings, &accepted) {
+        Ok(()) => {
+            let disproved_count = findings.len().saturating_sub(accepted.len());
+            println!("resume:      {} skeptic output", chunk.id);
+            Ok(Some((disproved_count, accepted)))
+        }
+        Err(err) => {
+            println!(
+                "warning: ignoring invalid accepted findings in {}: {err}",
+                accepted_json_path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_resume_review_results(
+    chunk: &RepoChunk,
+    accepted: &[AcceptedFinding],
+    results_json_path: &Path,
+) -> Result<Option<Vec<ReviewResult>>> {
+    let Some(results) =
+        try_load_existing_json::<Vec<ReviewResult>>(results_json_path, "review results")?
+    else {
+        return Ok(None);
+    };
+
+    match validate_review_results(accepted, &results) {
+        Ok(()) => {
+            println!("resume:      {} review results", chunk.id);
+            Ok(Some(results))
+        }
+        Err(err) => {
+            println!(
+                "warning: ignoring invalid review results in {}: {err}",
+                results_json_path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_load_existing_json<T>(path: &Path, label: &str) -> Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    match load_json_file(path) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(err) => {
+            println!(
+                "warning: ignoring invalid existing {label} in {}: {err}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) -> LlmBackend {
@@ -920,7 +1186,12 @@ Requirements:
     )
 }
 
-fn build_fix_prompt(verified_json: &Path, results_json: &Path, results_md: &Path) -> String {
+fn build_fix_prompt(
+    verified_json: &Path,
+    results_json: &Path,
+    results_md: &Path,
+    branch: &str,
+) -> String {
     format!(
         r#"You are the final implementation pass in a multi-pass bug pipeline.
 
@@ -932,7 +1203,12 @@ Input verified findings file:
 Rules:
 - Modify code only as needed to address the verified findings plus the minimum adjacent integration surfaces.
 - Run validation commands that honestly support your changes.
-- Do not commit, push, or create branches.
+- Stay on the currently checked-out branch `{branch}`.
+- Commit only truthful fix increments with a message like `repo-name: bug fixes`.
+- Push to `origin/{branch}` after each successful commit.
+- Do not create or switch branches.
+- Do not stage or commit unrelated pre-existing changes already present in the worktree.
+- Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`.
 - Only write these files:
   - `{results_json}`
   - `{results_md}`
@@ -956,6 +1232,7 @@ Requirements:
         verified_json = verified_json.display(),
         results_json = results_json.display(),
         results_md = results_md.display(),
+        branch = branch,
     )
 }
 
@@ -1055,6 +1332,29 @@ fn validate_findings(chunk: &RepoChunk, findings: &[BugFinding]) -> Result<()> {
         if finding.falsification_checks.is_empty() {
             bail!(
                 "finder output for {} must include falsification checks",
+                finding.bug_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_accepted_findings(findings: &[BugFinding], accepted: &[AcceptedFinding]) -> Result<()> {
+    let finding_ids = findings
+        .iter()
+        .map(|finding| finding.bug_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for finding in accepted {
+        if !finding_ids.contains(finding.bug_id.as_str()) {
+            bail!(
+                "accepted findings contains unknown bug id `{}`",
+                finding.bug_id
+            );
+        }
+        if !seen.insert(finding.bug_id.as_str()) {
+            bail!(
+                "accepted findings contains duplicate bug id `{}`",
                 finding.bug_id
             );
         }
@@ -1749,6 +2049,35 @@ fn prepare_output_dir(repo_root: &Path, output_dir: &Path) -> Result<Option<Path
     Ok(archived)
 }
 
+fn prepare_bug_output_dir(
+    repo_root: &Path,
+    output_dir: &Path,
+    resume: bool,
+) -> Result<(Option<PathBuf>, bool)> {
+    if !resume {
+        return Ok((prepare_output_dir(repo_root, output_dir)?, false));
+    }
+
+    if !output_dir.exists() {
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+        return Ok((None, false));
+    }
+    if !output_dir.is_dir() {
+        bail!(
+            "bug output path {} is not a directory",
+            output_dir.display()
+        );
+    }
+
+    let has_contents = fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+        .next()
+        .transpose()?
+        .is_some();
+    Ok((None, has_contents))
+}
+
 trait EmptyFallback {
     fn if_empty_then<'a>(&'a self, fallback: &'a str) -> &'a str;
 }
@@ -1768,8 +2097,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        collect_repo_chunks, escape_unescaped_quotes_in_json_strings, repair_llm_json,
-        should_audit_path, slugify, BugFinding, SkepticVerdict,
+        build_fix_prompt, collect_repo_chunks, escape_unescaped_quotes_in_json_strings,
+        repair_llm_json, should_audit_path, slugify, validate_accepted_findings, AcceptedFinding,
+        BugFinding, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
 
@@ -1802,6 +2132,57 @@ mod tests {
             PiProvider::Minimax.resolve_model("minimax", "gpt-5.4"),
             "minimax/MiniMax-M2.7-highspeed"
         );
+    }
+
+    #[test]
+    fn fix_prompt_requires_commit_and_push_to_current_branch() {
+        let prompt = build_fix_prompt(
+            Path::new("bug/verified-findings.json"),
+            Path::new("bug/implementation-results.json"),
+            Path::new("bug/implementation-results.md"),
+            "main",
+        );
+
+        assert!(prompt.contains("Commit only truthful fix increments"));
+        assert!(prompt.contains("Push to `origin/main` after each successful commit."));
+        assert!(prompt.contains(
+            "Do not stage or commit unrelated pre-existing changes already present in the worktree."
+        ));
+        assert!(prompt.contains(
+            "Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`."
+        ));
+    }
+
+    #[test]
+    fn accepted_findings_must_reference_known_bug_ids() {
+        let findings = vec![BugFinding {
+            bug_id: "BUG-001-01".to_string(),
+            title: "title".to_string(),
+            location: "path:1".to_string(),
+            impact: "medium".to_string(),
+            points: 5,
+            description: "desc".to_string(),
+            why_plausible: "why".to_string(),
+            falsification_checks: vec!["check".to_string()],
+            evidence: vec!["evidence".to_string()],
+        }];
+        let accepted = vec![AcceptedFinding {
+            bug_id: "BUG-999-01".to_string(),
+            chunk_id: "chunk-001-root".to_string(),
+            title: "title".to_string(),
+            location: "path:1".to_string(),
+            impact: "medium".to_string(),
+            points: 5,
+            description: "desc".to_string(),
+            why_plausible: "why".to_string(),
+            falsification_checks: vec!["check".to_string()],
+            evidence: vec!["evidence".to_string()],
+            skeptic_confidence_percent: 90,
+            skeptic_counter_argument: "counter".to_string(),
+            skeptic_follow_up_checks: vec!["follow-up".to_string()],
+        }];
+
+        assert!(validate_accepted_findings(&findings, &accepted).is_err());
     }
 
     #[test]

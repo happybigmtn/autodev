@@ -142,6 +142,7 @@ Behavior:
   - Kimi skeptic
   - Kimi verification review
   - final `gpt-5.4` `xhigh` implementation over all verified findings
+- Commits and pushes truthful implementation fixes back to the currently checked-out branch
 - Streams parsed model output live for both Codex and PI backends
 - Writes durable artifacts under `bug/`:
   - per-chunk prompts, raw model responses, JSON verdicts, and markdown summaries
@@ -149,10 +150,12 @@ Behavior:
   - `bug/verified-findings.json`
   - `bug/implementation-results.json`
 - Archives the previous `bug/` folder under `.auto/fresh-input/` before refresh
+- `--resume` reuses existing chunk artifacts in `bug/` and reruns only the first incomplete or invalid phase outputs instead of wiping the directory
 
 Safety:
 
 - Full implementation mode checkpoints and pushes pre-existing dirty changes on the current branch before the bug pipeline starts
+- Full implementation mode pushes model-created bug-fix commits and, when `--allow-dirty` is not set, checkpoints and pushes any trailing uncommitted implementation changes
 - Use `--report-only` to stop after verification and summary generation
 - Use `--allow-dirty` if you intentionally want the final implementation pass to layer on top of an already-dirty tree without the startup checkpoint
 
@@ -173,6 +176,7 @@ Useful flags:
 
 - `--chunk-size <n>` to change the per-chunk file budget
 - `--max-chunks <n>` to cap the run
+- `--resume` to continue an interrupted bug run in-place
 - `--report-only` to skip the final implementation pass
 - `--dry-run` to preview the chunk plan
 

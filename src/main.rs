@@ -99,6 +99,10 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
+    /// Reuse existing bug artifacts and continue from the first incomplete or invalid phase output
+    #[arg(long)]
+    resume: bool,
+
     /// Maximum files per audit chunk
     #[arg(long, default_value_t = 24)]
     chunk_size: usize,
