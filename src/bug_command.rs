@@ -13,12 +13,14 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, run_git, timestamp_slug,
+    git_stdout, opencode_agent_dir, prune_pi_runtime_state, run_git, timestamp_slug,
+    truncate_file_to_max_bytes,
 };
 use crate::BugArgs;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "xhigh";
+const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct RepoChunk {
@@ -376,23 +378,32 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     }
 
     write_bug_summary(&output_dir, &outcomes, &fixes, args.report_only)?;
+    let should_prune_bug_output = !args.report_only && !all_verified.is_empty();
+    if should_prune_bug_output {
+        fs::remove_dir_all(&output_dir)
+            .with_context(|| format!("failed to prune {}", output_dir.display()))?;
+    }
     println!();
     println!("bug run complete");
-    println!(
-        "summary:     {}",
-        output_dir.join("BUG_REPORT.md").display()
-    );
-    println!(
-        "verified:    {}",
-        output_dir.join("verified-findings.json").display()
-    );
-    if !fixes.is_empty() {
+    if should_prune_bug_output {
+        println!("cleanup:     pruned {}", output_dir.display());
+    } else {
         println!(
-            "implemented: {}",
-            output_dir.join("implementation-results.json").display()
+            "summary:     {}",
+            output_dir.join("BUG_REPORT.md").display()
         );
+        println!(
+            "verified:    {}",
+            output_dir.join("verified-findings.json").display()
+        );
+        if !fixes.is_empty() {
+            println!(
+                "implemented: {}",
+                output_dir.join("implementation-results.json").display()
+            );
+        }
+        println!("stderr log:  {}", stderr_log_path.display());
     }
-    println!("stderr log:  {}", stderr_log_path.display());
 
     Ok(())
 }
@@ -907,6 +918,7 @@ async fn run_backend_prompt(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .current_dir(repo_root);
+            configure_pi_env(&mut command, repo_root)?;
 
             let mut child = command.spawn().with_context(|| {
                 format!(
@@ -938,6 +950,7 @@ async fn run_backend_prompt(
                 .await
                 .context("PI stderr capture task panicked")??;
             append_stderr_log(stderr_log_path, &stderr_text)?;
+            prune_pi_runtime_state(repo_root)?;
 
             if !status.success() {
                 bail!(
@@ -981,6 +994,16 @@ fn append_stderr_log(stderr_log_path: &Path, stderr_text: &str) -> Result<()> {
     };
     existing.extend_from_slice(entry.as_bytes());
     atomic_write(stderr_log_path, &existing)?;
+    truncate_file_to_max_bytes(stderr_log_path, BUG_STDERR_LOG_MAX_BYTES)?;
+    Ok(())
+}
+
+fn configure_pi_env(command: &mut TokioCommand, repo_root: &Path) -> Result<()> {
+    let agent_dir = opencode_agent_dir(repo_root);
+    fs::create_dir_all(&agent_dir)
+        .with_context(|| format!("failed to create {}", agent_dir.display()))?;
+    command.env("PI_CODING_AGENT_DIR", &agent_dir);
+    command.env("OPENCODE_CODING_AGENT_DIR", &agent_dir);
     Ok(())
 }
 
@@ -1837,12 +1860,12 @@ fn advance_json_context_after_comma(contexts: &mut [JsonRepairContext]) {
 }
 
 fn context_expects_value(contexts: &[JsonRepairContext]) -> bool {
-    match contexts.last() {
+    matches!(
+        contexts.last(),
         Some(JsonRepairContext::Object(ObjectParseState::Value))
-        | Some(JsonRepairContext::Array(ArrayParseState::ValueOrEnd))
-        | None => true,
-        _ => false,
-    }
+            | Some(JsonRepairContext::Array(ArrayParseState::ValueOrEnd))
+            | None
+    )
 }
 
 fn is_likely_string_terminator(

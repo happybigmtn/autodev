@@ -1048,7 +1048,7 @@ fn skip_csi_sequence<I>(chars: &mut std::iter::Peekable<I>)
 where
     I: Iterator<Item = char>,
 {
-    while let Some(ch) = chars.next() {
+    for ch in chars.by_ref() {
         if ('@'..='~').contains(&ch) {
             break;
         }

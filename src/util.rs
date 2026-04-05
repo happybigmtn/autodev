@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -21,6 +22,11 @@ const CHECKPOINT_EXCLUDES: [&str; 4] = [
     ":(exclude)nemesis",
     ":(exclude)gen-*",
 ];
+const AUTO_LOG_KEEP_FILES: usize = 64;
+const AUTO_FRESH_INPUT_KEEP_ENTRIES: usize = 12;
+const AUTO_QUEUE_RUN_KEEP_ENTRIES: usize = 12;
+const PI_RUNTIME_LOG_KEEP_FILES: usize = 5;
+const PI_RUNTIME_LOG_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn git_repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
@@ -156,6 +162,16 @@ pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create {}", path.display()))?;
     }
+    prune_old_entries(&repo_root.join(".auto").join("logs"), AUTO_LOG_KEEP_FILES)?;
+    prune_old_entries(
+        &repo_root.join(".auto").join("fresh-input"),
+        AUTO_FRESH_INPUT_KEEP_ENTRIES,
+    )?;
+    prune_old_entries(
+        &repo_root.join(".auto").join("queue-runs"),
+        AUTO_QUEUE_RUN_KEEP_ENTRIES,
+    )?;
+    prune_pi_runtime_state(repo_root)?;
     Ok(())
 }
 
@@ -255,14 +271,122 @@ pub(crate) fn clip_line_for_display(line: &str, max_chars: usize) -> String {
     line.chars().take(max_chars).collect()
 }
 
+pub(crate) fn prune_old_entries(dir: &Path, keep: usize) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if keep == 0 {
+        clear_dir_contents(dir)?;
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .into_iter()
+        .map(|entry| {
+            let path = entry.path();
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect::<Vec<_>>();
+    if entries.len() <= keep {
+        return Ok(());
+    }
+
+    entries.sort_by_key(|(modified, path)| (*modified, path.clone()));
+    let remove_count = entries.len().saturating_sub(keep);
+    for (_, path) in entries.into_iter().take(remove_count) {
+        remove_path(&path)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn truncate_file_to_max_bytes(path: &Path, max_bytes: usize) -> Result<()> {
+    if !path.exists() || max_bytes == 0 {
+        return Ok(());
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() <= max_bytes {
+        return Ok(());
+    }
+    let keep_from = bytes.len().saturating_sub(max_bytes);
+    atomic_write(path, &bytes[keep_from..])?;
+    Ok(())
+}
+
+pub(crate) fn opencode_agent_dir(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join(".auto")
+        .join("opencode-data")
+        .join("opencode")
+}
+
+pub(crate) fn prune_pi_runtime_state(repo_root: &Path) -> Result<()> {
+    let agent_dir = opencode_agent_dir(repo_root);
+    if !agent_dir.exists() {
+        return Ok(());
+    }
+
+    let log_dir = agent_dir.join("log");
+    if log_dir.exists() {
+        prune_old_entries(&log_dir, PI_RUNTIME_LOG_KEEP_FILES)?;
+        for entry in fs::read_dir(&log_dir)
+            .with_context(|| format!("failed to read {}", log_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.is_file() {
+                truncate_file_to_max_bytes(&path, PI_RUNTIME_LOG_MAX_BYTES)?;
+            }
+        }
+    }
+
+    clear_and_recreate_dir(&agent_dir.join("snapshot"))?;
+    clear_and_recreate_dir(&agent_dir.join("storage").join("session_diff"))?;
+    Ok(())
+}
+
+pub(crate) fn clear_and_recreate_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to clear {}", path.display()))?;
+    }
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(())
+}
+
+fn clear_dir_contents(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        remove_path(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread::sleep;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{checkpoint_status, clip_line_for_display, stage_checkpoint_changes};
+    use super::{
+        checkpoint_status, clip_line_for_display, prune_old_entries, stage_checkpoint_changes,
+        truncate_file_to_max_bytes,
+    };
 
     fn temp_repo_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -351,5 +475,41 @@ mod tests {
         assert_eq!(staged, "README.md\nsrc/new.txt\n");
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn truncate_file_to_max_bytes_keeps_tail() {
+        let dir = temp_repo_path("truncate-file");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("log.txt");
+        fs::write(&path, b"abcdefghij").expect("failed to write log");
+
+        truncate_file_to_max_bytes(&path, 4).expect("failed to truncate file");
+
+        let text = fs::read_to_string(&path).expect("failed to read log");
+        assert_eq!(text, "ghij");
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn prune_old_entries_keeps_latest_paths() {
+        let dir = temp_repo_path("prune-old-entries");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let first = dir.join("one.txt");
+        let second = dir.join("two.txt");
+        let third = dir.join("three.txt");
+
+        fs::write(&first, "one").expect("failed to write first");
+        sleep(Duration::from_millis(5));
+        fs::write(&second, "two").expect("failed to write second");
+        sleep(Duration::from_millis(5));
+        fs::write(&third, "three").expect("failed to write third");
+
+        prune_old_entries(&dir, 2).expect("failed to prune entries");
+
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(third.exists());
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 }

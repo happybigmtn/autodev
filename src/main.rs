@@ -86,6 +86,10 @@ pub(crate) struct CorpusArgs {
     #[arg(long)]
     idea: Option<String>,
 
+    /// Steer corpus attention toward specific repo concerns without skipping the full sweep
+    #[arg(long)]
+    focus: Option<String>,
+
     /// Additional repository roots that corpus must inspect as reference material
     #[arg(long = "reference-repo")]
     reference_repos: Vec<PathBuf>,

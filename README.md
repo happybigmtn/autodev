@@ -87,6 +87,7 @@ What it reads:
 
 What it writes:
 
+- `genesis/FOCUS.md` when `--focus` is used
 - `genesis/IDEA.md` when `--idea` is used
 - `genesis/ASSESSMENT.md`
 - `genesis/SPEC.md`
@@ -103,6 +104,8 @@ What it actually does:
 - Reviews the repo as the primary truth source
 - Uses the repo's real agent-instruction convention in generated docs and plans; for Codex-first
   repos that means `AGENTS.md`, regardless of which planning model ran `auto corpus`
+- When `--focus "..."` is supplied, writes the normalized steering brief to `genesis/FOCUS.md`
+  and uses it to bias attention and plan ordering without skipping the full repo sweep
 - When `--idea "..."` is supplied, first runs a non-interactive office-hours-style shaping pass
   and writes the normalized seed brief to `genesis/IDEA.md`
 - Produces a corpus that includes:
@@ -128,6 +131,14 @@ Idea mode:
 - Missing evidence is marked as hypothesis instead of being faked
 - The rest of the corpus then expands that seed into the normal `genesis/` outputs
 
+Focus mode:
+
+- `auto corpus --focus "..."` is for "do the full repo-wide planning pass, but spend extra attention here"
+- It treats the quoted focus as a steering signal, not a hard scope boundary
+- Critical issues outside the focus should still be surfaced if they outrank the requested area
+- The resulting `genesis/FOCUS.md` captures the raw focus string, normalized themes, affected
+  surfaces, repo-wide checks that still mattered, and whether the focus changed priority ordering
+
 When to run it:
 
 - At the start of a new planning cycle
@@ -137,6 +148,8 @@ When to run it:
 Useful flags:
 
 - `--planning-root <dir>` to change the corpus destination
+- `--focus "..."` to bias the planning pass toward specific surfaces while preserving repo-wide
+  coverage
 - `--idea "..."` to seed the corpus from a desired product direction or greenfield-style concept
 - `--reference-repo <dir>` to require inspection of sibling or external repos as first-class
   reference inputs during corpus authoring
@@ -289,6 +302,10 @@ What it actually does:
 - Pushes truthful implementation fixes back to the current branch
 - Pushes harder on believable reproduction, root-cause fixes, and regression coverage than the old
   pipeline did
+- Archives the previous `bug/` folder under `.auto/fresh-input/` before a fresh run
+- Reuses existing chunk artifacts in `bug/` when `--resume` is set
+- Prunes `bug/` automatically after a successful full implementation run so disposable artifacts do
+  not accumulate
 
 Default model layout:
 
@@ -304,6 +321,9 @@ Safety behavior:
 - May create a trailing checkpoint commit if implementation work leaves additional unstaged changes
   behind
 - Skips the final implementation pass entirely when `--report-only` is set
+- Isolates PI/OpenCode state under `.auto/opencode-data/`
+- Bounds old `.auto/logs/` entries automatically and prunes PI snapshot/session-diff caches after
+  each PI phase
 
 When to run it:
 
@@ -802,6 +822,13 @@ Seed planning from a product idea:
 
 ```bash
 auto corpus --idea "build X for Y user with Z constraint"
+auto gen
+```
+
+Refresh planning with a full sweep but extra attention on specific surfaces:
+
+```bash
+auto corpus --focus "wire reconnects, TLS failures, session-token handling, and player/runtime parity"
 auto gen
 ```
 

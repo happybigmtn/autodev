@@ -11,6 +11,7 @@ pub(crate) struct PlanningCorpus {
     pub(crate) planning_root: String,
     pub(crate) assessment_path: Option<String>,
     pub(crate) design_path: Option<String>,
+    pub(crate) focus_path: Option<String>,
     pub(crate) idea_path: Option<String>,
     pub(crate) report_path: Option<String>,
     pub(crate) plans_index_path: Option<String>,
@@ -76,6 +77,7 @@ pub(crate) fn load_planning_corpus(planning_root: &Path) -> Result<PlanningCorpu
         planning_root: planning_root.display().to_string(),
         assessment_path: optional_doc_path(&planning_root, "ASSESSMENT.md"),
         design_path: optional_doc_path(&planning_root, "DESIGN.md"),
+        focus_path: optional_doc_path(&planning_root, "FOCUS.md"),
         idea_path: optional_doc_path(&planning_root, "IDEA.md"),
         report_path: optional_doc_path(&planning_root, "GENESIS-REPORT.md"),
         plans_index_path: optional_doc_path(&planning_root, "PLANS.md"),
@@ -99,6 +101,7 @@ pub(crate) fn emit_corpus_snapshot(corpus: &PlanningCorpus, output_root: &Path) 
     for doc in [
         corpus.assessment_path.as_deref(),
         corpus.design_path.as_deref(),
+        corpus.focus_path.as_deref(),
         corpus.idea_path.as_deref(),
         corpus.report_path.as_deref(),
         corpus.plans_index_path.as_deref(),

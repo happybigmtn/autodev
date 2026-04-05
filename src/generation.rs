@@ -117,6 +117,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     if let Some(idea) = args.idea.as_deref() {
         println!("idea:        {}", idea);
     }
+    if let Some(focus) = args.focus.as_deref() {
+        println!("focus:       {}", focus);
+    }
     if !reference_repos.is_empty() {
         println!("references:  {}", reference_repos.len());
         for path in &reference_repos {
@@ -145,6 +148,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         previous_snapshot.as_deref(),
         args.parallelism.clamp(1, 10),
         args.idea.as_deref(),
+        args.focus.as_deref(),
         &reference_repos,
     );
     let prompt_path = repo_root
@@ -177,7 +181,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     }
 
     print_stage("verify corpus outputs", run_started_at);
-    let summary = verify_corpus_outputs(&planning_root)?;
+    let summary = verify_corpus_outputs(&planning_root, args.focus.is_some())?;
     print_stage("save corpus state", run_started_at);
     let mut state = load_state(&repo_root)?;
     state.planning_root = Some(planning_root.clone());
@@ -191,6 +195,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     println!("report:      {}", summary.report_path.display());
     if let Some(design) = summary.design_path {
         println!("design:      {}", design.display());
+    }
+    if let Some(focus) = summary.focus_path {
+        println!("focus brief: {}", focus.display());
     }
     if let Some(idea) = summary.idea_path {
         println!("idea brief:  {}", idea.display());
@@ -656,16 +663,21 @@ struct CorpusOutputSummary {
     plans_index_path: PathBuf,
     report_path: PathBuf,
     design_path: Option<PathBuf>,
+    focus_path: Option<PathBuf>,
     idea_path: Option<PathBuf>,
     plan_count: usize,
 }
 
-fn verify_corpus_outputs(planning_root: &Path) -> Result<CorpusOutputSummary> {
+fn verify_corpus_outputs(
+    planning_root: &Path,
+    focus_requested: bool,
+) -> Result<CorpusOutputSummary> {
     let assessment_path = planning_root.join("ASSESSMENT.md");
     let spec_path = planning_root.join("SPEC.md");
     let plans_index_path = planning_root.join("PLANS.md");
     let report_path = planning_root.join("GENESIS-REPORT.md");
     let design_path = planning_root.join("DESIGN.md");
+    let focus_path = planning_root.join("FOCUS.md");
     let plans_dir = planning_root.join("plans");
 
     for path in [
@@ -685,12 +697,16 @@ fn verify_corpus_outputs(planning_root: &Path) -> Result<CorpusOutputSummary> {
             plans_dir.display()
         );
     }
+    if focus_requested && !focus_path.exists() {
+        bail!("corpus generation did not write {}", focus_path.display());
+    }
     Ok(CorpusOutputSummary {
         assessment_path,
         spec_path,
         plans_index_path,
         report_path,
         design_path: design_path.exists().then_some(design_path),
+        focus_path: focus_path.exists().then_some(focus_path),
         idea_path: planning_root
             .join("IDEA.md")
             .exists()
@@ -705,6 +721,7 @@ fn build_corpus_prompt(
     previous_planning_snapshot: Option<&Path>,
     parallelism: usize,
     idea: Option<&str>,
+    focus: Option<&str>,
     reference_repos: &[PathBuf],
 ) -> String {
     let planning_root = planning_root
@@ -722,6 +739,11 @@ fn build_corpus_prompt(
         .unwrap_or_default();
     let idea_output_clause = if idea.is_some() {
         format!("- `{planning_root}/IDEA.md`\n")
+    } else {
+        String::new()
+    };
+    let focus_output_clause = if focus.is_some() {
+        format!("- `{planning_root}/FOCUS.md`\n")
     } else {
         String::new()
     };
@@ -771,6 +793,28 @@ Run a non-interactive office-hours shaping pass first:
             )
         })
         .unwrap_or_default();
+    let focus_context_clause = focus
+        .map(|focus| {
+            format!(
+                r#"- Focus steering from the operator: `{focus}`
+
+Treat this as an attention and prioritization signal, not a blinders command:
+- Still perform a wide repo sweep and do not ignore critical issues outside the focus
+- Spend extra review budget on the focused surfaces, likely failure modes, and next-priority decisions
+- Use the focus to rank recommendations and plans, not to invent scope unsupported by the codebase
+- Write the normalized focus brief to `{planning_root}/FOCUS.md`
+
+`FOCUS.md` must include:
+- the raw focus string
+- the normalized focus themes
+- the likely code, product, and operational surfaces this implies
+- what still requires repo-wide review despite the focus
+- the main questions the focus should answer
+- how the focus changed priority ordering, if it did
+"#
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"You are the interim CEO/CTO of this repository at `{target_repo}`. Your job is to perform a deep repo review and author a detailed planning corpus.
 
@@ -788,7 +832,7 @@ Mandatory output files:
 - `{planning_root}/PLANS.md`
 - `{planning_root}/GENESIS-REPORT.md`
 - `{planning_root}/DESIGN.md` if the repo has meaningful user-facing surfaces
-{idea_output_clause}- `{planning_root}/plans/001-master-plan.md`
+{idea_output_clause}{focus_output_clause}- `{planning_root}/plans/001-master-plan.md`
 - `{planning_root}/plans/002-*.md` through `plans/NNN-*.md`
 
 Review the actual codebase first, not just docs:
@@ -797,6 +841,7 @@ Review the actual codebase first, not just docs:
 - Treat completed docs and plans as claims that must be verified against code
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
 - If an idea seed is present, use it as intentional product direction, then reconcile it against repo reality, reusable assets, and the actual gaps.
+- If a focus seed is present, use it to bias depth and plan ordering while still preserving full-repo coverage.
 - The current codebase is still the truth for current state, constraints, and what can be reused.
 - When the repo needs an agent-instruction file, prefer the repo's actual primary convention.
   - In Codex-first repos, prefer `AGENTS.md`.
@@ -816,6 +861,7 @@ Review the actual codebase first, not just docs:
 - For future phases with unresolved feasibility, keep the artifacts at research/design level instead of pretending the implementation details are already locked.
 
 {idea_context_clause}
+{focus_context_clause}
 
 ASSESSMENT.md must include:
 - what the project says it is vs what the code shows it is
@@ -828,6 +874,7 @@ ASSESSMENT.md must include:
 - code-review coverage list proving which source files were actually read
 - target users, success criteria, and repo constraints
 - assumption ledger: what seems true, what is verified, and what still needs proof
+- focus-response section: what the operator focus emphasized, what the code says about it, and any non-focused risks that still outrank it
 - opportunity framing: strongest direction, rejected directions, and why they were rejected
 - for developer-facing repos: a short DX assessment covering first-run friction, copy-paste onboarding honesty, error clarity, and whether the fastest path produces a meaningful success moment
 
@@ -836,6 +883,7 @@ SPEC.md must summarize the repo as a product/system with concrete behaviors grou
 PLANS.md must index the plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives.
 
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
+If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
 
 Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, vertically sliced where possible, and scoped to a concrete deliverable that a single focused worker can close truthfully.
 Future-phase plans with unresolved feasibility must say so clearly and center research gates before implementation promises.
@@ -872,7 +920,9 @@ Never trust docs over code. If docs claim something the code does not support, s
         previous_snapshot_clause = previous_snapshot_clause,
         reference_repo_clause = reference_repo_clause,
         idea_output_clause = idea_output_clause,
+        focus_output_clause = focus_output_clause,
         idea_context_clause = idea_context_clause,
+        focus_context_clause = focus_context_clause,
     )
 }
 
@@ -913,6 +963,15 @@ fn build_spec_generation_prompt(
             )
         })
         .unwrap_or_else(|| "No IDEA.md seed is present for this corpus.".to_string());
+    let focus_clause = corpus
+        .focus_path
+        .as_deref()
+        .map(|path| {
+            format!(
+                "If `{path}` exists in the corpus snapshot, treat it as operator steering for what deserved extra attention in the planning pass. Preserve the full-system view, but use the focus brief to understand why certain priorities may have been ranked ahead of equally plausible alternatives."
+            )
+        })
+        .unwrap_or_else(|| "No FOCUS.md steering brief is present for this corpus.".to_string());
     format!(
         r#"You are generating a new spec snapshot for `{repo_root}`.
 
@@ -931,6 +990,9 @@ Existing corpus plans:
 
 Idea-seed context:
 {idea_clause}
+
+Focus context:
+{focus_clause}
 
 Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
@@ -969,6 +1031,7 @@ Cover the main product and system surfaces represented in the repo. Use the code
             spec_listing
         },
         idea_clause = idea_clause,
+        focus_clause = focus_clause,
         plan_listing = if plan_listing.is_empty() {
             "- none".to_string()
         } else {
@@ -1942,6 +2005,7 @@ Spec: `specs/050426-deterministic-transcripts.md`
             None,
             4,
             Some("build a thing"),
+            None,
             &[],
         );
 
@@ -1949,6 +2013,23 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("alternatives considered"));
         assert!(prompt.contains("explicit checkpoint or decision-gate plan file"));
         assert!(prompt.contains("prefer `AGENTS.md`"));
+    }
+
+    #[test]
+    fn corpus_prompt_can_require_focus_brief_without_losing_repo_wide_sweep() {
+        let prompt = build_corpus_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            None,
+            4,
+            None,
+            Some("wire reconnects, TLS failures, session-token handling"),
+            &[],
+        );
+
+        assert!(prompt.contains("`genesis/FOCUS.md`"));
+        assert!(prompt.contains("Still perform a wide repo sweep"));
+        assert!(prompt.contains("attention and prioritization signal"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, repo_name, run_git, timestamp_slug,
+    git_stdout, opencode_agent_dir, prune_pi_runtime_state, repo_name, run_git, timestamp_slug,
 };
 use crate::NemesisArgs;
 
@@ -713,7 +713,8 @@ async fn run_pi(
     thinking: &str,
     pi_bin: &Path,
 ) -> Result<String> {
-    let mut child = TokioCommand::new(pi_bin)
+    let mut command = TokioCommand::new(pi_bin);
+    command
         .arg("--model")
         .arg(model)
         .arg("--thinking")
@@ -728,15 +729,15 @@ async fn run_pi(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(repo_root)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to launch PI at {} from {}",
-                pi_bin.display(),
-                repo_root.display()
-            )
-        })?;
+        .current_dir(repo_root);
+    configure_pi_env(&mut command, repo_root)?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch PI at {} from {}",
+            pi_bin.display(),
+            repo_root.display()
+        )
+    })?;
 
     let stdout = child
         .stdout
@@ -762,6 +763,7 @@ async fn run_pi(
     let stderr = stderr_task
         .await
         .context("PI stderr capture task panicked")??;
+    prune_pi_runtime_state(repo_root)?;
     if status.success() {
         if let Some(detail) = parse_pi_error(&stdout) {
             bail!("PI Nemesis run failed: {detail}");
@@ -774,6 +776,15 @@ async fn run_pi(
             .trim()
             .if_empty_then(parse_pi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
     );
+}
+
+fn configure_pi_env(command: &mut TokioCommand, repo_root: &Path) -> Result<()> {
+    let agent_dir = opencode_agent_dir(repo_root);
+    fs::create_dir_all(&agent_dir)
+        .with_context(|| format!("failed to create {}", agent_dir.display()))?;
+    command.env("PI_CODING_AGENT_DIR", &agent_dir);
+    command.env("OPENCODE_CODING_AGENT_DIR", &agent_dir);
+    Ok(())
 }
 
 async fn read_stream<R>(stream: R) -> Result<String>
