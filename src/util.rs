@@ -108,8 +108,7 @@ pub(crate) fn auto_checkpoint_if_needed(
     stage_checkpoint_changes(repo_root)?;
     let message = format!("{}: {message_suffix}", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
-    sync_branch_with_remote(repo_root, branch)?;
-    run_git(repo_root, ["push", "origin", branch])?;
+    push_branch_with_remote_sync(repo_root, branch)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
     Ok(Some(commit.trim().to_string()))
 }
@@ -124,6 +123,12 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
         ["pull", "--rebase", "--autostash", "origin", branch],
     )?;
     Ok(true)
+}
+
+pub(crate) fn push_branch_with_remote_sync(repo_root: &Path, branch: &str) -> Result<bool> {
+    let synced = sync_branch_with_remote(repo_root, branch)?;
+    run_git(repo_root, ["push", "origin", branch])?;
+    Ok(synced)
 }
 
 fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
@@ -415,8 +420,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        checkpoint_status, clip_line_for_display, prune_old_entries, stage_checkpoint_changes,
-        sync_branch_with_remote, truncate_file_to_max_bytes,
+        checkpoint_status, clip_line_for_display, prune_old_entries, push_branch_with_remote_sync,
+        stage_checkpoint_changes, sync_branch_with_remote, truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -636,6 +641,30 @@ mod tests {
         assert!(status.contains(" M README.md"));
         let readme = fs::read_to_string(worker.join("README.md")).expect("failed to read README");
         assert_eq!(readme, "# dirty\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn push_branch_with_remote_sync_rebases_then_pushes() {
+        let (root, _remote, upstream, worker) = init_remote_and_clones("push-remote-sync", "trunk");
+
+        fs::write(upstream.join("UPSTREAM.md"), "upstream\n").expect("failed to write upstream");
+        run_git_in(&upstream, ["add", "UPSTREAM.md"]);
+        run_git_in(&upstream, ["commit", "-m", "upstream change"]);
+        run_git_in(&upstream, ["push", "origin", "trunk"]);
+
+        fs::write(worker.join("WORKER.md"), "worker\n").expect("failed to write worker");
+        run_git_in(&worker, ["add", "WORKER.md"]);
+        run_git_in(&worker, ["commit", "-m", "worker change"]);
+
+        let synced =
+            push_branch_with_remote_sync(&worker, "trunk").expect("failed to push synced branch");
+
+        assert!(synced);
+        run_git_in(&upstream, ["fetch", "origin", "trunk"]);
+        let log = run_git_in(&upstream, ["log", "--format=%s", "-2", "origin/trunk"]);
+        assert_eq!(log, "worker change\nupstream change\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }

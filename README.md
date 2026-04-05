@@ -47,6 +47,9 @@ need to pass directories in the normal case.
   targeting the repo's resolved base branch
 - `auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `xhigh` implementation pass
   unless `--report-only` is used
+- All mutating branch commands (`auto loop`, `auto qa`, `auto review`, `auto ship`, `auto bug`,
+  and `auto nemesis`) now rebase onto `origin/<branch>` when that remote branch exists before
+  starting work and again before pushing, so remote fast-forwards do not kill long runs at the end
 
 ## How To Think About The Commands
 
@@ -300,6 +303,8 @@ What it actually does:
 - Runs a final repo-wide implementation pass over the surviving findings unless `--report-only` is
   set
 - Pushes truthful implementation fixes back to the current branch
+- Rebases onto `origin/<branch>` before implementation and before pushing fixes when that remote
+  branch exists, so verified-fix runs tolerate a moving remote branch
 - Pushes harder on believable reproduction, root-cause fixes, and regression coverage than the old
   pipeline did
 - Archives the previous `bug/` folder under `.auto/fresh-input/` before a fresh run
@@ -375,6 +380,8 @@ What it actually does:
 - Writes implementation results under `nemesis/`
 - Appends only still-open unchecked Nemesis tasks back into the root plan after implementation
 - Commits and pushes truthful Nemesis hardening increments plus trailing Nemesis outputs
+- Rebases onto `origin/<branch>` before implementation and before each push when that remote
+  branch exists, so long Nemesis runs do not die on a non-fast-forward at the end
 
 Important rule:
 
@@ -509,6 +516,8 @@ What it actually does:
 - Fixes bounded high-signal problems directly when the issue is clear and worth addressing in the
   pass
 - Pushes truthful QA increments back to the same branch
+- Rebases onto `origin/<branch>` before QA starts and again before each push when that remote
+  branch exists, so long QA passes tolerate remote fast-forwards
 
 QA tiers:
 
@@ -674,6 +683,8 @@ What it actually does:
   - blast radius wider than the touched files suggest
 - Writes unresolved issues to `WORKLIST.md`
 - Moves only truly cleared review items into `ARCHIVED.md`
+- Rebases onto `origin/<branch>` before review starts and again before each push when that remote
+  branch exists, so long review passes tolerate remote fast-forwards
 
 Important queue rule:
 
@@ -738,6 +749,8 @@ What it actually does:
 - Treats accessibility and performance checks as part of release confidence for user-facing repos
 - Appends unresolved blockers and follow-ups to `WORKLIST.md`
 - Commits and pushes truthful ship-prep increments
+- Rebases onto `origin/<branch>` before ship work starts and again before each push when that
+  remote branch exists, so release-prep runs tolerate remote fast-forwards
 - If the current branch is not the base branch and `gh` is available, creates or refreshes a PR
 
 Base branch resolution:

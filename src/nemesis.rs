@@ -13,7 +13,8 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, opencode_agent_dir, prune_pi_runtime_state, repo_name, run_git, timestamp_slug,
+    git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
+    repo_name, run_git, sync_branch_with_remote, timestamp_slug,
 };
 use crate::NemesisArgs;
 
@@ -359,6 +360,9 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         println!("mode:        dry-run");
         return Ok(());
     }
+    if !args.report_only && sync_branch_with_remote(&repo_root, current_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", current_branch);
+    }
     if !args.report_only {
         if let Some(commit) =
             auto_checkpoint_if_needed(&repo_root, current_branch.as_str(), "nemesis checkpoint")?
@@ -430,8 +434,10 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         )?;
         implementation_results = Some(implementation_path);
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        if commit_before.trim() != commit_after.trim() {
-            run_git(&repo_root, ["push", "origin", current_branch.as_str()])?;
+        if commit_before.trim() != commit_after.trim()
+            && push_branch_with_remote_sync(&repo_root, current_branch.as_str())?
+        {
+            println!("remote sync: rebased onto origin/{}", current_branch);
         }
     }
     let root_spec = sync_nemesis_spec_to_root(&repo_root, &spec_path)?;
@@ -1033,7 +1039,7 @@ fn commit_nemesis_outputs_if_needed(repo_root: &Path, branch: &str) -> Result<Op
 
     let message = format!("{}: record nemesis outputs", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
-    run_git(repo_root, ["push", "origin", branch])?;
+    push_branch_with_remote_sync(repo_root, branch)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
     Ok(Some(commit.trim().to_string()))
 }

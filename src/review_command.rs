@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
-    run_git, timestamp_slug,
+    push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
 use crate::ReviewArgs;
 
@@ -131,6 +131,10 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
     println!("run root:    {}", run_root.display());
 
+    if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", push_branch);
+    }
+
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
     {
@@ -190,7 +194,9 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             break;
         }
 
-        run_git(&repo_root, ["push", "origin", push_branch.as_str()])?;
+        if push_branch_with_remote_sync(&repo_root, push_branch.as_str())? {
+            println!("remote sync: rebased onto origin/{}", push_branch);
+        }
         if let Some(commit) =
             auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
         {

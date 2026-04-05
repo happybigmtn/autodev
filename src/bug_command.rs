@@ -13,8 +13,8 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, opencode_agent_dir, prune_pi_runtime_state, run_git, timestamp_slug,
-    truncate_file_to_max_bytes,
+    git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
+    sync_branch_with_remote, timestamp_slug, truncate_file_to_max_bytes,
 };
 use crate::BugArgs;
 
@@ -232,6 +232,12 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         }
         return Ok(());
     }
+    if !args.report_only
+        && !current_branch.is_empty()
+        && sync_branch_with_remote(&repo_root, current_branch.as_str())?
+    {
+        println!("remote sync: rebased onto origin/{}", current_branch);
+    }
     if !args.report_only && !args.allow_dirty {
         if let Some(commit) =
             auto_checkpoint_if_needed(&repo_root, current_branch.as_str(), "auto bug checkpoint")?
@@ -351,7 +357,9 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     if let Some(commit_before) = fix_commit_before {
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         if commit_before.trim() != commit_after.trim() {
-            run_git(&repo_root, ["push", "origin", current_branch.as_str()])?;
+            if push_branch_with_remote_sync(&repo_root, current_branch.as_str())? {
+                println!("remote sync: rebased onto origin/{}", current_branch);
+            }
             if !args.allow_dirty {
                 if let Some(commit) = auto_checkpoint_if_needed(
                     &repo_root,
