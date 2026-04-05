@@ -21,6 +21,7 @@ use crate::BugArgs;
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "xhigh";
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
+const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 struct RepoChunk {
@@ -958,7 +959,12 @@ async fn run_backend_prompt(
                 .await
                 .context("PI stderr capture task panicked")??;
             append_stderr_log(stderr_log_path, &stderr_text)?;
-            prune_pi_runtime_state(repo_root)?;
+            if let Err(err) = prune_pi_runtime_state(repo_root) {
+                eprintln!(
+                    "warning: failed to prune PI runtime state in {}: {err}",
+                    opencode_agent_dir(repo_root).display()
+                );
+            }
 
             if !status.success() {
                 bail!(
@@ -1554,7 +1560,19 @@ where
     match serde_json::from_str(&content) {
         Ok(parsed) => Ok(parsed),
         Err(original_error) => {
-            if let Some(repaired) = repair_llm_json(&content) {
+            let repair_candidate = json_repair_candidate(&content);
+            if repair_candidate.len() > JSON_REPAIR_MAX_BYTES {
+                bail!(
+                    "failed to parse JSON from {}: {}; automatic repair skipped because the \
+candidate is {} bytes and exceeds the {}-byte limit",
+                    path.display(),
+                    original_error,
+                    repair_candidate.len(),
+                    JSON_REPAIR_MAX_BYTES
+                );
+            }
+
+            if let Some(repaired) = repair_llm_json_candidate(&repair_candidate, &content) {
                 match serde_json::from_str(&repaired) {
                     Ok(parsed) => {
                         println!(
@@ -1585,10 +1603,21 @@ where
 }
 
 fn repair_llm_json(content: &str) -> Option<String> {
-    let candidate = extract_fenced_json_block(content).unwrap_or_else(|| content.to_string());
+    let candidate = json_repair_candidate(content);
+    if candidate.len() > JSON_REPAIR_MAX_BYTES {
+        return None;
+    }
+    repair_llm_json_candidate(&candidate, content)
+}
+
+fn json_repair_candidate(content: &str) -> String {
+    extract_fenced_json_block(content).unwrap_or_else(|| content.to_string())
+}
+
+fn repair_llm_json_candidate(candidate: &str, original: &str) -> Option<String> {
     let escaped = escape_unescaped_quotes_in_json_strings(&candidate);
     let repaired = normalize_bug_pipeline_json_shapes(&escaped).unwrap_or(escaped);
-    (repaired != content).then_some(repaired)
+    (repaired != original).then_some(repaired)
 }
 
 fn normalize_bug_pipeline_json_shapes(content: &str) -> Option<String> {
@@ -2135,14 +2164,40 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         build_fix_prompt, collect_repo_chunks, escape_unescaped_quotes_in_json_strings,
-        repair_llm_json, should_audit_path, slugify, validate_accepted_findings, AcceptedFinding,
-        BugFinding, SkepticVerdict,
+        load_json_file, repair_llm_json, run_backend_prompt, should_audit_path, slugify,
+        validate_accepted_findings, AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("autodev-bug-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn write_fake_pi_script(path: &Path) {
+        let script = "#!/bin/sh\nprintf '[]\\n'\n";
+        fs::write(path, script).expect("failed to write fake pi script");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("failed to stat fake pi script")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("failed to chmod fake pi script");
+        }
+    }
 
     #[test]
     fn excludes_generated_and_binary_paths() {
@@ -2273,5 +2328,60 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].evidence.is_empty());
         assert_eq!(parsed[0].falsification_checks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pi_cleanup_failure_is_best_effort_after_successful_run() {
+        let repo_root = temp_path("pi-cleanup-best-effort");
+        fs::create_dir_all(&repo_root).expect("failed to create repo root");
+        let agent_dir = repo_root
+            .join(".auto")
+            .join("opencode-data")
+            .join("opencode");
+        fs::create_dir_all(&agent_dir).expect("failed to create agent dir");
+        fs::write(agent_dir.join("snapshot"), "not a directory")
+            .expect("failed to create invalid snapshot path");
+
+        let fake_pi = repo_root.join("fake-pi.sh");
+        write_fake_pi_script(&fake_pi);
+
+        let backend = LlmBackend::Pi {
+            provider_label: "pi-kimi",
+            model: "kimi-coding/k2p5".to_string(),
+            thinking: "high".to_string(),
+            pi_bin: fake_pi,
+        };
+        let stderr_log_path = repo_root.join("bug.stderr.log");
+
+        let result = run_backend_prompt(
+            &repo_root,
+            "prompt",
+            &backend,
+            &stderr_log_path,
+            "test pi cleanup",
+        )
+        .await;
+
+        let stdout = result.expect("successful PI output should survive cleanup failures");
+        assert_eq!(stdout, "[]\n");
+    }
+
+    #[test]
+    fn oversized_invalid_json_skips_automatic_repair() {
+        let path = temp_path("oversized-json").join("finder-response.json");
+        fs::create_dir_all(path.parent().expect("temp file should have a parent"))
+            .expect("failed to create temp dir");
+        let repeated_quotes = "\"broken\" ".repeat(40_000);
+        let invalid = format!(
+            "[{{\"bug_id\":\"BUG-001-01\",\"decision\":\"disproved\",\"confidence_percent\":95,\
+\"counter_argument\":\"{repeated_quotes}\",\"risk_calculation\":\"low\",\"follow_up_checks\":[\"check\"]}}]"
+        );
+        fs::write(&path, invalid).expect("failed to write oversized invalid json");
+
+        let error = load_json_file::<Vec<SkepticVerdict>>(&path)
+            .expect_err("oversized invalid JSON should not attempt automatic repair");
+        let message = error.to_string();
+        assert!(message.contains("automatic repair skipped"));
+        assert!(message.contains("exceeds"));
     }
 }

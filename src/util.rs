@@ -244,8 +244,22 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
     fs::write(&temp, bytes).with_context(|| format!("failed to write {}", temp.display()))?;
-    fs::rename(&temp, path)
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
+    if let Err(rename_error) = fs::rename(&temp, path) {
+        let cleanup_error = match fs::remove_file(&temp) {
+            Ok(()) => None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => Some(err),
+        };
+        let mut context = format!("failed to atomically replace {}", path.display());
+        if let Some(err) = cleanup_error {
+            context.push_str(&format!(
+                "; also failed to remove temp {}: {}",
+                temp.display(),
+                err
+            ));
+        }
+        return Err(rename_error).with_context(|| context);
+    }
     Ok(())
 }
 
@@ -420,8 +434,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        checkpoint_status, clip_line_for_display, prune_old_entries, push_branch_with_remote_sync,
-        stage_checkpoint_changes, sync_branch_with_remote, truncate_file_to_max_bytes,
+        atomic_write, checkpoint_status, clip_line_for_display, prune_old_entries,
+        push_branch_with_remote_sync, stage_checkpoint_changes, sync_branch_with_remote,
+        truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -667,5 +682,32 @@ mod tests {
         assert_eq!(log, "worker change\nupstream change\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn atomic_write_removes_temp_file_after_rename_failure() {
+        let dir = temp_repo_path("atomic-write-cleanup");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("result.json");
+        fs::create_dir_all(&target).expect("failed to create conflicting target directory");
+
+        let err = atomic_write(&target, br#"{"ok":true}"#)
+            .expect_err("renaming a file over a directory should fail");
+        assert!(err.to_string().contains("failed to atomically replace"));
+
+        let mut entries = fs::read_dir(&dir)
+            .expect("failed to read temp dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read temp dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, vec!["result.json".to_string()]);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 }
