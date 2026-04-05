@@ -72,6 +72,7 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
 
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";
 const REVIEW_HEADER: &str = "# REVIEW";
+const ARCHIVED_HEADER: &str = "# ARCHIVED";
 
 pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
@@ -79,6 +80,8 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
 
     let completed_path = repo_root.join("COMPLETED.md");
     let review_path = repo_root.join("REVIEW.md");
+    let archived_path = repo_root.join("ARCHIVED.md");
+    ensure_review_docs(&review_path, &archived_path)?;
     let moved_items = handoff_completed_items_to_review_queue(&completed_path, &review_path)?;
     if !review_path.exists() || !has_reviewable_items(&review_path)? {
         println!("auto review");
@@ -253,12 +256,7 @@ fn extract_review_items(content: &str) -> Vec<String> {
     if content.lines().any(|line| line.starts_with("## ")) {
         return extract_section_review_items(content);
     }
-    content
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| line.starts_with("- "))
-        .map(ToOwned::to_owned)
-        .collect()
+    extract_bullet_review_items(content)
 }
 
 fn extract_section_review_items(content: &str) -> Vec<String> {
@@ -291,19 +289,75 @@ fn write_queue(path: &Path, title: &str, items: &[String]) -> Result<()> {
     atomic_write(path, content.as_bytes())
 }
 
+fn ensure_review_docs(review_path: &Path, archived_path: &Path) -> Result<()> {
+    if !review_path.exists() {
+        atomic_write(review_path, format!("{REVIEW_HEADER}\n\n").as_bytes())
+            .with_context(|| format!("failed to initialize {}", review_path.display()))?;
+    }
+    if !archived_path.exists() {
+        atomic_write(archived_path, format!("{ARCHIVED_HEADER}\n\n").as_bytes())
+            .with_context(|| format!("failed to initialize {}", archived_path.display()))?;
+    }
+    Ok(())
+}
+
+fn extract_bullet_review_items(content: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end();
+        if line.starts_with("- ") {
+            if !current.is_empty() {
+                items.push(current.join("\n").trim_end().to_string());
+                current.clear();
+            }
+            current.push(line.to_string());
+            continue;
+        }
+
+        if current.is_empty() {
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            current.push(String::new());
+            continue;
+        }
+
+        if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
+            current.push(line.to_string());
+            continue;
+        }
+
+        items.push(current.join("\n").trim_end().to_string());
+        current.clear();
+    }
+
+    if !current.is_empty() {
+        items.push(current.join("\n").trim_end().to_string());
+    }
+
+    items
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_review_items;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{ensure_review_docs, extract_review_items, ARCHIVED_HEADER, REVIEW_HEADER};
 
     #[test]
     fn extracts_bullet_review_items() {
-        let content = "# COMPLETED\n\n- `VAL-001` Added validation\n- `SEC-001` Hardened auth\n";
+        let content = "# COMPLETED\n\n- `VAL-001` Added validation\n  Validation:\n  `cargo test`\n\n- `SEC-001` Hardened auth\n  Note: tightened auth boundary\n";
         let items = extract_review_items(content);
         assert_eq!(
             items,
             vec![
-                "- `VAL-001` Added validation".to_string(),
-                "- `SEC-001` Hardened auth".to_string()
+                "- `VAL-001` Added validation\n  Validation:\n  `cargo test`".to_string(),
+                "- `SEC-001` Hardened auth\n  Note: tightened auth boundary".to_string()
             ]
         );
     }
@@ -315,5 +369,34 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items[0].starts_with("## `VAL-001`"));
         assert!(items[1].starts_with("## `SEC-001`"));
+    }
+
+    #[test]
+    fn initializes_review_and_archived_docs() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let review_path = temp.join("REVIEW.md");
+        let archived_path = temp.join("ARCHIVED.md");
+
+        ensure_review_docs(&review_path, &archived_path).expect("init docs");
+
+        assert_eq!(
+            fs::read_to_string(review_path).expect("read review"),
+            format!("{REVIEW_HEADER}\n\n")
+        );
+        assert_eq!(
+            fs::read_to_string(archived_path).expect("read archived"),
+            format!("{ARCHIVED_HEADER}\n\n")
+        );
+
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("autodev-review-test-{nanos}"))
     }
 }
