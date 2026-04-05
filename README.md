@@ -101,6 +101,8 @@ What it actually does:
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
 - Reviews the repo as the primary truth source
+- Uses the repo's real agent-instruction convention in generated docs and plans; for Codex-first
+  repos that means `AGENTS.md`, regardless of which planning model ran `auto corpus`
 - When `--idea "..."` is supplied, first runs a non-interactive office-hours-style shaping pass
   and writes the normalized seed brief to `genesis/IDEA.md`
 - Produces a corpus that includes:

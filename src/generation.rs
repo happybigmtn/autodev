@@ -798,6 +798,9 @@ Review the actual codebase first, not just docs:
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
 - If an idea seed is present, use it as intentional product direction, then reconcile it against repo reality, reusable assets, and the actual gaps.
 - The current codebase is still the truth for current state, constraints, and what can be reused.
+- When the repo needs an agent-instruction file, prefer the repo's actual primary convention.
+  - In Codex-first repos, prefer `AGENTS.md`.
+  - Do not choose the instruction filename based on which planning model ran the corpus pass.
 - Start by framing the repo as a real product/system:
   - write a crisp "How Might We" style problem statement grounded in the current code reality
   - identify the primary users/operators and what success should look like for them
@@ -1945,6 +1948,7 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("key assumptions to validate next"));
         assert!(prompt.contains("alternatives considered"));
         assert!(prompt.contains("explicit checkpoint or decision-gate plan file"));
+        assert!(prompt.contains("prefer `AGENTS.md`"));
     }
 
     #[test]
