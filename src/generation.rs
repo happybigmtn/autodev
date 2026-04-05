@@ -354,6 +354,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     };
     print_stage("sync generated specs to root", run_started_at);
     let root_specs = sync_generated_specs_to_root(&repo_root, &generated_specs)?;
+    rewrite_generated_plan_spec_refs(&implementation_plan, &root_specs)?;
     let root_plan = match mode {
         GenerationMode::Gen => Some(sync_generated_plan_to_root_preserving_open_tasks(
             &repo_root,
@@ -1404,6 +1405,80 @@ fn sync_generated_plan_to_root_preserving_open_tasks(
     Ok(root_plan)
 }
 
+fn rewrite_generated_plan_spec_refs(
+    generated_plan: &Path,
+    root_specs: &SpecSyncSummary,
+) -> Result<()> {
+    if root_specs.appended_paths.is_empty() {
+        return Ok(());
+    }
+
+    let markdown = fs::read_to_string(generated_plan)
+        .with_context(|| format!("failed to read {}", generated_plan.display()))?;
+    let rewritten = rewrite_plan_spec_refs_to_root(&markdown, root_specs);
+    if rewritten == markdown {
+        return Ok(());
+    }
+
+    atomic_write(generated_plan, rewritten.as_bytes())
+        .with_context(|| format!("failed to rewrite {}", generated_plan.display()))?;
+    Ok(())
+}
+
+fn rewrite_plan_spec_refs_to_root(markdown: &str, root_specs: &SpecSyncSummary) -> String {
+    let slug_to_root = root_specs
+        .appended_paths
+        .iter()
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?;
+            let slug = spec_topic_slug(stem);
+            let relative = Path::new("specs").join(path.file_name()?);
+            Some((slug, relative.display().to_string()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut changed = false;
+    let rewritten_lines = markdown
+        .lines()
+        .map(|line| rewrite_plan_spec_line(line, &slug_to_root, &mut changed))
+        .collect::<Vec<_>>();
+    if !changed {
+        return markdown.to_string();
+    }
+
+    let mut rewritten = rewritten_lines.join("\n");
+    if markdown.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn rewrite_plan_spec_line(
+    line: &str,
+    slug_to_root: &std::collections::BTreeMap<String, String>,
+    changed: &mut bool,
+) -> String {
+    let Some(spec_index) = line.find("Spec:") else {
+        return line.to_string();
+    };
+    let prefix = &line[..spec_index];
+    let rest = line[spec_index + "Spec:".len()..].trim();
+    let unquoted = rest.trim_matches('`');
+    let path = Path::new(unquoted);
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return line.to_string();
+    };
+    let slug = spec_topic_slug(stem);
+    let Some(root_path) = slug_to_root.get(&slug) else {
+        return line.to_string();
+    };
+    let normalized = format!("{prefix}Spec: `{root_path}`");
+    if normalized != line {
+        *changed = true;
+    }
+    normalized
+}
+
 fn merge_generated_plan_with_existing_open_tasks(
     generated: &str,
     existing: &str,
@@ -1614,7 +1689,8 @@ mod tests {
         generated_spec_has_acceptance_criteria, lint_future_phase_research_discipline,
         lint_session_resume_wire_contract, lint_signature_policy_consistency,
         merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        GeneratedSpecDocument, IMPLEMENTATION_PLAN_HEADER,
+        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, SpecSyncSummary,
+        IMPLEMENTATION_PLAN_HEADER,
     };
     use std::path::PathBuf;
 
@@ -1794,5 +1870,38 @@ This should be bulletized.
             .expect_err("expected future-phase research lint");
 
         assert!(error.to_string().contains("research/design level"));
+    }
+
+    #[test]
+    fn rewrites_plan_spec_refs_to_actual_root_snapshots() {
+        let markdown = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `WS-01` Scaffold workspace
+Spec: `specs/050426-workspace-build-system.md`
+
+## Follow-On Work
+
+- [ ] `TR-01` Build transcripts
+Spec: `specs/050426-deterministic-transcripts.md`
+
+## Completed / Already Satisfied
+"#;
+
+        let rewritten = rewrite_plan_spec_refs_to_root(
+            markdown,
+            &SpecSyncSummary {
+                appended_paths: vec![
+                    PathBuf::from("/tmp/specs/040426-workspace-build-system.md"),
+                    PathBuf::from("/tmp/specs/040426-deterministic-transcripts.md"),
+                ],
+                skipped_count: 0,
+            },
+        );
+
+        assert!(rewritten.contains("Spec: `specs/040426-workspace-build-system.md`"));
+        assert!(rewritten.contains("Spec: `specs/040426-deterministic-transcripts.md`"));
+        assert!(!rewritten.contains("050426"));
     }
 }
