@@ -1,19 +1,23 @@
 mod bug_command;
+mod codex_exec;
 mod codex_stream;
 mod corpus;
 mod generation;
+mod health_command;
 mod loop_command;
 mod nemesis;
 mod pi_backend;
 mod qa_command;
+mod qa_only_command;
 mod review_command;
+mod ship_command;
 mod state;
 mod util;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -40,10 +44,33 @@ enum Command {
     Loop(LoopArgs),
     /// Run a runtime QA and ship-readiness pass on the current branch
     Qa(QaArgs),
+    /// Run a report-only runtime QA pass on the current branch
+    QaOnly(QaOnlyArgs),
+    /// Run a repo-wide quality and verification health report
+    Health(HealthArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
+    /// Prepare the current branch to ship, push it, and open or refresh a PR when appropriate
+    Ship(ShipArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
     Nemesis(NemesisArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum QaTier {
+    Quick,
+    Standard,
+    Exhaustive,
+}
+
+impl QaTier {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Exhaustive => "exhaustive",
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -51,6 +78,10 @@ pub(crate) struct CorpusArgs {
     /// Planning corpus root. Defaults to <repo>/genesis
     #[arg(long)]
     planning_root: Option<PathBuf>,
+
+    /// Seed corpus generation with a product idea and run an office-hours-style shaping pass
+    #[arg(long)]
+    idea: Option<String>,
 
     /// Model used for corpus authoring
     #[arg(long, default_value = "claude-opus-4-6")]
@@ -258,6 +289,103 @@ pub(crate) struct QaArgs {
     /// Codex executable to invoke
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+
+    /// QA depth. Quick focuses on critical/high issues, Standard adds medium issues, Exhaustive includes polish and cosmetic issues.
+    #[arg(long, value_enum, default_value_t = QaTier::Standard)]
+    tier: QaTier,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct QaOnlyArgs {
+    /// Optional override for the report-only QA prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Model to use for the QA report worker
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex QA report worker
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Optional branch to require for the QA report; defaults to the currently checked-out branch
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Directory for QA report logs. Defaults to <repo>/.auto/qa-only
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// QA depth. Quick focuses on critical/high issues, Standard adds medium issues, Exhaustive includes polish and cosmetic issues.
+    #[arg(long, value_enum, default_value_t = QaTier::Standard)]
+    tier: QaTier,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct HealthArgs {
+    /// Optional override for the health prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Model to use for the health worker
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex health worker
+    #[arg(long, default_value = "high")]
+    reasoning_effort: String,
+
+    /// Optional branch to require for the health report; defaults to the currently checked-out branch
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Directory for health logs. Defaults to <repo>/.auto/health
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct ShipArgs {
+    /// Stop after this many successful ship iterations. Default is 1.
+    #[arg(long, default_value_t = 1)]
+    max_iterations: usize,
+
+    /// Optional override for the ship prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Model to use for the ship worker
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex ship worker
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Optional branch to require for the ship loop; defaults to the currently checked-out branch
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Optional explicit base branch for diff and PR targeting
+    #[arg(long)]
+    base_branch: Option<String>,
+
+    /// Directory for ship logs. Defaults to <repo>/.auto/ship
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -316,7 +444,10 @@ async fn main() -> Result<()> {
         Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
         Command::Qa(args) => qa_command::run_qa(args).await,
+        Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
+        Command::Health(args) => health_command::run_health(args).await,
         Command::Review(args) => review_command::run_review(args).await,
+        Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
     }
 }

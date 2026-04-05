@@ -1,12 +1,9 @@
 use std::fs;
 use std::path::Path;
-use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command as TokioCommand;
 
-use crate::codex_stream;
+use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     run_git, timestamp_slug,
@@ -25,12 +22,15 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
 2. Use this review workflow for every item:
    - Understand the intended behavior and expected change first.
    - Review the tests and verification evidence before reviewing the implementation details.
+   - Reconstruct the changed-file set and blast radius for the reviewed item from commits, diffs, touched tests, and adjacent integration surfaces before you decide the item is safe.
    - Review the implementation across these five axes:
      - correctness
      - readability and simplicity
      - architecture and boundaries
      - security and trust boundaries
      - performance and scalability
+   - If a base branch is discoverable, compare the current branch diff against that base instead of reviewing files in isolation.
+   - Pay special attention to structural issues that tests often miss: SQL/query safety, trust-boundary violations, unintended conditional side effects, stale config or migration coupling, and changes whose blast radius is wider than the touched files imply.
    - For browser-facing or runtime-sensitive items, use browser/runtime verification when available instead of static review alone.
    - Verify the verification story itself: commands actually run, outputs believable, screenshots or runtime evidence consistent with the code.
    - Categorize any findings as `Critical`, required, `Optional`, or `FYI`.
@@ -148,13 +148,14 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!();
         println!("running review iteration {}", iteration + 1);
 
-        let exit_status = run_codex_iteration(
+        let exit_status = run_codex_exec(
             &repo_root,
             &full_prompt,
             &args.model,
             &args.reasoning_effort,
             &args.codex_bin,
             &stderr_log_path,
+            "auto review",
         )
         .await?;
         if !exit_status.success() {
@@ -198,96 +199,6 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn run_codex_iteration(
-    repo_root: &Path,
-    full_prompt: &str,
-    model: &str,
-    reasoning_effort: &str,
-    codex_bin: &Path,
-    stderr_log_path: &Path,
-) -> Result<std::process::ExitStatus> {
-    let mut command = TokioCommand::new(codex_bin);
-    command
-        .arg("exec")
-        .arg("--json")
-        .arg("--dangerously-bypass-approvals-and-sandbox")
-        .arg("--skip-git-repo-check")
-        .arg("--cd")
-        .arg(repo_root)
-        .arg("-m")
-        .arg(model)
-        .arg("-c")
-        .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .current_dir(repo_root);
-
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to launch Codex at {} from {}",
-            codex_bin.display(),
-            repo_root.display()
-        )
-    })?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("Codex stdin should be piped for auto review")?;
-    stdin
-        .write_all(full_prompt.as_bytes())
-        .await
-        .context("failed to write Codex review prompt")?;
-    drop(stdin);
-
-    let stdout = child
-        .stdout
-        .take()
-        .context("Codex stdout should be piped for auto review")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("Codex stderr should be piped for auto review")?;
-
-    let stdout_task = tokio::spawn(async move { codex_stream::stream_codex_output(stdout).await });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
-
-    let status = child.wait().await.context("failed waiting for Codex")?;
-    stdout_task
-        .await
-        .context("Codex stdout streaming task panicked")??;
-    let stderr_text = stderr_task
-        .await
-        .context("Codex stderr capture task panicked")??;
-    if !stderr_text.trim().is_empty() {
-        let entry = format!("\n===== {} =====\n{stderr_text}\n", timestamp_slug());
-        let mut existing = if stderr_log_path.exists() {
-            fs::read(stderr_log_path)
-                .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
-        } else {
-            Vec::new()
-        };
-        existing.extend_from_slice(entry.as_bytes());
-        atomic_write(stderr_log_path, &existing)?;
-    }
-
-    Ok(status)
-}
-
-async fn read_stream<R>(stream: R) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(stream);
-    let mut text = String::new();
-    reader
-        .read_to_string(&mut text)
-        .await
-        .context("failed to read child stream")?;
-    Ok(text)
 }
 
 pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {

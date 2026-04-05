@@ -101,6 +101,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     println!("auto corpus");
     println!("repo root:   {}", repo_root.display());
     println!("planning:    {}", planning_root.display());
+    if let Some(idea) = args.idea.as_deref() {
+        println!("idea:        {}", idea);
+    }
     println!("model:       {}", args.model);
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
@@ -121,6 +124,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         &planning_root,
         previous_snapshot.as_deref(),
         args.parallelism.clamp(1, 10),
+        args.idea.as_deref(),
     );
     let prompt_path = repo_root
         .join(".auto")
@@ -161,6 +165,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     println!("report:      {}", summary.report_path.display());
     if let Some(design) = summary.design_path {
         println!("design:      {}", design.display());
+    }
+    if let Some(idea) = summary.idea_path {
+        println!("idea brief:  {}", idea.display());
     }
     if let Some(previous) = previous_snapshot {
         println!("prior input: {}", previous.display());
@@ -524,6 +531,7 @@ struct CorpusOutputSummary {
     plans_index_path: PathBuf,
     report_path: PathBuf,
     design_path: Option<PathBuf>,
+    idea_path: Option<PathBuf>,
     plan_count: usize,
 }
 
@@ -562,6 +570,10 @@ fn verify_corpus_outputs(planning_root: &Path) -> Result<CorpusOutputSummary> {
         plans_index_path,
         report_path,
         design_path: design_path.exists().then_some(design_path),
+        idea_path: planning_root
+            .join("IDEA.md")
+            .exists()
+            .then_some(planning_root.join("IDEA.md")),
         plan_count,
     })
 }
@@ -571,6 +583,7 @@ fn build_corpus_prompt(
     planning_root: &Path,
     previous_planning_snapshot: Option<&Path>,
     parallelism: usize,
+    idea: Option<&str>,
 ) -> String {
     let planning_root = planning_root
         .strip_prefix(repo_root)
@@ -582,6 +595,43 @@ fn build_corpus_prompt(
             format!(
                 "- Archived previous planning snapshot for optional historical context: `{}`\n",
                 path.display()
+            )
+        })
+        .unwrap_or_default();
+    let idea_output_clause = if idea.is_some() {
+        format!("- `{planning_root}/IDEA.md`\n")
+    } else {
+        String::new()
+    };
+    let idea_context_clause = idea
+        .map(|idea| {
+            format!(
+                r#"- Idea seed from the operator: `{idea}`
+
+Run a non-interactive office-hours shaping pass first:
+- Treat the idea seed as the intended future state.
+- Do not ask follow-up questions. Infer the strongest truthful framing from the idea, the repo, and the surrounding code reality.
+- Pressure-test the idea the way office-hours would: demand reality, status quo, desperate specificity, narrowest wedge, observation risk, and future-fit.
+- If evidence is missing because the idea is early, label those sections as hypotheses or open questions instead of pretending certainty.
+- Infer whether this is closer to startup mode or builder mode and say why.
+- Write the result to `{planning_root}/IDEA.md` as a durable seed brief before expanding the rest of the corpus.
+
+`IDEA.md` must include:
+- the raw idea in normalized form
+- inferred mode: startup or builder, with a short rationale
+- problem statement
+- target user or audience
+- strongest demand evidence currently available vs what is still hypothetical
+- status quo / current workaround
+- narrowest wedge
+- success criteria
+- constraints
+- assumptions and open questions
+- candidate approaches
+- risks
+- explicit non-goals
+- one recommended direction
+"#
             )
         })
         .unwrap_or_default();
@@ -601,7 +651,7 @@ Mandatory output files:
 - `{planning_root}/PLANS.md`
 - `{planning_root}/GENESIS-REPORT.md`
 - `{planning_root}/DESIGN.md` if the repo has meaningful user-facing surfaces
-- `{planning_root}/plans/001-master-plan.md`
+{idea_output_clause}- `{planning_root}/plans/001-master-plan.md`
 - `{planning_root}/plans/002-*.md` through `plans/NNN-*.md`
 
 Review the actual codebase first, not just docs:
@@ -609,12 +659,17 @@ Review the actual codebase first, not just docs:
 - Review security boundaries, input validation, observability, tests, CI, and git history
 - Treat completed docs and plans as claims that must be verified against code
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
+- If an idea seed is present, use it as intentional product direction, then reconcile it against repo reality, reusable assets, and the actual gaps.
+- The current codebase is still the truth for current state, constraints, and what can be reused.
 - Start by framing the repo as a real product/system:
   - write a crisp "How Might We" style problem statement grounded in the current code reality
   - identify the primary users/operators and what success should look like for them
   - surface the biggest constraints, hidden assumptions, and trade-offs
   - consider 2-3 plausible future directions before choosing the recommended one
   - make a clear "Not Doing" list so the corpus reflects focus, not wishful scope
+  - if the repo is developer-facing, also assess the first-run developer experience: zero friction at T0, learn-by-doing, uncertainty reduction, and whether the onboarding examples are honest about the real work
+
+{idea_context_clause}
 
 ASSESSMENT.md must include:
 - what the project says it is vs what the code shows it is
@@ -628,6 +683,7 @@ ASSESSMENT.md must include:
 - target users, success criteria, and repo constraints
 - assumption ledger: what seems true, what is verified, and what still needs proof
 - opportunity framing: strongest direction, rejected directions, and why they were rejected
+- for developer-facing repos: a short DX assessment covering first-run friction, copy-paste onboarding honesty, error clarity, and whether the fastest path produces a meaningful success moment
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
@@ -642,6 +698,8 @@ Never trust docs over code. If docs claim something the code does not support, s
         planning_root = planning_root,
         parallelism = parallelism,
         previous_snapshot_clause = previous_snapshot_clause,
+        idea_output_clause = idea_output_clause,
+        idea_context_clause = idea_context_clause,
     )
 }
 
@@ -673,6 +731,15 @@ fn build_spec_generation_prompt(
         .map(|plan| format!("- `{}` — {}", plan.path, plan.title))
         .collect::<Vec<_>>()
         .join("\n");
+    let idea_clause = corpus
+        .idea_path
+        .as_deref()
+        .map(|path| {
+            format!(
+                "If `{path}` exists in the corpus snapshot, treat it as the office-hours-style seed brief for intended future direction. Preserve its product framing unless later corpus evidence or code reality clearly overrides it."
+            )
+        })
+        .unwrap_or_else(|| "No IDEA.md seed is present for this corpus.".to_string());
     format!(
         r#"You are generating a new spec snapshot for `{repo_root}`.
 
@@ -689,6 +756,9 @@ Existing corpus spec documents:
 Existing corpus plans:
 {plan_listing}
 
+Idea-seed context:
+{idea_clause}
+
 Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
 - Filenames must use `ddmmyy-topic-slug.md`
@@ -702,6 +772,7 @@ Required output contract:
 - Avoid placeholders and abstract framework prose
 - Surface important assumptions or spec/code conflicts explicitly instead of smoothing them over
 - Include commands, boundaries, or open questions when they materially affect implementation or verification
+- If the repo is developer-facing, capture onboarding, error handling, and first-success expectations truthfully enough that a future worker can improve the DX without guessing
 - Preserve proven current behavior in reverse mode
 - Preserve intended future behavior from the corpus in gen mode when the code has not caught up yet
 
@@ -716,6 +787,7 @@ Cover the main product and system surfaces represented in the repo. Use the code
         } else {
             spec_listing
         },
+        idea_clause = idea_clause,
         plan_listing = if plan_listing.is_empty() {
             "- none".to_string()
         } else {
@@ -766,6 +838,7 @@ Before writing the plan, do the real planning work:
 - prefer vertical slices over horizontal layer dumps
 - keep tasks small enough for one focused worker session
 - do not hide ambiguity; encode real blockers and assumptions in the task contracts
+- if the repo is developer-facing, explicitly consider zero-friction onboarding, learn-by-doing examples, error clarity, and uncertainty-reducing docs or tooling as first-class planning concerns
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`

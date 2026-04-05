@@ -1,12 +1,14 @@
 # autodev
 
-`autodev` is a lightweight repo-root planning and execution toolchain. It keeps the useful parts of the old Malina workflow and drops the Fabro-centered workspace, orchestration layer, and other legacy weight.
+`autodev` is a lightweight repo-root planning and execution toolchain. It keeps the useful parts
+of the old Malina workflow and drops the Fabro-centered workspace, orchestration layer, and other
+legacy weight.
 
 The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` only owns eight commands:
+`auto` owns eleven commands:
 
 - `auto corpus`
 - `auto gen`
@@ -15,251 +17,686 @@ The local CLI command is `auto`.
 - `auto nemesis`
 - `auto loop`
 - `auto qa`
+- `auto qa-only`
+- `auto health`
 - `auto review`
+- `auto ship`
 
 It does not own the old parallel `malina run` workflow.
 
 ## Defaults
 
-All commands resolve the git repo root automatically from the current working directory. You do not need to pass directories in the normal case.
+All commands resolve the git repo root automatically from the current working directory. You do not
+need to pass directories in the normal case.
 
 - Planning root defaults to `<repo>/genesis`
 - Generated output defaults to `<repo>/gen-<timestamp>`
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `xhigh` implementation pass by default
+- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `xhigh`
+  implementation pass by default
 - `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
-- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
-- `auto nemesis` runs a PI-only two-stage audit by default: MiniMax draft pass, then Kimi synthesis pass
+- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `xhigh`, and the
+  `standard` tier
+- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `xhigh`, and
+  the `standard` tier
+- `auto health` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
+- `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`,
+  targeting the repo's resolved base branch
+- `auto nemesis` runs a PI-only two-stage audit by default: MiniMax draft pass, then Kimi
+  synthesis pass
 
-## Command Contract
+## How To Think About The Commands
+
+The commands form one opinionated lifecycle:
+
+1. `auto corpus` builds a disposable understanding of the repo and folds in light strategy and DX
+   thinking.
+2. `auto gen` turns that understanding into durable specs and an execution queue.
+3. `auto loop` burns down the execution queue one truthful task at a time.
+4. `auto qa` runs runtime checks and hardens the branch with direct evidence.
+5. `auto health` captures the repo-wide verification state.
+6. `auto review` reviews completed work and archives only what really clears.
+7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
+   PR when appropriate.
+
+The other four commands are side lanes:
+
+- `auto reverse` documents current behavior from code reality.
+- `auto bug` runs a bug-finding and implementation pipeline.
+- `auto nemesis` runs a deeper disposable audit and appends its findings back into specs and plan.
+- `auto qa-only` runs runtime QA without fixing anything.
+
+## Detailed Command Guide
 
 ### `auto corpus`
 
-`auto corpus` builds a fresh planning corpus under `genesis/`.
+Purpose:
 
-Behavior:
+- Build a fresh disposable planning corpus under `genesis/`
+- Re-understand the repo from code reality before planning
+- Fold light product strategy and focus-setting into the same pass
 
-- Reads the live repo as the primary source of truth
-- Treats any existing `genesis/` as optional historical context
-- Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
-- Destructively refreshes `genesis/`
-- Folds strategic ideation directly into the corpus pass instead of relying on a separate ideation command
-- Surfaces target users, success criteria, assumptions, candidate directions, and a clear "Not Doing" list inside the generated corpus
+What it reads:
 
-Expected outputs:
+- The live repository
+- Existing `genesis/` only as optional historical context
 
+What it writes:
+
+- `genesis/IDEA.md` when `--idea` is used
 - `genesis/ASSESSMENT.md`
 - `genesis/SPEC.md`
 - `genesis/PLANS.md`
 - `genesis/GENESIS-REPORT.md`
 - `genesis/DESIGN.md` when the repo has meaningful UI surfaces
 - `genesis/plans/*.md`
+- prompt and model logs under `.auto/logs/`
 
-### `auto reverse`
+What it actually does:
 
-`auto reverse` reverse-engineers durable product specs from code reality.
+- Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
+- Rebuilds `genesis/` from scratch
+- Reviews the repo as the primary truth source
+- When `--idea "..."` is supplied, first runs a non-interactive office-hours-style shaping pass
+  and writes the normalized seed brief to `genesis/IDEA.md`
+- Produces a corpus that includes:
+  - what the repo currently is
+  - what users or operators appear to need
+  - what success looks like
+  - what assumptions are verified vs unverified
+  - what candidate directions exist
+  - what is explicitly out of scope right now
+- For developer-facing repos, also assesses first-run DX, onboarding honesty, error clarity, and
+  whether the fastest path leads to a real success moment
 
-Behavior:
+Idea mode:
 
-- Uses the live codebase as truth
-- Uses `genesis/` only as supporting context
-- Writes a fresh `gen-<timestamp>/specs/`
-- Appends new snapshot specs into root `specs/`
-- Does not modify root `IMPLEMENTATION_PLAN.md`
-- Requires each generated spec to include `## Objective`, `## Acceptance Criteria`, and `## Verification`
-- Surfaces important assumptions and spec/code conflicts explicitly instead of smoothing them over
+- `auto corpus --idea "..."` is for "here is the thing we want this repo to become"
+- It treats the quoted idea as intentional future direction, then reconciles it against current
+  codebase reality, reusable assets, constraints, and missing pieces
+- The idea is pressure-tested in an office-hours style pass: demand reality, status quo, target
+  user, narrowest wedge, future-fit, assumptions, risks, and non-goals
+- Missing evidence is marked as hypothesis instead of being faked
+- The rest of the corpus then expands that seed into the normal `genesis/` outputs
 
-Root spec filenames use this format:
+When to run it:
 
-- `ddmmyy-topic-slug.md`
+- At the start of a new planning cycle
+- After major drift between code and docs
+- When the repo’s direction feels fuzzy and you want a fresh planning baseline
 
-The root `specs/` directory is snapshot-based and append-only. Existing snapshots are not reconciled in place.
+Useful flags:
+
+- `--planning-root <dir>` to change the corpus destination
+- `--idea "..."` to seed the corpus from a desired product direction or greenfield-style concept
+- `--model <name>` to pick a different Claude model
+- `--max-turns <n>` to raise or lower the planning budget
+- `--parallelism <n>` to encourage more or less parallel planning work
+- `--dry-run` to preview without invoking the model
 
 ### `auto gen`
 
-`auto gen` turns the disposable planning corpus into a fresh actionable plan.
+Purpose:
 
-Behavior:
+- Turn the disposable planning corpus into durable specs and an actionable execution queue
 
-- Reads `genesis/`
-- Writes a fresh `gen-<timestamp>/specs/`
-- Writes `gen-<timestamp>/IMPLEMENTATION_PLAN.md`
-- Appends new generated spec snapshots into root `specs/`
-- Merges the latest generated plan into root `IMPLEMENTATION_PLAN.md`
-- Requires each generated spec to include `## Objective`, `## Acceptance Criteria`, and `## Verification`
-- Builds the implementation plan with dependency order, bounded task size, explicit acceptance criteria, and concrete verification commands
-- Validates task contracts for substance rather than only top-level markdown shape
+What it reads:
+
+- `genesis/`
+
+What it writes:
+
+- `gen-<timestamp>/specs/*.md`
+- `gen-<timestamp>/IMPLEMENTATION_PLAN.md`
+- root `specs/*.md` snapshot files
+- root `IMPLEMENTATION_PLAN.md`
+- prompt and model logs under `.auto/logs/`
+
+What it actually does:
+
+- Generates fresh specs from the planning corpus
+- Requires each generated spec to include:
+  - `## Objective`
+  - `## Acceptance Criteria`
+  - `## Verification`
+- Generates a new implementation plan with dependency-ordered tasks
+- Requires each active plan task to include real execution fields such as:
+  - spec reference
+  - why now
+  - codebase evidence
+  - owned surfaces
+  - scope boundary
+  - acceptance criteria
+  - verification commands or runtime checks
+  - dependencies
+  - estimated scope
+  - completion signal
+- For developer-facing repos, treats onboarding, learn-by-doing examples, error clarity, and
+  uncertainty-reducing docs/tooling as first-class planning concerns
+- Merges the fresh generated plan into the repo-root `IMPLEMENTATION_PLAN.md`
 
 Root plan merge rule:
 
-- The new generated plan becomes the baseline
-- Existing still-open root tasks that are not present in the new generated plan are appended back in
-- Completed items are not preserved in the live root plan
+- The newly generated plan becomes the new baseline
+- Old still-open tasks that are missing from the new generated plan are appended back in
+- Completed items are not preserved in the live root queue
 
-This keeps the root implementation plan non-destructive for unfinished work while still letting each generation pass replace stale planning structure.
+When to run it:
+
+- After `auto corpus`
+- After refreshing planning and wanting a new working queue
+- After substantial product or architectural changes that require replanning
+
+Useful flags:
+
+- `--planning-root <dir>` to point at a non-default corpus
+- `--output-dir <dir>` to control the disposable generation output
+- `--plan-only` to reuse an existing `gen-*` output and only regenerate the plan
+- `--model`, `--max-turns`, and `--parallelism` to tune the generation pass
+
+### `auto reverse`
+
+Purpose:
+
+- Reverse-engineer durable specs from the current codebase
+
+What it reads:
+
+- The live repository as truth
+- `genesis/` only as supporting context
+
+What it writes:
+
+- `gen-<timestamp>/specs/*.md`
+- root `specs/*.md` snapshot files
+- prompt and model logs under `.auto/logs/`
+
+What it does not write:
+
+- It does not rewrite root `IMPLEMENTATION_PLAN.md`
+
+What it actually does:
+
+- Produces specs grounded in current behavior
+- Uses the same stronger spec format as `auto gen`
+- Surfaces assumptions and spec/code conflicts instead of silently reconciling them
+- Appends the results into the append-only snapshot-based root `specs/` directory
+
+Spec naming rule:
+
+- Root spec snapshots use `ddmmyy-topic-slug.md`
+
+When to run it:
+
+- When the code has moved and the specs are stale
+- When onboarding to a repo and you want to know what it really does
+- Before a review or audit that depends on truthful current-state documentation
+
+Useful flags:
+
+- Same as `auto gen`: `--planning-root`, `--output-dir`, `--model`, `--max-turns`,
+  `--parallelism`, `--plan-only`
+
+### `auto bug`
+
+Purpose:
+
+- Run a multi-pass bug-finding pipeline and optionally implement the verified fixes
+
+What it reads:
+
+- The tracked repository files, chunked by top-level scope
+- Existing `bug/` artifacts when `--resume` is used
+
+What it writes:
+
+- `bug/BUG_REPORT.md`
+- `bug/verified-findings.json`
+- `bug/implementation-results.json`
+- per-chunk prompts, raw model outputs, JSON verdicts, and markdown summaries
+
+What it actually does:
+
+- Splits the repo into manageable chunks
+- Runs a finder pass to maximize plausible bug recall
+- Runs a skeptic pass to eliminate weak or speculative findings
+- Runs a verification review pass to decide what is concrete enough to fix
+- Runs a final repo-wide implementation pass over the surviving findings unless `--report-only` is
+  set
+- Pushes truthful implementation fixes back to the current branch
+- Pushes harder on believable reproduction, root-cause fixes, and regression coverage than the old
+  pipeline did
+
+Default model layout:
+
+- finder: MiniMax `minimax/MiniMax-M2.7-highspeed` with `high`
+- skeptic: Kimi with `high`
+- reviewer: Kimi with `high`
+- implementer: `gpt-5.4` with `xhigh`
+
+Safety behavior:
+
+- Checkpoints and pushes pre-existing dirty changes before a full implementation run
+- Pushes model-created bug-fix commits
+- May create a trailing checkpoint commit if implementation work leaves additional unstaged changes
+  behind
+- Skips the final implementation pass entirely when `--report-only` is set
+
+When to run it:
+
+- When you want a broad bug hunt with adversarial invalidation
+- When you want a report with optional automatic fixes
+- When the repo is too large to sensibly review as a single monolithic pass
+
+Useful flags:
+
+- `--chunk-size <n>` to change chunk size
+- `--max-chunks <n>` to cap the run
+- `--resume` to continue in-place instead of starting over
+- `--report-only` to stop after the verification/reporting phases
+- `--allow-dirty` to intentionally layer implementation on top of an already-dirty tree
+- `--dry-run` to preview chunking without invoking models
+- `--finder-model`, `--skeptic-model`, `--reviewer-model` to override the audit passes
+- `--codex-bin` and `--pi-bin` to point at non-default executables
 
 ### `auto nemesis`
 
-`auto nemesis` runs a disposable deep audit inspired by the upstream Nemesis auditor.
+Purpose:
 
-Behavior:
+- Run a deeper disposable audit and feed the surviving findings back into repo specs and plan
 
-- Uses a Nemesis-style iterative audit:
-  - initial draft pass to maximize evidence-backed recall
-  - final synthesis pass to discard weak claims and tighten the surviving work
-  - each pass still performs the internal Feynman/state back-and-forth method from the prompt
-- Writes disposable outputs into `nemesis/`
-- Produces:
-  - `nemesis/nemesis-audit.md`
-  - `nemesis/IMPLEMENTATION_PLAN.md`
-  - `nemesis/draft-nemesis-audit.md`
-  - `nemesis/draft-IMPLEMENTATION_PLAN.md`
-- Appends the generated audit spec into root `specs/`
-- Appends new unchecked Nemesis tasks into root `IMPLEMENTATION_PLAN.md`
-- Treats `nemesis/` as disposable and archives the previous folder under `.auto/fresh-input/` before refresh
+What it reads:
+
+- The live repository
+
+What it writes:
+
+- `nemesis/nemesis-audit.md`
+- `nemesis/IMPLEMENTATION_PLAN.md`
+- `nemesis/draft-nemesis-audit.md`
+- `nemesis/draft-IMPLEMENTATION_PLAN.md`
+- appended audit spec snapshots in root `specs/`
+- appended unchecked Nemesis tasks in root `IMPLEMENTATION_PLAN.md`
+
+What it actually does:
+
+- Archives the previous `nemesis/` folder under `.auto/fresh-input/`
+- Runs a draft audit pass to maximize evidence-backed recall
+- Runs a synthesis pass to tighten or discard weak claims
+- Treats `nemesis/` as disposable working output, not long-term canonical state
+- Appends only new unchecked Nemesis tasks back into the root plan
+
+Important rule:
+
+- `auto nemesis` is audit-docs only
+- It does not edit repo code
 
 Backend selection:
 
 - Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
 - Final reviewer default: PI with `kimi-coding/k2p5` and `high`
-- `auto nemesis --kimi`: uses Kimi for the draft auditor pass
-- `auto nemesis --minimax`: uses MiniMax for the draft auditor pass
-- `auto nemesis --model kimi`: same as `--kimi`
-- `auto nemesis --model minimax`: same as `--minimax`
-- `--reviewer-model <model>` and `--reviewer-effort <level>` override the final synthesis pass
+- `--kimi` switches the draft pass to Kimi
+- `--minimax` switches the draft pass to MiniMax
+- `--model kimi` and `--model minimax` do the same through the generic model flag
+- `--reviewer-model` and `--reviewer-effort` override the final synthesis pass
 
-Code-writing rule:
+When to run it:
 
-- `auto nemesis` is audit-docs only. The model passes are not used for repo code edits.
-
-Unlike `auto gen`, Nemesis does not replace the root implementation plan structure. It only appends new unchecked audit tasks that are not already present.
-
-### `auto bug`
-
-`auto bug` runs a single chunked multi-pass bug pipeline over the repo.
-
-Behavior:
-
-- Splits tracked repo files into manageable chunks by top-level scope
-- Runs three per-chunk audit passes plus one repo-wide implementation pass by default:
-  - MiniMax finder
-  - Kimi skeptic
-  - Kimi verification review
-  - final `gpt-5.4` `xhigh` implementation over all verified findings
-- Commits and pushes truthful implementation fixes back to the currently checked-out branch
-- Streams parsed model output live for both Codex and PI backends
-- Writes durable artifacts under `bug/`:
-  - per-chunk prompts, raw model responses, JSON verdicts, and markdown summaries
-  - `bug/BUG_REPORT.md`
-  - `bug/verified-findings.json`
-  - `bug/implementation-results.json`
-- Archives the previous `bug/` folder under `.auto/fresh-input/` before refresh
-- `--resume` reuses existing chunk artifacts in `bug/` and reruns only the first incomplete or invalid phase outputs instead of wiping the directory
-
-Safety:
-
-- Full implementation mode checkpoints and pushes pre-existing dirty changes on the current branch before the bug pipeline starts
-- Full implementation mode pushes model-created bug-fix commits and, when `--allow-dirty` is not set, checkpoints and pushes any trailing uncommitted implementation changes
-- Use `--report-only` to stop after verification and summary generation
-- Use `--allow-dirty` if you intentionally want the final implementation pass to layer on top of an already-dirty tree without the startup checkpoint
-
-Default pass layout:
-
-- finder: `minimax/MiniMax-M2.7-highspeed` with `high`
-- skeptic: `kimi` with `high`
-- reviewer: `kimi` with `high`
-- implementer: `gpt-5.4` with `xhigh`
-
-Model routing:
-
-- MiniMax aliases resolve to `minimax/MiniMax-M2.7-highspeed` and Kimi aliases resolve to `kimi-coding/k2p5`
-- Any other model name uses Codex
-- The implementation pass is pinned to `gpt-5.4` with `xhigh`
+- When you want a stronger disposable audit than `auto bug`
+- When you want audit-derived plan items without directly changing code
+- Before a risky implementation cycle or large hardening effort
 
 Useful flags:
 
-- `--chunk-size <n>` to change the per-chunk file budget
-- `--max-chunks <n>` to cap the run
-- `--resume` to continue an interrupted bug run in-place
-- `--report-only` to skip the final implementation pass
-- `--dry-run` to preview the chunk plan
+- `--output-dir <dir>` to change the disposable audit destination
+- `--prompt-file <path>` to override the prompt template
+- `--dry-run` to preview without invoking models
+- `--codex-bin` and `--pi-bin` to point at non-default executables
 
 ### `auto loop`
 
-`auto loop` is the single-worker implementation loop.
+Purpose:
 
-Behavior:
+- Run the single-worker implementation loop against the repo’s live execution queue
 
-- Runs Codex on the checked-out primary branch alias: `main`, `master`, or `trunk`
-- Reads `AGENTS.md`, `specs/*`, and `IMPLEMENTATION_PLAN.md`
-- Takes the next unchecked task from the top of the plan
-- Builds a task brief from the plan contract before editing
-- Implements it fully in the smallest truthful slice
-- Uses reproduce-first and root-cause debugging patterns when behavior changes or failures appear
-- Runs the required validations and runtime checks when applicable
-- Removes completed items from `IMPLEMENTATION_PLAN.md`
+What it reads:
+
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+
+What it writes:
+
+- updates to code and tests
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `WORKLIST.md` when useful out-of-scope follow-ups are found
+- `AGENTS.md` only when operational run/build knowledge improves
+- logs under `.auto/loop/` and `.auto/logs/`
+
+What it actually does:
+
+- Selects the branch it is allowed to operate on
+- Reads the next unchecked task from the top of the plan
+- Builds a short task brief from the task contract before editing
+- Implements the smallest truthful slice that fully closes the task
+- Uses reproduce-first, root-cause debugging when failures appear
+- Uses browser or runtime verification when the task actually needs it
+- Runs the verification steps required by the task
+- Removes finished tasks from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
-- Appends out-of-scope but worthwhile follow-ups to `WORKLIST.md`
-- Commits and pushes truthful increments to the repo's primary branch
-- Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
+- Commits and pushes truthful increments to the allowed branch
 
-Default branch:
+Default branch resolution:
 
-- If the current branch is `main`, `master`, or `trunk`, `auto loop` runs there
-- Otherwise it tries `origin/HEAD`
-- Then it falls back to any available branch named `main`, `master`, or `trunk`
-- Use `--branch <name>` to override explicitly
+- If the current branch is `main`, `master`, or `trunk`, use it
+- Otherwise try `origin/HEAD`
+- Otherwise fall back to any available `main`, `master`, or `trunk`
+- Use `--branch <name>` to require a specific branch instead
 
-Default model:
+When to run it:
 
-- `gpt-5.4`
-- reasoning effort `xhigh`
+- After `auto gen`
+- Whenever you want the repo to execute the next planned task
+- When you want one bounded implementation worker instead of a broad audit
+
+Useful flags:
+
+- `--max-iterations <n>` to stop after a fixed number of completed task iterations
+- `--prompt-file <path>` to override the loop prompt
+- `--branch <name>` to lock the loop to a specific branch
+- `--run-root <dir>` to change where loop logs are stored
+- `--model` and `--reasoning-effort` to tune the worker
 
 ### `auto qa`
 
-`auto qa` is the runtime QA and ship-readiness hardening loop.
+Purpose:
 
-Behavior:
+- Run a runtime QA and ship-readiness hardening pass on the current branch
 
-- Runs Codex on the currently checked-out branch by default
-- Reads `AGENTS.md`, `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `WORKLIST.md`, `LEARNINGS.md`, and `QA.md` when present
-- Builds a QA charter from recent work, open review items, and the actual runnable surfaces in the repo
-- Prefers real runtime verification over static inspection
-- Uses browser/devtools/runtime tools when available for user-facing flows
-- Writes a durable branch-level report to `QA.md`
-- Appends unresolved actionable findings to `WORKLIST.md`
-- Records durable lessons in `LEARNINGS.md`
-- Fixes bounded high-signal issues directly and commits/pushes truthful QA increments back to the current branch
+What it reads:
 
-Default model:
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `REVIEW.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- `QA.md` when it already exists
+- `HEALTH.md` when it already exists
 
-- `gpt-5.4`
-- reasoning effort `xhigh`
+What it writes:
+
+- `QA.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- bounded code or test fixes when evidence supports them
+- logs under `.auto/qa/` and `.auto/logs/`
+
+What it actually does:
+
+- Builds a QA charter from recent work, open review items, prior health signals, and actual
+  runnable surfaces
+- Prefers real runtime evidence over static reasoning
+- Uses browser or runtime tools when they exist and the repo exposes user-facing flows
+- Scores the branch before and after fixes on a 0-10 scale
+- Records a ship-readiness verdict: `Ready`, `Ready with follow-ups`, or `Not ready`
+- Records tested surfaces, evidence, findings, fixes landed, performance notes, and remaining
+  risks in `QA.md`
+- Fixes bounded high-signal problems directly when the issue is clear and worth addressing in the
+  pass
+- Pushes truthful QA increments back to the same branch
+
+QA tiers:
+
+- `quick`: focus on critical and high-severity issues first
+- `standard`: cover critical, high, and medium-severity issues
+- `exhaustive`: continue through polish, edge cases, and lower-severity defects when evidence
+  supports them
+
+Important branch rule:
+
+- By default it stays on the currently checked-out branch
+- `--branch <name>` can be used as a guard so the command fails if you are not on the expected
+  branch
+
+When to run it:
+
+- After `auto loop`
+- Before merging or handing work off for review
+- When you want runtime evidence, not just static confidence
+
+Useful flags:
+
+- `--max-iterations <n>` to allow multiple QA/fix cycles in one run
+- `--prompt-file <path>` to override the QA prompt
+- `--branch <name>` to enforce a specific branch
+- `--run-root <dir>` to change QA log location
+- `--tier <quick|standard|exhaustive>` to control depth
+- `--model` and `--reasoning-effort` to tune the QA worker
+
+### `auto qa-only`
+
+Purpose:
+
+- Run the same runtime QA and ship-readiness workflow as `auto qa`, but in report-only mode
+
+What it reads:
+
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `REVIEW.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- `QA.md` when it already exists
+- `HEALTH.md` when it already exists
+
+What it writes:
+
+- `QA.md`
+- logs under `.auto/qa-only/` and `.auto/logs/`
+
+What it actually does:
+
+- Builds a QA charter from recent work, open review items, prior health signals, and runnable
+  surfaces
+- Runs runtime checks with direct evidence
+- Produces a branch health score, ship-readiness verdict, severity-grouped findings, and a
+  performance note
+- Does not change source code, tests, build config, or docs other than `QA.md`
+- Does not stage, commit, or push
+
+When to run it:
+
+- When you want a QA report without any fixes
+- Before deciding whether a branch is worth hardening
+- When you want evidence for handoff, triage, or release review
+
+Useful flags:
+
+- `--prompt-file <path>` to override the report-only QA prompt
+- `--branch <name>` to enforce a specific branch
+- `--run-root <dir>` to change QA log location
+- `--tier <quick|standard|exhaustive>` to control depth
+- `--model` and `--reasoning-effort` to tune the QA worker
+
+### `auto health`
+
+Purpose:
+
+- Produce a repo-wide quality and verification report without fixing code
+
+What it reads:
+
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `REVIEW.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- `HEALTH.md` when it already exists
+
+What it writes:
+
+- `HEALTH.md`
+- logs under `.auto/health/` and `.auto/logs/`
+
+What it actually does:
+
+- Detects the real validation surface from the repo: manifests, CI config, scripts, docs, and
+  repo instructions
+- Runs the strongest honest checks available for the repo
+- Records exact commands, pass/fail status, warnings, blind spots, and partial lanes
+- Scores the repo 0-10 overall
+- Adds sub-scores for build, correctness, static analysis, and test confidence when those lanes
+  exist
+- Does not change code, stage, commit, or push
+
+When to run it:
+
+- Before `auto ship`
+- After major refactors or dependency changes
+- When you want a truthful repo-health snapshot separate from runtime QA
+
+Useful flags:
+
+- `--prompt-file <path>` to override the health prompt
+- `--branch <name>` to enforce a specific branch
+- `--run-root <dir>` to change health log location
+- `--model` and `--reasoning-effort` to tune the health worker
 
 ### `auto review`
 
-`auto review` is the completed-work hardening and archival loop.
+Purpose:
 
-Behavior:
+- Review completed work, harden what needs hardening, and archive only what truly clears
+
+What it reads:
+
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `REVIEW.md`
+- `ARCHIVED.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+
+What it writes:
+
+- `REVIEW.md`
+- `ARCHIVED.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- bounded code or test fixes when review findings are clear and worth fixing immediately
+- logs under `.auto/review/` and `.auto/logs/`
+
+What it actually does:
 
 - Moves current `COMPLETED.md` items into `REVIEW.md` before review starts
-- Leaves `COMPLETED.md` free for new implementation completions while review is running
-- Vendors the full review rubric directly into the review prompt: tests-first reading, five-axis review, severity-tagged findings, and verification-of-verification
-- May use `/ce:review` or other helper workflows as accelerators when they are available
-- Writes unresolved findings to `WORKLIST.md`
-- Moves only truly cleared review items from `REVIEW.md` to `ARCHIVED.md`
-- Commits and pushes truthful review increments back to the current branch
-- Automatically creates and pushes checkpoint commits when the worker leaves repo changes behind
+- Leaves `COMPLETED.md` free for new implementation work while review is happening
+- Reviews each item as a claim that must be verified
+- Reconstructs changed files and blast radius before clearing an item
+- Reviews correctness, readability, architecture, security, trust boundaries, and performance
+- Pays extra attention to structural issues that tests often miss:
+  - SQL and query safety
+  - trust-boundary violations
+  - unintended conditional side effects
+  - stale config or migration coupling
+  - blast radius wider than the touched files suggest
+- Writes unresolved issues to `WORKLIST.md`
+- Moves only truly cleared review items into `ARCHIVED.md`
 
-Default model:
+Important queue rule:
 
-- `gpt-5.4`
-- reasoning effort `xhigh`
+- `auto review` does not reopen work in `IMPLEMENTATION_PLAN.md`
+- Review findings become worklist items instead
 
-`auto review` does not reopen work in `IMPLEMENTATION_PLAN.md`. Review findings become worklist items instead.
+When to run it:
+
+- After a batch of `auto loop` or manual implementation work
+- Before calling a group of completed items truly done
+- When you want a hardening pass that focuses on regressions and review risk, not new features
+
+Useful flags:
+
+- `--max-iterations <n>` to allow multiple review/fix cycles
+- `--prompt-file <path>` to override the review prompt
+- `--branch <name>` to require a specific branch
+- `--run-root <dir>` to change review log location
+- `--model` and `--reasoning-effort` to tune the review worker
+
+### `auto ship`
+
+Purpose:
+
+- Prepare the current branch to ship, update release artifacts, and create or refresh a PR when
+  appropriate
+
+What it reads:
+
+- `AGENTS.md`
+- `specs/*`
+- `IMPLEMENTATION_PLAN.md`
+- `COMPLETED.md`
+- `REVIEW.md`
+- `ARCHIVED.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- `QA.md`
+- `HEALTH.md`
+- `README.md`
+- `CHANGELOG.md` when it exists
+- `VERSION` when it exists
+
+What it writes:
+
+- `SHIP.md`
+- `WORKLIST.md`
+- `LEARNINGS.md`
+- `README.md`, `CHANGELOG.md`, `VERSION`, or other release-facing docs when they need truthful sync
+- logs under `.auto/ship/` and `.auto/logs/`
+
+What it actually does:
+
+- Resolves the working branch and base branch
+- Reviews the branch diff against the base branch
+- Runs the real validations required by the repo
+- Updates docs, versioning, and changelog surfaces only when warranted by what is actually shipping
+- Refreshes QA or health evidence when it is missing or obviously stale
+- Maintains `SHIP.md` as the durable release report for the branch
+- Appends unresolved blockers and follow-ups to `WORKLIST.md`
+- Commits and pushes truthful ship-prep increments
+- If the current branch is not the base branch and `gh` is available, creates or refreshes a PR
+
+Base branch resolution:
+
+- `--base-branch <name>` wins when supplied
+- Otherwise try `origin/HEAD`
+- Otherwise fall back to `main`, `master`, or `trunk`
+- If none can be resolved, `auto ship` fails and asks you to pass `--base-branch`
+
+When to run it:
+
+- After `auto qa`, `auto health`, and `auto review`
+- When a branch is close to mergeable and you want release bookkeeping handled honestly
+- When docs, changelog, or version surfaces need to match what is really going out
+
+Useful flags:
+
+- `--max-iterations <n>` to allow multiple ship/fix cycles
+- `--prompt-file <path>` to override the ship prompt
+- `--branch <name>` to require a specific checked-out branch
+- `--base-branch <name>` to explicitly control diff and PR target
+- `--run-root <dir>` to change ship log location
+- `--model` and `--reasoning-effort` to tune the ship worker
 
 ## Repo Files
 
@@ -273,23 +710,30 @@ Default model:
 - `ARCHIVED.md`
 - `WORKLIST.md`
 - `LEARNINGS.md`
+- `IDEA.md`
 - `QA.md`
+- `HEALTH.md`
+- `SHIP.md`
 - `bug/`
 - `nemesis/`
 
-Only some are required at startup. The command will create missing files when appropriate for its workflow.
+Only some are required at startup. The command will create missing files when appropriate for its
+workflow.
 
 ## Runtime Requirements
 
 - Git repository with a valid `origin`
 - `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
-- `codex` on `PATH` for `auto nemesis`, `auto loop`, `auto qa`, and `auto review`
+- `codex` on `PATH` for `auto nemesis`, `auto loop`, `auto qa`, `auto qa-only`, `auto health`,
+  `auto review`, and `auto ship`
 - `codex` on `PATH` for any `auto bug` phase using a non-PI model
 - `pi` on `PATH` for `auto bug` MiniMax/Kimi passes and both default `auto nemesis` audit passes
+- `gh` on `PATH` if you want `auto ship` to create or refresh pull requests
 
 Recommended environment:
 
-- Claude Code with Compound Engineering installed if you want optional helpers such as `/ce:review`, `/ce:work`, and `/ce:compound`
+- Claude Code with Compound Engineering installed if you want optional helpers such as `/ce:review`,
+  `/ce:work`, and `/ce:compound`
 
 ## Install
 
@@ -311,6 +755,13 @@ Refresh planning:
 
 ```bash
 auto corpus
+auto gen
+```
+
+Seed planning from a product idea:
+
+```bash
+auto corpus --idea "build X for Y user with Z constraint"
 auto gen
 ```
 
@@ -360,12 +811,32 @@ Run runtime QA and hardening:
 auto qa
 ```
 
+Run report-only QA:
+
+```bash
+auto qa-only --tier exhaustive
+```
+
+Capture a repo-health snapshot:
+
+```bash
+auto health
+```
+
 Review completed work:
 
 ```bash
 auto review
 ```
 
+Prepare the branch to land:
+
+```bash
+auto ship
+```
+
 ## Design Goal
 
-This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`, `bug`, `nemesis`, `loop`, `qa`, or `review`, it probably does not belong here.
+This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`,
+`bug`, `nemesis`, `loop`, `qa`, `qa-only`, `health`, `review`, or `ship`, it probably does not
+belong here.
