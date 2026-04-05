@@ -1153,9 +1153,14 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
     }
     let mut docs = Vec::new();
     for spec in &specs {
-        let text = fs::read_to_string(spec)
+        let original = fs::read_to_string(spec)
             .with_context(|| format!("failed to read {}", spec.display()))?;
-        if !text.starts_with("# Specification:") {
+        let normalized = normalize_generated_spec_markdown(&original);
+        if normalized != original {
+            atomic_write(spec, normalized.as_bytes())
+                .with_context(|| format!("failed to normalize {}", spec.display()))?;
+        }
+        if !normalized.starts_with("# Specification:") {
             bail!(
                 "generated spec {} must start with `# Specification:`",
                 spec.display()
@@ -1166,7 +1171,7 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
             SPEC_ACCEPTANCE_CRITERIA_HEADER,
             SPEC_VERIFICATION_HEADER,
         ] {
-            if !generated_spec_has_section(&text, section) {
+            if !generated_spec_has_section(&normalized, section) {
                 bail!(
                     "generated spec {} must include `{}`",
                     spec.display(),
@@ -1174,19 +1179,19 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
                 );
             }
         }
-        if !generated_spec_has_section(&text, "## Evidence Status") {
+        if !generated_spec_has_section(&normalized, "## Evidence Status") {
             bail!(
                 "generated spec {} must include `## Evidence Status`",
                 spec.display()
             );
         }
-        if !generated_spec_has_section(&text, "## Open Questions") {
+        if !generated_spec_has_section(&normalized, "## Open Questions") {
             bail!(
                 "generated spec {} must include `## Open Questions`",
                 spec.display()
             );
         }
-        if !generated_spec_has_acceptance_criteria(&text) {
+        if !generated_spec_has_acceptance_criteria(&normalized) {
             bail!(
                 "generated spec {} must include `{}` with at least one bullet",
                 spec.display(),
@@ -1195,7 +1200,7 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
         }
         docs.push(GeneratedSpecDocument {
             path: spec.clone(),
-            text,
+            text: normalized,
         });
     }
     lint_generated_spec_set(&docs)?;
@@ -1217,7 +1222,95 @@ fn generated_spec_has_acceptance_criteria(markdown: &str) -> bool {
     section_body.lines().any(|line| {
         let trimmed = line.trim_start();
         trimmed.starts_with("- ") || trimmed.starts_with("* ")
-    })
+    }) || acceptance_criteria_has_structured_items(section_body)
+}
+
+fn acceptance_criteria_has_structured_items(section_body: &str) -> bool {
+    let mut saw_heading = false;
+    let mut saw_body = false;
+
+    for line in section_body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("### ") {
+            if saw_heading && saw_body {
+                return true;
+            }
+            saw_heading = true;
+            saw_body = false;
+            continue;
+        }
+        if saw_heading && !trimmed.is_empty() && !trimmed.starts_with("## ") {
+            saw_body = true;
+        }
+    }
+
+    saw_heading && saw_body
+}
+
+fn normalize_generated_spec_markdown(markdown: &str) -> String {
+    normalize_ordered_acceptance_list(markdown)
+}
+
+fn normalize_ordered_acceptance_list(markdown: &str) -> String {
+    let Some((body_start, section_end)) =
+        markdown_section_body_bounds(markdown, SPEC_ACCEPTANCE_CRITERIA_HEADER)
+    else {
+        return markdown.to_string();
+    };
+    let section_body = &markdown[body_start..section_end];
+    let normalized_body = normalize_ordered_list_to_bullets(section_body);
+    if normalized_body == section_body {
+        return markdown.to_string();
+    }
+
+    let mut normalized = String::with_capacity(markdown.len() + 16);
+    normalized.push_str(&markdown[..body_start]);
+    normalized.push_str(&normalized_body);
+    normalized.push_str(&markdown[section_end..]);
+    normalized
+}
+
+fn normalize_ordered_list_to_bullets(section_body: &str) -> String {
+    let mut normalized = String::with_capacity(section_body.len());
+    for raw_line in section_body.split_inclusive('\n') {
+        let (line, newline) = raw_line
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((raw_line, ""));
+        let trimmed = line.trim_start();
+        if let Some(content) = strip_ordered_list_marker(trimmed) {
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            normalized.push_str(&line[..indent_len]);
+            normalized.push_str("- ");
+            normalized.push_str(content.trim_start());
+            normalized.push_str(newline);
+        } else {
+            normalized.push_str(raw_line);
+        }
+    }
+    normalized
+}
+
+fn strip_ordered_list_marker(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == 0 || index >= bytes.len() {
+        return None;
+    }
+    if bytes[index] != b'.' && bytes[index] != b')' {
+        return None;
+    }
+    index += 1;
+    if index >= bytes.len() || !bytes[index].is_ascii_whitespace() {
+        return None;
+    }
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    Some(&line[index..])
 }
 
 fn split_markdown_section<'a>(markdown: &'a str, header: &str) -> Option<(&'a str, &'a str)> {
@@ -1231,6 +1324,17 @@ fn split_markdown_section<'a>(markdown: &'a str, header: &str) -> Option<(&'a st
         &markdown[start..section_end],
         &markdown[start + header.len()..section_end],
     ))
+}
+
+fn markdown_section_body_bounds(markdown: &str, header: &str) -> Option<(usize, usize)> {
+    let start = markdown.find(header)?;
+    let body_start = start + header.len();
+    let after_header = &markdown[body_start..];
+    let section_end = after_header
+        .find("\n## ")
+        .map(|offset| body_start + offset)
+        .unwrap_or(markdown.len());
+    Some((body_start, section_end))
 }
 
 fn lint_generated_spec_set(specs: &[GeneratedSpecDocument]) -> Result<()> {
@@ -1781,8 +1885,8 @@ mod tests {
         generated_spec_has_acceptance_criteria, lint_future_phase_research_discipline,
         lint_session_resume_wire_contract, lint_signature_policy_consistency,
         merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, GenerationMode, SpecSyncSummary,
-        IMPLEMENTATION_PLAN_HEADER,
+        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root, GeneratedSpecDocument,
+        GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use std::path::PathBuf;
 
@@ -1912,6 +2016,44 @@ This should be bulletized.
 "#;
 
         assert!(!generated_spec_has_acceptance_criteria(spec));
+    }
+
+    #[test]
+    fn normalizes_numbered_acceptance_criteria_into_bullets() {
+        let spec = r#"# Specification: Example
+
+## Acceptance Criteria
+
+1. One
+2. Two
+
+## Verification
+
+- Check
+"#;
+
+        let normalized = normalize_generated_spec_markdown(spec);
+
+        assert!(normalized.contains("## Acceptance Criteria\n\n- One\n- Two"));
+        assert!(generated_spec_has_acceptance_criteria(&normalized));
+    }
+
+    #[test]
+    fn accepts_structured_acceptance_items_with_subheadings() {
+        let spec = r#"# Specification: Example
+
+## Acceptance Criteria
+
+### AC-01: One
+
+This is a concrete acceptance item.
+
+### AC-02: Two
+
+This is another acceptance item.
+"#;
+
+        assert!(generated_spec_has_acceptance_criteria(spec));
     }
 
     #[test]
