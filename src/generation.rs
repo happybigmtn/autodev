@@ -678,11 +678,7 @@ fn verify_corpus_outputs(planning_root: &Path) -> Result<CorpusOutputSummary> {
             bail!("corpus generation did not write {}", path.display());
         }
     }
-    let plan_count = fs::read_dir(&plans_dir)
-        .with_context(|| format!("failed to read {}", plans_dir.display()))?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("md"))
-        .count();
+    let plan_count = list_markdown_files(&plans_dir)?.len();
     if plan_count == 0 {
         bail!(
             "corpus generation did not write any plans under {}",
@@ -838,6 +834,30 @@ GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended
 
 Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, vertically sliced where possible, and scoped to a concrete deliverable that a single focused worker can close truthfully.
 Future-phase plans with unresolved feasibility must say so clearly and center research gates before implementation promises.
+Model every numbered plan after a strong task-breakdown document:
+- each plan should describe one concrete slice or research gate, not a vague epic
+- prefer vertical slices over horizontal layer dumps
+- if a task feels larger than one focused implementation session, break it down further
+- make dependencies explicit instead of burying them in prose
+- include crisp checkpoints that a worker or reviewer can actually verify
+
+Each numbered plan under `{planning_root}/plans/` must include:
+- a markdown title
+- a short description or objective
+- `## Acceptance Criteria`
+- `## Verification`
+- `## Dependencies`
+
+`## Acceptance Criteria` requirements for numbered plans:
+- use flat bullet points
+- express specific, testable observable outcomes
+- avoid vague language like "supports", "handles", or "is robust" without saying how that is proven
+- keep acceptance criteria concrete enough that a future worker knows when to stop
+
+`## Verification` requirements for numbered plans:
+- name the concrete commands, runtime checks, benchmarks, or review steps
+- if a plan is research-only, say exactly what artifact or decision closes it
+- if a plan is implementation-oriented, say how the slice will be tested or demonstrated
 
 Never trust docs over code. If docs claim something the code does not support, say so clearly."#,
         target_repo = repo_root.display(),
