@@ -33,6 +33,8 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
    - Pay special attention to structural issues that tests often miss: SQL/query safety, trust-boundary violations, unintended conditional side effects, stale config or migration coupling, and changes whose blast radius is wider than the touched files imply.
    - For browser-facing or runtime-sensitive items, use browser/runtime verification when available instead of static review alone.
    - Verify the verification story itself: commands actually run, outputs believable, screenshots or runtime evidence consistent with the code.
+   - Run a bounded simplification pass on the touched code when it will clearly improve readability or reduce complexity without changing behavior. Keep that simplification inside the reviewed surfaces; no drive-by cleanup.
+   - If the reviewed item quietly bundles multiple logical changes, call that out and split the follow-up work truthfully instead of waving it through as one thing.
    - Categorize any findings as `Critical`, required, `Optional`, or `FYI`.
 
 3. Respect the queue split:
@@ -143,6 +145,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             .join(format!("review-{}-prompt.md", timestamp_slug()));
         atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        println!("prompt log:  {}", prompt_path.display());
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();

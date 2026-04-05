@@ -72,6 +72,7 @@ pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
         .join(format!("health-{}-prompt.md", timestamp_slug()));
     atomic_write(&prompt_path, full_prompt.as_bytes())
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!("prompt log:  {}", prompt_path.display());
 
     println!("auto health");
     println!("repo root:   {}", repo_root.display());

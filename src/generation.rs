@@ -761,7 +761,9 @@ Run a non-interactive office-hours shaping pass first:
 - success criteria
 - constraints
 - assumptions and open questions
+- key assumptions to validate next, with the fastest credible validation path for each
 - candidate approaches
+- alternatives considered and why they were rejected
 - risks
 - explicit non-goals
 - one recommended direction
@@ -840,6 +842,7 @@ Model every numbered plan after a strong task-breakdown document:
 - if a task feels larger than one focused implementation session, break it down further
 - make dependencies explicit instead of burying them in prose
 - include crisp checkpoints that a worker or reviewer can actually verify
+- after every 2-3 numbered plans or at meaningful phase boundaries, include an explicit checkpoint or decision-gate plan file that says what must be true before later work proceeds
 
 Each numbered plan under `{planning_root}/plans/` must include:
 - a markdown title
@@ -1019,6 +1022,7 @@ Before writing the plan, do the real planning work:
 - if the repo is developer-facing, explicitly consider zero-friction onboarding, learn-by-doing examples, error clarity, and uncertainty-reducing docs or tooling as first-class planning concerns
 - treat spec statements labeled as hypotheses, recommendations, design-phase, or research-required as non-binding until the plan closes the corresponding decision gate
 - do not create implementation tasks whose contract depends on unverified future-phase details; write a research, validation, or decision task first
+- add explicit checkpoint tasks after each risky cluster or every 2-3 priority tasks so a future worker knows when to stop and re-evaluate before widening scope
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
@@ -1049,6 +1053,7 @@ Output requirements:
 - Front-load risk where practical, but never at the cost of violating dependency order
 - `Acceptance criteria:` must be specific, testable, and truthful
 - `Verification:` must name the concrete commands or runtime checks a worker should run
+- For behavior-changing tasks, `Verification:` should prefer a prove-it path: failing test or repro first, then green proof, then broader regression checks
 - `Estimated scope:` should be `XS`, `S`, `M`, or `L`; avoid `L` unless the codebase reality truly leaves no smaller slice
 - Put only unfinished work in the unchecked queue sections
 - Put already-satisfied items only in `## Completed / Already Satisfied`
@@ -1706,10 +1711,11 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_corpus_prompt, build_implementation_plan_prompt,
         generated_spec_has_acceptance_criteria, lint_future_phase_research_discipline,
         lint_session_resume_wire_contract, lint_signature_policy_consistency,
         merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, SpecSyncSummary,
+        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, GenerationMode, SpecSyncSummary,
         IMPLEMENTATION_PLAN_HEADER,
     };
     use std::path::PathBuf;
@@ -1923,5 +1929,38 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(rewritten.contains("Spec: `specs/040426-workspace-build-system.md`"));
         assert!(rewritten.contains("Spec: `specs/040426-deterministic-transcripts.md`"));
         assert!(!rewritten.contains("050426"));
+    }
+
+    #[test]
+    fn corpus_prompt_requires_assumption_validation_and_checkpoint_plans() {
+        let prompt = build_corpus_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            None,
+            4,
+            Some("build a thing"),
+            &[],
+        );
+
+        assert!(prompt.contains("key assumptions to validate next"));
+        assert!(prompt.contains("alternatives considered"));
+        assert!(prompt.contains("explicit checkpoint or decision-gate plan file"));
+    }
+
+    #[test]
+    fn implementation_plan_prompt_requires_checkpoint_tasks_and_prove_it_verification() {
+        let prompt = build_implementation_plan_prompt(
+            GenerationMode::Gen,
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/gen-123"),
+            &[generated_spec(
+                "workspace-build-system",
+                "# Specification: Workspace Build System\n",
+            )],
+            4,
+        );
+
+        assert!(prompt.contains("checkpoint tasks"));
+        assert!(prompt.contains("failing test or repro first"));
     }
 }

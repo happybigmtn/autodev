@@ -135,6 +135,7 @@ pub(crate) async fn run_qa(args: QaArgs) -> Result<()> {
             .join(format!("qa-{}-prompt.md", timestamp_slug()));
         atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        println!("prompt log:  {}", prompt_path.display());
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();

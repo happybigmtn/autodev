@@ -173,6 +173,7 @@ What it actually does:
 - Refuses to accept generated specs that contradict each other on shared contracts such as message
   shapes, signature policy, or speculative future-phase behavior
 - Generates a new implementation plan with dependency-ordered tasks
+- Pushes the generated plan toward explicit checkpoint and decision-gate tasks after risky clusters
 - Requires each active plan task to include real execution fields such as:
   - spec reference
   - why now
@@ -411,9 +412,12 @@ What it actually does:
 - Selects the branch it is allowed to operate on
 - Reads the next unchecked task from the top of the plan
 - Builds a short task brief from the task contract before editing
+- Defaults to a RED/GREEN/REFACTOR implementation rhythm for behavior-changing work
 - Implements the smallest truthful slice that fully closes the task
 - Uses reproduce-first, root-cause debugging when failures appear
 - Uses browser or runtime verification when the task actually needs it
+- Runs a bounded simplification pass on touched code before commit when it improves clarity without
+  widening scope
 - Runs the verification steps required by the task
 - Removes finished tasks from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
@@ -634,6 +638,8 @@ What it actually does:
 - Reviews each item as a claim that must be verified
 - Reconstructs changed files and blast radius before clearing an item
 - Reviews correctness, readability, architecture, security, trust boundaries, and performance
+- Applies a bounded simplification pass on reviewed code when it clearly improves readability
+  without changing behavior
 - Pays extra attention to structural issues that tests often miss:
   - SQL and query safety
   - trust-boundary violations
@@ -701,6 +707,9 @@ What it actually does:
 - Updates docs, versioning, and changelog surfaces only when warranted by what is actually shipping
 - Refreshes QA or health evidence when it is missing or obviously stale
 - Maintains `SHIP.md` as the durable release report for the branch
+- Records rollback path, monitoring path, and rollout posture in `SHIP.md` when those surfaces
+  exist
+- Treats accessibility and performance checks as part of release confidence for user-facing repos
 - Appends unresolved blockers and follow-ups to `WORKLIST.md`
 - Commits and pushes truthful ship-prep increments
 - If the current branch is not the base branch and `gh` is available, creates or refreshes a PR

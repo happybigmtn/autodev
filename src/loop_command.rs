@@ -23,14 +23,18 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
    - Do not reprioritize the queue yourself.
    - Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.
    - Build a short task brief for yourself before editing: task id, spec refs, owned surfaces, integration touchpoints, scope boundary, acceptance criteria, verification, and any assumptions you are relying on.
+   - Restate the task's assumptions and success conditions from repo evidence before editing. If the plan/spec/task contract is ambiguous, resolve the ambiguity in the docs before pretending implementation can start.
 
-2. Implement the task in the smallest truthful slice that fully closes it:
+2. Implement the task in the smallest truthful slice that fully closes it using a RED/GREEN/REFACTOR cycle by default:
    - Stay within the task contract's owned surfaces plus the minimum adjacent integration edits needed to make the code work.
    - Prefer the simplest solution that matches the existing codebase patterns. Do not add abstractions that are not earning their complexity.
    - Keep the codebase compilable while you work. Do not leave placeholders, TODOs, or half-wired scaffolding.
    - If the repo is still greenfield, perform the bootstrap work the plan requires instead of pretending later tasks are ready.
-   - If the task changes behavior or fixes a bug, add or update a failing test or equivalent executable proof first when practical, then make it pass.
+   - If the task changes behavior or fixes a bug, start by writing or identifying a failing test, failing command, or other executable proof. Confirm the proof fails before claiming the bug or missing behavior is reproduced.
+   - Make the minimum code change that turns the proof green.
+   - After the proof is green, run a short simplification pass on the touched code: improve names, remove dead paths, reduce unnecessary branching, and collapse unearned abstractions without changing behavior or widening scope.
    - For browser-facing or runtime-sensitive changes, use browser/runtime verification when available instead of relying on static reasoning alone.
+   - If the slice needs to land before the full user-facing feature is ready, prefer existing safe-default or feature-gating patterns in the repo. Do not invent a new flag system if the repo has none.
 
 3. When anything breaks, stop the line and debug systematically:
    - Preserve the failing command, output, repro step, or screenshot evidence.
@@ -50,6 +54,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
    - Stage only the files relevant to the completed task plus `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, and `AGENTS.md` when they changed.
    - Do not sweep unrelated pre-existing churn into the commit.
    - Commit with a message like `repo-name: TASK-ID short description` using this repository's actual name.
+   - Before committing, rerun the task's direct proof plus the strongest broad regression commands this repo honestly supports.
    - After committing, run `git status` to verify no implementation files were left unstaged. If any were, amend the commit.
    - Push directly to `origin/{branch}` after the commit.
 
@@ -140,6 +145,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .join(format!("loop-{}-prompt.md", timestamp_slug()));
         atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        println!("prompt log:  {}", prompt_path.display());
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();
@@ -299,6 +305,9 @@ mod tests {
         assert!(prompt.contains("origin/trunk"));
         assert!(prompt.contains("branch `trunk`"));
         assert!(!prompt.contains("origin/main"));
+        assert!(prompt.contains("RED/GREEN/REFACTOR"));
+        assert!(prompt.contains("failing test"));
+        assert!(prompt.contains("simplification pass"));
     }
 
     #[test]
