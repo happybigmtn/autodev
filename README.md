@@ -432,6 +432,8 @@ What it writes:
 What it actually does:
 
 - Selects the branch it is allowed to operate on
+- Rebases onto `origin/<branch>` before work starts when that remote branch exists, so a behind
+  local branch does not fail only at push time
 - Reads the next unchecked task from the top of the plan
 - Builds a short task brief from the task contract before editing
 - Defaults to a RED/GREEN/REFACTOR implementation rhythm for behavior-changing work
@@ -444,6 +446,8 @@ What it actually does:
 - Removes finished tasks from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
 - Commits and pushes truthful increments to the allowed branch
+- Rebases onto `origin/<branch>` again before each push so direct-to-primary-branch loops tolerate
+  remote fast-forwards instead of dying with a raw non-fast-forward error
 
 Default branch resolution:
 

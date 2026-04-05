@@ -104,12 +104,43 @@ pub(crate) fn auto_checkpoint_if_needed(
         return Ok(None);
     }
 
+    sync_branch_with_remote(repo_root, branch)?;
     stage_checkpoint_changes(repo_root)?;
     let message = format!("{}: {message_suffix}", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
+    sync_branch_with_remote(repo_root, branch)?;
     run_git(repo_root, ["push", "origin", branch])?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
     Ok(Some(commit.trim().to_string()))
+}
+
+pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<bool> {
+    if !remote_branch_exists(repo_root, branch)? {
+        return Ok(false);
+    }
+
+    run_git(
+        repo_root,
+        ["pull", "--rebase", "--autostash", "origin", branch],
+    )?;
+    Ok(true)
+}
+
+fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-remote", "--heads", "origin", branch])
+        .output()
+        .with_context(|| format!("failed to query origin in {}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git command failed in {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn stage_checkpoint_changes(repo_root: &Path) -> Result<()> {
@@ -385,7 +416,7 @@ mod tests {
 
     use super::{
         checkpoint_status, clip_line_for_display, prune_old_entries, stage_checkpoint_changes,
-        truncate_file_to_max_bytes,
+        sync_branch_with_remote, truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -421,6 +452,53 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git stdout should be utf-8")
+    }
+
+    fn init_remote_and_clones(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = temp_repo_path(name);
+        let remote = root.join("remote.git");
+        let upstream = root.join("upstream");
+        let worker = root.join("worker");
+
+        fs::create_dir_all(&root).expect("failed to create temp root");
+        run_git_in(
+            &root,
+            [
+                "init",
+                "--bare",
+                remote.to_str().expect("remote path utf-8"),
+            ],
+        );
+        run_git_in(
+            &root,
+            [
+                "clone",
+                remote.to_str().expect("remote path utf-8"),
+                upstream.to_str().expect("upstream path utf-8"),
+            ],
+        );
+        run_git_in(&upstream, ["config", "user.name", "autodev tests"]);
+        run_git_in(&upstream, ["config", "user.email", "autodev@example.com"]);
+        fs::write(upstream.join("README.md"), "# init\n").expect("failed to write README");
+        run_git_in(&upstream, ["add", "README.md"]);
+        run_git_in(&upstream, ["commit", "-m", "init"]);
+        run_git_in(&upstream, ["branch", "-M", branch]);
+        run_git_in(&upstream, ["push", "-u", "origin", branch]);
+
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                branch,
+                remote.to_str().expect("remote path utf-8"),
+                worker.to_str().expect("worker path utf-8"),
+            ],
+        );
+        run_git_in(&worker, ["config", "user.name", "autodev tests"]);
+        run_git_in(&worker, ["config", "user.email", "autodev@example.com"]);
+
+        (root, remote, upstream, worker)
     }
 
     #[test]
@@ -511,5 +589,54 @@ mod tests {
         assert!(second.exists());
         assert!(third.exists());
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn sync_branch_with_remote_rebases_local_commits() {
+        let (root, _remote, upstream, worker) =
+            init_remote_and_clones("sync-remote-rebase", "trunk");
+
+        fs::write(upstream.join("UPSTREAM.md"), "upstream\n").expect("failed to write upstream");
+        run_git_in(&upstream, ["add", "UPSTREAM.md"]);
+        run_git_in(&upstream, ["commit", "-m", "upstream change"]);
+        run_git_in(&upstream, ["push", "origin", "trunk"]);
+
+        fs::write(worker.join("WORKER.md"), "worker\n").expect("failed to write worker");
+        run_git_in(&worker, ["add", "WORKER.md"]);
+        run_git_in(&worker, ["commit", "-m", "worker change"]);
+
+        let synced = sync_branch_with_remote(&worker, "trunk").expect("failed to sync branch");
+
+        assert!(synced);
+        assert!(worker.join("UPSTREAM.md").exists());
+        assert!(worker.join("WORKER.md").exists());
+        let log = run_git_in(&worker, ["log", "--format=%s", "-2"]);
+        assert_eq!(log, "worker change\nupstream change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn sync_branch_with_remote_preserves_dirty_worktree_with_autostash() {
+        let (root, _remote, upstream, worker) =
+            init_remote_and_clones("sync-remote-dirty", "trunk");
+
+        fs::write(upstream.join("UPSTREAM.md"), "upstream\n").expect("failed to write upstream");
+        run_git_in(&upstream, ["add", "UPSTREAM.md"]);
+        run_git_in(&upstream, ["commit", "-m", "upstream change"]);
+        run_git_in(&upstream, ["push", "origin", "trunk"]);
+
+        fs::write(worker.join("README.md"), "# dirty\n").expect("failed to dirty README");
+
+        let synced = sync_branch_with_remote(&worker, "trunk").expect("failed to sync branch");
+
+        assert!(synced);
+        assert!(worker.join("UPSTREAM.md").exists());
+        let status = run_git_in(&worker, ["status", "--short"]);
+        assert!(status.contains(" M README.md"));
+        let readme = fs::read_to_string(worker.join("README.md")).expect("failed to read README");
+        assert_eq!(readme, "# dirty\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
 }

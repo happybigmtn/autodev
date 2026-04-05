@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
-    run_git, timestamp_slug,
+    run_git, sync_branch_with_remote, timestamp_slug,
 };
 use crate::LoopArgs;
 
@@ -123,6 +123,10 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .unwrap_or_else(|| "built-in Ralph worker".to_string())
     );
 
+    if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", target_branch);
+    }
+
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
     {
@@ -192,6 +196,9 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             break;
         }
 
+        if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
+            println!("remote sync: rebased onto origin/{}", target_branch);
+        }
         run_git(&repo_root, ["push", "origin", target_branch.as_str()])?;
         if let Some(commit) =
             auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
