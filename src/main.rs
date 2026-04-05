@@ -19,10 +19,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::util::CLI_LONG_VERSION;
+
 #[derive(Parser)]
 #[command(
     name = "auto",
     version,
+    long_version = CLI_LONG_VERSION,
     about = "Lightweight repo-root planning and execution workflow"
 )]
 struct Cli {
@@ -82,6 +85,10 @@ pub(crate) struct CorpusArgs {
     /// Seed corpus generation with a product idea and run an office-hours-style shaping pass
     #[arg(long)]
     idea: Option<String>,
+
+    /// Additional repository roots that corpus must inspect as reference material
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
 
     /// Model used for corpus authoring
     #[arg(long, default_value = "claude-opus-4-6")]
@@ -422,9 +429,25 @@ pub(crate) struct NemesisArgs {
     #[arg(long, conflicts_with = "kimi")]
     minimax: bool,
 
+    /// Stop after audit and synthesis without running the implementation pass
+    #[arg(long)]
+    report_only: bool,
+
+    /// Optional branch to require for the Nemesis implementation pass; defaults to the current branch
+    #[arg(long)]
+    branch: Option<String>,
+
     /// Preview the Nemesis run without invoking a model
     #[arg(long)]
     dry_run: bool,
+
+    /// Model to use for the Nemesis implementation pass
+    #[arg(long, default_value = "gpt-5.4")]
+    fixer_model: String,
+
+    /// Reasoning effort / variant for the Nemesis implementation pass
+    #[arg(long, default_value = "xhigh")]
+    fixer_effort: String,
 
     /// Codex executable to invoke for the default backend
     #[arg(long, default_value = "codex")]

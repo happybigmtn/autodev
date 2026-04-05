@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
@@ -8,7 +9,8 @@ use chrono::{Local, NaiveDate};
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state};
 use crate::util::{
-    atomic_write, copy_tree, ensure_repo_layout, git_repo_root, list_markdown_files, timestamp_slug,
+    atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
+    list_markdown_files, timestamp_slug,
 };
 use crate::{CorpusArgs, GenerationArgs};
 
@@ -45,6 +47,11 @@ impl GenerationMode {
 struct SpecSyncSummary {
     appended_paths: Vec<PathBuf>,
     skipped_count: usize,
+}
+
+struct GeneratedSpecDocument {
+    path: PathBuf,
+    text: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,23 +93,35 @@ const REQUIRED_PLAN_TASK_FIELDS: [&str; 12] = [
 ];
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
+    let run_started_at = Instant::now();
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
     let planning_root = args
         .planning_root
         .unwrap_or_else(|| repo_root.join("genesis"));
+    print_command_header(
+        "auto corpus",
+        &repo_root,
+        Some(&planning_root),
+        run_started_at,
+    );
     ensure_planning_root_ready_for_corpus(&planning_root)?;
+    print_stage("prepare planning root", run_started_at);
     let previous_snapshot = if args.dry_run {
         None
     } else {
         prepare_planning_root_for_corpus(&repo_root, &planning_root)?
     };
 
-    println!("auto corpus");
-    println!("repo root:   {}", repo_root.display());
-    println!("planning:    {}", planning_root.display());
     if let Some(idea) = args.idea.as_deref() {
         println!("idea:        {}", idea);
+    }
+    if !reference_repos.is_empty() {
+        println!("references:  {}", reference_repos.len());
+        for path in &reference_repos {
+            println!("  - {}", path.display());
+        }
     }
     println!("model:       {}", args.model);
     println!("max turns:   {}", args.max_turns);
@@ -112,6 +131,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         return Ok(());
     }
 
+    print_stage("create corpus skeleton", run_started_at);
     fs::create_dir_all(planning_root.join("plans")).with_context(|| {
         format!(
             "failed to create corpus plan directory {}",
@@ -125,6 +145,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         previous_snapshot.as_deref(),
         args.parallelism.clamp(1, 10),
         args.idea.as_deref(),
+        &reference_repos,
     );
     let prompt_path = repo_root
         .join(".auto")
@@ -132,13 +153,16 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         .join(format!("corpus-{}-prompt.md", timestamp_slug()));
     atomic_write(&prompt_path, prompt.as_bytes())
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!("prompt log:  {}", prompt_path.display());
 
+    print_stage("run corpus model", run_started_at);
     let response = run_claude_prompt(
         &repo_root,
         &prompt,
         &args.model,
         args.max_turns,
         "corpus generation",
+        &prompt_path,
     )?;
     let response_path = prompt_path.with_file_name(
         prompt_path
@@ -152,7 +176,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", response_path.display()))?;
     }
 
+    print_stage("verify corpus outputs", run_started_at);
     let summary = verify_corpus_outputs(&planning_root)?;
+    print_stage("save corpus state", run_started_at);
     let mut state = load_state(&repo_root)?;
     state.planning_root = Some(planning_root.clone());
     save_state(&repo_root, &state)?;
@@ -177,6 +203,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     if response_path.exists() {
         println!("model log:   {}", response_path.display());
     }
+    println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
 }
 
@@ -189,6 +216,7 @@ pub(crate) async fn run_reverse(args: GenerationArgs) -> Result<()> {
 }
 
 async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()> {
+    let run_started_at = Instant::now();
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
     let mut state = load_state(&repo_root)?;
@@ -210,6 +238,18 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             .unwrap_or_else(|| repo_root.join(format!("gen-{}", timestamp_slug())))
     };
 
+    print_command_header(
+        mode.command_label(),
+        &repo_root,
+        Some(&planning_root),
+        run_started_at,
+    );
+    println!("output dir:  {}", output_dir.display());
+    println!("model:       {}", args.model);
+    println!("max turns:   {}", args.max_turns);
+    println!("parallelism: {}", args.parallelism.clamp(1, 10));
+    println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
+
     if args.plan_only {
         if !output_dir.exists() {
             bail!(
@@ -219,18 +259,18 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             );
         }
     } else {
-        print_stage("prepare output dir");
+        print_stage("prepare output dir", run_started_at);
         prepare_generation_output_dir(&output_dir)?;
     }
 
-    print_stage("load planning corpus");
+    print_stage("load planning corpus", run_started_at);
     let corpus = load_planning_corpus(&planning_root).with_context(|| {
         format!(
             "failed to load planning corpus from {}",
             planning_root.display()
         )
     })?;
-    print_stage("snapshot corpus into output dir");
+    print_stage("snapshot corpus into output dir", run_started_at);
     emit_corpus_snapshot(&corpus, &output_dir).with_context(|| {
         format!(
             "failed to copy planning corpus into {}",
@@ -239,10 +279,10 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     })?;
 
     let generated_specs = if args.plan_only {
-        print_stage("reuse existing generated specs");
+        print_stage("reuse existing generated specs", run_started_at);
         verify_generated_specs(&output_dir)?
     } else {
-        print_stage("generate specs");
+        print_stage("generate specs", run_started_at);
         let prompt = build_spec_generation_prompt(
             mode,
             &repo_root,
@@ -268,10 +308,10 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
 
     let (implementation_plan, plan_phase) = if args.plan_only {
         if output_dir.join("IMPLEMENTATION_PLAN.md").exists() {
-            print_stage("reuse existing generated plan");
+            print_stage("reuse existing generated plan", run_started_at);
             (verify_generated_implementation_plan(&output_dir)?, None)
         } else {
-            print_stage("generate implementation plan");
+            print_stage("generate implementation plan", run_started_at);
             let plan_prompt = build_implementation_plan_prompt(
                 mode,
                 &repo_root,
@@ -292,7 +332,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             )
         }
     } else {
-        print_stage("generate implementation plan");
+        print_stage("generate implementation plan", run_started_at);
         let plan_prompt = build_implementation_plan_prompt(
             mode,
             &repo_root,
@@ -312,7 +352,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             Some(plan_phase),
         )
     };
-    print_stage("sync generated specs to root");
+    print_stage("sync generated specs to root", run_started_at);
     let root_specs = sync_generated_specs_to_root(&repo_root, &generated_specs)?;
     let root_plan = match mode {
         GenerationMode::Gen => Some(sync_generated_plan_to_root_preserving_open_tasks(
@@ -322,7 +362,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         GenerationMode::Reverse => None,
     };
 
-    print_stage("save generator state");
+    print_stage("save generator state", run_started_at);
     state.planning_root = Some(planning_root.clone());
     state.latest_output_dir = Some(output_dir.clone());
     save_state(&repo_root, &state)?;
@@ -332,6 +372,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("planning:    {}", planning_root.display());
     println!("output dir:  {}", output_dir.display());
     println!("model:       {}", args.model);
+    println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("specs:       {}", generated_specs.len());
     println!("plan:        {}", implementation_plan.display());
@@ -353,11 +394,54 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     } else {
         println!("plan prompt: reused existing generated plan");
     }
+    println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
 }
 
-fn print_stage(stage: &str) {
-    println!("stage:       {stage}");
+fn print_stage(stage: &str, run_started_at: Instant) {
+    println!(
+        "stage:       {stage} (+{})",
+        format_duration(run_started_at.elapsed())
+    );
+}
+
+fn print_command_header(
+    label: &str,
+    repo_root: &Path,
+    planning_root: Option<&Path>,
+    run_started_at: Instant,
+) {
+    println!("{label}");
+    println!("binary:      {}", binary_provenance_line());
+    println!("repo root:   {}", repo_root.display());
+    if let Some(path) = planning_root {
+        println!("planning:    {}", path.display());
+    }
+    println!(
+        "started:     +{}",
+        format_duration(run_started_at.elapsed())
+    );
+}
+
+fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            repo_root.join(path)
+        };
+        let canonical = absolute
+            .canonicalize()
+            .with_context(|| format!("failed to resolve reference repo {}", absolute.display()))?;
+        if !canonical.is_dir() {
+            bail!("reference repo {} is not a directory", canonical.display());
+        }
+        resolved.push(canonical);
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
 }
 
 fn ensure_planning_root_exists(planning_root: &Path) -> Result<()> {
@@ -455,7 +539,16 @@ fn run_logged_claude_phase(
         .join(format!("{phase_slug}-{}-prompt.md", timestamp_slug()));
     atomic_write(&prompt_path, prompt.as_bytes())
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
-    let response = run_claude_prompt(repo_root, prompt, model, max_turns, phase_slug)?;
+    println!("phase:       {phase_slug}");
+    println!("prompt log:  {}", prompt_path.display());
+    let response = run_claude_prompt(
+        repo_root,
+        prompt,
+        model,
+        max_turns,
+        phase_slug,
+        &prompt_path,
+    )?;
     let response_path = if response.trim().is_empty() {
         None
     } else {
@@ -482,7 +575,9 @@ fn run_claude_prompt(
     model: &str,
     max_turns: usize,
     phase_label: &str,
+    prompt_path: &Path,
 ) -> Result<String> {
+    let phase_started_at = Instant::now();
     let mut child = Command::new("claude")
         .arg("-p")
         .arg("--verbose")
@@ -497,6 +592,13 @@ fn run_claude_prompt(
         .current_dir(repo_root)
         .spawn()
         .with_context(|| format!("failed to launch Claude for {phase_label}"))?;
+    let pid = child.id();
+    println!("model:       {model}");
+    println!("max turns:   {max_turns}");
+    println!("phase start: {phase_label}");
+    println!("claude pid:  {pid}");
+    println!("cwd:         {}", repo_root.display());
+    println!("prompt file: {}", prompt_path.display());
 
     use std::io::Write;
     child
@@ -513,8 +615,16 @@ fn run_claude_prompt(
     let stdout = String::from_utf8(output.stdout).context("Claude stdout was not valid UTF-8")?;
     let stderr = String::from_utf8(output.stderr).context("Claude stderr was not valid UTF-8")?;
     if output.status.success() {
+        println!(
+            "phase done:  {phase_label} (+{})",
+            format_duration(phase_started_at.elapsed())
+        );
         return Ok(stdout.trim().to_string());
     }
+    println!(
+        "phase fail:  {phase_label} (+{})",
+        format_duration(phase_started_at.elapsed())
+    );
     let detail = if !stderr.trim().is_empty() {
         stderr.trim().to_string()
     } else if !stdout.trim().is_empty() {
@@ -523,6 +633,20 @@ fn run_claude_prompt(
         "no stderr/stdout".to_string()
     };
     bail!("{phase_label} failed: {detail}");
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 struct CorpusOutputSummary {
@@ -584,6 +708,7 @@ fn build_corpus_prompt(
     previous_planning_snapshot: Option<&Path>,
     parallelism: usize,
     idea: Option<&str>,
+    reference_repos: &[PathBuf],
 ) -> String {
     let planning_root = planning_root
         .strip_prefix(repo_root)
@@ -602,6 +727,18 @@ fn build_corpus_prompt(
         format!("- `{planning_root}/IDEA.md`\n")
     } else {
         String::new()
+    };
+    let reference_repo_clause = if reference_repos.is_empty() {
+        String::new()
+    } else {
+        let listing = reference_repos
+            .iter()
+            .map(|path| format!("- Mandatory reference repo: `{}`", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Reference repositories to inspect as required input:\n{listing}\n\nWhen reference repos are listed:\n- Inspect them directly; do not treat them as optional background.\n- Use them to distinguish reusable code, architectural inspiration, and non-reusable coupling.\n- Be explicit about which conclusions came from the target repo vs the reference repos.\n\n"
+        )
     };
     let idea_context_clause = idea
         .map(|idea| {
@@ -644,6 +781,7 @@ Use up to {parallelism} parallel subagents when helpful for code review, repo-hi
 
 Additional operator-provided context:
 {previous_snapshot_clause}
+{reference_repo_clause}
 
 Mandatory output files:
 - `{planning_root}/ASSESSMENT.md`
@@ -668,6 +806,12 @@ Review the actual codebase first, not just docs:
   - consider 2-3 plausible future directions before choosing the recommended one
   - make a clear "Not Doing" list so the corpus reflects focus, not wishful scope
   - if the repo is developer-facing, also assess the first-run developer experience: zero friction at T0, learn-by-doing, uncertainty reduction, and whether the onboarding examples are honest about the real work
+- Every exact version, dependency tag, timeout, threshold, benchmark target, chain choice, or protocol detail must be handled explicitly as one of:
+  - verified from code or a primary source
+  - recommendation for the new system
+  - hypothesis / open question
+- Do not present guessed values as settled requirements.
+- For future phases with unresolved feasibility, keep the artifacts at research/design level instead of pretending the implementation details are already locked.
 
 {idea_context_clause}
 
@@ -692,12 +836,14 @@ PLANS.md must index the plan set and explain sequencing, dependency order, and w
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 
 Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, vertically sliced where possible, and scoped to a concrete deliverable that a single focused worker can close truthfully.
+Future-phase plans with unresolved feasibility must say so clearly and center research gates before implementation promises.
 
 Never trust docs over code. If docs claim something the code does not support, say so clearly."#,
         target_repo = repo_root.display(),
         planning_root = planning_root,
         parallelism = parallelism,
         previous_snapshot_clause = previous_snapshot_clause,
+        reference_repo_clause = reference_repo_clause,
         idea_output_clause = idea_output_clause,
         idea_context_clause = idea_context_clause,
     )
@@ -764,14 +910,22 @@ Required output contract:
 - Filenames must use `ddmmyy-topic-slug.md`
 - Each file must start with `# Specification: ...`
 - Each file must include `## Objective`
+- Each file must include `## Evidence Status`
 - Each file must include a `## Acceptance Criteria` section
 - Each file must include a `## Verification` section
+- Each file must include `## Open Questions`
 - Acceptance criteria must be concrete, testable, and phrased as truthful observable outcomes
 - Acceptance criteria should use flat bullet points, not prose paragraphs
 - Specs must be concrete, file-grounded, and implementation-oriented
 - Avoid placeholders and abstract framework prose
 - Surface important assumptions or spec/code conflicts explicitly instead of smoothing them over
 - Include commands, boundaries, or open questions when they materially affect implementation or verification
+- `## Evidence Status` must separate:
+  - verified facts grounded in code or primary-source documentation
+  - recommendations for the intended system
+  - hypotheses / unresolved questions
+- Any exact version, timeout, threshold, dependency tag, benchmark target, chain choice, or protocol step that is not verified must be labeled as a recommendation or hypothesis instead of stated as settled fact
+- If a spec describes a future phase or unresolved surface, keep it at research/design level and avoid implementation detail that the evidence does not yet support
 - If the repo is developer-facing, capture onboarding, error handling, and first-success expectations truthfully enough that a future worker can improve the DX without guessing
 - Preserve proven current behavior in reverse mode
 - Preserve intended future behavior from the corpus in gen mode when the code has not caught up yet
@@ -800,7 +954,7 @@ fn build_implementation_plan_prompt(
     mode: GenerationMode,
     repo_root: &Path,
     output_dir: &Path,
-    generated_specs: &[PathBuf],
+    generated_specs: &[GeneratedSpecDocument],
     parallelism: usize,
 ) -> String {
     let mode_clause = match mode {
@@ -816,7 +970,10 @@ fn build_implementation_plan_prompt(
         .map(|path| {
             format!(
                 "- `{}`",
-                path.strip_prefix(output_dir).unwrap_or(path).display()
+                path.path
+                    .strip_prefix(output_dir)
+                    .unwrap_or(&path.path)
+                    .display()
             )
         })
         .collect::<Vec<_>>()
@@ -839,6 +996,8 @@ Before writing the plan, do the real planning work:
 - keep tasks small enough for one focused worker session
 - do not hide ambiguity; encode real blockers and assumptions in the task contracts
 - if the repo is developer-facing, explicitly consider zero-friction onboarding, learn-by-doing examples, error clarity, and uncertainty-reducing docs or tooling as first-class planning concerns
+- treat spec statements labeled as hypotheses, recommendations, design-phase, or research-required as non-binding until the plan closes the corresponding decision gate
+- do not create implementation tasks whose contract depends on unverified future-phase details; write a research, validation, or decision task first
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
@@ -872,6 +1031,7 @@ Output requirements:
 - `Estimated scope:` should be `XS`, `S`, `M`, or `L`; avoid `L` unless the codebase reality truly leaves no smaller slice
 - Put only unfinished work in the unchecked queue sections
 - Put already-satisfied items only in `## Completed / Already Satisfied`
+- Future-phase work with unresolved feasibility must stay in research-shaped tasks until the prerequisite evidence exists
 
 The goal is a truthful, execution-ready implementation queue."#,
         repo_root = repo_root.display(),
@@ -887,7 +1047,7 @@ The goal is a truthful, execution-ready implementation queue."#,
     )
 }
 
-fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
+fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument>> {
     let specs_dir = output_dir.join("specs");
     if !specs_dir.is_dir() {
         bail!("spec generation did not write {}", specs_dir.display());
@@ -899,6 +1059,7 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
             specs_dir.display()
         );
     }
+    let mut docs = Vec::new();
     for spec in &specs {
         let text = fs::read_to_string(spec)
             .with_context(|| format!("failed to read {}", spec.display()))?;
@@ -921,6 +1082,18 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
                 );
             }
         }
+        if !generated_spec_has_section(&text, "## Evidence Status") {
+            bail!(
+                "generated spec {} must include `## Evidence Status`",
+                spec.display()
+            );
+        }
+        if !generated_spec_has_section(&text, "## Open Questions") {
+            bail!(
+                "generated spec {} must include `## Open Questions`",
+                spec.display()
+            );
+        }
         if !generated_spec_has_acceptance_criteria(&text) {
             bail!(
                 "generated spec {} must include `{}` with at least one bullet",
@@ -928,8 +1101,13 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<PathBuf>> {
                 SPEC_ACCEPTANCE_CRITERIA_HEADER
             );
         }
+        docs.push(GeneratedSpecDocument {
+            path: spec.clone(),
+            text,
+        });
     }
-    Ok(specs)
+    lint_generated_spec_set(&docs)?;
+    Ok(docs)
 }
 
 fn generated_spec_has_section(markdown: &str, header: &str) -> bool {
@@ -961,6 +1139,131 @@ fn split_markdown_section<'a>(markdown: &'a str, header: &str) -> Option<(&'a st
         &markdown[start..section_end],
         &markdown[start + header.len()..section_end],
     ))
+}
+
+fn lint_generated_spec_set(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    lint_signature_policy_consistency(specs)?;
+    lint_session_resume_wire_contract(specs)?;
+    lint_session_persistence_abort_language(specs)?;
+    lint_future_phase_research_discipline(specs)?;
+    Ok(())
+}
+
+fn lint_signature_policy_consistency(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    let Some(transcript) = find_generated_spec(specs, "deterministic-transcripts") else {
+        return Ok(());
+    };
+    let Some(adversarial) = find_generated_spec(specs, "adversarial-robustness") else {
+        return Ok(());
+    };
+    let transcript_requires_cosign = transcript.text.contains("requires both signatures")
+        || transcript.text.contains("requires both player signatures")
+        || transcript
+            .text
+            .contains("rejects `build()` without both player signatures");
+    let adversarial_allows_unsigned = adversarial.text.contains("recorded as unsigned");
+    if transcript_requires_cosign && adversarial_allows_unsigned {
+        bail!(
+            "generated specs disagree about transcript signature policy: {} requires both player signatures, but {} allows unsigned completed transcripts",
+            transcript.path.display(),
+            adversarial.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn lint_session_resume_wire_contract(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    let Some(session) = find_generated_spec(specs, "session-persistence") else {
+        return Ok(());
+    };
+    let Some(wire) = find_generated_spec(specs, "wire-protocol") else {
+        return Ok(());
+    };
+
+    let hello_line = markdown_line_containing(&wire.text, "| `Hello` |").unwrap_or_default();
+    if session.text.contains("resume_session") && !hello_line.contains("resume_session") {
+        bail!(
+            "generated specs disagree about the Hello message: {} extends Hello with `resume_session`, but {} does not include that field",
+            session.path.display(),
+            wire.path.display()
+        );
+    }
+    if session.text.contains("last_hand_digests") && !hello_line.contains("last_hand_digests") {
+        bail!(
+            "generated specs disagree about the Hello message: {} extends Hello with `last_hand_digests`, but {} does not include that field",
+            session.path.display(),
+            wire.path.display()
+        );
+    }
+
+    let hello_ack_line = markdown_line_containing(&wire.text, "| `HelloAck` |").unwrap_or_default();
+    if session.text.contains("HelloAck` with `resumed: true`")
+        && !hello_ack_line.contains("resumed")
+    {
+        bail!(
+            "generated specs disagree about HelloAck: {} requires a `resumed` field, but {} does not include it",
+            session.path.display(),
+            wire.path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn lint_session_persistence_abort_language(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    let Some(session) = find_generated_spec(specs, "session-persistence") else {
+        return Ok(());
+    };
+    if session.text.contains("not silently lost") && session.text.contains("silently aborted") {
+        bail!(
+            "generated spec {} contradicts itself about in-flight hand recovery: it says hands are not silently lost and also says they are silently aborted",
+            session.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn lint_future_phase_research_discipline(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    for doc in specs {
+        let slug = doc
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let looks_future_phase = slug.contains("settlement") || slug.contains("ring-game");
+        if !looks_future_phase {
+            continue;
+        }
+        let has_research_guard = doc.text.contains("research")
+            || doc.text.contains("Research")
+            || doc.text.contains("design phase")
+            || doc.text.contains("future phase")
+            || doc.text.contains("not yet implemented");
+        if !has_research_guard {
+            bail!(
+                "future-phase generated spec {} must explicitly stay at research/design level until feasibility is proven",
+                doc.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn find_generated_spec<'a>(
+    specs: &'a [GeneratedSpecDocument],
+    needle: &str,
+) -> Option<&'a GeneratedSpecDocument> {
+    specs.iter().find(|doc| {
+        doc.path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|stem| stem.contains(needle))
+            .unwrap_or(false)
+    })
+}
+
+fn markdown_line_containing<'a>(markdown: &'a str, needle: &str) -> Option<&'a str> {
+    markdown.lines().find(|line| line.contains(needle))
 }
 
 fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
@@ -1029,14 +1332,14 @@ fn normalize_generated_implementation_plan(markdown: &str) -> String {
 
 fn sync_generated_specs_to_root(
     repo_root: &Path,
-    generated_specs: &[PathBuf],
+    generated_specs: &[GeneratedSpecDocument],
 ) -> Result<SpecSyncSummary> {
     sync_generated_specs_to_root_for_date(repo_root, generated_specs, Local::now().date_naive())
 }
 
 fn sync_generated_specs_to_root_for_date(
     repo_root: &Path,
-    generated_specs: &[PathBuf],
+    generated_specs: &[GeneratedSpecDocument],
     today: NaiveDate,
 ) -> Result<SpecSyncSummary> {
     let root_specs_dir = repo_root.join("specs");
@@ -1047,11 +1350,16 @@ fn sync_generated_specs_to_root_for_date(
 
     for spec in generated_specs {
         let source_name = spec
+            .path
             .file_stem()
             .and_then(|value| value.to_str())
             .context("generated spec must have a file stem")?;
         let slug = spec_topic_slug(source_name);
-        let extension = spec.extension().and_then(|v| v.to_str()).unwrap_or("md");
+        let extension = spec
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("md");
         let mut counter = 1usize;
         let destination = loop {
             let candidate = if counter == 1 {
@@ -1064,10 +1372,10 @@ fn sync_generated_specs_to_root_for_date(
             }
             counter += 1;
         };
-        fs::copy(spec, &destination).with_context(|| {
+        fs::copy(&spec.path, &destination).with_context(|| {
             format!(
                 "failed to copy {} -> {}",
-                spec.display(),
+                spec.path.display(),
                 destination.display()
             )
         })?;
@@ -1303,9 +1611,19 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        generated_spec_has_acceptance_criteria, merge_generated_plan_with_existing_open_tasks,
-        normalize_generated_implementation_plan, IMPLEMENTATION_PLAN_HEADER,
+        generated_spec_has_acceptance_criteria, lint_future_phase_research_discipline,
+        lint_session_resume_wire_contract, lint_signature_policy_consistency,
+        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
+        GeneratedSpecDocument, IMPLEMENTATION_PLAN_HEADER,
     };
+    use std::path::PathBuf;
+
+    fn generated_spec(slug: &str, text: &str) -> GeneratedSpecDocument {
+        GeneratedSpecDocument {
+            path: PathBuf::from(format!("/tmp/{slug}.md")),
+            text: text.to_string(),
+        }
+    }
 
     #[test]
     fn normalizes_noncanonical_plan_heading() {
@@ -1426,5 +1744,55 @@ This should be bulletized.
 "#;
 
         assert!(!generated_spec_has_acceptance_criteria(spec));
+    }
+
+    #[test]
+    fn rejects_conflicting_signature_policy_specs() {
+        let specs = vec![
+            generated_spec(
+                "deterministic-transcripts",
+                "# Specification: Deterministic Transcripts\n\nrequires both signatures\n",
+            ),
+            generated_spec(
+                "adversarial-robustness",
+                "# Specification: Adversarial Robustness\n\nrecorded as unsigned\n",
+            ),
+        ];
+
+        let error =
+            lint_signature_policy_consistency(&specs).expect_err("expected signature mismatch");
+
+        assert!(error.to_string().contains("signature policy"));
+    }
+
+    #[test]
+    fn rejects_session_resume_contract_drift() {
+        let specs = vec![
+            generated_spec(
+                "session-persistence",
+                "# Specification: Session Persistence\n\nresume_session\nlast_hand_digests\nHelloAck` with `resumed: true`\n",
+            ),
+            generated_spec(
+                "wire-protocol",
+                "# Specification: Wire Protocol\n\n| `Hello` | `session_id` |\n| `HelloAck` | `session_id` |\n",
+            ),
+        ];
+
+        let error = lint_session_resume_wire_contract(&specs).expect_err("expected Hello mismatch");
+
+        assert!(error.to_string().contains("Hello message"));
+    }
+
+    #[test]
+    fn rejects_future_phase_specs_without_research_framing() {
+        let specs = vec![generated_spec(
+            "settlement-architecture",
+            "# Specification: Settlement Architecture\n\n## Objective\nShip full escrow replay.\n",
+        )];
+
+        let error = lint_future_phase_research_discipline(&specs)
+            .expect_err("expected future-phase research lint");
+
+        assert!(error.to_string().contains("research/design level"));
     }
 }

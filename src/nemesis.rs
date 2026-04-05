@@ -4,12 +4,17 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
+use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
+use crate::codex_exec::run_codex_exec;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
-use crate::util::{atomic_write, copy_tree, ensure_repo_layout, git_repo_root, timestamp_slug};
+use crate::util::{
+    atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
+    git_stdout, repo_name, run_git, timestamp_slug,
+};
 use crate::NemesisArgs;
 
 const DEFAULT_NEMESIS_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
@@ -94,6 +99,49 @@ Additional requirements:
 - Prefer fewer stronger findings over a longer noisy report.
 - If a draft item is directionally right but over-scoped, narrow it before keeping it.
 "#;
+const DEFAULT_NEMESIS_IMPLEMENT_PROMPT: &str = r#"You are the final Nemesis implementation pass.
+
+Input audit artifacts:
+- `{audit_path}`
+- `{plan_path}`
+
+Rules:
+- Treat the live codebase as truth and the final Nemesis plan as the execution contract.
+- Implement the unchecked `NEM-` tasks in `## Priority Work` first, then `## Follow-On Work` when their dependencies are satisfied.
+- Reproduce the issue, failing invariant, or strongest direct proof first when practical. If literal reproduction is not practical, document the best executable proof you used instead of pretending.
+- Fix root causes, not cosmetic symptoms.
+- Add or update regression coverage when the repo exposes a real test surface for the affected behavior.
+- For runtime-sensitive or user-facing issues, use runtime/browser verification when available.
+- Update `{plan_path}` as tasks are truly completed. Mark completed tasks as satisfied instead of leaving them open.
+- Do not edit root `specs/` or root `IMPLEMENTATION_PLAN.md` directly in this pass.
+- Stay on the currently checked-out branch `{branch}`.
+- Commit only truthful fix increments with a message like `repo-name: nemesis fixes`.
+- Push to `origin/{branch}` after each successful commit.
+- Do not create or switch branches.
+- Do not stage or commit unrelated pre-existing changes already present in the worktree.
+- Do not stage or commit generated workflow artifacts under `.auto/`, `bug/`, or `gen-*`.
+- Only write these files directly as workflow artifacts:
+  - `{results_json}`
+  - `{results_md}`
+
+`{results_json}` must be a JSON array using exactly this schema:
+{{
+  "task_id": "NEM-001",
+  "status": "fixed|deferred|blocked",
+  "summary": "What changed and why",
+  "validation_commands": ["Command actually run"],
+  "touched_files": ["path/to/file"],
+  "residual_risks": ["Anything still not fully closed"]
+}}
+
+Requirements:
+- Cover every unchecked `NEM-` task in the plan with one result entry unless the final plan already marks it satisfied.
+- `fixed` means the root cause was addressed and re-verified.
+- `deferred` means the task remains valid but was intentionally left open with a truthful reason.
+- `blocked` means an external dependency, ambiguity, or repo limitation prevented a truthful close.
+- `{results_md}` should summarize proof-before-fix, root cause, changes made, validation, and any deferred or blocked tasks.
+- JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+"#;
 
 const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
@@ -122,6 +170,16 @@ struct PlanTaskBlock {
 struct PhaseConfig {
     model: String,
     effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NemesisFixResult {
+    task_id: String,
+    status: String,
+    summary: String,
+    validation_commands: Vec<String>,
+    touched_files: Vec<String>,
+    residual_risks: Vec<String>,
 }
 
 enum NemesisBackend {
@@ -166,6 +224,22 @@ impl NemesisBackend {
 pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
+    let current_branch = current_branch.trim().to_string();
+    if !args.dry_run && !args.report_only && current_branch.is_empty() {
+        bail!(
+            "auto nemesis requires a checked-out branch so implementation commits can push to origin"
+        );
+    }
+    if let Some(required_branch) = args.branch.as_deref() {
+        if current_branch != required_branch {
+            bail!(
+                "auto nemesis must run on branch `{}` (current: `{}`)",
+                required_branch,
+                current_branch
+            );
+        }
+    }
 
     let output_dir = args
         .output_dir
@@ -185,8 +259,13 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         model: args.reviewer_model.clone(),
         effort: args.reviewer_effort.clone(),
     };
+    let fixer = PhaseConfig {
+        model: args.fixer_model.clone(),
+        effort: args.fixer_effort.clone(),
+    };
     ensure_pi_phase_config("auto nemesis audit pass", &auditor)?;
     ensure_pi_phase_config("auto nemesis synthesis pass", &reviewer)?;
+    ensure_nemesis_fixer_config(&fixer)?;
     let audit_backend = select_backend(
         &auditor.model,
         &auditor.effort,
@@ -214,6 +293,8 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     let draft_plan_path = output_dir.join("draft-IMPLEMENTATION_PLAN.md");
     let final_audit_path = output_dir.join("nemesis-audit.md");
     let final_plan_path = output_dir.join("IMPLEMENTATION_PLAN.md");
+    let implementation_results_json_path = output_dir.join("implementation-results.json");
+    let implementation_results_md_path = output_dir.join("implementation-results.md");
     let audit_prompt = build_audit_prompt(&prompt_template, &draft_audit_path, &draft_plan_path);
     let review_prompt = build_review_prompt(
         &prompt_template,
@@ -234,6 +315,22 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         .join(format!("nemesis-{}-review-prompt.md", timestamp_slug()));
     atomic_write(&review_prompt_path, review_prompt.as_bytes())
         .with_context(|| format!("failed to write {}", review_prompt_path.display()))?;
+    let implementation_prompt = build_implementation_prompt(
+        &final_audit_path,
+        &final_plan_path,
+        &implementation_results_json_path,
+        &implementation_results_md_path,
+        args.branch.as_deref().unwrap_or(&current_branch),
+    );
+    let implementation_prompt_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("nemesis-{}-implement-prompt.md", timestamp_slug()));
+    atomic_write(
+        &implementation_prompt_path,
+        implementation_prompt.as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", implementation_prompt_path.display()))?;
 
     println!("auto nemesis");
     println!("repo root:   {}", repo_root.display());
@@ -248,12 +345,28 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         review_backend.model(),
         review_backend.variant()
     );
+    if !args.report_only {
+        println!("fixer:       {} ({})", fixer.model, fixer.effort);
+        println!(
+            "branch:      {}",
+            args.branch.as_deref().unwrap_or(&current_branch)
+        );
+    }
     if let Some(previous) = &previous_snapshot {
         println!("prior input: {}", previous.display());
     }
     if args.dry_run {
         println!("mode:        dry-run");
         return Ok(());
+    }
+    if !args.report_only {
+        if let Some(commit) =
+            auto_checkpoint_if_needed(&repo_root, current_branch.as_str(), "nemesis checkpoint")?
+        {
+            println!("checkpoint:  committed pre-existing changes at {commit}");
+        }
+    } else {
+        println!("mode:        report-only");
     }
 
     print_phase_header("auditor", &audit_backend);
@@ -280,8 +393,54 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
 
     let spec_path = verify_nemesis_spec(&output_dir)?;
     let plan_path = verify_nemesis_plan(&output_dir)?;
+    let mut implementation_results = None::<PathBuf>;
+    if !args.report_only {
+        let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        println!();
+        println!("phase:       implementer");
+        println!("backend:     codex");
+        println!("model:       {}", fixer.model);
+        println!("variant:     {}", fixer.effort);
+
+        let exit_status = run_codex_exec(
+            &repo_root,
+            &implementation_prompt,
+            &fixer.model,
+            &fixer.effort,
+            &args.codex_bin,
+            &output_dir.join("codex.stderr.log"),
+            "auto nemesis implementation",
+        )
+        .await?;
+        if !exit_status.success() {
+            bail!(
+                "Codex Nemesis implementation failed with status {}; see {}",
+                exit_status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                output_dir.join("codex.stderr.log").display()
+            );
+        }
+
+        let implementation_path = verify_nemesis_implementation_results(
+            &implementation_results_json_path,
+            &implementation_results_md_path,
+            &plan_path,
+        )?;
+        implementation_results = Some(implementation_path);
+        let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        if commit_before.trim() != commit_after.trim() {
+            run_git(&repo_root, ["push", "origin", current_branch.as_str()])?;
+        }
+    }
     let root_spec = sync_nemesis_spec_to_root(&repo_root, &spec_path)?;
     let appended = append_nemesis_plan_to_root(&repo_root, &plan_path)?;
+    let trailing_commit = if args.report_only {
+        None
+    } else {
+        commit_nemesis_outputs_if_needed(&repo_root, current_branch.as_str())?
+    };
 
     println!();
     println!("nemesis complete");
@@ -289,13 +448,24 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     println!("plan:        {}", plan_path.display());
     println!("root spec:   {}", root_spec.display());
     println!("root tasks:  {} appended", appended);
+    if let Some(path) = implementation_results {
+        println!("implementation: {}", path.display());
+    } else {
+        println!("implementation: report-only");
+    }
     println!("audit prompt: {}", audit_prompt_path.display());
     println!("review prompt: {}", review_prompt_path.display());
+    if !args.report_only {
+        println!("implement prompt: {}", implementation_prompt_path.display());
+    }
     if audit_response_path.exists() {
         println!("audit log:   {}", audit_response_path.display());
     }
     if review_response_path.exists() {
         println!("review log:  {}", review_response_path.display());
+    }
+    if let Some(commit) = trailing_commit {
+        println!("outputs commit: {}", commit);
     }
 
     Ok(())
@@ -329,6 +499,16 @@ fn ensure_pi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
     Ok(())
 }
 
+fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
+    if PiProvider::detect(&config.model).is_some() {
+        bail!(
+            "auto nemesis implementation pass must use a Codex model; got `{}`",
+            config.model
+        );
+    }
+    Ok(())
+}
+
 fn build_audit_prompt(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
     let prompt = render_prompt_outputs(prompt_template, audit_path, plan_path);
     format!(
@@ -351,6 +531,21 @@ fn build_review_prompt(
         )
         .replace("{draft_plan_path}", &draft_plan_path.display().to_string())
         .replace("{final_prompt}", &final_prompt)
+}
+
+fn build_implementation_prompt(
+    audit_path: &Path,
+    plan_path: &Path,
+    results_json: &Path,
+    results_md: &Path,
+    branch: &str,
+) -> String {
+    DEFAULT_NEMESIS_IMPLEMENT_PROMPT
+        .replace("{audit_path}", &audit_path.display().to_string())
+        .replace("{plan_path}", &plan_path.display().to_string())
+        .replace("{results_json}", &results_json.display().to_string())
+        .replace("{results_md}", &results_md.display().to_string())
+        .replace("{branch}", branch)
 }
 
 fn render_prompt_outputs(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
@@ -630,6 +825,92 @@ fn verify_nemesis_plan(output_dir: &Path) -> Result<PathBuf> {
     Ok(plan_path)
 }
 
+fn verify_nemesis_implementation_results(
+    results_json_path: &Path,
+    results_md_path: &Path,
+    plan_path: &Path,
+) -> Result<PathBuf> {
+    if !results_json_path.exists() {
+        bail!(
+            "Nemesis implementation did not write {}",
+            results_json_path.display()
+        );
+    }
+    if !results_md_path.exists() {
+        bail!(
+            "Nemesis implementation did not write {}",
+            results_md_path.display()
+        );
+    }
+
+    let results = load_nemesis_fix_results(results_json_path)?;
+    let expected_ids = extract_plan_task_blocks(
+        &fs::read_to_string(plan_path)
+            .with_context(|| format!("failed to read {}", plan_path.display()))?,
+    )?
+    .into_iter()
+    .filter(|block| !block.checked)
+    .map(|block| block.task_id)
+    .collect::<std::collections::BTreeSet<_>>();
+    let actual_ids = results
+        .iter()
+        .map(|result| result.task_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for task_id in &expected_ids {
+        if !actual_ids.contains(task_id.as_str()) {
+            bail!("Nemesis implementation results missing task `{task_id}`");
+        }
+    }
+    Ok(results_json_path.to_path_buf())
+}
+
+fn load_nemesis_fix_results(path: &Path) -> Result<Vec<NemesisFixResult>> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let results: Vec<NemesisFixResult> = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    for result in &results {
+        match result.status.trim().to_ascii_lowercase().as_str() {
+            "fixed" | "deferred" | "blocked" => {}
+            other => bail!(
+                "invalid Nemesis fix status `{other}` for {}",
+                result.task_id
+            ),
+        }
+        if result.task_id.trim().is_empty() || result.summary.trim().is_empty() {
+            bail!(
+                "Nemesis implementation result is missing required fields for `{}`",
+                result.task_id
+            );
+        }
+        if result.status.eq_ignore_ascii_case("fixed") {
+            if result.validation_commands.is_empty() {
+                bail!(
+                    "Nemesis implementation result for `{}` must include validation commands",
+                    result.task_id
+                );
+            }
+            if result.touched_files.is_empty() {
+                bail!(
+                    "Nemesis implementation result for `{}` must include touched files",
+                    result.task_id
+                );
+            }
+        }
+        if (result.status.eq_ignore_ascii_case("deferred")
+            || result.status.eq_ignore_ascii_case("blocked"))
+            && result.residual_risks.is_empty()
+        {
+            bail!(
+                "Nemesis {} result for `{}` must explain residual risks",
+                result.status,
+                result.task_id
+            );
+        }
+    }
+    Ok(results)
+}
+
 fn sync_nemesis_spec_to_root(repo_root: &Path, spec_path: &Path) -> Result<PathBuf> {
     let root_specs_dir = repo_root.join("specs");
     fs::create_dir_all(&root_specs_dir)
@@ -683,6 +964,67 @@ fn append_nemesis_plan_to_root(repo_root: &Path, nemesis_plan_path: &Path) -> Re
     atomic_write(&root_plan_path, merged.as_bytes())
         .with_context(|| format!("failed to write {}", root_plan_path.display()))?;
     Ok(appended)
+}
+
+fn commit_nemesis_outputs_if_needed(repo_root: &Path, branch: &str) -> Result<Option<String>> {
+    let status = git_stdout(
+        repo_root,
+        [
+            "status",
+            "--short",
+            "--",
+            ".",
+            ":(exclude).auto",
+            ":(exclude)bug",
+            ":(exclude)gen-*",
+        ],
+    )?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+
+    run_git(
+        repo_root,
+        [
+            "add",
+            "-u",
+            "--",
+            ".",
+            ":(exclude).auto",
+            ":(exclude)bug",
+            ":(exclude)gen-*",
+        ],
+    )?;
+    let untracked = git_stdout(
+        repo_root,
+        ["ls-files", "-z", "--others", "--exclude-standard"],
+    )?;
+    let stageable = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| {
+            !path.starts_with(".auto/")
+                && !path.starts_with("bug/")
+                && !path.starts_with("nemesis/codex.stderr.log")
+                && !path
+                    .split('/')
+                    .next()
+                    .map(|segment| segment.starts_with("gen-"))
+                    .unwrap_or(false)
+        })
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    for chunk in stageable.chunks(100) {
+        let mut add_args = vec!["add".to_string(), "--".to_string()];
+        add_args.extend(chunk.iter().cloned());
+        run_git(repo_root, add_args.iter().map(|arg| arg.as_str()))?;
+    }
+
+    let message = format!("{}: record nemesis outputs", repo_name(repo_root));
+    run_git(repo_root, ["commit", "-m", &message])?;
+    run_git(repo_root, ["push", "origin", branch])?;
+    let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    Ok(Some(commit.trim().to_string()))
 }
 
 fn append_new_open_tasks(existing: &str, nemesis_plan: &str) -> Result<(String, usize)> {
@@ -879,7 +1221,10 @@ impl EmptyFallback for str {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{append_new_open_tasks, ensure_pi_phase_config, select_backend, PhaseConfig};
+    use super::{
+        append_new_open_tasks, build_implementation_prompt, ensure_nemesis_fixer_config,
+        ensure_pi_phase_config, select_backend, PhaseConfig,
+    };
     use crate::NemesisArgs;
 
     #[test]
@@ -968,7 +1313,11 @@ Spec: specs/020426-nemesis-audit.md
             reviewer_effort: "high".to_string(),
             kimi: false,
             minimax: false,
+            report_only: false,
+            branch: None,
             dry_run: true,
+            fixer_model: "gpt-5.4".to_string(),
+            fixer_effort: "xhigh".to_string(),
             codex_bin: PathBuf::from("codex"),
             pi_bin: PathBuf::from("pi"),
         }
@@ -1022,5 +1371,34 @@ Spec: specs/020426-nemesis-audit.md
             effort: "xhigh".to_string(),
         };
         assert!(ensure_pi_phase_config("nemesis", &config).is_err());
+    }
+
+    #[test]
+    fn implementation_prompt_requires_commit_and_push_on_current_branch() {
+        let prompt = build_implementation_prompt(
+            Path::new("nemesis/nemesis-audit.md"),
+            Path::new("nemesis/IMPLEMENTATION_PLAN.md"),
+            Path::new("nemesis/implementation-results.json"),
+            Path::new("nemesis/implementation-results.md"),
+            "main",
+        );
+
+        assert!(prompt.contains("Commit only truthful fix increments"));
+        assert!(prompt.contains("Push to `origin/main`"));
+        assert!(
+            prompt.contains("Do not edit root `specs/` or root `IMPLEMENTATION_PLAN.md` directly")
+        );
+    }
+
+    #[test]
+    fn nemesis_fixer_must_not_use_pi_model() {
+        let config = PhaseConfig {
+            model: "kimi".to_string(),
+            effort: "high".to_string(),
+        };
+        let error = ensure_nemesis_fixer_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must use a Codex model"));
     }
 }

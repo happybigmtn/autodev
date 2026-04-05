@@ -5,6 +5,16 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
+pub(crate) const CLI_LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ",
+    env!("AUTODEV_GIT_SHA"),
+    "\ndirty: ",
+    env!("AUTODEV_GIT_DIRTY"),
+    "\nprofile: ",
+    env!("AUTODEV_BUILD_PROFILE"),
+);
+
 const CHECKPOINT_EXCLUDES: [&str; 4] = [
     ":(exclude).auto",
     ":(exclude)bug",
@@ -151,6 +161,23 @@ pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {
 
 pub(crate) fn timestamp_slug() -> String {
     Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+pub(crate) fn current_binary_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(crate) fn binary_provenance_line() -> String {
+    format!(
+        "{} @ {} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        current_binary_path(),
+        env!("AUTODEV_GIT_SHA"),
+        env!("AUTODEV_GIT_DIRTY")
+    )
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

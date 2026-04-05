@@ -45,8 +45,8 @@ need to pass directories in the normal case.
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
 - `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`,
   targeting the repo's resolved base branch
-- `auto nemesis` runs a PI-only two-stage audit by default: MiniMax draft pass, then Kimi
-  synthesis pass
+- `auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `xhigh` implementation pass
+  unless `--report-only` is used
 
 ## How To Think About The Commands
 
@@ -66,7 +66,8 @@ The other four commands are side lanes:
 
 - `auto reverse` documents current behavior from code reality.
 - `auto bug` runs a bug-finding and implementation pipeline.
-- `auto nemesis` runs a deeper disposable audit and appends its findings back into specs and plan.
+- `auto nemesis` runs a deeper audit, applies bounded hardening fixes, and appends unresolved
+  findings back into specs and plan.
 - `auto qa-only` runs runtime QA without fixing anything.
 
 ## Detailed Command Guide
@@ -111,6 +112,9 @@ What it actually does:
   - what is explicitly out of scope right now
 - For developer-facing repos, also assesses first-run DX, onboarding honesty, error clarity, and
   whether the fastest path leads to a real success moment
+- Emits stage-by-stage observability to stdout, including binary provenance, repo root, prompt log
+  path, Claude phase start/finish markers, Claude PID, cwd, and elapsed timings so long runs are
+  inspectable instead of silent
 
 Idea mode:
 
@@ -132,6 +136,8 @@ Useful flags:
 
 - `--planning-root <dir>` to change the corpus destination
 - `--idea "..."` to seed the corpus from a desired product direction or greenfield-style concept
+- `--reference-repo <dir>` to require inspection of sibling or external repos as first-class
+  reference inputs during corpus authoring
 - `--model <name>` to pick a different Claude model
 - `--max-turns <n>` to raise or lower the planning budget
 - `--parallelism <n>` to encourage more or less parallel planning work
@@ -162,6 +168,10 @@ What it actually does:
   - `## Objective`
   - `## Acceptance Criteria`
   - `## Verification`
+  - `## Evidence Status`
+  - `## Open Questions`
+- Refuses to accept generated specs that contradict each other on shared contracts such as message
+  shapes, signature policy, or speculative future-phase behavior
 - Generates a new implementation plan with dependency-ordered tasks
 - Requires each active plan task to include real execution fields such as:
   - spec reference
@@ -177,6 +187,8 @@ What it actually does:
 - For developer-facing repos, treats onboarding, learn-by-doing examples, error clarity, and
   uncertainty-reducing docs/tooling as first-class planning concerns
 - Merges the fresh generated plan into the repo-root `IMPLEMENTATION_PLAN.md`
+- Emits first-class observability for every stage, including command header, prompt log paths,
+  Claude phase start/finish markers, PID, cwd, and elapsed time per stage
 
 Root plan merge rule:
 
@@ -196,6 +208,11 @@ Useful flags:
 - `--output-dir <dir>` to control the disposable generation output
 - `--plan-only` to reuse an existing `gen-*` output and only regenerate the plan
 - `--model`, `--max-turns`, and `--parallelism` to tune the generation pass
+
+Binary provenance:
+
+- `auto --version` prints the package version plus embedded git commit, dirty/clean status, and
+  build profile so operators can confirm which binary they are actually running
 
 ### `auto reverse`
 
@@ -306,7 +323,8 @@ Useful flags:
 
 Purpose:
 
-- Run a deeper disposable audit and feed the surviving findings back into repo specs and plan
+- Run a deeper audit, implement bounded hardening fixes, and feed unresolved findings back into
+  repo specs and plan
 
 What it reads:
 
@@ -316,6 +334,8 @@ What it writes:
 
 - `nemesis/nemesis-audit.md`
 - `nemesis/IMPLEMENTATION_PLAN.md`
+- `nemesis/implementation-results.json`
+- `nemesis/implementation-results.md`
 - `nemesis/draft-nemesis-audit.md`
 - `nemesis/draft-IMPLEMENTATION_PLAN.md`
 - appended audit spec snapshots in root `specs/`
@@ -326,33 +346,42 @@ What it actually does:
 - Archives the previous `nemesis/` folder under `.auto/fresh-input/`
 - Runs a draft audit pass to maximize evidence-backed recall
 - Runs a synthesis pass to tighten or discard weak claims
-- Treats `nemesis/` as disposable working output, not long-term canonical state
-- Appends only new unchecked Nemesis tasks back into the root plan
+- Runs a final `gpt-5.4` `xhigh` implementation pass against the synthesized Nemesis plan by
+  default
+- Treats the Nemesis plan as the execution contract for bounded hardening work
+- Writes implementation results under `nemesis/`
+- Appends only still-open unchecked Nemesis tasks back into the root plan after implementation
+- Commits and pushes truthful Nemesis hardening increments plus trailing Nemesis outputs
 
 Important rule:
 
-- `auto nemesis` is audit-docs only
-- It does not edit repo code
+- `auto nemesis` now edits repo code by default
+- Use `--report-only` if you want the old audit-docs-only behavior
 
 Backend selection:
 
 - Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
 - Final reviewer default: PI with `kimi-coding/k2p5` and `high`
+- Final implementer default: Codex `gpt-5.4` with `xhigh`
 - `--kimi` switches the draft pass to Kimi
 - `--minimax` switches the draft pass to MiniMax
 - `--model kimi` and `--model minimax` do the same through the generic model flag
 - `--reviewer-model` and `--reviewer-effort` override the final synthesis pass
+- `--fixer-model` and `--fixer-effort` override the final implementation pass
 
 When to run it:
 
-- When you want a stronger disposable audit than `auto bug`
-- When you want audit-derived plan items without directly changing code
-- Before a risky implementation cycle or large hardening effort
+- When you want a stronger logic-and-invariant audit than `auto bug`
+- Before or during a risky hardening cycle where you want Nemesis findings turned into real fixes
+- When you want unresolved audit findings converted into durable root plan items only after
+  implementation has taken its best shot
 
 Useful flags:
 
 - `--output-dir <dir>` to change the disposable audit destination
 - `--prompt-file <path>` to override the prompt template
+- `--report-only` to stop after audit and synthesis without running the implementation pass
+- `--branch <name>` to require a specific checked-out branch for implementation
 - `--dry-run` to preview without invoking models
 - `--codex-bin` and `--pi-bin` to point at non-default executables
 
@@ -775,6 +804,12 @@ Run a disposable Nemesis audit:
 
 ```bash
 auto nemesis
+```
+
+Run Nemesis in report-only mode:
+
+```bash
+auto nemesis --report-only
 ```
 
 Run the multi-pass bug pipeline:
