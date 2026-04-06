@@ -182,6 +182,9 @@ What it writes:
 What it actually does:
 
 - Generates fresh specs from the planning corpus
+- Uses the planning corpus for intended future direction, but treats the live codebase as
+  authoritative for current-state facts such as commands, counts, metric names, filenames, and
+  behavior claims
 - Requires each generated spec to include:
   - `## Objective`
   - `## Acceptance Criteria`
@@ -205,6 +208,8 @@ What it actually does:
   - completion signal
 - For developer-facing repos, treats onboarding, learn-by-doing examples, error clarity, and
   uncertainty-reducing docs/tooling as first-class planning concerns
+- Scrubs generated and rewritten plan `Spec:` references against the actual spec files before the
+  run is accepted
 - Merges the fresh generated plan into the repo-root `IMPLEMENTATION_PLAN.md`
 - Emits first-class observability for every stage, including command header, prompt log paths,
   Claude phase start/finish markers, PID, cwd, and elapsed time per stage
@@ -259,7 +264,8 @@ What it actually does:
 - Produces specs grounded in current behavior
 - Uses the same stronger spec format as `auto gen`
 - Surfaces assumptions and spec/code conflicts instead of silently reconciling them
-- Appends the results into the append-only snapshot-based root `specs/` directory
+- Writes the results into the root `specs/` snapshot directory and replaces same-day same-topic
+  snapshots instead of accumulating `-2`, `-3`, and similar duplicates
 
 Spec naming rule:
 
@@ -442,6 +448,8 @@ What it actually does:
 - Rebases onto `origin/<branch>` before work starts when that remote branch exists, so a behind
   local branch does not fail only at push time
 - Reads the next unchecked task from the top of the plan
+- When the repo has multiple dated specs for the same surface, treats the newest spec referenced by
+  the current unchecked task as authoritative and older duplicates as historical context
 - Builds a short task brief from the task contract before editing
 - Defaults to a RED/GREEN/REFACTOR implementation rhythm for behavior-changing work
 - Implements the smallest truthful slice that fully closes the task

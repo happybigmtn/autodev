@@ -369,6 +369,8 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         )?),
         GenerationMode::Reverse => None,
     };
+    print_stage("scrub root outputs", run_started_at);
+    scrub_root_generated_outputs(&repo_root, mode)?;
 
     print_stage("save generator state", run_started_at);
     state.planning_root = Some(planning_root.clone());
@@ -936,7 +938,7 @@ fn build_spec_generation_prompt(
 ) -> String {
     let mode_clause = match mode {
         GenerationMode::Gen => {
-            "This is a corpus-first generation pass. The planning corpus defines the intended system shape. Use the codebase to verify gaps, current implementation status, and naming."
+            "This is a generation pass guided by the planning corpus. Use the corpus for intended future direction, but treat the live codebase as authoritative for every current-state fact, concrete filename, metric name, command, count, API shape, and behavior claim."
         }
         GenerationMode::Reverse => {
             "This is a reverse-engineering pass. The live codebase is the source of truth. Use the planning corpus only as supporting context."
@@ -1009,15 +1011,17 @@ Required output contract:
 - Avoid placeholders and abstract framework prose
 - Surface important assumptions or spec/code conflicts explicitly instead of smoothing them over
 - Include commands, boundaries, or open questions when they materially affect implementation or verification
+- Every exact current-state fact should be backed by a file path, command, or primary-source documentation citation in `## Evidence Status`
 - `## Evidence Status` must separate:
   - verified facts grounded in code or primary-source documentation
   - recommendations for the intended system
   - hypotheses / unresolved questions
+- Treat the live codebase as authoritative for current-state facts in every mode
 - Any exact version, timeout, threshold, dependency tag, benchmark target, chain choice, or protocol step that is not verified must be labeled as a recommendation or hypothesis instead of stated as settled fact
 - If a spec describes a future phase or unresolved surface, keep it at research/design level and avoid implementation detail that the evidence does not yet support
 - If the repo is developer-facing, capture onboarding, error handling, and first-success expectations truthfully enough that a future worker can improve the DX without guessing
 - Preserve proven current behavior in reverse mode
-- Preserve intended future behavior from the corpus in gen mode when the code has not caught up yet
+- In gen mode, preserve intended future direction from the corpus, but keep future intent under recommendations or hypotheses until code or primary-source evidence proves otherwise
 
 Cover the main product and system surfaces represented in the repo. Use the codebase and the planning corpus to decide the right spec set."#,
         repo_root = repo_root.display(),
@@ -1049,7 +1053,7 @@ fn build_implementation_plan_prompt(
 ) -> String {
     let mode_clause = match mode {
         GenerationMode::Gen => {
-            "This is a corpus-first planning pass. Use the generated specs plus current code review to surface the true remaining work."
+            "This is a planning pass grounded in the generated specs plus current code review. Use the specs to preserve intended direction, but treat the live codebase as authoritative for current-state facts, repo shape, counts, commands, metric names, and existing coverage."
         }
         GenerationMode::Reverse => {
             "This is a reverse-engineering planning pass. Use the generated specs and current code reality to identify the next actionable work."
@@ -1088,6 +1092,7 @@ Before writing the plan, do the real planning work:
 - if the repo is developer-facing, explicitly consider zero-friction onboarding, learn-by-doing examples, error clarity, and uncertainty-reducing docs or tooling as first-class planning concerns
 - treat spec statements labeled as hypotheses, recommendations, design-phase, or research-required as non-binding until the plan closes the corresponding decision gate
 - do not create implementation tasks whose contract depends on unverified future-phase details; write a research, validation, or decision task first
+- verify every exact current-state fact in the plan from code, tests, or concrete commands before you write it down
 - add explicit checkpoint tasks after each risky cluster or every 2-3 priority tasks so a future worker knows when to stop and re-evaluate before widening scope
 
 Output requirements:
@@ -1113,6 +1118,7 @@ Output requirements:
   - `Estimated scope:`
   - `Completion signal:`
 - `Spec:` values must point to `specs/*.md`
+- Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames
 - Keep the plan concrete, file-grounded, and executable
 - Do not include lane prose, staffing prose, or meta commentary
 - Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
@@ -1338,9 +1344,31 @@ fn markdown_section_body_bounds(markdown: &str, header: &str) -> Option<(usize, 
 }
 
 fn lint_generated_spec_set(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    lint_duplicate_spec_topics(specs)?;
     lint_signature_policy_consistency(specs)?;
     lint_session_resume_wire_contract(specs)?;
     lint_session_persistence_abort_language(specs)?;
+    Ok(())
+}
+
+fn lint_duplicate_spec_topics(specs: &[GeneratedSpecDocument]) -> Result<()> {
+    let mut seen = std::collections::BTreeMap::<String, &GeneratedSpecDocument>::new();
+    for spec in specs {
+        let slug = spec
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(spec_topic_slug)
+            .context("generated spec must have a file stem")?;
+        if let Some(previous) = seen.insert(slug.clone(), spec) {
+            bail!(
+                "generated specs duplicate the `{}` topic: {} and {}",
+                slug,
+                previous.path.display(),
+                spec.path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1466,6 +1494,12 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
             }
         }
     }
+    let available_specs = collect_available_spec_refs(&output_dir.join("specs"))?;
+    validate_plan_spec_refs(
+        &normalized,
+        &available_specs,
+        &format!("generated implementation plan {}", plan_path.display()),
+    )?;
     if normalized != markdown {
         atomic_write(&plan_path, normalized.as_bytes())
             .with_context(|| format!("failed to normalize {}", plan_path.display()))?;
@@ -1529,18 +1563,8 @@ fn sync_generated_specs_to_root_for_date(
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("md");
-        let mut counter = 1usize;
-        let destination = loop {
-            let candidate = if counter == 1 {
-                root_specs_dir.join(format!("{date_prefix}-{slug}.{extension}"))
-            } else {
-                root_specs_dir.join(format!("{date_prefix}-{slug}-{counter}.{extension}"))
-            };
-            if !candidate.exists() {
-                break candidate;
-            }
-            counter += 1;
-        };
+        remove_same_day_topic_snapshots(&root_specs_dir, &date_prefix, &slug, extension)?;
+        let destination = root_specs_dir.join(format!("{date_prefix}-{slug}.{extension}"));
         fs::copy(&spec.path, &destination).with_context(|| {
             format!(
                 "failed to copy {} -> {}",
@@ -1645,6 +1669,138 @@ fn rewrite_plan_spec_line(
         *changed = true;
     }
     normalized
+}
+
+fn remove_same_day_topic_snapshots(
+    root_specs_dir: &Path,
+    date_prefix: &str,
+    slug: &str,
+    extension: &str,
+) -> Result<()> {
+    for existing in find_same_day_topic_snapshots(root_specs_dir, date_prefix, slug, extension)? {
+        fs::remove_file(&existing)
+            .with_context(|| format!("failed to remove {}", existing.display()))?;
+    }
+    Ok(())
+}
+
+fn find_same_day_topic_snapshots(
+    root_specs_dir: &Path,
+    date_prefix: &str,
+    slug: &str,
+    extension: &str,
+) -> Result<Vec<PathBuf>> {
+    let canonical_stem = format!("{date_prefix}-{slug}");
+    let duplicate_prefix = format!("{canonical_stem}-");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(root_specs_dir)
+        .with_context(|| format!("failed to read {}", root_specs_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read {}", root_specs_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if stem == canonical_stem {
+            matches.push(path);
+            continue;
+        }
+        let Some(suffix) = stem.strip_prefix(&duplicate_prefix) else {
+            continue;
+        };
+        if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            matches.push(path);
+        }
+    }
+    Ok(matches)
+}
+
+fn collect_available_spec_refs(specs_dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let mut refs = std::collections::BTreeSet::new();
+    if !specs_dir.is_dir() {
+        return Ok(refs);
+    }
+    for path in list_markdown_files(specs_dir)? {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        refs.insert(format!("specs/{name}"));
+    }
+    Ok(refs)
+}
+
+fn validate_plan_spec_refs(
+    markdown: &str,
+    available_specs: &std::collections::BTreeSet<String>,
+    context_label: &str,
+) -> Result<()> {
+    for (line_index, line) in markdown.lines().enumerate() {
+        if !line.contains("Spec:") {
+            continue;
+        }
+        let refs = extract_spec_refs_from_line(line);
+        if refs.is_empty() {
+            bail!(
+                "{context_label} line {} contains `Spec:` but no `specs/*.md` path",
+                line_index + 1
+            );
+        }
+        for spec_ref in refs {
+            if !available_specs.contains(&spec_ref) {
+                bail!(
+                    "{context_label} references missing spec `{spec_ref}` on line {}",
+                    line_index + 1
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_spec_refs_from_line(line: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut search_start = 0usize;
+
+    while let Some(relative_start) = line[search_start..].find("specs/") {
+        let start = search_start + relative_start;
+        let candidate = &line[start..];
+        let end = candidate
+            .char_indices()
+            .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-')))
+            .map(|(index, _)| index)
+            .unwrap_or(candidate.len());
+        let path = &candidate[..end];
+        if path.ends_with(".md") {
+            refs.push(path.to_string());
+        }
+        search_start = start + end.max(1);
+    }
+
+    refs
+}
+
+fn scrub_root_generated_outputs(repo_root: &Path, mode: GenerationMode) -> Result<()> {
+    let available_specs = collect_available_spec_refs(&repo_root.join("specs"))?;
+    if mode == GenerationMode::Gen {
+        let root_plan = repo_root.join("IMPLEMENTATION_PLAN.md");
+        if root_plan.exists() {
+            let markdown = fs::read_to_string(&root_plan)
+                .with_context(|| format!("failed to read {}", root_plan.display()))?;
+            validate_plan_spec_refs(
+                &markdown,
+                &available_specs,
+                &format!("root implementation plan {}", root_plan.display()),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn merge_generated_plan_with_existing_open_tasks(
@@ -1858,16 +2014,30 @@ mod tests {
         generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
         normalize_generated_implementation_plan, normalize_generated_spec_markdown,
-        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, GenerationMode,
+        rewrite_plan_spec_refs_to_root, sync_generated_specs_to_root_for_date,
+        verify_generated_implementation_plan, GeneratedSpecDocument, GenerationMode,
         SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
+    use chrono::NaiveDate;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn generated_spec(slug: &str, text: &str) -> GeneratedSpecDocument {
         GeneratedSpecDocument {
             path: PathBuf::from(format!("/tmp/{slug}.md")),
             text: text.to_string(),
         }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("autodev-{label}-{suffix}"));
+        fs::create_dir_all(&path).expect("failed to create temp dir");
+        path
     }
 
     #[test]
@@ -2149,5 +2319,86 @@ Spec: `specs/050426-deterministic-transcripts.md`
 
         assert!(prompt.contains("checkpoint tasks"));
         assert!(prompt.contains("failing test or repro first"));
+        assert!(prompt.contains("generated spec paths listed for this run"));
+        assert!(prompt.contains("verify every exact current-state fact"));
+    }
+
+    #[test]
+    fn generation_prompt_makes_code_authoritative_for_current_state_facts() {
+        let prompt = build_implementation_plan_prompt(
+            GenerationMode::Gen,
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/gen-123"),
+            &[generated_spec(
+                "workspace-build-system",
+                "# Specification: Workspace Build System\n",
+            )],
+            4,
+        );
+
+        assert!(prompt.contains("authoritative for current-state facts"));
+        assert!(prompt.contains("metric names"));
+        assert!(prompt.contains("do not invent alternate dates or filenames"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_missing_spec_refs() {
+        let root = temp_dir("missing-spec-ref");
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(
+            specs_dir.join("050426-real.md"),
+            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Evidence Status\n\n- ok\n\n## Open Questions\n\n- none\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\nSpec: `specs/060426-missing.md`\nWhy now: needed\nCodebase evidence: present\nOwns: docs\nIntegration touchpoints: none\nScope boundary: docs only\nAcceptance criteria: docs land\nVerification: check file\nRequired tests: none\nDependencies: none\nEstimated scope: S\nCompletion signal: merged\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .unwrap();
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected missing spec failure");
+
+        assert!(error.to_string().contains("references missing spec"));
+    }
+
+    #[test]
+    fn sync_replaces_same_day_duplicate_root_specs_with_canonical_snapshot() {
+        let repo_root = temp_dir("spec-sync");
+        let root_specs = repo_root.join("specs");
+        fs::create_dir_all(&root_specs).unwrap();
+        fs::write(
+            root_specs.join("050426-example-topic.md"),
+            "old canonical snapshot\n",
+        )
+        .unwrap();
+        fs::write(
+            root_specs.join("050426-example-topic-2.md"),
+            "stale duplicate snapshot\n",
+        )
+        .unwrap();
+
+        let output_dir = temp_dir("spec-output");
+        let generated_path = output_dir.join("050426-example-topic.md");
+        fs::write(&generated_path, "fresh generated snapshot\n").unwrap();
+        let generated = GeneratedSpecDocument {
+            path: generated_path,
+            text: "fresh generated snapshot\n".to_string(),
+        };
+
+        let summary = sync_generated_specs_to_root_for_date(
+            &repo_root,
+            &[generated],
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.appended_paths.len(), 1);
+        assert_eq!(
+            fs::read_to_string(root_specs.join("050426-example-topic.md")).unwrap(),
+            "fresh generated snapshot\n"
+        );
+        assert!(!root_specs.join("050426-example-topic-2.md").exists());
     }
 }

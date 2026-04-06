@@ -14,9 +14,10 @@ use crate::LoopArgs;
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
 pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
-0b. Study `specs/*` with full repo context to understand the application specifications.
-0c. Study `IMPLEMENTATION_PLAN.md`.
-0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and specs as evidence, record the conflict truthfully, and do not bluff your way through it.
+0b. Study `IMPLEMENTATION_PLAN.md` and identify the first unchecked task whose explicit dependencies are already satisfied.
+0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
+0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
+0e. For every current-state fact, trust the live codebase over planning artifacts unless the code is plainly stale and the repo includes stronger primary-source evidence.
 
 1. Your task is to implement functionality per the specifications using the full repository context.
    - Follow `IMPLEMENTATION_PLAN.md` in order and take the next unchecked task from top to bottom.
@@ -314,6 +315,8 @@ mod tests {
         assert!(prompt.contains("RED/GREEN/REFACTOR"));
         assert!(prompt.contains("failing test"));
         assert!(prompt.contains("simplification pass"));
+        assert!(prompt.contains("newest spec referenced by the current unchecked task"));
+        assert!(prompt.contains("historical context only"));
     }
 
     #[test]
