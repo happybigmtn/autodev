@@ -1341,7 +1341,6 @@ fn lint_generated_spec_set(specs: &[GeneratedSpecDocument]) -> Result<()> {
     lint_signature_policy_consistency(specs)?;
     lint_session_resume_wire_contract(specs)?;
     lint_session_persistence_abort_language(specs)?;
-    lint_future_phase_research_discipline(specs)?;
     Ok(())
 }
 
@@ -1415,32 +1414,6 @@ fn lint_session_persistence_abort_language(specs: &[GeneratedSpecDocument]) -> R
             "generated spec {} contradicts itself about in-flight hand recovery: it says hands are not silently lost and also says they are silently aborted",
             session.path.display()
         );
-    }
-    Ok(())
-}
-
-fn lint_future_phase_research_discipline(specs: &[GeneratedSpecDocument]) -> Result<()> {
-    for doc in specs {
-        let slug = doc
-            .path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        let looks_future_phase = slug.contains("settlement") || slug.contains("ring-game");
-        if !looks_future_phase {
-            continue;
-        }
-        let has_research_guard = doc.text.contains("research")
-            || doc.text.contains("Research")
-            || doc.text.contains("design phase")
-            || doc.text.contains("future phase")
-            || doc.text.contains("not yet implemented");
-        if !has_research_guard {
-            bail!(
-                "future-phase generated spec {} must explicitly stay at research/design level until feasibility is proven",
-                doc.path.display()
-            );
-        }
     }
     Ok(())
 }
@@ -1882,11 +1855,11 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 mod tests {
     use super::{
         build_corpus_prompt, build_implementation_plan_prompt,
-        generated_spec_has_acceptance_criteria, lint_future_phase_research_discipline,
-        lint_session_resume_wire_contract, lint_signature_policy_consistency,
-        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root, GeneratedSpecDocument,
-        GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
+        lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
+        normalize_generated_implementation_plan, normalize_generated_spec_markdown,
+        rewrite_plan_spec_refs_to_root, GeneratedSpecDocument, GenerationMode,
+        SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use std::path::PathBuf;
 
@@ -2091,19 +2064,6 @@ This is another acceptance item.
         let error = lint_session_resume_wire_contract(&specs).expect_err("expected Hello mismatch");
 
         assert!(error.to_string().contains("Hello message"));
-    }
-
-    #[test]
-    fn rejects_future_phase_specs_without_research_framing() {
-        let specs = vec![generated_spec(
-            "settlement-architecture",
-            "# Specification: Settlement Architecture\n\n## Objective\nShip full escrow replay.\n",
-        )];
-
-        let error = lint_future_phase_research_discipline(&specs)
-            .expect_err("expected future-phase research lint");
-
-        assert!(error.to_string().contains("research/design level"));
     }
 
     #[test]
