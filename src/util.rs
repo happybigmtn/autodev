@@ -16,17 +16,41 @@ pub(crate) const CLI_LONG_VERSION: &str = concat!(
     env!("AUTODEV_BUILD_PROFILE"),
 );
 
-const CHECKPOINT_EXCLUDES: [&str; 4] = [
-    ":(exclude).auto",
-    ":(exclude)bug",
-    ":(exclude)nemesis",
-    ":(exclude)gen-*",
-];
 const AUTO_LOG_KEEP_FILES: usize = 64;
 const AUTO_FRESH_INPUT_KEEP_ENTRIES: usize = 12;
 const AUTO_QUEUE_RUN_KEEP_ENTRIES: usize = 12;
 const PI_RUNTIME_LOG_KEEP_FILES: usize = 5;
 const PI_RUNTIME_LOG_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointExcludeRule {
+    Root(&'static str),
+    TopLevelPrefix(&'static str),
+}
+
+impl CheckpointExcludeRule {
+    fn git_pathspec(self) -> String {
+        match self {
+            Self::Root(root) => format!(":(exclude){root}"),
+            Self::TopLevelPrefix(prefix) => format!(":(exclude){prefix}*"),
+        }
+    }
+
+    fn matches(self, path: &str) -> bool {
+        let first_segment = path.split('/').next().unwrap_or(path);
+        match self {
+            Self::Root(root) => first_segment == root,
+            Self::TopLevelPrefix(prefix) => first_segment.starts_with(prefix),
+        }
+    }
+}
+
+const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 4] = [
+    CheckpointExcludeRule::Root(".auto"),
+    CheckpointExcludeRule::Root("bug"),
+    CheckpointExcludeRule::Root("nemesis"),
+    CheckpointExcludeRule::TopLevelPrefix("gen-"),
+];
 
 pub(crate) fn git_repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
@@ -82,7 +106,8 @@ pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a s
 
 fn checkpoint_status(repo_root: &Path) -> Result<String> {
     let mut args = vec!["status", "--short", "--", "."];
-    args.extend(CHECKPOINT_EXCLUDES);
+    let excludes = checkpoint_exclude_pathspecs();
+    args.extend(excludes.iter().map(String::as_str));
     git_stdout(repo_root, args)
 }
 
@@ -150,7 +175,8 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
 
 fn stage_checkpoint_changes(repo_root: &Path) -> Result<()> {
     let mut tracked_args = vec!["add", "-u", "--", "."];
-    tracked_args.extend(CHECKPOINT_EXCLUDES);
+    let excludes = checkpoint_exclude_pathspecs();
+    tracked_args.extend(excludes.iter().map(String::as_str));
     run_git(repo_root, tracked_args)?;
 
     let untracked = git_stdout(
@@ -174,20 +200,33 @@ fn stage_checkpoint_changes(repo_root: &Path) -> Result<()> {
 }
 
 fn is_checkpoint_excluded_path(path: &str) -> bool {
-    path == ".auto"
-        || path == "bug"
-        || path == "nemesis"
-        || path.starts_with(".auto/")
-        || path.starts_with("bug/")
-        || path.starts_with("nemesis/")
-        || path
-            .split('/')
-            .next()
-            .map(|segment| segment.starts_with("gen-"))
-            .unwrap_or(false)
+    CHECKPOINT_EXCLUDE_RULES
+        .iter()
+        .copied()
+        .any(|rule| rule.matches(path))
+}
+
+fn checkpoint_exclude_pathspecs() -> Vec<String> {
+    CHECKPOINT_EXCLUDE_RULES
+        .iter()
+        .copied()
+        .map(CheckpointExcludeRule::git_pathspec)
+        .collect()
 }
 
 pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {
+    ensure_repo_layout_with(repo_root, prune_old_entries, prune_pi_runtime_state)
+}
+
+fn ensure_repo_layout_with<F, G>(
+    repo_root: &Path,
+    mut prune_entries: F,
+    mut prune_pi_state: G,
+) -> Result<()>
+where
+    F: FnMut(&Path, usize) -> Result<()>,
+    G: FnMut(&Path) -> Result<()>,
+{
     for rel in [
         ".auto",
         ".auto/fresh-input",
@@ -198,16 +237,39 @@ pub(crate) fn ensure_repo_layout(repo_root: &Path) -> Result<()> {
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create {}", path.display()))?;
     }
-    prune_old_entries(&repo_root.join(".auto").join("logs"), AUTO_LOG_KEEP_FILES)?;
-    prune_old_entries(
-        &repo_root.join(".auto").join("fresh-input"),
-        AUTO_FRESH_INPUT_KEEP_ENTRIES,
-    )?;
-    prune_old_entries(
-        &repo_root.join(".auto").join("queue-runs"),
-        AUTO_QUEUE_RUN_KEEP_ENTRIES,
-    )?;
-    prune_pi_runtime_state(repo_root)?;
+
+    let mut failures = Vec::new();
+    for (path, keep) in [
+        (repo_root.join(".auto").join("logs"), AUTO_LOG_KEEP_FILES),
+        (
+            repo_root.join(".auto").join("fresh-input"),
+            AUTO_FRESH_INPUT_KEEP_ENTRIES,
+        ),
+        (
+            repo_root.join(".auto").join("queue-runs"),
+            AUTO_QUEUE_RUN_KEEP_ENTRIES,
+        ),
+    ] {
+        if let Err(err) = prune_entries(&path, keep) {
+            eprintln!("warning: failed to prune {}: {err}", path.display());
+            failures.push(format!("{}: {err}", path.display()));
+        }
+    }
+
+    if let Err(err) = prune_pi_state(repo_root) {
+        let agent_dir = opencode_agent_dir(repo_root);
+        eprintln!(
+            "warning: failed to prune PI runtime state in {}: {err}",
+            agent_dir.display()
+        );
+        failures.push(format!("{}: {err}", agent_dir.display()));
+    }
+    if !failures.is_empty() {
+        bail!(
+            "failed to finish repo layout pruning:\n- {}",
+            failures.join("\n- ")
+        );
+    }
     Ok(())
 }
 
@@ -243,24 +305,34 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
-    fs::write(&temp, bytes).with_context(|| format!("failed to write {}", temp.display()))?;
-    if let Err(rename_error) = fs::rename(&temp, path) {
-        let cleanup_error = match fs::remove_file(&temp) {
-            Ok(()) => None,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => Some(err),
-        };
-        let mut context = format!("failed to atomically replace {}", path.display());
-        if let Some(err) = cleanup_error {
-            context.push_str(&format!(
-                "; also failed to remove temp {}: {}",
-                temp.display(),
-                err
-            ));
-        }
-        return Err(rename_error).with_context(|| context);
-    }
+    fs::write(&temp, bytes).map_err(|err| {
+        atomic_write_failure(err, &temp, format!("failed to write {}", temp.display()))
+    })?;
+    fs::rename(&temp, path).map_err(|err| {
+        atomic_write_failure(
+            err,
+            &temp,
+            format!("failed to atomically replace {}", path.display()),
+        )
+    })?;
     Ok(())
+}
+
+fn atomic_write_failure(error: std::io::Error, temp: &Path, context: String) -> anyhow::Error {
+    let cleanup_error = match fs::remove_file(temp) {
+        Ok(()) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(err),
+    };
+    let mut message = context;
+    if let Some(err) = cleanup_error {
+        message.push_str(&format!(
+            "; also failed to remove temp {}: {}",
+            temp.display(),
+            err
+        ));
+    }
+    anyhow::Error::new(error).context(message)
 }
 
 pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
@@ -428,15 +500,17 @@ fn remove_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread::sleep;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        atomic_write, checkpoint_status, clip_line_for_display, prune_old_entries,
-        push_branch_with_remote_sync, stage_checkpoint_changes, sync_branch_with_remote,
-        truncate_file_to_max_bytes,
+        atomic_write, checkpoint_status, clip_line_for_display, ensure_repo_layout_with,
+        is_checkpoint_excluded_path, prune_old_entries, push_branch_with_remote_sync,
+        stage_checkpoint_changes, sync_branch_with_remote, truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -576,6 +650,68 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_exclusion_rules_cover_all_generated_paths() {
+        for excluded in [
+            ".auto",
+            ".auto/logs/run.log",
+            "bug",
+            "bug/BUG_REPORT.md",
+            "nemesis",
+            "nemesis/nemesis-audit.md",
+            "gen-123",
+            "gen-123/spec.md",
+        ] {
+            assert!(
+                is_checkpoint_excluded_path(excluded),
+                "{excluded} should be excluded"
+            );
+        }
+        for included in [
+            "",
+            "README.md",
+            "src/main.rs",
+            "generated/output.md",
+            "notes/gen-plan.md",
+        ] {
+            assert!(
+                !is_checkpoint_excluded_path(included),
+                "{included} should stay stageable"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_status_matches_stageable_changes() {
+        let repo = init_repo("checkpoint-consistency");
+        fs::write(repo.join(".gitignore"), ".auto/\n").expect("failed to write .gitignore");
+        run_git_in(&repo, ["add", ".gitignore"]);
+        run_git_in(&repo, ["commit", "-m", "ignore auto"]);
+        fs::create_dir_all(repo.join(".auto").join("review")).expect("failed to create .auto");
+        fs::create_dir_all(repo.join("bug")).expect("failed to create bug dir");
+        fs::create_dir_all(repo.join("gen-001")).expect("failed to create gen dir");
+        fs::write(repo.join(".auto").join("review").join("log.txt"), "log\n")
+            .expect("failed to write .auto file");
+        fs::write(repo.join("bug").join("BUG_REPORT.md"), "# bug\n")
+            .expect("failed to write bug report");
+        fs::write(repo.join("gen-001").join("SPEC.md"), "# generated\n")
+            .expect("failed to write gen spec");
+        fs::write(repo.join("README.md"), "# changed\n").expect("failed to update README");
+        fs::write(repo.join("new.txt"), "new\n").expect("failed to write new file");
+
+        let stageable = checkpoint_status(&repo).expect("checkpoint status failed");
+        let expected = stageable
+            .lines()
+            .map(|line| line[3..].to_string())
+            .collect::<Vec<_>>();
+        stage_checkpoint_changes(&repo).expect("checkpoint add should succeed");
+        let staged = run_git_in(&repo, ["diff", "--cached", "--name-only"]);
+        let actual = staged.lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
     fn truncate_file_to_max_bytes_keeps_tail() {
         let dir = temp_repo_path("truncate-file");
         fs::create_dir_all(&dir).expect("failed to create temp dir");
@@ -709,5 +845,86 @@ mod tests {
         assert_eq!(entries, vec!["result.json".to_string()]);
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_leaves_no_temp_file_after_write_failure() {
+        let dir = temp_repo_path("atomic-write-write-failure");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let original_permissions = fs::metadata(&dir)
+            .expect("failed to stat temp dir")
+            .permissions();
+        let readonly_permissions = PermissionsExt::from_mode(0o500);
+        fs::set_permissions(&dir, readonly_permissions).expect("failed to lock temp dir");
+
+        let target = dir.join("result.json");
+        let err = atomic_write(&target, br#"{"ok":true}"#)
+            .expect_err("writing inside a non-writable directory should fail");
+        assert!(err.to_string().contains("failed to write"));
+
+        let mut entries = fs::read_dir(&dir)
+            .expect("failed to read temp dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read temp dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert!(entries.is_empty(), "unexpected leftovers: {entries:?}");
+
+        fs::set_permissions(&dir, original_permissions).expect("failed to unlock temp dir");
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn ensure_repo_layout_collects_all_prune_failures() {
+        let repo = temp_repo_path("ensure-repo-layout");
+        let mut prune_calls = Vec::new();
+        let mut pi_calls = 0usize;
+
+        let err = ensure_repo_layout_with(
+            &repo,
+            |path, keep| {
+                prune_calls.push((path.to_path_buf(), keep));
+                match keep {
+                    64 => anyhow::bail!("logs failure"),
+                    12 if path.ends_with("queue-runs") => anyhow::bail!("queue failure"),
+                    _ => Ok(()),
+                }
+            },
+            |_repo_root| {
+                pi_calls += 1;
+                anyhow::bail!("pi failure")
+            },
+        )
+        .expect_err("prune failures should bubble up after all attempts");
+
+        assert_eq!(pi_calls, 1);
+        assert_eq!(prune_calls.len(), 3);
+        assert!(
+            prune_calls[0].0.ends_with(".auto/logs"),
+            "first prune should target logs"
+        );
+        assert!(
+            prune_calls[1].0.ends_with(".auto/fresh-input"),
+            "second prune should target fresh-input"
+        );
+        assert!(
+            prune_calls[2].0.ends_with(".auto/queue-runs"),
+            "third prune should target queue-runs"
+        );
+        let message = err.to_string();
+        assert!(message.contains(".auto/logs"));
+        assert!(message.contains("logs failure"));
+        assert!(message.contains(".auto/queue-runs"));
+        assert!(message.contains("queue failure"));
+        assert!(message.contains(".auto/opencode-data/opencode"));
+        assert!(message.contains("pi failure"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
 }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -13,8 +13,8 @@ use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
-    git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
-    repo_name, run_git, sync_branch_with_remote, timestamp_slug,
+    git_stdout, opencode_agent_dir, push_branch_with_remote_sync, repo_name, run_git,
+    sync_branch_with_remote, timestamp_slug,
 };
 use crate::NemesisArgs;
 
@@ -145,6 +145,7 @@ Requirements:
 "#;
 
 const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
+const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "minimax/MiniMax-M2.7-highspeed";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Priority Work",
@@ -181,6 +182,12 @@ struct NemesisFixResult {
     validation_commands: Vec<String>,
     touched_files: Vec<String>,
     residual_risks: Vec<String>,
+}
+
+#[derive(Debug)]
+struct VerifiedNemesisOutputs {
+    spec_path: PathBuf,
+    plan_path: PathBuf,
 }
 
 enum NemesisBackend {
@@ -247,13 +254,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| repo_root.join("nemesis"));
     let auditor = PhaseConfig {
-        model: if args.kimi {
-            "kimi".to_string()
-        } else if args.minimax {
-            "minimax".to_string()
-        } else {
-            args.model.clone()
-        },
+        model: resolve_auditor_model(&args),
         effort: args.reasoning_effort.clone(),
     };
     let reviewer = PhaseConfig {
@@ -279,11 +280,8 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         &args.codex_bin,
         &args.pi_bin,
     );
-    let previous_snapshot = if args.dry_run {
-        None
-    } else {
-        prepare_output_dir(&repo_root, &output_dir)?
-    };
+    validate_nemesis_backend_binaries(&audit_backend, &review_backend, args.report_only, &args)?;
+    let previous_snapshot = maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run)?;
 
     let prompt_template = match &args.prompt_file {
         Some(path) => fs::read_to_string(path)
@@ -374,7 +372,16 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     }
 
     print_phase_header("auditor", &audit_backend);
-    let audit_response = run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend).await?;
+    let audit_response = run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend)
+        .await
+        .map_err(|err| {
+            annotate_output_recovery(
+                err,
+                &output_dir,
+                previous_snapshot.as_deref(),
+                "Nemesis audit pass failed",
+            )
+        })?;
     let audit_response_path = repo_root
         .join(".auto")
         .join("logs")
@@ -385,7 +392,16 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     }
 
     print_phase_header("reviewer", &review_backend);
-    let review_response = run_nemesis_backend(&repo_root, &review_prompt, &review_backend).await?;
+    let review_response = run_nemesis_backend(&repo_root, &review_prompt, &review_backend)
+        .await
+        .map_err(|err| {
+            annotate_output_recovery(
+                err,
+                &output_dir,
+                previous_snapshot.as_deref(),
+                "Nemesis synthesis pass failed",
+            )
+        })?;
     let review_response_path = repo_root
         .join(".auto")
         .join("logs")
@@ -395,49 +411,66 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", review_response_path.display()))?;
     }
 
-    let spec_path = verify_nemesis_spec(&output_dir)?;
-    let plan_path = verify_nemesis_plan(&output_dir)?;
+    let VerifiedNemesisOutputs {
+        spec_path,
+        plan_path,
+    } = verify_nemesis_outputs(&output_dir).map_err(|err| {
+        annotate_output_recovery(
+            err,
+            &output_dir,
+            previous_snapshot.as_deref(),
+            "Nemesis output verification failed",
+        )
+    })?;
     let mut implementation_results = None::<PathBuf>;
+    let mut implementation_summary = "report-only".to_string();
     if !args.report_only {
+        let pending_tasks = load_unchecked_nemesis_task_ids(&plan_path)?;
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();
         println!("phase:       implementer");
         println!("backend:     codex");
         println!("model:       {}", fixer.model);
         println!("variant:     {}", fixer.effort);
+        if pending_tasks.is_empty() {
+            println!("status:      no unchecked Nemesis tasks; skipping Codex");
+            implementation_summary =
+                format!("skipped (no unchecked tasks in {})", plan_path.display());
+        } else {
+            let exit_status = run_codex_exec(
+                &repo_root,
+                &implementation_prompt,
+                &fixer.model,
+                &fixer.effort,
+                &args.codex_bin,
+                &output_dir.join("codex.stderr.log"),
+                "auto nemesis implementation",
+            )
+            .await?;
+            if !exit_status.success() {
+                bail!(
+                    "Codex Nemesis implementation failed with status {}; see {}",
+                    exit_status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".to_string()),
+                    output_dir.join("codex.stderr.log").display()
+                );
+            }
 
-        let exit_status = run_codex_exec(
-            &repo_root,
-            &implementation_prompt,
-            &fixer.model,
-            &fixer.effort,
-            &args.codex_bin,
-            &output_dir.join("codex.stderr.log"),
-            "auto nemesis implementation",
-        )
-        .await?;
-        if !exit_status.success() {
-            bail!(
-                "Codex Nemesis implementation failed with status {}; see {}",
-                exit_status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "signal".to_string()),
-                output_dir.join("codex.stderr.log").display()
-            );
-        }
-
-        let implementation_path = verify_nemesis_implementation_results(
-            &implementation_results_json_path,
-            &implementation_results_md_path,
-            &plan_path,
-        )?;
-        implementation_results = Some(implementation_path);
-        let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        if commit_before.trim() != commit_after.trim()
-            && push_branch_with_remote_sync(&repo_root, current_branch.as_str())?
-        {
-            println!("remote sync: rebased onto origin/{}", current_branch);
+            let implementation_path = verify_nemesis_implementation_results(
+                &implementation_results_json_path,
+                &implementation_results_md_path,
+                &plan_path,
+            )?;
+            implementation_summary = implementation_path.display().to_string();
+            implementation_results = Some(implementation_path);
+            let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+            if commit_before.trim() != commit_after.trim()
+                && push_branch_with_remote_sync(&repo_root, current_branch.as_str())?
+            {
+                println!("remote sync: rebased onto origin/{}", current_branch);
+            }
         }
     }
     let root_spec = sync_nemesis_spec_to_root(&repo_root, &spec_path)?;
@@ -445,7 +478,13 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     let trailing_commit = if args.report_only {
         None
     } else {
-        commit_nemesis_outputs_if_needed(&repo_root, current_branch.as_str())?
+        commit_nemesis_outputs_if_needed(
+            &repo_root,
+            current_branch.as_str(),
+            &output_dir,
+            &root_spec,
+            &repo_root.join("IMPLEMENTATION_PLAN.md"),
+        )?
     };
 
     println!();
@@ -457,7 +496,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     if let Some(path) = implementation_results {
         println!("implementation: {}", path.display());
     } else {
-        println!("implementation: report-only");
+        println!("implementation: {}", implementation_summary);
     }
     println!("audit prompt: {}", audit_prompt_path.display());
     println!("review prompt: {}", review_prompt_path.display());
@@ -513,6 +552,99 @@ fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_auditor_model(args: &NemesisArgs) -> String {
+    if args.model != DEFAULT_NEMESIS_AUDIT_MODEL {
+        return args.model.clone();
+    }
+    if args.kimi {
+        return "kimi".to_string();
+    }
+    if args.minimax {
+        return "minimax".to_string();
+    }
+    args.model.clone()
+}
+
+fn validate_nemesis_backend_binaries(
+    audit_backend: &NemesisBackend,
+    review_backend: &NemesisBackend,
+    report_only: bool,
+    args: &NemesisArgs,
+) -> Result<()> {
+    validate_backend_binary("Nemesis audit backend", audit_backend)?;
+    validate_backend_binary("Nemesis synthesis backend", review_backend)?;
+    if !report_only {
+        ensure_executable_available("Nemesis implementation backend", &args.codex_bin)?;
+    }
+    Ok(())
+}
+
+fn validate_backend_binary(label: &str, backend: &NemesisBackend) -> Result<()> {
+    match backend {
+        NemesisBackend::Codex { codex_bin, .. } => ensure_executable_available(label, codex_bin),
+        NemesisBackend::Pi { pi_bin, .. } => ensure_executable_available(label, pi_bin),
+    }
+}
+
+fn ensure_executable_available(label: &str, executable: &Path) -> Result<()> {
+    if executable.components().count() > 1 || executable.is_absolute() {
+        let metadata = fs::metadata(executable).with_context(|| {
+            format!(
+                "{label} executable {} is not available",
+                executable.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            bail!("{label} executable {} is not a file", executable.display());
+        }
+        return Ok(());
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        bail!(
+            "PATH is not set, so {label} executable `{}` cannot be resolved",
+            executable.display()
+        );
+    };
+    for directory in std::env::split_paths(&path) {
+        if directory.join(executable).is_file() {
+            return Ok(());
+        }
+    }
+    bail!(
+        "{label} executable `{}` was not found on PATH",
+        executable.display()
+    );
+}
+
+fn maybe_prepare_output_dir(
+    repo_root: &Path,
+    output_dir: &Path,
+    dry_run: bool,
+) -> Result<Option<PathBuf>> {
+    if dry_run {
+        return Ok(None);
+    }
+    prepare_output_dir(repo_root, output_dir)
+}
+
+fn annotate_output_recovery(
+    error: anyhow::Error,
+    output_dir: &Path,
+    previous_snapshot: Option<&Path>,
+    context: &str,
+) -> anyhow::Error {
+    let mut message = format!("{context} for {}", output_dir.display());
+    if let Some(snapshot) = previous_snapshot {
+        message.push_str(&format!(
+            ". Previous outputs were archived at {}; restore from that snapshot after fixing \
+             the backend failure.",
+            snapshot.display()
+        ));
+    }
+    error.context(message)
 }
 
 fn build_audit_prompt(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
@@ -769,7 +901,6 @@ async fn run_pi(
     let stderr = stderr_task
         .await
         .context("PI stderr capture task panicked")??;
-    prune_pi_runtime_state(repo_root)?;
     if status.success() {
         if let Some(detail) = parse_pi_error(&stdout) {
             bail!("PI Nemesis run failed: {detail}");
@@ -806,28 +937,48 @@ where
     Ok(text)
 }
 
-fn verify_nemesis_spec(output_dir: &Path) -> Result<PathBuf> {
+fn verify_nemesis_outputs(output_dir: &Path) -> Result<VerifiedNemesisOutputs> {
     let spec_path = output_dir.join("nemesis-audit.md");
-    if !spec_path.exists() {
-        bail!("Nemesis run did not write {}", spec_path.display());
+    let plan_path = output_dir.join("IMPLEMENTATION_PLAN.md");
+    let has_spec = spec_path.exists();
+    let has_plan = plan_path.exists();
+    match (has_spec, has_plan) {
+        (true, true) => {}
+        (false, false) => {
+            bail!(
+                "Nemesis run did not write either {} or {}. Check the model logs and rerun.",
+                spec_path.display(),
+                plan_path.display()
+            );
+        }
+        (false, true) => {
+            bail!(
+                "Nemesis run only partially completed: missing {} but found {}. Review the \
+                 model logs, remove the partial output, and rerun.",
+                spec_path.display(),
+                plan_path.display()
+            );
+        }
+        (true, false) => {
+            bail!(
+                "Nemesis run only partially completed: found {} but missing {}. Review the \
+                 model logs, remove the partial output, and rerun.",
+                spec_path.display(),
+                plan_path.display()
+            );
+        }
     }
-    let markdown = fs::read_to_string(&spec_path)
+
+    let spec_markdown = fs::read_to_string(&spec_path)
         .with_context(|| format!("failed to read {}", spec_path.display()))?;
-    if !markdown.starts_with("# Specification:") {
+    if !spec_markdown.starts_with("# Specification:") {
         bail!(
             "Nemesis spec {} must start with `# Specification:`",
             spec_path.display()
         );
     }
-    Ok(spec_path)
-}
 
-fn verify_nemesis_plan(output_dir: &Path) -> Result<PathBuf> {
-    let plan_path = output_dir.join("IMPLEMENTATION_PLAN.md");
-    if !plan_path.exists() {
-        bail!("Nemesis run did not write {}", plan_path.display());
-    }
-    let markdown = fs::read_to_string(&plan_path)
+    let plan_markdown = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
     for required in [
         "# IMPLEMENTATION_PLAN",
@@ -835,11 +986,14 @@ fn verify_nemesis_plan(output_dir: &Path) -> Result<PathBuf> {
         "## Follow-On Work",
         "## Completed / Already Satisfied",
     ] {
-        if !markdown.contains(required) {
+        if !plan_markdown.contains(required) {
             bail!("Nemesis implementation plan is missing `{required}`");
         }
     }
-    Ok(plan_path)
+    Ok(VerifiedNemesisOutputs {
+        spec_path,
+        plan_path,
+    })
 }
 
 fn verify_nemesis_implementation_results(
@@ -861,14 +1015,7 @@ fn verify_nemesis_implementation_results(
     }
 
     let results = load_nemesis_fix_results(results_json_path)?;
-    let expected_ids = extract_plan_task_blocks(
-        &fs::read_to_string(plan_path)
-            .with_context(|| format!("failed to read {}", plan_path.display()))?,
-    )?
-    .into_iter()
-    .filter(|block| !block.checked)
-    .map(|block| block.task_id)
-    .collect::<std::collections::BTreeSet<_>>();
+    let expected_ids = load_unchecked_nemesis_task_ids(plan_path)?;
     let actual_ids = results
         .iter()
         .map(|result| result.task_id.as_str())
@@ -879,6 +1026,22 @@ fn verify_nemesis_implementation_results(
         }
     }
     Ok(results_json_path.to_path_buf())
+}
+
+fn load_unchecked_nemesis_task_ids(plan_path: &Path) -> Result<std::collections::BTreeSet<String>> {
+    unchecked_nemesis_task_ids(
+        &fs::read_to_string(plan_path)
+            .with_context(|| format!("failed to read {}", plan_path.display()))?,
+    )
+}
+
+fn unchecked_nemesis_task_ids(markdown: &str) -> Result<std::collections::BTreeSet<String>> {
+    Ok(extract_plan_task_blocks(markdown)?
+        .into_iter()
+        .filter(|block| !block.checked)
+        .filter(|block| block.task_id.starts_with("NEM-"))
+        .map(|block| block.task_id)
+        .collect())
 }
 
 fn load_nemesis_fix_results(path: &Path) -> Result<Vec<NemesisFixResult>> {
@@ -932,8 +1095,24 @@ fn sync_nemesis_spec_to_root(repo_root: &Path, spec_path: &Path) -> Result<PathB
     let root_specs_dir = repo_root.join("specs");
     fs::create_dir_all(&root_specs_dir)
         .with_context(|| format!("failed to create {}", root_specs_dir.display()))?;
+    let destination = next_nemesis_spec_destination(&root_specs_dir, spec_path, Local::now());
 
-    let date_prefix = Local::now().format("%d%m%y").to_string();
+    fs::copy(spec_path, &destination).with_context(|| {
+        format!(
+            "failed to copy {} -> {}",
+            spec_path.display(),
+            destination.display()
+        )
+    })?;
+    Ok(destination)
+}
+
+fn next_nemesis_spec_destination(
+    root_specs_dir: &Path,
+    spec_path: &Path,
+    timestamp: DateTime<Local>,
+) -> PathBuf {
+    let date_prefix = timestamp.format("%d%m%y-%H%M%S").to_string();
     let slug = spec_path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -944,26 +1123,17 @@ fn sync_nemesis_spec_to_root(repo_root: &Path, spec_path: &Path) -> Result<PathB
         .unwrap_or("md");
 
     let mut counter = 1usize;
-    let destination = loop {
+    loop {
         let candidate = if counter == 1 {
             root_specs_dir.join(format!("{date_prefix}-{slug}.{extension}"))
         } else {
             root_specs_dir.join(format!("{date_prefix}-{slug}-{counter}.{extension}"))
         };
         if !candidate.exists() {
-            break candidate;
+            return candidate;
         }
         counter += 1;
-    };
-
-    fs::copy(spec_path, &destination).with_context(|| {
-        format!(
-            "failed to copy {} -> {}",
-            spec_path.display(),
-            destination.display()
-        )
-    })?;
-    Ok(destination)
+    }
 }
 
 fn append_nemesis_plan_to_root(repo_root: &Path, nemesis_plan_path: &Path) -> Result<usize> {
@@ -983,65 +1153,112 @@ fn append_nemesis_plan_to_root(repo_root: &Path, nemesis_plan_path: &Path) -> Re
     Ok(appended)
 }
 
-fn commit_nemesis_outputs_if_needed(repo_root: &Path, branch: &str) -> Result<Option<String>> {
-    let status = git_stdout(
-        repo_root,
-        [
-            "status",
-            "--short",
-            "--",
-            ".",
-            ":(exclude).auto",
-            ":(exclude)bug",
-            ":(exclude)gen-*",
-        ],
-    )?;
+fn commit_nemesis_outputs_if_needed(
+    repo_root: &Path,
+    branch: &str,
+    output_dir: &Path,
+    root_spec: &Path,
+    root_plan: &Path,
+) -> Result<Option<String>> {
+    let pathspecs = nemesis_commit_pathspecs(repo_root, output_dir, root_spec, root_plan);
+    if pathspecs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut status_args = vec!["status", "--short", "--"];
+    status_args.extend(pathspecs.iter().map(String::as_str));
+    let status = git_stdout(repo_root, status_args)?;
     if status.trim().is_empty() {
         return Ok(None);
     }
 
-    run_git(
-        repo_root,
-        [
-            "add",
-            "-u",
-            "--",
-            ".",
-            ":(exclude).auto",
-            ":(exclude)bug",
-            ":(exclude)gen-*",
-        ],
-    )?;
-    let untracked = git_stdout(
-        repo_root,
-        ["ls-files", "-z", "--others", "--exclude-standard"],
-    )?;
-    let stageable = untracked
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .filter(|path| {
-            !path.starts_with(".auto/")
-                && !path.starts_with("bug/")
-                && !path.starts_with("nemesis/codex.stderr.log")
-                && !path
-                    .split('/')
-                    .next()
-                    .map(|segment| segment.starts_with("gen-"))
-                    .unwrap_or(false)
-        })
-        .map(|path| path.to_string())
-        .collect::<Vec<_>>();
-    for chunk in stageable.chunks(100) {
-        let mut add_args = vec!["add".to_string(), "--".to_string()];
-        add_args.extend(chunk.iter().cloned());
-        run_git(repo_root, add_args.iter().map(|arg| arg.as_str()))?;
+    let mut snapshot_args = vec!["diff", "--cached", "--binary", "--"];
+    snapshot_args.extend(pathspecs.iter().map(String::as_str));
+    let staged_snapshot = git_stdout(repo_root, snapshot_args)?;
+    let message = format!("{}: record nemesis outputs", repo_name(repo_root));
+    let commit_result = (|| -> Result<()> {
+        let mut add_args = vec!["add", "--all", "--"];
+        add_args.extend(pathspecs.iter().map(String::as_str));
+        run_git(repo_root, add_args)?;
+
+        let mut commit_args = vec!["commit", "-m", &message, "--"];
+        commit_args.extend(pathspecs.iter().map(String::as_str));
+        run_git(repo_root, commit_args)?;
+        Ok(())
+    })();
+    if let Err(error) = commit_result {
+        restore_nemesis_commit_index(repo_root, &pathspecs, &staged_snapshot)
+            .context("failed to restore index after Nemesis output commit error")?;
+        return Err(error);
     }
 
-    let message = format!("{}: record nemesis outputs", repo_name(repo_root));
-    run_git(repo_root, ["commit", "-m", &message])?;
     push_branch_with_remote_sync(repo_root, branch)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
     Ok(Some(commit.trim().to_string()))
+}
+
+fn nemesis_commit_pathspecs(
+    repo_root: &Path,
+    output_dir: &Path,
+    root_spec: &Path,
+    root_plan: &Path,
+) -> Vec<String> {
+    let mut pathspecs = Vec::<String>::new();
+    push_unique_pathspec(&mut pathspecs, repo_relative_path(repo_root, output_dir));
+    if let Some(relative_output_dir) = repo_relative_path(repo_root, output_dir) {
+        pathspecs.push(format!(":(exclude){relative_output_dir}/codex.stderr.log"));
+    }
+    push_unique_pathspec(&mut pathspecs, repo_relative_path(repo_root, root_spec));
+    push_unique_pathspec(&mut pathspecs, repo_relative_path(repo_root, root_plan));
+    pathspecs
+}
+
+fn push_unique_pathspec(pathspecs: &mut Vec<String>, candidate: Option<String>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if !pathspecs.iter().any(|existing| existing == &candidate) {
+        pathspecs.push(candidate);
+    }
+}
+
+fn repo_relative_path(repo_root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(repo_root).ok()?;
+    let display = relative.to_string_lossy().replace('\\', "/");
+    if display.is_empty() {
+        return None;
+    }
+    Some(display)
+}
+
+fn restore_nemesis_commit_index(
+    repo_root: &Path,
+    pathspecs: &[String],
+    staged_snapshot: &str,
+) -> Result<()> {
+    let mut reset_args = vec!["reset", "--"];
+    reset_args.extend(pathspecs.iter().map(String::as_str));
+    run_git(repo_root, reset_args)?;
+    if staged_snapshot.trim().is_empty() {
+        return Ok(());
+    }
+
+    let patch_path = std::env::temp_dir().join(format!(
+        "autodev-nemesis-index-{}-{}.patch",
+        std::process::id(),
+        timestamp_slug()
+    ));
+    fs::write(&patch_path, staged_snapshot)
+        .with_context(|| format!("failed to write {}", patch_path.display()))?;
+    let patch_path_text = patch_path.display().to_string();
+    let apply_result = run_git(repo_root, ["apply", "--cached", &patch_path_text]);
+    let cleanup_result = fs::remove_file(&patch_path);
+    if let Err(error) = apply_result {
+        cleanup_result.with_context(|| format!("failed to remove {}", patch_path.display()))?;
+        return Err(error);
+    }
+    cleanup_result.with_context(|| format!("failed to remove {}", patch_path.display()))?;
+    Ok(())
 }
 
 fn append_new_open_tasks(existing: &str, nemesis_plan: &str) -> Result<(String, usize)> {
@@ -1236,13 +1453,105 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use chrono::{Local, TimeZone};
 
     use super::{
-        append_new_open_tasks, build_implementation_prompt, ensure_nemesis_fixer_config,
-        ensure_pi_phase_config, select_backend, PhaseConfig,
+        annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
+        commit_nemesis_outputs_if_needed, ensure_nemesis_fixer_config, ensure_pi_phase_config,
+        maybe_prepare_output_dir, next_nemesis_spec_destination, prepare_output_dir,
+        resolve_auditor_model, select_backend, unchecked_nemesis_task_ids, verify_nemesis_outputs,
+        PhaseConfig,
     };
     use crate::NemesisArgs;
+
+    fn temp_repo_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "autodev-nemesis-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn run_git_in<'a>(repo: &Path, args: impl IntoIterator<Item = &'a str>) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to launch git");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git stdout should be utf-8")
+    }
+
+    fn init_repo(name: &str) -> PathBuf {
+        let repo = temp_repo_path(name);
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+        run_git_in(&repo, ["init"]);
+        run_git_in(&repo, ["config", "user.name", "autodev tests"]);
+        run_git_in(&repo, ["config", "user.email", "autodev@example.com"]);
+        fs::write(repo.join("README.md"), "# temp\n").expect("failed to write README");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        repo
+    }
+
+    fn init_remote_and_worker(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = temp_repo_path(name);
+        let remote = root.join("remote.git");
+        let upstream = root.join("upstream");
+        let worker = root.join("worker");
+
+        fs::create_dir_all(&root).expect("failed to create temp root");
+        run_git_in(
+            &root,
+            [
+                "init",
+                "--bare",
+                remote.to_str().expect("remote path should be utf-8"),
+            ],
+        );
+        run_git_in(
+            &root,
+            [
+                "clone",
+                remote.to_str().expect("remote path should be utf-8"),
+                upstream.to_str().expect("upstream path should be utf-8"),
+            ],
+        );
+        run_git_in(&upstream, ["config", "user.name", "autodev tests"]);
+        run_git_in(&upstream, ["config", "user.email", "autodev@example.com"]);
+        fs::write(upstream.join("README.md"), "# init\n").expect("failed to write README");
+        run_git_in(&upstream, ["add", "README.md"]);
+        run_git_in(&upstream, ["commit", "-m", "init"]);
+        run_git_in(&upstream, ["branch", "-M", branch]);
+        run_git_in(&upstream, ["push", "-u", "origin", branch]);
+
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                branch,
+                remote.to_str().expect("remote path should be utf-8"),
+                worker.to_str().expect("worker path should be utf-8"),
+            ],
+        );
+        run_git_in(&worker, ["config", "user.name", "autodev tests"]);
+        run_git_in(&worker, ["config", "user.email", "autodev@example.com"]);
+        (root, remote, upstream, worker)
+    }
 
     #[test]
     fn appends_only_new_unchecked_nemesis_tasks() {
@@ -1382,6 +1691,28 @@ Spec: specs/020426-nemesis-audit.md
     }
 
     #[test]
+    fn explicit_model_override_wins_over_kimi_flag() {
+        let mut args = sample_args("kimi-coding/k2p5");
+        args.kimi = true;
+        assert_eq!(resolve_auditor_model(&args), "kimi-coding/k2p5");
+    }
+
+    #[test]
+    fn explicit_model_override_wins_over_minimax_flag() {
+        let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
+        args.model = "minimax/MiniMax-M2.7".to_string();
+        args.minimax = true;
+        assert_eq!(resolve_auditor_model(&args), "minimax/MiniMax-M2.7");
+    }
+
+    #[test]
+    fn shorthand_flags_only_apply_when_model_is_default() {
+        let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
+        args.kimi = true;
+        assert_eq!(resolve_auditor_model(&args), "kimi");
+    }
+
+    #[test]
     fn nemesis_phase_rejects_non_pi_models() {
         let config = PhaseConfig {
             model: "gpt-5.4".to_string(),
@@ -1417,5 +1748,228 @@ Spec: specs/020426-nemesis-audit.md
             .unwrap_err()
             .to_string();
         assert!(error.contains("must use a Codex model"));
+    }
+
+    #[test]
+    fn prepare_output_dir_failure_points_to_archived_snapshot() {
+        let repo = init_repo("output-dir-recovery");
+        let output_dir = repo.join("nemesis");
+        fs::create_dir_all(&output_dir).expect("failed to create output dir");
+        fs::write(output_dir.join("nemesis-audit.md"), "# old\n")
+            .expect("failed to seed old output");
+
+        let archived = prepare_output_dir(&repo, &output_dir).expect("prepare should archive");
+        let annotated = annotate_output_recovery(
+            anyhow::anyhow!("simulated model failure"),
+            &output_dir,
+            archived.as_deref(),
+            "Nemesis audit pass failed",
+        );
+        let message = format!("{annotated:#}");
+        assert!(message.contains("simulated model failure"));
+        assert!(message.contains("Previous outputs were archived at"));
+        assert!(message.contains(
+            archived
+                .as_ref()
+                .expect("snapshot should exist")
+                .display()
+                .to_string()
+                .as_str()
+        ));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn dry_run_output_dir_prep_is_non_destructive() {
+        let repo = init_repo("dry-run-output-dir");
+        let output_dir = repo.join("nemesis");
+        fs::create_dir_all(&output_dir).expect("failed to create output dir");
+        let original = output_dir.join("nemesis-audit.md");
+        fs::write(&original, "# keep me\n").expect("failed to seed old output");
+
+        let archived =
+            maybe_prepare_output_dir(&repo, &output_dir, true).expect("dry-run should succeed");
+        assert!(archived.is_none());
+        assert!(
+            original.exists(),
+            "dry-run should not delete existing outputs"
+        );
+        assert!(
+            !repo.join(".auto").join("fresh-input").exists(),
+            "dry-run should not archive output snapshots"
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn verify_nemesis_outputs_reports_partial_state() {
+        let repo = init_repo("partial-nemesis-output");
+        let output_dir = repo.join("nemesis");
+        fs::create_dir_all(&output_dir).expect("failed to create output dir");
+        fs::write(
+            output_dir.join("nemesis-audit.md"),
+            "# Specification: partial\n",
+        )
+        .expect("failed to write partial spec");
+
+        let error = verify_nemesis_outputs(&output_dir)
+            .expect_err("partial output should fail verification")
+            .to_string();
+        assert!(error.contains("only partially completed"));
+        assert!(error.contains("IMPLEMENTATION_PLAN.md"));
+        assert!(error.contains("rerun"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn unchecked_task_preflight_skips_satisfied_plans() {
+        let unchecked = unchecked_nemesis_task_ids(
+            r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+## Follow-On Work
+
+## Completed / Already Satisfied
+
+- [x] `NEM-001` Already done
+Spec: nemesis/nemesis-audit.md
+"#,
+        )
+        .expect("plan should parse");
+        assert!(unchecked.is_empty());
+    }
+
+    #[test]
+    fn spec_sync_destination_uses_time_and_collision_suffix() {
+        let root = temp_repo_path("spec-destination");
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(&specs_dir).expect("failed to create specs dir");
+        let spec_path = root.join("nemesis-audit.md");
+        fs::write(&spec_path, "# Specification:\n").expect("failed to write spec");
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 4, 5, 12, 34, 56)
+            .single()
+            .expect("timestamp should exist");
+
+        let first = next_nemesis_spec_destination(&specs_dir, &spec_path, timestamp);
+        assert!(first
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("file name should be utf-8")
+            .starts_with("050426-123456-nemesis-audit"));
+        fs::write(&first, "# existing\n").expect("failed to create existing collision file");
+        let second = next_nemesis_spec_destination(&specs_dir, &spec_path, timestamp);
+        assert_ne!(first, second);
+        assert!(second
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("file name should be utf-8")
+            .contains("-2."));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn output_commit_ignores_preexisting_staged_changes() {
+        let (root, _remote, _upstream, worker) = init_remote_and_worker("commit-isolation", "main");
+        let output_dir = worker.join("nemesis");
+        fs::create_dir_all(&output_dir).expect("failed to create output dir");
+        fs::create_dir_all(worker.join("specs")).expect("failed to create specs dir");
+        fs::create_dir_all(worker.join("src")).expect("failed to create src dir");
+        fs::write(output_dir.join("nemesis-audit.md"), "# Specification:\n")
+            .expect("failed to write audit");
+        fs::write(
+            output_dir.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n",
+        )
+        .expect("failed to write nemesis plan");
+        fs::write(worker.join("specs").join("nemesis.md"), "# spec\n")
+            .expect("failed to write root spec");
+        fs::write(
+            worker.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .expect("failed to write root plan");
+        fs::write(worker.join("src").join("lib.rs"), "pub fn untouched() {}\n")
+            .expect("failed to write unrelated file");
+        run_git_in(&worker, ["add", "src/lib.rs"]);
+
+        let commit = commit_nemesis_outputs_if_needed(
+            &worker,
+            "main",
+            &output_dir,
+            &worker.join("specs").join("nemesis.md"),
+            &worker.join("IMPLEMENTATION_PLAN.md"),
+        )
+        .expect("output commit should succeed")
+        .expect("output commit should produce a commit");
+        assert!(!commit.is_empty());
+
+        let committed = run_git_in(&worker, ["show", "--name-only", "--format=", "HEAD"]);
+        assert!(committed.contains("nemesis/nemesis-audit.md"));
+        assert!(committed.contains("nemesis/IMPLEMENTATION_PLAN.md"));
+        assert!(committed.contains("specs/nemesis.md"));
+        assert!(committed.contains("IMPLEMENTATION_PLAN.md"));
+        assert!(!committed.contains("src/lib.rs"));
+
+        let staged = run_git_in(&worker, ["diff", "--cached", "--name-only"]);
+        assert_eq!(staged, "src/lib.rs\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repos");
+    }
+
+    #[test]
+    fn output_commit_restores_index_after_commit_failure() {
+        let repo = init_repo("commit-rollback");
+        let output_dir = repo.join("nemesis");
+        fs::create_dir_all(&output_dir).expect("failed to create output dir");
+        fs::create_dir_all(repo.join("specs")).expect("failed to create specs dir");
+        fs::create_dir_all(repo.join("src")).expect("failed to create src dir");
+        fs::write(output_dir.join("nemesis-audit.md"), "# Specification:\n")
+            .expect("failed to write audit");
+        fs::write(
+            output_dir.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n",
+        )
+        .expect("failed to write nemesis plan");
+        fs::write(repo.join("specs").join("nemesis.md"), "# spec\n")
+            .expect("failed to write root spec");
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .expect("failed to write root plan");
+        fs::write(repo.join("src").join("lib.rs"), "pub fn staged() {}\n")
+            .expect("failed to write unrelated file");
+        run_git_in(&repo, ["add", "src/lib.rs"]);
+        run_git_in(&repo, ["config", "user.useConfigOnly", "true"]);
+        run_git_in(&repo, ["config", "--unset", "user.name"]);
+        run_git_in(&repo, ["config", "--unset", "user.email"]);
+
+        let error = commit_nemesis_outputs_if_needed(
+            &repo,
+            "main",
+            &output_dir,
+            &repo.join("specs").join("nemesis.md"),
+            &repo.join("IMPLEMENTATION_PLAN.md"),
+        )
+        .expect_err("commit should fail without user identity")
+        .to_string();
+        assert!(error.contains("git command failed"));
+
+        let staged = run_git_in(&repo, ["diff", "--cached", "--name-only"]);
+        assert_eq!(staged, "src/lib.rs\n");
+        let status = run_git_in(&repo, ["status", "--short"]);
+        assert!(status.contains("A  src/lib.rs"));
+        assert!(output_dir.join("IMPLEMENTATION_PLAN.md").exists());
+        assert!(output_dir.join("nemesis-audit.md").exists());
+        assert!(repo.join("specs").join("nemesis.md").exists());
+        assert!(repo.join("IMPLEMENTATION_PLAN.md").exists());
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
 }

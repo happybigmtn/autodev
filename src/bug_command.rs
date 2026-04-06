@@ -442,6 +442,7 @@ async fn run_finder_phase(
         &format!("finder {} {}", chunk.id, backend.label()),
     )
     .await?;
+    prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
     let findings: Vec<BugFinding> = load_json_file(&findings_json_path)?;
@@ -499,6 +500,7 @@ async fn run_skeptic_phase(
         &format!("skeptic {} {}", chunk.id, backend.label()),
     )
     .await?;
+    prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
     let verdicts: Vec<SkepticVerdict> = load_json_file(&verdicts_json_path)?;
@@ -569,6 +571,7 @@ async fn run_fix_phase(
         &format!("implementer {}", backend.label()),
     )
     .await?;
+    prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
     let results: Vec<FixResult> = load_json_file(&results_json_path)?;
@@ -640,6 +643,7 @@ async fn run_review_phase(
         &format!("reviewer {} {}", chunk.id, backend.label()),
     )
     .await?;
+    prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
     let results: Vec<ReviewResult> = load_json_file(&results_json_path)?;
@@ -959,12 +963,6 @@ async fn run_backend_prompt(
                 .await
                 .context("PI stderr capture task panicked")??;
             append_stderr_log(stderr_log_path, &stderr_text)?;
-            if let Err(err) = prune_pi_runtime_state(repo_root) {
-                eprintln!(
-                    "warning: failed to prune PI runtime state in {}: {err}",
-                    opencode_agent_dir(repo_root).display()
-                );
-            }
 
             if !status.success() {
                 bail!(
@@ -979,6 +977,18 @@ async fn run_backend_prompt(
             }
             Ok(stdout)
         }
+    }
+}
+
+fn prune_bug_phase_pi_state(repo_root: &Path, backend: &LlmBackend) {
+    if !matches!(backend, LlmBackend::Pi { .. }) {
+        return;
+    }
+    if let Err(err) = prune_pi_runtime_state(repo_root) {
+        eprintln!(
+            "warning: failed to prune PI runtime state in {}: {err}",
+            opencode_agent_dir(repo_root).display()
+        );
     }
 }
 
