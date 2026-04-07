@@ -107,6 +107,7 @@ struct PhaseConfig {
     effort: String,
 }
 
+#[derive(Clone)]
 enum LlmBackend {
     Codex {
         model: String,
@@ -435,10 +436,11 @@ async fn run_finder_phase(
 
     let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
     print_phase_header("finder", chunk, &backend);
-    let raw_response = run_backend_prompt(
+    let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
         &prompt,
         &backend,
+        &args.codex_bin,
         stderr_log_path,
         &format!("finder {} {}", chunk.id, backend.label()),
     )
@@ -502,10 +504,11 @@ async fn run_skeptic_phase(
 
     let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
     print_phase_header("skeptic", chunk, &backend);
-    let raw_response = run_backend_prompt(
+    let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
         &prompt,
         &backend,
+        &args.codex_bin,
         stderr_log_path,
         &format!("skeptic {} {}", chunk.id, backend.label()),
     )
@@ -582,10 +585,11 @@ async fn run_fix_phase(
 
     let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
     print_global_phase_header("implementer", &backend);
-    let raw_response = run_backend_prompt(
+    let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
         &prompt,
         &backend,
+        &args.codex_bin,
         stderr_log_path,
         &format!("implementer {}", backend.label()),
     )
@@ -663,10 +667,11 @@ async fn run_review_phase(
 
     let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
     print_phase_header("reviewer", chunk, &backend);
-    let raw_response = run_backend_prompt(
+    let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
         &prompt,
         &backend,
+        &args.codex_bin,
         stderr_log_path,
         &format!("reviewer {} {}", chunk.id, backend.label()),
     )
@@ -1014,6 +1019,40 @@ async fn run_backend_prompt(
             }
             Ok(stdout)
         }
+    }
+}
+
+/// Wrapper that falls back to Codex when a PI backend terminates.
+async fn run_backend_prompt_with_fallback(
+    repo_root: &Path,
+    prompt: &str,
+    backend: &LlmBackend,
+    codex_bin: &Path,
+    stderr_log_path: &Path,
+    stream_label: &str,
+) -> Result<(String, LlmBackend)> {
+    match run_backend_prompt(repo_root, prompt, backend, stderr_log_path, stream_label).await {
+        Ok(r) => Ok((r, backend.clone())),
+        Err(e) if matches!(backend, LlmBackend::Pi { .. }) => {
+            eprintln!("[auto-bug] PI backend failed: {e:#}");
+            eprintln!("[auto-bug] falling back to Codex");
+            let fallback = LlmBackend::Codex {
+                model: DEFAULT_CODEX_MODEL.to_string(),
+                reasoning_effort: DEFAULT_CODEX_REASONING_EFFORT.to_string(),
+                codex_bin: codex_bin.to_path_buf(),
+            };
+            print_global_phase_header("fallback", &fallback);
+            let r = run_backend_prompt(
+                repo_root,
+                prompt,
+                &fallback,
+                stderr_log_path,
+                &format!("{stream_label} (codex-fallback)"),
+            )
+            .await?;
+            Ok((r, fallback))
+        }
+        Err(e) => Err(e),
     }
 }
 
