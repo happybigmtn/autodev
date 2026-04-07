@@ -130,8 +130,12 @@ fn log_selection(
         };
         match usage {
             Some(u) => eprintln!(
-                "[quota-router]   {} session={:>3}% weekly={:>3}% resets_in={}s{marker}",
-                entry.name, u.session_used_pct, u.weekly_used_pct, u.session_resets_in_secs,
+                "[quota-router]   {} session_used={:>3}% weekly_remaining={:>3}% weekly_resets_in={}s session_resets_in={}s{marker}",
+                entry.name,
+                u.session_used_pct,
+                u.weekly_remaining_pct,
+                u.weekly_resets_in_secs,
+                u.session_resets_in_secs,
             ),
             None => eprintln!(
                 "[quota-router]   {} (no usage data){marker}",
