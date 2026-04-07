@@ -135,7 +135,12 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     println!("branch:      {}", push_branch);
     if args.claude {
         println!("harness:     Claude (Opus 4.6 high)");
-        println!("max turns:   {}", args.max_turns);
+        println!(
+            "max turns:   {}",
+            args.max_turns
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unlimited".to_string())
+        );
     } else {
         println!("model:       {}", args.model);
         println!("reasoning:   {}", args.reasoning_effort);

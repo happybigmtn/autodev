@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::claude_exec::run_claude_exec;
+use crate::claude_exec::{run_claude_exec, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
@@ -83,7 +83,10 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 99999999. CRITICAL: Do not assume functionality is missing — search the codebase to confirm before implementing anything new.
 999999999. Every new module must be importable and wired into the package. Dead code that isn't reachable from any entry point is an island — wire it before committing.
 9999999999. When you learn something new about how to build, run, or validate the repo, update `AGENTS.md` — but keep it brief and operational only.
-99999999999. A task is not done because the code looks right. It is done when the acceptance criteria are satisfied and the verification evidence is real."#;
+99999999999. A task is not done because the code looks right. It is done when the acceptance criteria are satisfied and the verification evidence is real.
+999999999999. Shell safety: never pass file contents or large strings (>50KB) as inline shell command arguments — write them to a temp file instead. Narrow glob patterns with directory prefixes so they cannot expand to thousands of paths and hit the OS argument limit.
+9999999999999. Search resilience: treat empty Grep/Glob/Find results as evidence, not proof a surface is missing. If an exact symbol search misses, inspect the containing enum/struct/module, nearby tests, and the latest compiler/test errors before retrying the search.
+99999999999999. Search futility: if the same search tool returns empty results 3 times in a row, stop and re-evaluate your approach. The thing you are looking for may not exist, may be named differently, or may live in a different location. Prefer behavior-level searches and current code definitions over stale symbol names."#;
 
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
@@ -126,7 +129,13 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     println!("branch:      {}", target_branch);
     if args.claude {
         println!("harness:     Claude (Opus 4.6 high)");
-        println!("max turns:   {}", args.max_turns);
+        println!(
+            "max turns:   {}",
+            args.max_turns
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unlimited".to_string())
+        );
+        println!("max retries: {}", args.max_retries);
     } else {
         println!("model:       {}", args.model);
         println!("reasoning:   {}", args.reasoning_effort);
@@ -157,6 +166,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     }
 
     let mut iteration = 0usize;
+    let mut consecutive_failures = 0usize;
     loop {
         if args.max_iterations.is_some_and(|limit| iteration >= limit) {
             println!(
@@ -200,15 +210,45 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .await?
         };
         if !exit_status.success() {
-            bail!(
-                "{harness} exited with status {}; see {}",
-                exit_status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "signal".to_string()),
-                stderr_log_path.display()
+            let exit_code = exit_status.code().unwrap_or(-1);
+            let is_futility = exit_code == FUTILITY_EXIT_MARKER;
+            consecutive_failures += 1;
+
+            // Checkpoint any partial progress before potentially bailing
+            if let Some(commit) = auto_checkpoint_if_needed(
+                &repo_root,
+                target_branch.as_str(),
+                &format!("auto loop checkpoint (pre-retry {})", consecutive_failures),
+            )? {
+                println!("checkpoint:  committed partial changes at {commit}");
+            }
+
+            if consecutive_failures > args.max_retries {
+                bail!(
+                    "{harness} exited with status {} after {} consecutive failures; see {}",
+                    if is_futility {
+                        "futility".to_string()
+                    } else {
+                        exit_code.to_string()
+                    },
+                    consecutive_failures,
+                    stderr_log_path.display()
+                );
+            }
+
+            println!(
+                "warning: {harness} exited non-zero ({}), retrying ({}/{})",
+                if is_futility {
+                    "futility spiral".to_string()
+                } else {
+                    format!("code {exit_code}")
+                },
+                consecutive_failures,
+                args.max_retries
             );
+            continue;
         }
+        consecutive_failures = 0;
 
         println!();
         println!("{harness} iteration complete");

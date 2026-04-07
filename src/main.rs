@@ -336,9 +336,13 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     claude: bool,
 
-    /// Maximum Claude turns (only used with --claude)
-    #[arg(long, default_value_t = 200)]
-    max_turns: usize,
+    /// Maximum Claude turns (only used with --claude). Omit for unlimited.
+    #[arg(long)]
+    max_turns: Option<usize>,
+
+    /// Maximum retries when Claude exits non-zero before bailing
+    #[arg(long, default_value_t = 2)]
+    max_retries: usize,
 }
 
 #[derive(Args, Clone)]
@@ -379,9 +383,9 @@ pub(crate) struct ReviewArgs {
     #[arg(long)]
     claude: bool,
 
-    /// Maximum Claude turns (only used with --claude)
-    #[arg(long, default_value_t = 200)]
-    max_turns: usize,
+    /// Maximum Claude turns (only used with --claude). Omit for unlimited.
+    #[arg(long)]
+    max_turns: Option<usize>,
 }
 
 #[derive(Args, Clone)]

@@ -1,10 +1,12 @@
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::oneshot;
 
 use crate::codex_stream;
 use crate::quota_config::Provider;
@@ -14,7 +16,7 @@ use crate::util::{atomic_write, timestamp_slug};
 pub(crate) async fn run_claude_exec(
     repo_root: &Path,
     full_prompt: &str,
-    max_turns: usize,
+    max_turns: Option<usize>,
     stderr_log_path: &Path,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
@@ -39,10 +41,12 @@ pub(crate) async fn run_claude_exec(
     Ok(status)
 }
 
+pub(crate) const FUTILITY_EXIT_MARKER: i32 = 137;
+
 async fn spawn_claude(
     repo_root: &Path,
     full_prompt: &str,
-    max_turns: usize,
+    max_turns: Option<usize>,
     context_label: &str,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new("claude");
@@ -51,9 +55,11 @@ async fn spawn_claude(
         .arg("--verbose")
         .arg("--dangerously-skip-permissions")
         .arg("--output-format")
-        .arg("stream-json")
-        .arg("--max-turns")
-        .arg(max_turns.to_string())
+        .arg("stream-json");
+    if let Some(turns) = max_turns {
+        command.arg("--max-turns").arg(turns.to_string());
+    }
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -82,10 +88,30 @@ async fn spawn_claude(
         .take()
         .with_context(|| format!("Claude stderr should be piped for {context_label}"))?;
 
-    let stdout_task = tokio::spawn(async move { codex_stream::stream_claude_output(stdout).await });
+    let (futility_tx, futility_rx) = oneshot::channel::<()>();
+    let stdout_task = tokio::spawn(async move {
+        codex_stream::stream_claude_output(stdout, Some(futility_tx)).await
+    });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
-    let status = child.wait().await.context("failed waiting for Claude")?;
+    let status = tokio::select! {
+        result = child.wait() => {
+            result.context("failed waiting for Claude")?
+        }
+        Ok(()) = futility_rx => {
+            println!(
+                "\nfutility spiral detected: killing Claude after {} consecutive empty tool results",
+                codex_stream::CLAUDE_FUTILITY_THRESHOLD,
+            );
+            let _ = child.start_kill();
+            // Return a synthetic non-zero exit status so the loop can retry
+            let _ = child.wait().await;
+            // Raw wait status: exit code in upper byte, lower byte is signal.
+            // Shift left by 8 so .code() returns FUTILITY_EXIT_MARKER.
+            std::process::ExitStatus::from_raw(FUTILITY_EXIT_MARKER << 8)
+        }
+    };
+
     stdout_task
         .await
         .context("Claude stdout streaming task panicked")??;

@@ -6,9 +6,13 @@ use anyhow::{Context, Result};
 use console::Style;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::sync::oneshot;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::util::clip_line_for_display;
+
+pub(crate) const CLAUDE_FUTILITY_THRESHOLD: usize = 8;
+const CLAUDE_SEARCH_MISS_HINT_THRESHOLD: usize = 3;
 
 #[derive(Default)]
 struct CodexRenderState {
@@ -42,6 +46,9 @@ struct ClaudeRenderState {
     tool_count: usize,
     current_tool_name: Option<String>,
     last_agent_message: Option<String>,
+    consecutive_empty_results: usize,
+    consecutive_search_misses: usize,
+    futility_detected: bool,
 }
 
 pub(crate) async fn capture_codex_output<R>(stream: R) -> Result<String>
@@ -75,12 +82,16 @@ where
     Ok(())
 }
 
-pub(crate) async fn stream_claude_output<R>(stream: R) -> Result<()>
+pub(crate) async fn stream_claude_output<R>(
+    stream: R,
+    futility_tx: Option<oneshot::Sender<()>>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream).lines();
     let mut state = ClaudeRenderState::default();
+    let mut futility_tx = futility_tx;
     while let Some(line) = reader
         .next_line()
         .await
@@ -90,6 +101,11 @@ where
         if !rendered.is_empty() {
             print!("{rendered}");
             let _ = io::stdout().flush();
+        }
+        if state.futility_detected {
+            if let Some(tx) = futility_tx.take() {
+                let _ = tx.send(());
+            }
         }
     }
     Ok(())
@@ -686,6 +702,7 @@ fn render_claude_stream_line(line: &str, state: &mut ClaudeRenderState) -> Strin
 
     let green = Style::new().green();
     let red = Style::new().red();
+    let yellow = Style::new().yellow();
     let dim = Style::new().dim();
 
     let event_type = value
@@ -699,6 +716,9 @@ fn render_claude_stream_line(line: &str, state: &mut ClaudeRenderState) -> Strin
         }
         "user" => {
             render_claude_tool_results(&value, &mut out, &green, &red);
+            if let Some(note) = track_claude_tool_futility(&value, state) {
+                push_styled_line(&mut out, &yellow, format!("note: {note}"));
+            }
         }
         "result" => {
             let cost = value.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
@@ -830,6 +850,103 @@ fn render_claude_tool_results(value: &Value, out: &mut String, green: &Style, re
             .or_else(|| compact_json(block.get("content").unwrap_or(&Value::Null)));
         write_block(out, prefix, text, style, 8);
     }
+}
+
+fn track_claude_tool_futility(value: &Value, state: &mut ClaudeRenderState) -> Option<&'static str> {
+    let blocks = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array);
+    let Some(blocks) = blocks else {
+        return None;
+    };
+    let mut emit_search_hint = false;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        if is_benign_search_miss(block, state.current_tool_name.as_deref()) {
+            state.consecutive_search_misses += 1;
+            state.consecutive_empty_results = 0;
+            if state.consecutive_search_misses == CLAUDE_SEARCH_MISS_HINT_THRESHOLD {
+                emit_search_hint = true;
+            }
+            continue;
+        }
+        state.consecutive_search_misses = 0;
+        if is_empty_tool_result(block) {
+            state.consecutive_empty_results += 1;
+        } else {
+            state.consecutive_empty_results = 0;
+        }
+    }
+    if state.consecutive_empty_results >= CLAUDE_FUTILITY_THRESHOLD {
+        state.futility_detected = true;
+    }
+    if emit_search_hint {
+        Some(
+            "repeated empty search results: inspect the containing enum/struct/module, nearby tests, or a focused compiler error before retrying the same search",
+        )
+    } else {
+        None
+    }
+}
+
+fn is_empty_tool_result(block: &Value) -> bool {
+    if block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match block.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            t.is_empty()
+                || t.starts_with("No matches found")
+                || t.starts_with("No files found")
+        }
+        Some(Value::Array(arr)) => arr.iter().all(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_none_or(|t| {
+                    t.is_empty()
+                        || t.starts_with("No matches found")
+                        || t.starts_with("No files found")
+                })
+        }),
+        _ => false,
+    }
+}
+
+fn is_benign_search_miss(block: &Value, current_tool_name: Option<&str>) -> bool {
+    if !current_tool_name.is_some_and(is_search_tool_name) {
+        return false;
+    }
+    match block.get("content") {
+        Some(Value::String(s)) => is_search_miss_text(s),
+        Some(Value::Array(arr)) => arr.iter().all(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_search_miss_text)
+        }),
+        _ => false,
+    }
+}
+
+fn is_search_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Grep" | "Glob" | "LS" | "Find" | "Search" | "search_code"
+    )
+}
+
+fn is_search_miss_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("No matches found") || trimmed.starts_with("No files found")
 }
 
 fn render_legacy_item_started(value: &Value, state: &mut CodexRenderState, out: &mut String) {
@@ -1280,7 +1397,7 @@ mod tests {
     use super::{
         render_claude_stream_line, render_codex_stream_line, render_opencode_stream_line,
         render_pi_stream_line, sanitize_terminal_text, ClaudeRenderState, CodexRenderState,
-        PiRenderState,
+        PiRenderState, CLAUDE_FUTILITY_THRESHOLD,
     };
 
     #[test]
@@ -1481,5 +1598,88 @@ mod tests {
 
         assert!(rendered.contains("Chunk audit complete"));
         assert!(rendered.contains("done | Tokens: in 10 out 5 | Cached: 5 | Tools: 0"));
+    }
+
+    #[test]
+    fn futility_detected_after_consecutive_empty_results() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+
+        let empty_result =
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
+
+        for _ in 0..CLAUDE_FUTILITY_THRESHOLD - 1 {
+            render_claude_stream_line(empty_result, &mut state);
+            assert!(!state.futility_detected);
+        }
+        render_claude_stream_line(empty_result, &mut state);
+        assert!(state.futility_detected);
+        assert_eq!(state.consecutive_empty_results, CLAUDE_FUTILITY_THRESHOLD);
+    }
+
+    #[test]
+    fn substantive_result_resets_futility_counter() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+
+        let empty_result =
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
+        let good_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_2","content":"fn main() { println!(\"hello\"); }","is_error":false}]}}"#;
+
+        for _ in 0..5 {
+            render_claude_stream_line(empty_result, &mut state);
+        }
+        assert_eq!(state.consecutive_empty_results, 5);
+
+        render_claude_stream_line(good_result, &mut state);
+        assert_eq!(state.consecutive_empty_results, 0);
+        assert!(!state.futility_detected);
+    }
+
+    #[test]
+    fn error_tool_results_count_toward_futility() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+
+        let error_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"Argument list too long","is_error":true}]}}"#;
+
+        for _ in 0..CLAUDE_FUTILITY_THRESHOLD {
+            render_claude_stream_line(error_result, &mut state);
+        }
+        assert!(state.futility_detected);
+    }
+
+    #[test]
+    fn benign_search_misses_do_not_count_toward_futility() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        state.current_tool_name = Some("Grep".to_string());
+
+        let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"No matches found","is_error":false}]}}"#;
+
+        for _ in 0..CLAUDE_FUTILITY_THRESHOLD + 2 {
+            render_claude_stream_line(empty_result, &mut state);
+        }
+
+        assert!(!state.futility_detected);
+        assert_eq!(state.consecutive_empty_results, 0);
+        assert_eq!(state.consecutive_search_misses, CLAUDE_FUTILITY_THRESHOLD + 2);
+    }
+
+    #[test]
+    fn repeated_search_misses_emit_recovery_hint() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        state.current_tool_name = Some("Grep".to_string());
+
+        let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"No matches found","is_error":false}]}}"#;
+
+        let first = render_claude_stream_line(empty_result, &mut state);
+        let second = render_claude_stream_line(empty_result, &mut state);
+        let third = render_claude_stream_line(empty_result, &mut state);
+
+        assert!(!first.contains("repeated empty search results"));
+        assert!(!second.contains("repeated empty search results"));
+        assert!(third.contains("repeated empty search results"));
     }
 }
