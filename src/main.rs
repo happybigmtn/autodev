@@ -1,4 +1,5 @@
 mod bug_command;
+mod claude_exec;
 mod codex_exec;
 mod codex_stream;
 mod corpus;
@@ -231,6 +232,10 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     branch: Option<String>,
 
+    /// Additional repo roots to add beyond auto-discovered sibling git repos.
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
     /// Directory for loop logs. Defaults to <repo>/.auto/loop
     #[arg(long)]
     run_root: Option<PathBuf>,
@@ -238,6 +243,14 @@ pub(crate) struct LoopArgs {
     /// Codex executable to invoke
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+
+    /// Use Claude (Opus 4.6 high) instead of Codex
+    #[arg(long)]
+    claude: bool,
+
+    /// Maximum Claude turns (only used with --claude)
+    #[arg(long, default_value_t = 200)]
+    max_turns: usize,
 }
 
 #[derive(Args, Clone)]
@@ -269,6 +282,14 @@ pub(crate) struct ReviewArgs {
     /// Codex executable to invoke
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+
+    /// Use Claude (Opus 4.6 high) instead of Codex
+    #[arg(long)]
+    claude: bool,
+
+    /// Maximum Claude turns (only used with --claude)
+    #[arg(long, default_value_t = 200)]
+    max_turns: usize,
 }
 
 #[derive(Args, Clone)]

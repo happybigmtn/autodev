@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
@@ -120,11 +121,18 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         .with_context(|| format!("failed to create {}", run_root.display()))?;
     let stderr_log_path = run_root.join("codex.stderr.log");
 
+    let harness = if args.claude { "Claude" } else { "Codex" };
+
     println!("auto review");
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", push_branch);
-    println!("model:       {}", args.model);
-    println!("reasoning:   {}", args.reasoning_effort);
+    if args.claude {
+        println!("harness:     Claude (Opus 4.6 high)");
+        println!("max turns:   {}", args.max_turns);
+    } else {
+        println!("model:       {}", args.model);
+        println!("reasoning:   {}", args.reasoning_effort);
+    }
     println!("review doc:  {}", review_path.display());
     if moved_items > 0 {
         println!(
@@ -156,21 +164,32 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
 
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();
-        println!("running review iteration {}", iteration + 1);
+        println!("running {harness} review iteration {}", iteration + 1);
 
-        let exit_status = run_codex_exec(
-            &repo_root,
-            &full_prompt,
-            &args.model,
-            &args.reasoning_effort,
-            &args.codex_bin,
-            &stderr_log_path,
-            "auto review",
-        )
-        .await?;
+        let exit_status = if args.claude {
+            run_claude_exec(
+                &repo_root,
+                &full_prompt,
+                args.max_turns,
+                &stderr_log_path,
+                "auto review",
+            )
+            .await?
+        } else {
+            run_codex_exec(
+                &repo_root,
+                &full_prompt,
+                &args.model,
+                &args.reasoning_effort,
+                &args.codex_bin,
+                &stderr_log_path,
+                "auto review",
+            )
+            .await?
+        };
         if !exit_status.success() {
             bail!(
-                "Codex exited with status {}; see {}",
+                "{harness} exited with status {}; see {}",
                 exit_status
                     .code()
                     .map(|code| code.to_string())
@@ -180,7 +199,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         }
 
         println!();
-        println!("review iteration complete");
+        println!("{harness} review iteration complete");
 
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         if commit_before.trim() == commit_after.trim() {

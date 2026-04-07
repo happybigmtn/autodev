@@ -432,6 +432,8 @@ What it reads:
 - `AGENTS.md`
 - `specs/*`
 - `IMPLEMENTATION_PLAN.md`
+- sibling git repos under the same parent directory, plus any extra repos passed via
+  `--reference-repo`
 
 What it writes:
 
@@ -448,6 +450,9 @@ What it actually does:
 - Rebases onto `origin/<branch>` before work starts when that remote branch exists, so a behind
   local branch does not fail only at push time
 - Reads the next unchecked task from the top of the plan
+- Auto-discovers sibling git repos under the same parent directory and treats them as valid
+  implementation surfaces when the task contract points there
+- Merges any `--reference-repo <dir>` entries on top of that default sibling repo set
 - When the repo has multiple dated specs for the same surface, treats the newest spec referenced by
   the current unchecked task as authoritative and older duplicates as historical context
 - Builds a short task brief from the task contract before editing
@@ -461,6 +466,9 @@ What it actually does:
 - Removes finished tasks from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
 - Commits and pushes truthful increments to the allowed branch
+- Treats a commit in the queue repo or any declared reference repo as real loop progress
+- Fails loudly if a declared reference repo was changed but left uncommitted at the end of an
+  iteration, instead of pretending nothing happened
 - Rebases onto `origin/<branch>` again before each push so direct-to-primary-branch loops tolerate
   remote fast-forwards instead of dying with a raw non-fast-forward error
 
@@ -480,6 +488,7 @@ When to run it:
 Useful flags:
 
 - `--max-iterations <n>` to stop after a fixed number of completed task iterations
+- `--reference-repo <dir>` to add an external repo beyond the auto-discovered sibling repo set
 - `--prompt-file <path>` to override the loop prompt
 - `--branch <name>` to lock the loop to a specific branch
 - `--run-root <dir>` to change where loop logs are stored

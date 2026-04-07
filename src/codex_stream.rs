@@ -37,6 +37,13 @@ struct PiRenderState {
     last_agent_message: Option<String>,
 }
 
+#[derive(Default)]
+struct ClaudeRenderState {
+    tool_count: usize,
+    current_tool_name: Option<String>,
+    last_agent_message: Option<String>,
+}
+
 pub(crate) async fn capture_codex_output<R>(stream: R) -> Result<String>
 where
     R: AsyncRead + Unpin,
@@ -65,6 +72,26 @@ where
     R: AsyncRead + Unpin,
 {
     capture_codex_output(stream).await?;
+    Ok(())
+}
+
+pub(crate) async fn stream_claude_output<R>(stream: R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream).lines();
+    let mut state = ClaudeRenderState::default();
+    while let Some(line) = reader
+        .next_line()
+        .await
+        .context("failed reading Claude JSON stream")?
+    {
+        let rendered = render_claude_stream_line(&line, &mut state);
+        if !rendered.is_empty() {
+            print!("{rendered}");
+            let _ = io::stdout().flush();
+        }
+    }
     Ok(())
 }
 
@@ -647,6 +674,164 @@ fn render_pi_stream_line(line: &str, state: &mut PiRenderState) -> String {
     out
 }
 
+fn render_claude_stream_line(line: &str, state: &mut ClaudeRenderState) -> String {
+    let mut out = String::new();
+    let trimmed = line.trim();
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        if !trimmed.is_empty() {
+            push_plain_line(&mut out, trimmed);
+        }
+        return out;
+    };
+
+    let green = Style::new().green();
+    let red = Style::new().red();
+    let dim = Style::new().dim();
+
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match event_type {
+        "assistant" => {
+            render_claude_assistant_message(&value, state, &mut out);
+        }
+        "user" => {
+            render_claude_tool_results(&value, &mut out, &green, &red);
+        }
+        "result" => {
+            let cost = value.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+            let duration_ms = value
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let turns = value.get("num_turns").and_then(Value::as_u64).unwrap_or(0);
+            let input_tokens = value
+                .get("total_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output_tokens = value
+                .get("total_output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            push_plain_line(&mut out, "");
+            push_plain_line(&mut out, "========================================");
+            push_styled_line(
+                &mut out,
+                &green,
+                format!(
+                    "done | ${cost:.2} | {turns} turns | Tokens: in {input_tokens} out {output_tokens} | Tools: {} | {:.0}s",
+                    state.tool_count,
+                    duration_ms as f64 / 1000.0,
+                ),
+            );
+        }
+        "error" => {
+            let message = json_string(&value, "error")
+                .or_else(|| json_string(&value, "message"))
+                .unwrap_or_else(|| value.to_string());
+            push_styled_line(&mut out, &red, format!("error: {message}"));
+        }
+        "system" => {
+            if let Some(msg) = json_string(&value, "message") {
+                push_styled_line(&mut out, &dim, format!("system: {msg}"));
+            }
+        }
+        _ => {}
+    }
+
+    out
+}
+
+fn render_claude_assistant_message(value: &Value, state: &mut ClaudeRenderState, out: &mut String) {
+    let yellow = Style::new().yellow();
+    let dim = Style::new().dim();
+
+    let content = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array);
+    let Some(blocks) = content else {
+        return;
+    };
+    for block in blocks {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => {
+                if let Some(text) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    if state.last_agent_message.as_deref() != Some(text) {
+                        write_block(out, "", Some(text.to_string()), &Style::new(), 8);
+                        state.last_agent_message = Some(text.to_string());
+                    }
+                }
+            }
+            "tool_use" => {
+                state.tool_count += 1;
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                state.current_tool_name = Some(name.to_string());
+                push_styled_line(out, &yellow, format!("[tool] {name}"));
+                write_block(
+                    out,
+                    "args: ",
+                    block.get("input").and_then(compact_json),
+                    &dim,
+                    4,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_claude_tool_results(value: &Value, out: &mut String, green: &Style, red: &Style) {
+    let content = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array);
+    let Some(blocks) = content else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let is_error = block
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let style = if is_error { red } else { green };
+        let prefix = if is_error {
+            "   -> error: "
+        } else {
+            "   -> result: "
+        };
+        let text = block
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                block
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|items| extract_content_text(items))
+                    .filter(|t| !t.trim().is_empty())
+            })
+            .or_else(|| compact_json(block.get("content").unwrap_or(&Value::Null)));
+        write_block(out, prefix, text, style, 8);
+    }
+}
+
 fn render_legacy_item_started(value: &Value, state: &mut CodexRenderState, out: &mut String) {
     let item = value.get("item").unwrap_or(&Value::Null);
     if item.get("type").and_then(Value::as_str) == Some("command_execution") {
@@ -1093,8 +1278,9 @@ fn pop_last_inline_char(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_codex_stream_line, render_opencode_stream_line, render_pi_stream_line,
-        sanitize_terminal_text, CodexRenderState, PiRenderState,
+        render_claude_stream_line, render_codex_stream_line, render_opencode_stream_line,
+        render_pi_stream_line, sanitize_terminal_text, ClaudeRenderState, CodexRenderState,
+        PiRenderState,
     };
 
     #[test]
@@ -1214,6 +1400,70 @@ mod tests {
         assert!(rendered.contains("[command]"));
         assert!(rendered.contains("   pwd"));
         assert!(rendered.contains("   -> result: /tmp/repo"));
+    }
+
+    #[test]
+    fn renders_claude_assistant_text_and_tool_use() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Reading the file now."},{"type":"tool_use","id":"tu_1","name":"Read","input":{"path":"/tmp/foo.rs"}}]}}"#;
+
+        let rendered = render_claude_stream_line(event, &mut state);
+
+        assert!(rendered.contains("Reading the file now."));
+        assert!(rendered.contains("[tool] Read"));
+        assert!(rendered.contains("/tmp/foo.rs"));
+        assert_eq!(state.tool_count, 1);
+    }
+
+    #[test]
+    fn renders_claude_tool_result() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        let event = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"fn main() {}","is_error":false}]}}"#;
+
+        let rendered = render_claude_stream_line(event, &mut state);
+
+        assert!(rendered.contains("-> result: fn main() {}"));
+    }
+
+    #[test]
+    fn renders_claude_tool_error() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        let event = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"file not found","is_error":true}]}}"#;
+
+        let rendered = render_claude_stream_line(event, &mut state);
+
+        assert!(rendered.contains("-> error: file not found"));
+    }
+
+    #[test]
+    fn renders_claude_result_summary() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        state.tool_count = 5;
+        let event = r#"{"type":"result","cost_usd":0.42,"duration_ms":30000,"num_turns":3,"total_input_tokens":10000,"total_output_tokens":2000}"#;
+
+        let rendered = render_claude_stream_line(event, &mut state);
+
+        assert!(rendered.contains("done"));
+        assert!(rendered.contains("$0.42"));
+        assert!(rendered.contains("3 turns"));
+        assert!(rendered.contains("in 10000 out 2000"));
+        assert!(rendered.contains("Tools: 5"));
+        assert!(rendered.contains("30s"));
+    }
+
+    #[test]
+    fn renders_claude_error_event() {
+        console::set_colors_enabled(false);
+        let mut state = ClaudeRenderState::default();
+        let event = r#"{"type":"error","error":"rate limit exceeded"}"#;
+
+        let rendered = render_claude_stream_line(event, &mut state);
+
+        assert!(rendered.contains("error: rate limit exceeded"));
     }
 
     #[test]

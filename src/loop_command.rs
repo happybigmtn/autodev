@@ -1,13 +1,14 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
-    push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
+    push_branch_with_remote_sync, repo_name, sync_branch_with_remote, timestamp_slug,
 };
 use crate::LoopArgs;
 
@@ -18,11 +19,13 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
 0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
 0e. For every current-state fact, trust the live codebase over planning artifacts unless the code is plainly stale and the repo includes stronger primary-source evidence.
+0f. When additional repositories are listed below, inspect and edit them directly when the current task's owned surfaces, acceptance criteria, or blocker evidence point there. Read each touched repo's own `AGENTS.md` and operational docs before editing it.
 
 1. Your task is to implement functionality per the specifications using the full repository context.
    - Follow `IMPLEMENTATION_PLAN.md` in order and take the next unchecked task from top to bottom.
    - Do not reprioritize the queue yourself.
    - Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.
+   - If the current task's owned surfaces live in an additional listed repo, do the code change there while keeping this queue repo's planning artifacts truthful.
    - Build a short task brief for yourself before editing: task id, spec refs, owned surfaces, integration touchpoints, scope boundary, acceptance criteria, verification, and any assumptions you are relying on.
    - Restate the task's assumptions and success conditions from repo evidence before editing. If the plan/spec/task contract is ambiguous, resolve the ambiguity in the docs before pretending implementation can start.
 
@@ -54,10 +57,11 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 5. When validation passes, commit the increment:
    - Stage only the files relevant to the completed task plus `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, and `AGENTS.md` when they changed.
    - Do not sweep unrelated pre-existing churn into the commit.
-   - Commit with a message like `repo-name: TASK-ID short description` using this repository's actual name.
+   - If you touch multiple repositories, commit and push each repository separately. Never try to mix files from different git repos into one commit.
+   - Commit with a message like `repo-name: TASK-ID short description` using the actual repository name for each touched repo.
    - Before committing, rerun the task's direct proof plus the strongest broad regression commands this repo honestly supports.
-   - After committing, run `git status` to verify no implementation files were left unstaged. If any were, amend the commit.
-   - Push directly to `origin/{branch}` after the commit.
+   - After committing, run `git status` in every touched repo to verify no implementation files were left unstaged. If any were, amend the relevant commit.
+   - Push the queue repo directly to `origin/{branch}` after the commit. For additional listed repos, push the currently checked-out branch unless that repo's own instructions require something else.
 
 6. If you hit a real blocker after genuine debugging:
    - Record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
@@ -84,6 +88,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     let current_branch = current_branch.trim().to_string();
@@ -97,9 +102,12 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     }
 
     let prompt_template = match &args.prompt_file {
-        Some(path) => fs::read_to_string(path)
-            .with_context(|| format!("failed to read prompt file {}", path.display()))?,
-        None => render_default_loop_prompt(&target_branch),
+        Some(path) => {
+            let prompt = fs::read_to_string(path)
+                .with_context(|| format!("failed to read prompt file {}", path.display()))?;
+            append_reference_repo_clause(prompt, &reference_repos)
+        }
+        None => render_default_loop_prompt(&target_branch, &reference_repos),
     };
     let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
 
@@ -110,12 +118,25 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         .with_context(|| format!("failed to create {}", run_root.display()))?;
     let stderr_log_path = run_root.join("codex.stderr.log");
 
+    let harness = if args.claude { "Claude" } else { "Codex" };
+
     println!("auto loop");
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", target_branch);
-    println!("model:       {}", args.model);
-    println!("reasoning:   {}", args.reasoning_effort);
+    if args.claude {
+        println!("harness:     Claude (Opus 4.6 high)");
+        println!("max turns:   {}", args.max_turns);
+    } else {
+        println!("model:       {}", args.model);
+        println!("reasoning:   {}", args.reasoning_effort);
+    }
     println!("run root:    {}", run_root.display());
+    if !reference_repos.is_empty() {
+        println!("references:  {}", reference_repos.len());
+        for path in &reference_repos {
+            println!("  - {}", path.display());
+        }
+    }
     println!(
         "prompt:      {}",
         args.prompt_file
@@ -152,23 +173,34 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
         println!("prompt log:  {}", prompt_path.display());
 
-        let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
+        let state_before = collect_tracked_repo_states(&repo_root, &reference_repos)?;
         println!();
-        println!("running Codex iteration {}", iteration + 1);
+        println!("running {harness} iteration {}", iteration + 1);
 
-        let exit_status = run_codex_exec(
-            &repo_root,
-            &full_prompt,
-            &args.model,
-            &args.reasoning_effort,
-            &args.codex_bin,
-            &stderr_log_path,
-            "auto loop",
-        )
-        .await?;
+        let exit_status = if args.claude {
+            run_claude_exec(
+                &repo_root,
+                &full_prompt,
+                args.max_turns,
+                &stderr_log_path,
+                "auto loop",
+            )
+            .await?
+        } else {
+            run_codex_exec(
+                &repo_root,
+                &full_prompt,
+                &args.model,
+                &args.reasoning_effort,
+                &args.codex_bin,
+                &stderr_log_path,
+                "auto loop",
+            )
+            .await?
+        };
         if !exit_status.success() {
             bail!(
-                "Codex exited with status {}; see {}",
+                "{harness} exited with status {}; see {}",
                 exit_status
                     .code()
                     .map(|code| code.to_string())
@@ -178,23 +210,32 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         }
 
         println!();
-        println!("Codex iteration complete");
+        println!("{harness} iteration complete");
 
-        let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
-        if commit_before.trim() == commit_after.trim() {
-            if let Some(commit) = auto_checkpoint_if_needed(
-                &repo_root,
-                target_branch.as_str(),
-                "auto loop checkpoint",
-            )? {
-                iteration += 1;
-                println!("checkpoint:  committed iteration changes at {commit}");
-                println!();
-                println!("================ LOOP {} ================", iteration);
-                continue;
+        let state_after = collect_tracked_repo_states(&repo_root, &reference_repos)?;
+        match summarize_repo_progress(&state_before, &state_after) {
+            RepoProgress::NewCommits => {}
+            RepoProgress::DirtyChanges(repos) => {
+                bail!(
+                    "tracked repo changes were left uncommitted in: {}; commit or revert them before continuing",
+                    repos.join(", ")
+                );
             }
-            println!("no new commit detected; stopping.");
-            break;
+            RepoProgress::None => {
+                if let Some(commit) = auto_checkpoint_if_needed(
+                    &repo_root,
+                    target_branch.as_str(),
+                    "auto loop checkpoint",
+                )? {
+                    iteration += 1;
+                    println!("checkpoint:  committed iteration changes at {commit}");
+                    println!();
+                    println!("================ LOOP {} ================", iteration);
+                    continue;
+                }
+                println!("no new commit detected; stopping.");
+                break;
+            }
         }
 
         if push_branch_with_remote_sync(&repo_root, target_branch.as_str())? {
@@ -213,8 +254,190 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_default_loop_prompt(branch: &str) -> String {
-    DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch)
+fn render_default_loop_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
+    append_reference_repo_clause(
+        DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch),
+        reference_repos,
+    )
+}
+
+fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> String {
+    if reference_repos.is_empty() {
+        return prompt;
+    }
+
+    let listing = reference_repos
+        .iter()
+        .map(|path| format!("- `{}`", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{prompt}\n\nAdditional repositories you may inspect or edit when the task contract points there:\n{listing}\n\nRepository-crossing rules:\n- If the current task's owned surfaces live in one of these repos, implement the code change there instead of pretending the queue repo should own it.\n- Keep `IMPLEMENTATION_PLAN.md` truthful as the active queue for this run even when code lands in another repo.\n- Read each touched repo's `AGENTS.md`, tests, and operational docs before editing it.\n- Commit and push each touched repo separately.\n"
+    )
+}
+
+fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut resolved = discover_sibling_git_repos(repo_root)?;
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            repo_root.join(path)
+        };
+        let canonical = absolute
+            .canonicalize()
+            .with_context(|| format!("failed to resolve reference repo {}", absolute.display()))?;
+        if !canonical.is_dir() {
+            bail!("reference repo {} is not a directory", canonical.display());
+        }
+
+        let git_root =
+            git_stdout(&canonical, ["rev-parse", "--show-toplevel"]).with_context(|| {
+                format!(
+                    "reference repo {} is not a git repository",
+                    canonical.display()
+                )
+            })?;
+        let git_root = PathBuf::from(git_root.trim())
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "failed to canonicalize git root for {}",
+                    canonical.display()
+                )
+            })?;
+        if git_root != repo_root {
+            resolved.push(git_root);
+        }
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
+}
+
+fn discover_sibling_git_repos(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let Some(parent) = repo_root.parent() else {
+        return Ok(Vec::new());
+    };
+
+    let mut siblings = Vec::new();
+    for entry in fs::read_dir(parent).with_context(|| {
+        format!(
+            "failed to read sibling directories under {}",
+            parent.display()
+        )
+    })? {
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", parent.display()))?;
+        let candidate = entry.path();
+        if !candidate.is_dir() {
+            continue;
+        }
+
+        let canonical = candidate.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize sibling directory {}",
+                candidate.display()
+            )
+        })?;
+        if canonical == repo_root {
+            continue;
+        }
+
+        let Ok(git_root) = git_stdout(&canonical, ["rev-parse", "--show-toplevel"]) else {
+            continue;
+        };
+        let git_root = PathBuf::from(git_root.trim())
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "failed to canonicalize git root for {}",
+                    canonical.display()
+                )
+            })?;
+        if git_root == canonical {
+            siblings.push(git_root);
+        }
+    }
+
+    siblings.sort();
+    siblings.dedup();
+    Ok(siblings)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrackedRepoState {
+    name: String,
+    path: PathBuf,
+    head: String,
+    status: String,
+}
+
+impl TrackedRepoState {
+    #[cfg(test)]
+    fn new(name: &str, path: &str, head: &str, status: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            head: head.to_string(),
+            status: status.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RepoProgress {
+    None,
+    NewCommits,
+    DirtyChanges(Vec<String>),
+}
+
+fn collect_tracked_repo_states(
+    repo_root: &Path,
+    reference_repos: &[PathBuf],
+) -> Result<Vec<TrackedRepoState>> {
+    let mut repos = Vec::with_capacity(reference_repos.len() + 1);
+    repos.push(repo_root.to_path_buf());
+    repos.extend(reference_repos.iter().cloned());
+
+    let mut states = Vec::with_capacity(repos.len());
+    for path in repos {
+        let head = git_stdout(&path, ["rev-parse", "HEAD"])?;
+        let status = git_stdout(&path, ["status", "--short"])?;
+        states.push(TrackedRepoState {
+            name: repo_name(&path),
+            path,
+            head: head.trim().to_string(),
+            status: status.trim().to_string(),
+        });
+    }
+    Ok(states)
+}
+
+fn summarize_repo_progress(
+    before: &[TrackedRepoState],
+    after: &[TrackedRepoState],
+) -> RepoProgress {
+    let mut dirty_repos = Vec::new();
+    for after_state in after {
+        let Some(before_state) = before.iter().find(|state| state.path == after_state.path) else {
+            return RepoProgress::NewCommits;
+        };
+        if before_state.head != after_state.head {
+            return RepoProgress::NewCommits;
+        }
+        if before_state.status != after_state.status {
+            dirty_repos.push(after_state.name.clone());
+        }
+    }
+
+    if dirty_repos.is_empty() {
+        RepoProgress::None
+    } else {
+        dirty_repos.sort();
+        dirty_repos.dedup();
+        RepoProgress::DirtyChanges(dirty_repos)
+    }
 }
 
 fn resolve_loop_branch(
@@ -304,11 +527,20 @@ fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        discover_sibling_git_repos, parse_origin_head_branch, pick_loop_branch,
+        render_default_loop_prompt, resolve_reference_repos, summarize_repo_progress, RepoProgress,
+        TrackedRepoState,
+    };
 
     #[test]
     fn default_prompt_uses_resolved_branch() {
-        let prompt = render_default_loop_prompt("trunk");
+        let prompt = render_default_loop_prompt("trunk", &[]);
         assert!(prompt.contains("origin/trunk"));
         assert!(prompt.contains("branch `trunk`"));
         assert!(!prompt.contains("origin/main"));
@@ -317,6 +549,15 @@ mod tests {
         assert!(prompt.contains("simplification pass"));
         assert!(prompt.contains("newest spec referenced by the current unchecked task"));
         assert!(prompt.contains("historical context only"));
+    }
+
+    #[test]
+    fn default_prompt_lists_reference_repos_when_declared() {
+        let prompt =
+            render_default_loop_prompt("main", &[PathBuf::from("/home/r/coding/robopokermulti")]);
+        assert!(prompt.contains("Additional repositories you may inspect or edit"));
+        assert!(prompt.contains("/home/r/coding/robopokermulti"));
+        assert!(prompt.contains("owned surfaces live in one of these repos"));
     }
 
     #[test]
@@ -357,5 +598,110 @@ mod tests {
             parse_origin_head_branch("origin/trunk"),
             Some("trunk".to_string())
         );
+    }
+
+    #[test]
+    fn repo_progress_detects_reference_repo_commit() {
+        let before = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+        let after = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb222", ""),
+        ];
+
+        let progress = summarize_repo_progress(&before, &after);
+        assert_eq!(progress, RepoProgress::NewCommits);
+    }
+
+    #[test]
+    fn repo_progress_flags_dirty_reference_repo_without_commit() {
+        let before = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+        let after = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new(
+                "robopokermulti",
+                "/tmp/robopokermulti",
+                "bbb111",
+                " M src/lib.rs",
+            ),
+        ];
+
+        let progress = summarize_repo_progress(&before, &after);
+        assert_eq!(
+            progress,
+            RepoProgress::DirtyChanges(vec!["robopokermulti".to_string()])
+        );
+    }
+
+    #[test]
+    fn discovers_sibling_git_repos_by_default() {
+        let workspace = unique_temp_dir("loop-siblings");
+        let repo_root = workspace.join("bitpoker");
+        let sibling_repo = workspace.join("robopokermulti");
+        let non_repo = workspace.join("notes");
+
+        init_git_repo(&repo_root);
+        init_git_repo(&sibling_repo);
+        fs::create_dir_all(&non_repo).expect("failed to create non-repo dir");
+
+        let discovered = discover_sibling_git_repos(&repo_root).expect("should discover siblings");
+
+        assert_eq!(
+            discovered,
+            vec![sibling_repo.canonicalize().expect("canonical sibling")]
+        );
+
+        fs::remove_dir_all(&workspace).expect("failed to remove temp workspace");
+    }
+
+    #[test]
+    fn resolve_reference_repos_merges_siblings_and_explicit_paths() {
+        let workspace = unique_temp_dir("loop-reference-merge");
+        let repo_root = workspace.join("bitpoker");
+        let sibling_repo = workspace.join("robopokermulti");
+        let explicit_repo = workspace.join("sharedlib");
+
+        init_git_repo(&repo_root);
+        init_git_repo(&sibling_repo);
+        init_git_repo(&explicit_repo);
+
+        let resolved = resolve_reference_repos(
+            &repo_root,
+            &[PathBuf::from("../sharedlib"), sibling_repo.clone()],
+        )
+        .expect("should resolve sibling and explicit repos");
+
+        assert_eq!(
+            resolved,
+            vec![
+                sibling_repo.canonicalize().expect("canonical sibling"),
+                explicit_repo.canonicalize().expect("canonical explicit"),
+            ]
+        );
+
+        fs::remove_dir_all(&workspace).expect("failed to remove temp workspace");
+    }
+
+    fn init_git_repo(path: &PathBuf) {
+        fs::create_dir_all(path).expect("failed to create repo dir");
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .arg(path)
+            .status()
+            .expect("failed to run git init");
+        assert!(status.success(), "git init should succeed");
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
     }
 }
