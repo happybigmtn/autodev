@@ -352,6 +352,10 @@ pub(crate) struct ReviewArgs {
     #[arg(long)]
     branch: Option<String>,
 
+    /// Additional repo roots to add beyond auto-discovered sibling git repos.
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
     /// Directory for review logs. Defaults to <repo>/.auto/review
     #[arg(long)]
     run_root: Option<PathBuf>,

@@ -673,6 +673,8 @@ What it reads:
 - `ARCHIVED.md`
 - `WORKLIST.md`
 - `LEARNINGS.md`
+- sibling git repos under the same parent directory, plus any extra repos passed via
+  `--reference-repo`
 
 What it writes:
 
@@ -687,6 +689,9 @@ What it actually does:
 
 - Moves current `COMPLETED.md` items into `REVIEW.md` before review starts
 - Leaves `COMPLETED.md` free for new implementation work while review is happening
+- Auto-discovers sibling git repos under the same parent directory and treats them as valid review
+  and fix surfaces when the reviewed item points there
+- Merges any `--reference-repo <dir>` entries on top of that default sibling repo set
 - Reviews each item as a claim that must be verified
 - Reconstructs changed files and blast radius before clearing an item
 - Reviews correctness, readability, architecture, security, trust boundaries, and performance
@@ -700,6 +705,9 @@ What it actually does:
   - blast radius wider than the touched files suggest
 - Writes unresolved issues to `WORKLIST.md`
 - Moves only truly cleared review items into `ARCHIVED.md`
+- Treats a commit in the queue repo or any additional listed repo as real review progress
+- Fails loudly if an additional listed repo was changed but left uncommitted at the end of an
+  iteration, instead of pretending nothing happened
 - Rebases onto `origin/<branch>` before review starts and again before each push when that remote
   branch exists, so long review passes tolerate remote fast-forwards
 
@@ -717,6 +725,7 @@ When to run it:
 Useful flags:
 
 - `--max-iterations <n>` to allow multiple review/fix cycles
+- `--reference-repo <dir>` to add an external repo beyond the auto-discovered sibling repo set
 - `--prompt-file <path>` to override the review prompt
 - `--branch <name>` to require a specific branch
 - `--run-root <dir>` to change review log location
