@@ -232,9 +232,13 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Additional repo roots to add beyond auto-discovered sibling git repos.
+    /// Additional repository roots the loop worker may inspect or edit
     #[arg(long = "reference-repo")]
     reference_repos: Vec<PathBuf>,
+
+    /// Auto-discover sibling git repos in the parent directory as reference repos
+    #[arg(long)]
+    include_siblings: bool,
 
     /// Directory for loop logs. Defaults to <repo>/.auto/loop
     #[arg(long)]

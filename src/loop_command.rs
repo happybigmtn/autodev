@@ -88,7 +88,8 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
-    let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
+    let reference_repos =
+        resolve_reference_repos(&repo_root, &args.reference_repos, args.include_siblings)?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     let current_branch = current_branch.trim().to_string();
@@ -276,8 +277,16 @@ fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> 
     )
 }
 
-fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut resolved = discover_sibling_git_repos(repo_root)?;
+fn resolve_reference_repos(
+    repo_root: &Path,
+    paths: &[PathBuf],
+    include_siblings: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut resolved = if include_siblings {
+        discover_sibling_git_repos(repo_root)?
+    } else {
+        Vec::new()
+    };
     for path in paths {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -675,6 +684,7 @@ mod tests {
         let resolved = resolve_reference_repos(
             &repo_root,
             &[PathBuf::from("../sharedlib"), sibling_repo.clone()],
+            true,
         )
         .expect("should resolve sibling and explicit repos");
 
