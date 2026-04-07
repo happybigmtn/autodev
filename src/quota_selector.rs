@@ -172,10 +172,6 @@ fn all_exhausted_error(
 mod tests {
     use super::*;
 
-    fn make_config(accounts: Vec<AccountEntry>) -> QuotaConfig {
-        QuotaConfig { accounts }
-    }
-
     fn make_account(name: &str, provider: Provider) -> AccountEntry {
         AccountEntry {
             name: name.into(),
@@ -192,7 +188,6 @@ mod tests {
         AccountUsage {
             plan: "test".into(),
             session_used_pct,
-            session_remaining_pct: 100u32.saturating_sub(session_used_pct),
             session_resets_in_secs,
             weekly_used_pct,
             weekly_remaining_pct: 100u32.saturating_sub(weekly_used_pct),

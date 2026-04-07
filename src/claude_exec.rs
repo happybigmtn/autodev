@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
 use crate::codex_stream;
+use crate::quota_config::Provider;
+use crate::quota_exec;
 use crate::util::{atomic_write, timestamp_slug};
 
 pub(crate) async fn run_claude_exec(
@@ -16,6 +18,33 @@ pub(crate) async fn run_claude_exec(
     stderr_log_path: &Path,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
+    let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Claude) {
+        let repo_root = repo_root.to_owned();
+        let full_prompt = full_prompt.to_owned();
+        let context_label = context_label.to_owned();
+        let result = quota_exec::run_with_quota(Provider::Claude, move || {
+            let repo_root = repo_root.clone();
+            let full_prompt = full_prompt.clone();
+            let context_label = context_label.clone();
+            async move {
+                spawn_claude(&repo_root, &full_prompt, max_turns, &context_label).await
+            }
+        })
+        .await?;
+        (result.exit_status, result.stderr_text)
+    } else {
+        spawn_claude(repo_root, full_prompt, max_turns, context_label).await?
+    };
+    log_stderr(&stderr_text, stderr_log_path)?;
+    Ok(status)
+}
+
+async fn spawn_claude(
+    repo_root: &Path,
+    full_prompt: &str,
+    max_turns: usize,
+    context_label: &str,
+) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new("claude");
     command
         .arg("-p")
@@ -63,6 +92,11 @@ pub(crate) async fn run_claude_exec(
     let stderr_text = stderr_task
         .await
         .context("Claude stderr capture task panicked")??;
+
+    Ok((status, stderr_text))
+}
+
+fn log_stderr(stderr_text: &str, stderr_log_path: &Path) -> Result<()> {
     if !stderr_text.trim().is_empty() {
         let entry = format!("\n===== {} =====\n{stderr_text}\n", timestamp_slug());
         let mut existing = if stderr_log_path.exists() {
@@ -74,8 +108,7 @@ pub(crate) async fn run_claude_exec(
         existing.extend_from_slice(entry.as_bytes());
         atomic_write(stderr_log_path, &existing)?;
     }
-
-    Ok(status)
+    Ok(())
 }
 
 async fn read_stream<R>(stream: R) -> Result<String>

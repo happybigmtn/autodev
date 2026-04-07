@@ -24,7 +24,6 @@ pub(crate) struct CodexRateLimit {
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexWindow {
     pub(crate) used_percent: u32,
-    pub(crate) limit_window_seconds: u64,
     pub(crate) reset_after_seconds: u64,
 }
 
@@ -34,7 +33,6 @@ pub(crate) struct CodexWindow {
 pub(crate) struct ClaudeUsageResponse {
     pub(crate) five_hour: ClaudeWindow,
     pub(crate) seven_day: ClaudeWindow,
-    pub(crate) extra_usage: Option<ClaudeExtraUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,20 +41,12 @@ pub(crate) struct ClaudeWindow {
     pub(crate) resets_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct ClaudeExtraUsage {
-    pub(crate) is_enabled: bool,
-    pub(crate) used_credits: f64,
-    pub(crate) monthly_limit: Option<f64>,
-}
-
 // ── Unified usage result ───────────────────────────────────────────────
 
 #[derive(Debug)]
 pub(crate) struct AccountUsage {
     pub(crate) plan: String,
     pub(crate) session_used_pct: u32,
-    pub(crate) session_remaining_pct: u32,
     pub(crate) session_resets_in_secs: u64,
     pub(crate) weekly_used_pct: u32,
     pub(crate) weekly_remaining_pct: u32,
@@ -106,7 +96,6 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
     Ok(AccountUsage {
         plan: usage.plan_type,
         session_used_pct: session_used,
-        session_remaining_pct: 100u32.saturating_sub(session_used),
         session_resets_in_secs: session_reset,
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),
@@ -153,7 +142,6 @@ pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsag
     Ok(AccountUsage {
         plan: "max".into(),
         session_used_pct: session_used,
-        session_remaining_pct: 100u32.saturating_sub(session_used),
         session_resets_in_secs: session_reset_secs,
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),

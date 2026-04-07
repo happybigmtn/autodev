@@ -185,7 +185,6 @@ fn acquire_swap_lock() -> Result<fd_lock::RwLock<fs::File>> {
 
 pub(crate) struct QuotaExecResult {
     pub(crate) exit_status: std::process::ExitStatus,
-    pub(crate) account_name: String,
     pub(crate) stderr_text: String,
 }
 
@@ -260,7 +259,6 @@ where
                         state.save()?;
                         return Ok(QuotaExecResult {
                             exit_status: status,
-                            account_name,
                             stderr_text,
                         });
                     }
