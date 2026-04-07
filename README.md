@@ -34,18 +34,18 @@ need to pass directories in the normal case.
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `xhigh`
+- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `high`
   implementation pass by default
-- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
-- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `xhigh`, and the
+- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `high`
+- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and the
   `standard` tier
-- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `xhigh`, and
+- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and
   the `standard` tier
 - `auto health` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
-- `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`
-- `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `xhigh`,
+- `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
+- `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `high`,
   targeting the repo's resolved base branch
-- `auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `xhigh` implementation pass
+- `auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `high` implementation pass
   unless `--report-only` is used
 - All mutating branch commands (`auto loop`, `auto qa`, `auto review`, `auto ship`, `auto bug`,
   and `auto nemesis`) now rebase onto `origin/<branch>` when that remote branch exists before
@@ -323,7 +323,7 @@ Default model layout:
 - finder: MiniMax `minimax/MiniMax-M2.7-highspeed` with `high`
 - skeptic: Kimi with `high`
 - reviewer: Kimi with `high`
-- implementer: `gpt-5.4` with `xhigh`
+- implementer: `gpt-5.4` with `high`
 
 Safety behavior:
 
@@ -380,7 +380,7 @@ What it actually does:
 - Archives the previous `nemesis/` folder under `.auto/fresh-input/`
 - Runs a draft audit pass to maximize evidence-backed recall
 - Runs a synthesis pass to tighten or discard weak claims
-- Runs a final `gpt-5.4` `xhigh` implementation pass against the synthesized Nemesis plan by
+- Runs a final `gpt-5.4` `high` implementation pass against the synthesized Nemesis plan by
   default
 - Treats the Nemesis plan as the execution contract for bounded hardening work
 - Writes implementation results under `nemesis/`
@@ -398,7 +398,7 @@ Backend selection:
 
 - Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
 - Final reviewer default: PI with `kimi-coding/k2p5` and `high`
-- Final implementer default: Codex `gpt-5.4` with `xhigh`
+- Final implementer default: Codex `gpt-5.4` with `high`
 - `--kimi` switches the draft pass to Kimi
 - `--minimax` switches the draft pass to MiniMax
 - `--model kimi` and `--model minimax` do the same through the generic model flag

@@ -188,8 +188,8 @@ pub(crate) struct BugArgs {
     #[arg(long, default_value = "gpt-5.4")]
     fixer_model: String,
 
-    /// Effort / variant for the final implementation pass. This stays pinned to xhigh.
-    #[arg(long, default_value = "xhigh")]
+    /// Effort / variant for the final implementation pass. This stays pinned to high.
+    #[arg(long, default_value = "high")]
     fixer_effort: String,
 
     /// Model for the verification review pass
@@ -224,7 +224,7 @@ pub(crate) struct LoopArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Branch that the loop is allowed to run on. Defaults to the repo's primary branch.
@@ -255,7 +255,7 @@ pub(crate) struct ReviewArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex review worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Optional branch to require for the review loop; defaults to the currently checked-out branch
@@ -286,7 +286,7 @@ pub(crate) struct QaArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex QA worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Optional branch to require for the QA loop; defaults to the currently checked-out branch
@@ -317,7 +317,7 @@ pub(crate) struct QaOnlyArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex QA report worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Optional branch to require for the QA report; defaults to the currently checked-out branch
@@ -379,7 +379,7 @@ pub(crate) struct ShipArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex ship worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Optional branch to require for the ship loop; defaults to the currently checked-out branch
@@ -450,7 +450,7 @@ pub(crate) struct NemesisArgs {
     fixer_model: String,
 
     /// Reasoning effort / variant for the Nemesis implementation pass
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     fixer_effort: String,
 
     /// Codex executable to invoke for the default backend

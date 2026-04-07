@@ -1643,7 +1643,7 @@ Spec: specs/020426-nemesis-audit.md
             branch: None,
             dry_run: true,
             fixer_model: "gpt-5.4".to_string(),
-            fixer_effort: "xhigh".to_string(),
+            fixer_effort: "high".to_string(),
             codex_bin: PathBuf::from("codex"),
             pi_bin: PathBuf::from("pi"),
         }
@@ -1716,7 +1716,7 @@ Spec: specs/020426-nemesis-audit.md
     fn nemesis_phase_rejects_non_pi_models() {
         let config = PhaseConfig {
             model: "gpt-5.4".to_string(),
-            effort: "xhigh".to_string(),
+            effort: "high".to_string(),
         };
         assert!(ensure_pi_phase_config("nemesis", &config).is_err());
     }

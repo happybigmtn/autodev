@@ -19,7 +19,7 @@ use crate::util::{
 use crate::BugArgs;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
-const DEFAULT_CODEX_REASONING_EFFORT: &str = "xhigh";
+const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 
