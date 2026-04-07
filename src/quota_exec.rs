@@ -168,8 +168,8 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
     Ok(AuthRestoreGuard::new(pairs))
 }
 
-fn acquire_swap_lock() -> Result<fd_lock::RwLock<fs::File>> {
-    let lock_path = QuotaConfig::config_dir().join("swap.lock");
+fn acquire_provider_lock(provider: Provider) -> Result<fd_lock::RwLock<fs::File>> {
+    let lock_path = QuotaConfig::config_dir().join(format!("swap-{}.lock", provider.label()));
     fs::create_dir_all(QuotaConfig::config_dir())
         .context("failed to create quota config dir")?;
 
@@ -224,15 +224,16 @@ where
             attempt + 1,
         );
 
-        let mut lock = acquire_swap_lock()?;
-        let _lock_guard = lock
-            .try_write()
-            .map_err(|_| anyhow::anyhow!("another quota-router instance holds the swap lock"))?;
+        let mut lock = acquire_provider_lock(provider)?;
+        let _lock_guard = lock.try_write().map_err(|_| {
+            anyhow::anyhow!(
+                "another {provider} quota-router instance is swapping credentials"
+            )
+        })?;
         let mut guard = swap_credentials(provider, &profile_dir)?;
 
         let result = exec_fn().await;
 
-        // Disarm guard and restore manually so we control the order
         guard.disarm();
         drop(guard);
         restore_credentials(provider)?;
@@ -328,11 +329,18 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
 
     eprintln!("[quota-router] selected account '{account_name}'");
 
-    let mut lock = acquire_swap_lock()?;
-    let _lock_guard = lock
-        .try_write()
-        .map_err(|_| anyhow::anyhow!("another quota-router instance holds the swap lock"))?;
-    let guard = swap_credentials(provider, &profile_dir)?;
+    // Hold the per-provider lock only during the credential swap,
+    // not during the entire interactive session.  This lets other
+    // quota-routed commands (even same-provider) proceed concurrently.
+    let mut restore_guard = {
+        let mut lock = acquire_provider_lock(provider)?;
+        let _write = lock.try_write().map_err(|_| {
+            anyhow::anyhow!(
+                "another {provider} quota-router instance is swapping credentials"
+            )
+        })?;
+        swap_credentials(provider, &profile_dir)?
+    };
 
     let bin = provider.label();
     let status = std::process::Command::new(bin)
@@ -340,7 +348,16 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
         .status()
         .with_context(|| format!("failed to launch {bin}"))?;
 
-    drop(guard);
+    // Re-acquire lock only for the restore.  Blocking write() is safe
+    // here because other holders only keep it during swap/restore (ms).
+    {
+        let mut lock = acquire_provider_lock(provider)?;
+        let _write = lock.write().map_err(|e| {
+            anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
+        })?;
+        restore_guard.disarm();
+        restore_credentials(provider)?;
+    }
 
     state.mark_used(&account_name, Utc::now());
     if status.success() {

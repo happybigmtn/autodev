@@ -143,11 +143,33 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
         return Ok(false);
     }
 
-    run_git(
-        repo_root,
-        ["pull", "--rebase", "--autostash", "origin", branch],
-    )?;
-    Ok(true)
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["pull", "--rebase", "--autostash", "origin", branch])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("no candidate for rebasing against")
+        || stderr.contains("unrelated histories")
+    {
+        eprintln!(
+            "warning: cannot rebase {branch} onto origin/{branch} \
+             (unrelated histories); continuing without sync"
+        );
+        return Ok(false);
+    }
+
+    bail!(
+        "git command failed in {}: {}",
+        repo_root.display(),
+        stderr.trim()
+    );
 }
 
 pub(crate) fn push_branch_with_remote_sync(repo_root: &Path, branch: &str) -> Result<bool> {

@@ -401,16 +401,17 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     }
 
     print_phase_header("auditor", &audit_backend);
-    let audit_response = run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend)
-        .await
-        .map_err(|err| {
-            annotate_output_recovery(
-                err,
-                &output_dir,
-                previous_snapshot.as_deref(),
-                "Nemesis audit pass failed",
-            )
-        })?;
+    let audit_response =
+        run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend, &args.codex_bin)
+            .await
+            .map_err(|err| {
+                annotate_output_recovery(
+                    err,
+                    &output_dir,
+                    previous_snapshot.as_deref(),
+                    "Nemesis audit pass failed",
+                )
+            })?;
     let audit_response_path = repo_root
         .join(".auto")
         .join("logs")
@@ -421,16 +422,17 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     }
 
     print_phase_header("reviewer", &review_backend);
-    let review_response = run_nemesis_backend(&repo_root, &review_prompt, &review_backend)
-        .await
-        .map_err(|err| {
-            annotate_output_recovery(
-                err,
-                &output_dir,
-                previous_snapshot.as_deref(),
-                "Nemesis synthesis pass failed",
-            )
-        })?;
+    let review_response =
+        run_nemesis_backend(&repo_root, &review_prompt, &review_backend, &args.codex_bin)
+            .await
+            .map_err(|err| {
+                annotate_output_recovery(
+                    err,
+                    &output_dir,
+                    previous_snapshot.as_deref(),
+                    "Nemesis synthesis pass failed",
+                )
+            })?;
     let review_response_path = repo_root
         .join(".auto")
         .join("logs")
@@ -490,6 +492,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             let implementation_path = verify_nemesis_implementation_results(
                 &repo_root,
                 &fix_backend,
+                &args.codex_bin,
                 &spec_path,
                 &implementation_results_json_path,
                 &implementation_results_md_path,
@@ -789,6 +792,7 @@ async fn run_nemesis_backend(
     repo_root: &Path,
     prompt: &str,
     backend: &NemesisBackend,
+    codex_bin: &Path,
 ) -> Result<String> {
     match backend {
         NemesisBackend::Codex {
@@ -801,7 +805,27 @@ async fn run_nemesis_backend(
             thinking,
             pi_bin,
             ..
-        } => run_pi(repo_root, prompt, model, thinking, pi_bin).await,
+        } => match run_pi(repo_root, prompt, model, thinking, pi_bin).await {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                eprintln!("[auto-nemesis] PI backend failed: {e:#}");
+                eprintln!("[auto-nemesis] falling back to Codex");
+                let fallback = NemesisBackend::Codex {
+                    model: DEFAULT_CODEX_NEMESIS_MODEL.to_string(),
+                    reasoning_effort: "high".to_string(),
+                    codex_bin: codex_bin.to_path_buf(),
+                };
+                print_phase_header("fallback", &fallback);
+                run_codex(
+                    repo_root,
+                    prompt,
+                    DEFAULT_CODEX_NEMESIS_MODEL,
+                    "high",
+                    codex_bin,
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -1032,6 +1056,7 @@ fn verify_nemesis_outputs(output_dir: &Path) -> Result<VerifiedNemesisOutputs> {
 async fn verify_nemesis_implementation_results(
     repo_root: &Path,
     backend: &NemesisBackend,
+    codex_bin: &Path,
     audit_path: &Path,
     results_json_path: &Path,
     results_md_path: &Path,
@@ -1048,6 +1073,7 @@ async fn verify_nemesis_implementation_results(
             repair_nemesis_implementation_outputs(
                 repo_root,
                 backend,
+                codex_bin,
                 audit_path,
                 plan_path,
                 results_json_path,
@@ -1209,6 +1235,7 @@ fn repair_nemesis_json(content: &str) -> Option<String> {
 async fn repair_nemesis_implementation_outputs(
     repo_root: &Path,
     backend: &NemesisBackend,
+    codex_bin: &Path,
     audit_path: &Path,
     plan_path: &Path,
     results_json_path: &Path,
@@ -1220,7 +1247,7 @@ async fn repair_nemesis_implementation_outputs(
         results_json_path,
         results_md_path,
     );
-    let repair_response = run_nemesis_backend(repo_root, &prompt, backend).await?;
+    let repair_response = run_nemesis_backend(repo_root, &prompt, backend, codex_bin).await?;
     if !repair_response.trim().is_empty() {
         let log_path = repo_root.join(".auto").join("logs").join(format!(
             "nemesis-{}-implementation-repair-response.log",
