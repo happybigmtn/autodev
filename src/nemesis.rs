@@ -142,11 +142,13 @@ Requirements:
 - `blocked` means an external dependency, ambiguity, or repo limitation prevented a truthful close.
 - `{results_md}` should summarize proof-before-fix, root cause, changes made, validation, and any deferred or blocked tasks.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 "#;
 
 const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
 const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "minimax/MiniMax-M2.7-highspeed";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
+const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Priority Work",
     "## Follow-On Work",
@@ -188,6 +190,32 @@ struct NemesisFixResult {
 struct VerifiedNemesisOutputs {
     spec_path: PathBuf,
     plan_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonRepairContext {
+    Object(ObjectParseState),
+    Array(ArrayParseState),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectParseState {
+    KeyOrEnd,
+    Colon,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArrayParseState {
+    ValueOrEnd,
+    CommaOrEnd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonStringRole {
+    Key,
+    Value,
 }
 
 enum NemesisBackend {
@@ -280,6 +308,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         &args.codex_bin,
         &args.pi_bin,
     );
+    let fix_backend = select_backend(&fixer.model, &fixer.effort, &args.codex_bin, &args.pi_bin);
     validate_nemesis_backend_binaries(&audit_backend, &review_backend, args.report_only, &args)?;
     let previous_snapshot = maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run)?;
 
@@ -459,10 +488,14 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             }
 
             let implementation_path = verify_nemesis_implementation_results(
+                &repo_root,
+                &fix_backend,
+                &spec_path,
                 &implementation_results_json_path,
                 &implementation_results_md_path,
                 &plan_path,
-            )?;
+            )
+            .await?;
             implementation_summary = implementation_path.display().to_string();
             implementation_results = Some(implementation_path);
             let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
@@ -996,11 +1029,55 @@ fn verify_nemesis_outputs(output_dir: &Path) -> Result<VerifiedNemesisOutputs> {
     })
 }
 
-fn verify_nemesis_implementation_results(
+async fn verify_nemesis_implementation_results(
+    repo_root: &Path,
+    backend: &NemesisBackend,
+    audit_path: &Path,
     results_json_path: &Path,
     results_md_path: &Path,
     plan_path: &Path,
 ) -> Result<PathBuf> {
+    match verify_nemesis_implementation_results_once(results_json_path, results_md_path, plan_path)
+    {
+        Ok(_) => {}
+        Err(original_error) => {
+            println!(
+                "warning: attempting backend repair for Nemesis implementation artifacts in {}",
+                results_json_path.display()
+            );
+            repair_nemesis_implementation_outputs(
+                repo_root,
+                backend,
+                audit_path,
+                plan_path,
+                results_json_path,
+                results_md_path,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "backend repair failed for Nemesis implementation artifacts in {}",
+                    results_json_path.display()
+                )
+            })?;
+            verify_nemesis_implementation_results_once(results_json_path, results_md_path, plan_path)
+                .map_err(|repair_error| {
+                    anyhow::anyhow!(
+                        "failed to recover Nemesis implementation artifacts after backend repair; original error: {}; repair error: {}",
+                        original_error,
+                        repair_error
+                    )
+                })?;
+        }
+    }
+    Ok(results_json_path.to_path_buf())
+}
+
+fn verify_nemesis_implementation_results_once(
+    results_json_path: &Path,
+    results_md_path: &Path,
+    plan_path: &Path,
+) -> Result<Vec<NemesisFixResult>> {
     if !results_json_path.exists() {
         bail!(
             "Nemesis implementation did not write {}",
@@ -1025,7 +1102,7 @@ fn verify_nemesis_implementation_results(
             bail!("Nemesis implementation results missing task `{task_id}`");
         }
     }
-    Ok(results_json_path.to_path_buf())
+    Ok(results)
 }
 
 fn load_unchecked_nemesis_task_ids(plan_path: &Path) -> Result<std::collections::BTreeSet<String>> {
@@ -1047,9 +1124,38 @@ fn unchecked_nemesis_task_ids(markdown: &str) -> Result<std::collections::BTreeS
 fn load_nemesis_fix_results(path: &Path) -> Result<Vec<NemesisFixResult>> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let results: Vec<NemesisFixResult> = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    for result in &results {
+    let results = match serde_json::from_str::<Vec<NemesisFixResult>>(&content) {
+        Ok(results) => results,
+        Err(original_error) => {
+            let Some(repaired) = repair_nemesis_json(&content) else {
+                bail!("failed to parse {}: {}", path.display(), original_error);
+            };
+            match serde_json::from_str::<Vec<NemesisFixResult>>(&repaired) {
+                Ok(results) => {
+                    println!(
+                        "warning: repaired invalid or incomplete JSON in {}",
+                        path.display()
+                    );
+                    if repaired != content {
+                        atomic_write(path, repaired.as_bytes())?;
+                    }
+                    results
+                }
+                Err(repair_error) => bail!(
+                    "failed to parse {}: {}; automatic repair also failed: {}",
+                    path.display(),
+                    original_error,
+                    repair_error
+                ),
+            }
+        }
+    };
+    validate_nemesis_fix_results(&results)?;
+    Ok(results)
+}
+
+fn validate_nemesis_fix_results(results: &[NemesisFixResult]) -> Result<()> {
+    for result in results {
         match result.status.trim().to_ascii_lowercase().as_str() {
             "fixed" | "deferred" | "blocked" => {}
             other => bail!(
@@ -1088,7 +1194,342 @@ fn load_nemesis_fix_results(path: &Path) -> Result<Vec<NemesisFixResult>> {
             );
         }
     }
-    Ok(results)
+    Ok(())
+}
+
+fn repair_nemesis_json(content: &str) -> Option<String> {
+    let candidate = extract_fenced_json_block(content).unwrap_or_else(|| content.to_string());
+    if candidate.len() > JSON_REPAIR_MAX_BYTES {
+        return None;
+    }
+    let repaired = escape_unescaped_quotes_in_json_strings(&candidate);
+    (repaired != content).then_some(repaired)
+}
+
+async fn repair_nemesis_implementation_outputs(
+    repo_root: &Path,
+    backend: &NemesisBackend,
+    audit_path: &Path,
+    plan_path: &Path,
+    results_json_path: &Path,
+    results_md_path: &Path,
+) -> Result<()> {
+    let prompt = build_nemesis_results_repair_prompt(
+        audit_path,
+        plan_path,
+        results_json_path,
+        results_md_path,
+    );
+    let repair_response = run_nemesis_backend(repo_root, &prompt, backend).await?;
+    if !repair_response.trim().is_empty() {
+        let log_path = repo_root.join(".auto").join("logs").join(format!(
+            "nemesis-{}-implementation-repair-response.log",
+            timestamp_slug()
+        ));
+        atomic_write(&log_path, repair_response.as_bytes())
+            .with_context(|| format!("failed to write {}", log_path.display()))?;
+    }
+    Ok(())
+}
+
+fn build_nemesis_results_repair_prompt(
+    audit_path: &Path,
+    plan_path: &Path,
+    results_json_path: &Path,
+    results_md_path: &Path,
+) -> String {
+    format!(
+        r#"You are repairing malformed implementation artifacts for auto nemesis.
+
+Input context:
+- Audit: `{audit_path}`
+- Plan: `{plan_path}`
+
+Artifacts to repair:
+- `{results_json_path}`
+- `{results_md_path}`
+
+Rules:
+- Do not modify code, tests, git state, or any workflow artifacts other than the two files above.
+- Read the audit, the plan, and the current repository state to recover the truthful implementation summary.
+- Rewrite `{results_json_path}` as valid JSON only. No markdown fences. No commentary.
+- Rewrite `{results_md_path}` as a concise markdown summary of the same results.
+- Preserve every recoverable task result. Do not invent work that did not happen.
+- `{results_json_path}` must be a JSON array using exactly this schema:
+[
+  {{
+    "task_id": "NEM-001",
+    "status": "fixed|deferred|blocked",
+    "summary": "What changed and why",
+    "validation_commands": ["Command actually run"],
+    "touched_files": ["path/to/file"],
+    "residual_risks": ["Anything still not fully closed"]
+  }}
+]
+- JSON strings must stay valid JSON. Escape embedded quotes when needed.
+- Double-escape literal backslashes in regexes, paths, and code snippets.
+"#,
+        audit_path = audit_path.display(),
+        plan_path = plan_path.display(),
+        results_json_path = results_json_path.display(),
+        results_md_path = results_md_path.display(),
+    )
+}
+
+fn extract_fenced_json_block(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+
+    let mut lines = trimmed.lines();
+    let opening = lines.next()?.trim();
+    if !opening.starts_with("```") {
+        return None;
+    }
+
+    let mut extracted = String::new();
+    let mut saw_closing = false;
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            saw_closing = true;
+            break;
+        }
+        extracted.push_str(line);
+        extracted.push('\n');
+    }
+
+    saw_closing.then(|| extracted.trim().to_string())
+}
+
+fn escape_unescaped_quotes_in_json_strings(content: &str) -> String {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut repaired = String::with_capacity(content.len() + 32);
+    let mut contexts = Vec::<JsonRepairContext>::new();
+    let mut string_role = None::<JsonStringRole>;
+    let mut primitive_value = false;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+
+        if primitive_value {
+            if matches!(ch, ',' | '}' | ']') {
+                finish_json_value(&mut contexts);
+                primitive_value = false;
+                continue;
+            }
+            repaired.push(ch);
+            index += 1;
+            continue;
+        }
+
+        if let Some(role) = string_role {
+            match ch {
+                '\\' => {
+                    if valid_json_string_escape_at(&chars, index) {
+                        repaired.push('\\');
+                        repaired.push(chars[index + 1]);
+                        if chars[index + 1] == 'u' {
+                            repaired.extend(chars[index + 2..index + 6].iter().copied());
+                            index += 6;
+                        } else {
+                            index += 2;
+                        }
+                    } else {
+                        repaired.push('\\');
+                        repaired.push('\\');
+                        index += 1;
+                    }
+                    continue;
+                }
+                '"' => {
+                    if is_likely_string_terminator(&chars, index, role, &contexts) {
+                        repaired.push(ch);
+                        string_role = None;
+                        finish_string_token(&mut contexts, role);
+                    } else {
+                        repaired.push('\\');
+                        repaired.push('"');
+                    }
+                }
+                _ => repaired.push(ch),
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                string_role = Some(current_string_role(&contexts));
+                repaired.push(ch);
+            }
+            '{' => {
+                contexts.push(JsonRepairContext::Object(ObjectParseState::KeyOrEnd));
+                repaired.push(ch);
+            }
+            '[' => {
+                contexts.push(JsonRepairContext::Array(ArrayParseState::ValueOrEnd));
+                repaired.push(ch);
+            }
+            '}' => {
+                repaired.push(ch);
+                if matches!(contexts.last(), Some(JsonRepairContext::Object(_))) {
+                    contexts.pop();
+                    finish_json_value(&mut contexts);
+                }
+            }
+            ']' => {
+                repaired.push(ch);
+                if matches!(contexts.last(), Some(JsonRepairContext::Array(_))) {
+                    contexts.pop();
+                    finish_json_value(&mut contexts);
+                }
+            }
+            ':' => {
+                repaired.push(ch);
+                if let Some(JsonRepairContext::Object(state)) = contexts.last_mut() {
+                    if *state == ObjectParseState::Colon {
+                        *state = ObjectParseState::Value;
+                    }
+                }
+            }
+            ',' => {
+                repaired.push(ch);
+                advance_json_context_after_comma(&mut contexts);
+            }
+            ch if ch.is_whitespace() => repaired.push(ch),
+            _ => {
+                repaired.push(ch);
+                primitive_value = context_expects_value(&contexts);
+            }
+        }
+
+        index += 1;
+    }
+
+    if primitive_value {
+        finish_json_value(&mut contexts);
+    }
+
+    repaired
+}
+
+fn current_string_role(contexts: &[JsonRepairContext]) -> JsonStringRole {
+    match contexts.last() {
+        Some(JsonRepairContext::Object(ObjectParseState::KeyOrEnd)) => JsonStringRole::Key,
+        _ => JsonStringRole::Value,
+    }
+}
+
+fn finish_string_token(contexts: &mut [JsonRepairContext], role: JsonStringRole) {
+    match role {
+        JsonStringRole::Key => {
+            if let Some(JsonRepairContext::Object(state)) = contexts.last_mut() {
+                *state = ObjectParseState::Colon;
+            }
+        }
+        JsonStringRole::Value => finish_json_value(contexts),
+    }
+}
+
+fn finish_json_value(contexts: &mut [JsonRepairContext]) {
+    if let Some(context) = contexts.last_mut() {
+        match context {
+            JsonRepairContext::Object(state) if *state == ObjectParseState::Value => {
+                *state = ObjectParseState::CommaOrEnd;
+            }
+            JsonRepairContext::Array(state) if *state == ArrayParseState::ValueOrEnd => {
+                *state = ArrayParseState::CommaOrEnd;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn advance_json_context_after_comma(contexts: &mut [JsonRepairContext]) {
+    if let Some(context) = contexts.last_mut() {
+        match context {
+            JsonRepairContext::Object(state) if *state == ObjectParseState::CommaOrEnd => {
+                *state = ObjectParseState::KeyOrEnd;
+            }
+            JsonRepairContext::Array(state) if *state == ArrayParseState::CommaOrEnd => {
+                *state = ArrayParseState::ValueOrEnd;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn context_expects_value(contexts: &[JsonRepairContext]) -> bool {
+    matches!(
+        contexts.last(),
+        Some(JsonRepairContext::Object(ObjectParseState::Value))
+            | Some(JsonRepairContext::Array(ArrayParseState::ValueOrEnd))
+            | None
+    )
+}
+
+fn is_likely_string_terminator(
+    chars: &[char],
+    quote_index: usize,
+    role: JsonStringRole,
+    contexts: &[JsonRepairContext],
+) -> bool {
+    let Some((delimiter_index, delimiter)) = next_significant_char(chars, quote_index + 1) else {
+        return role == JsonStringRole::Value;
+    };
+
+    match role {
+        JsonStringRole::Key => delimiter == ':',
+        JsonStringRole::Value => match delimiter {
+            '}' | ']' => true,
+            ',' => {
+                let Some((_, next_token)) = next_significant_char(chars, delimiter_index + 1)
+                else {
+                    return false;
+                };
+                match contexts.last() {
+                    Some(JsonRepairContext::Object(ObjectParseState::Value)) => next_token == '"',
+                    Some(JsonRepairContext::Array(ArrayParseState::ValueOrEnd)) => {
+                        is_valid_array_value_start(next_token)
+                    }
+                    None => false,
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+    }
+}
+
+fn next_significant_char(chars: &[char], mut index: usize) -> Option<(usize, char)> {
+    while index < chars.len() {
+        let ch = chars[index];
+        if !ch.is_whitespace() {
+            return Some((index, ch));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_valid_array_value_start(ch: char) -> bool {
+    matches!(ch, '"' | '{' | '[' | '-' | 't' | 'f' | 'n') || ch.is_ascii_digit()
+}
+
+fn valid_json_string_escape_at(chars: &[char], index: usize) -> bool {
+    let Some(next) = chars.get(index + 1).copied() else {
+        return false;
+    };
+
+    match next {
+        '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => true,
+        'u' => chars.get(index + 2..index + 6).is_some_and(|digits| {
+            digits.len() == 4 && digits.iter().all(|digit| digit.is_ascii_hexdigit())
+        }),
+        _ => false,
+    }
 }
 
 fn sync_nemesis_spec_to_root(repo_root: &Path, spec_path: &Path) -> Result<PathBuf> {
@@ -1462,7 +1903,8 @@ mod tests {
 
     use super::{
         annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
-        commit_nemesis_outputs_if_needed, ensure_nemesis_fixer_config, ensure_pi_phase_config,
+        build_nemesis_results_repair_prompt, commit_nemesis_outputs_if_needed,
+        ensure_nemesis_fixer_config, ensure_pi_phase_config, load_nemesis_fix_results,
         maybe_prepare_output_dir, next_nemesis_spec_destination, prepare_output_dir,
         resolve_auditor_model, select_backend, unchecked_nemesis_task_ids, verify_nemesis_outputs,
         PhaseConfig,
@@ -1736,6 +2178,46 @@ Spec: specs/020426-nemesis-audit.md
         assert!(
             prompt.contains("Do not edit root `specs/` or root `IMPLEMENTATION_PLAN.md` directly")
         );
+    }
+
+    #[test]
+    fn nemesis_results_repair_prompt_is_file_scoped() {
+        let prompt = build_nemesis_results_repair_prompt(
+            Path::new("nemesis/nemesis-audit.md"),
+            Path::new("nemesis/IMPLEMENTATION_PLAN.md"),
+            Path::new("nemesis/implementation-results.json"),
+            Path::new("nemesis/implementation-results.md"),
+        );
+
+        assert!(prompt.contains("Do not modify code, tests, git state"));
+        assert!(prompt.contains("implementation-results.json"));
+        assert!(prompt.contains("implementation-results.md"));
+        assert!(prompt.contains("\"task_id\": \"NEM-001\""));
+    }
+
+    #[test]
+    fn load_nemesis_fix_results_repairs_invalid_backslash_escapes() {
+        let path = temp_repo_path("nemesis-invalid-escapes").join("implementation-results.json");
+        fs::create_dir_all(path.parent().expect("temp file should have a parent"))
+            .expect("failed to create temp dir");
+        fs::write(
+            &path,
+            r#"[
+  {
+    "task_id": "NEM-001",
+    "status": "blocked",
+    "summary": "The pattern \d+\_suffix still appears in the copied output.",
+    "validation_commands": [],
+    "touched_files": [],
+    "residual_risks": ["Needs manual review"]
+  }
+]"#,
+        )
+        .expect("failed to write invalid json");
+
+        let results = load_nemesis_fix_results(&path).expect("repair should recover JSON");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].summary.contains("\\d+\\_suffix"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -445,7 +446,16 @@ async fn run_finder_phase(
     prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
-    let findings: Vec<BugFinding> = load_json_file(&findings_json_path)?;
+    let findings: Vec<BugFinding> = load_json_file_with_backend_repair(
+        repo_root,
+        &findings_json_path,
+        &backend,
+        stderr_log_path,
+        "finder findings",
+        finder_json_schema(),
+        &response_path,
+    )
+    .await?;
     validate_findings(chunk, &findings)?;
     Ok(findings)
 }
@@ -503,7 +513,16 @@ async fn run_skeptic_phase(
     prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
-    let verdicts: Vec<SkepticVerdict> = load_json_file(&verdicts_json_path)?;
+    let verdicts: Vec<SkepticVerdict> = load_json_file_with_backend_repair(
+        repo_root,
+        &verdicts_json_path,
+        &backend,
+        stderr_log_path,
+        "skeptic verdicts",
+        skeptic_verdict_json_schema(),
+        &response_path,
+    )
+    .await?;
     let (disproved_count, accepted) = derive_accepted_findings(chunk, findings, &verdicts)?;
     atomic_write(
         &chunk_dir.join("accepted-findings.json"),
@@ -574,7 +593,16 @@ async fn run_fix_phase(
     prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
-    let results: Vec<FixResult> = load_json_file(&results_json_path)?;
+    let results: Vec<FixResult> = load_json_file_with_backend_repair(
+        repo_root,
+        &results_json_path,
+        &backend,
+        stderr_log_path,
+        "implementation results",
+        fix_result_json_schema(),
+        &response_path,
+    )
+    .await?;
     let verified: Vec<AcceptedFinding> = load_json_file(&verified_json_path)?;
     validate_fix_results(&verified, &results)?;
     Ok(results)
@@ -646,7 +674,16 @@ async fn run_review_phase(
     prune_bug_phase_pi_state(repo_root, &backend);
     atomic_write(&response_path, raw_response.as_bytes())?;
 
-    let results: Vec<ReviewResult> = load_json_file(&results_json_path)?;
+    let results: Vec<ReviewResult> = load_json_file_with_backend_repair(
+        repo_root,
+        &results_json_path,
+        &backend,
+        stderr_log_path,
+        "review results",
+        review_result_json_schema(),
+        &response_path,
+    )
+    .await?;
     validate_review_results(accepted, &results)?;
     Ok(results)
 }
@@ -1176,6 +1213,7 @@ Requirements:
 - Use bug IDs with prefix `BUG-{ordinal:03}-`.
 - Match `points` to `impact` exactly.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 - `{findings_md}` should summarize the same findings, grouped by impact, and end with a total score.
 "#,
         chunk_id = chunk.id,
@@ -1226,6 +1264,7 @@ Requirements:
 - Prefer discarding findings that cannot be grounded in a runnable falsification path or direct code evidence.
 - Only `accepted` findings should survive to verification.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 - `{verdicts_md}` should summarize disproved vs accepted findings and call out the hardest borderline decisions.
 "#,
         chunk_id = chunk.id,
@@ -1283,6 +1322,7 @@ Requirements:
 - For browser-facing or runtime-sensitive bugs, use runtime/browser verification when available.
 - `{results_md}` should summarize proof-before-fix, root cause, fix, validation, and any deferred items.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 "#,
         verified_json = verified_json.display(),
         results_json = results_json.display(),
@@ -1329,6 +1369,7 @@ Requirements:
 - Prefer `verified` only when the bug is concrete enough to justify a reproduce-first/root-cause fix workflow.
 - Call out missing regression coverage, missing runtime proof, or suspiciously broad scope in `follow_up`.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 - `{results_md}` should summarize what survived to implementation and what was discarded.
 "#,
         chunk_id = chunk.id,
@@ -1612,6 +1653,49 @@ candidate is {} bytes and exceeds the {}-byte limit",
     }
 }
 
+async fn load_json_file_with_backend_repair<T>(
+    repo_root: &Path,
+    path: &Path,
+    backend: &LlmBackend,
+    stderr_log_path: &Path,
+    artifact_label: &str,
+    schema_hint: &str,
+    raw_response_path: &Path,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    match load_json_file(path) {
+        Ok(parsed) => Ok(parsed),
+        Err(original_error) => {
+            println!(
+                "warning: attempting backend repair for invalid {artifact_label} in {}",
+                path.display()
+            );
+            attempt_llm_json_file_repair(
+                repo_root,
+                path,
+                backend,
+                stderr_log_path,
+                artifact_label,
+                schema_hint,
+                raw_response_path,
+            )
+            .await
+            .with_context(|| format!("backend repair failed for {}", path.display()))?;
+            load_json_file(path).map_err(|repair_error| {
+                anyhow::anyhow!(
+                    "failed to recover {artifact_label} in {} after backend repair; original error: {}; repair error: {}",
+                    path.display(),
+                    original_error,
+                    repair_error
+                )
+            })
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn repair_llm_json(content: &str) -> Option<String> {
     let candidate = json_repair_candidate(content);
     if candidate.len() > JSON_REPAIR_MAX_BYTES {
@@ -1757,7 +1841,6 @@ fn escape_unescaped_quotes_in_json_strings(content: &str) -> String {
     let mut repaired = String::with_capacity(content.len() + 32);
     let mut contexts = Vec::<JsonRepairContext>::new();
     let mut string_role = None::<JsonStringRole>;
-    let mut escaped = false;
     let mut primitive_value = false;
     let mut index = 0usize;
 
@@ -1776,17 +1859,23 @@ fn escape_unescaped_quotes_in_json_strings(content: &str) -> String {
         }
 
         if let Some(role) = string_role {
-            if escaped {
-                repaired.push(ch);
-                escaped = false;
-                index += 1;
-                continue;
-            }
-
             match ch {
                 '\\' => {
-                    repaired.push(ch);
-                    escaped = true;
+                    if valid_json_string_escape_at(&chars, index) {
+                        repaired.push('\\');
+                        repaired.push(chars[index + 1]);
+                        if chars[index + 1] == 'u' {
+                            repaired.extend(chars[index + 2..index + 6].iter().copied());
+                            index += 6;
+                        } else {
+                            index += 2;
+                        }
+                    } else {
+                        repaired.push('\\');
+                        repaired.push('\\');
+                        index += 1;
+                    }
+                    continue;
                 }
                 '"' => {
                     if is_likely_string_terminator(&chars, index, role, &contexts) {
@@ -1961,6 +2050,144 @@ fn next_significant_char(chars: &[char], mut index: usize) -> Option<(usize, cha
 
 fn is_valid_array_value_start(ch: char) -> bool {
     matches!(ch, '"' | '{' | '[' | '-' | 't' | 'f' | 'n') || ch.is_ascii_digit()
+}
+
+fn finder_json_schema() -> &'static str {
+    r#"[
+  {
+    "bug_id": "BUG-001-01",
+    "title": "Short finding title",
+    "location": "path/to/file:line",
+    "impact": "critical|high|medium|low",
+    "points": 0,
+    "description": "Concrete failure mode",
+    "why_plausible": "Why the code suggests this is real",
+    "falsification_checks": ["Runnable checks"],
+    "evidence": ["Direct code evidence"]
+  }
+]"#
+}
+
+fn skeptic_verdict_json_schema() -> &'static str {
+    r#"[
+  {
+    "bug_id": "BUG-001-01",
+    "decision": "accepted|disproved",
+    "confidence_percent": 0,
+    "counter_argument": "Why it fails or survives challenge",
+    "risk_calculation": "Downside of dismissing it incorrectly",
+    "follow_up_checks": ["Extra validation that would tighten confidence"]
+  }
+]"#
+}
+
+fn fix_result_json_schema() -> &'static str {
+    r#"[
+  {
+    "bug_id": "BUG-001-01",
+    "status": "fixed|deferred|blocked",
+    "summary": "What changed and why",
+    "validation_commands": ["Command actually run"],
+    "touched_files": ["path/to/file"],
+    "residual_risks": ["Anything still not fully closed"]
+  }
+]"#
+}
+
+fn review_result_json_schema() -> &'static str {
+    r#"[
+  {
+    "bug_id": "BUG-001-01",
+    "verdict": "verified|discarded",
+    "confidence": "high|medium|low",
+    "notes": "Why this should or should not be implemented",
+    "follow_up": ["Missing proof, scope risk, or test gaps"]
+  }
+]"#
+}
+
+fn build_bug_json_repair_prompt(
+    target_path: &Path,
+    raw_response_path: &Path,
+    artifact_label: &str,
+    schema_hint: &str,
+) -> String {
+    format!(
+        r#"You are repairing a malformed JSON workflow artifact for auto bug.
+
+Artifact type:
+- `{artifact_label}`
+
+Target artifact:
+- `{target_path}`
+
+Raw backend response log:
+- `{raw_response_path}`
+
+Rules:
+- Do not modify code.
+- Do not edit any workflow artifact other than `{target_path}`.
+- Read the target artifact if it exists and the raw backend response log to recover the intended content.
+- Rewrite `{target_path}` so it contains valid JSON only. No markdown fences. No commentary.
+- Preserve every recoverable entry and field value. If wording is ambiguous, prefer the most literal faithful reconstruction instead of inventing new findings.
+- Keep the artifact as a JSON array using exactly this schema:
+{schema_hint}
+- JSON strings must stay valid JSON. Escape embedded quotes when needed.
+- Double-escape literal backslashes in regexes, paths, and code snippets.
+"#,
+        artifact_label = artifact_label,
+        target_path = target_path.display(),
+        raw_response_path = raw_response_path.display(),
+    )
+}
+
+async fn attempt_llm_json_file_repair(
+    repo_root: &Path,
+    path: &Path,
+    backend: &LlmBackend,
+    stderr_log_path: &Path,
+    artifact_label: &str,
+    schema_hint: &str,
+    raw_response_path: &Path,
+) -> Result<()> {
+    let prompt = build_bug_json_repair_prompt(path, raw_response_path, artifact_label, schema_hint);
+    let repair_response = run_backend_prompt(
+        repo_root,
+        &prompt,
+        backend,
+        stderr_log_path,
+        &format!("repair {artifact_label}"),
+    )
+    .await?;
+    if !repair_response.trim().is_empty() {
+        let log_path = repo_root.join(".auto").join("logs").join(format!(
+            "bug-{}-repair-response.log",
+            slugify(&format!(
+                "{}-{}",
+                artifact_label,
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("artifact")
+            ))
+        ));
+        atomic_write(&log_path, repair_response.as_bytes())
+            .with_context(|| format!("failed to write {}", log_path.display()))?;
+    }
+    Ok(())
+}
+
+fn valid_json_string_escape_at(chars: &[char], index: usize) -> bool {
+    let Some(next) = chars.get(index + 1).copied() else {
+        return false;
+    };
+
+    match next {
+        '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => true,
+        'u' => chars.get(index + 2..index + 6).is_some_and(|digits| {
+            digits.len() == 4 && digits.iter().all(|digit| digit.is_ascii_hexdigit())
+        }),
+        _ => false,
+    }
 }
 
 fn write_bug_summary(
@@ -2313,6 +2540,50 @@ mod tests {
         assert!(parsed[0]
             .counter_argument
             .contains("\"message\":\"bitino-house live funding*"));
+    }
+
+    #[test]
+    fn repairs_invalid_backslash_escapes_inside_json_strings() {
+        let invalid = r#"[
+  {
+    "bug_id": "BUG-003-03",
+    "decision": "disproved",
+    "confidence_percent": 95,
+    "counter_argument": "The matcher still treats \d+\_suffix as a literal pattern fragment.",
+    "risk_calculation": "Very low risk.",
+    "follow_up_checks": ["Check the live logs"]
+  }
+]"#;
+
+        assert!(serde_json::from_str::<Vec<SkepticVerdict>>(invalid).is_err());
+
+        let repaired = escape_unescaped_quotes_in_json_strings(invalid);
+        let parsed = serde_json::from_str::<Vec<SkepticVerdict>>(&repaired)
+            .expect("repaired JSON should parse");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].counter_argument.contains("\\d+\\_suffix"));
+    }
+
+    #[test]
+    fn repairs_invalid_unicode_escapes_inside_json_strings() {
+        let invalid = r#"[
+  {
+    "bug_id": "BUG-003-04",
+    "decision": "disproved",
+    "confidence_percent": 95,
+    "counter_argument": "The note includes \u12G4 as a literal token from the log output.",
+    "risk_calculation": "Very low risk.",
+    "follow_up_checks": ["Check the live logs"]
+  }
+]"#;
+
+        assert!(serde_json::from_str::<Vec<SkepticVerdict>>(invalid).is_err());
+
+        let repaired = escape_unescaped_quotes_in_json_strings(invalid);
+        let parsed = serde_json::from_str::<Vec<SkepticVerdict>>(&repaired)
+            .expect("repaired JSON should parse");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].counter_argument.contains("\\u12G4"));
     }
 
     #[test]
