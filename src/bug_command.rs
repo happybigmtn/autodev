@@ -1695,7 +1695,7 @@ where
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn repair_llm_json(content: &str) -> Option<String> {
     let candidate = json_repair_candidate(content);
     if candidate.len() > JSON_REPAIR_MAX_BYTES {
