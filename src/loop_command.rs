@@ -402,8 +402,10 @@ fn collect_tracked_repo_states(
 
     let mut states = Vec::with_capacity(repos.len());
     for path in repos {
-        let head = git_stdout(&path, ["rev-parse", "HEAD"])?;
-        let status = git_stdout(&path, ["status", "--short"])?;
+        let Ok(head) = git_stdout(&path, ["rev-parse", "HEAD"]) else {
+            continue;
+        };
+        let status = git_stdout(&path, ["status", "--short"]).unwrap_or_default();
         states.push(TrackedRepoState {
             name: repo_name(&path),
             path,
