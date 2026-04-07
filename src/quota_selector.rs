@@ -17,7 +17,7 @@ pub(crate) struct SelectedAccount<'a> {
 ///
 /// Strategy:
 /// 1. Among non-exhausted accounts with ≥15% weekly quota remaining,
-///    pick the one whose session quota resets soonest.
+///    pick the one whose weekly quota resets soonest.
 /// 2. If all accounts have <15% weekly remaining, pick the one with
 ///    the highest weekly remaining percentage.
 /// 3. Accounts whose usage could not be fetched are used only as a
@@ -79,12 +79,12 @@ fn pick_best<'a>(
         .collect();
 
     if !above_floor.is_empty() {
-        // Soonest session reset wins; tiebreak by LRU then name
+        // Soonest weekly reset wins; tiebreak by LRU then name
         let (entry, _) = above_floor
             .iter()
             .min_by(|a, b| {
-                let ra = a.1.as_ref().map_or(u64::MAX, |u| u.session_resets_in_secs);
-                let rb = b.1.as_ref().map_or(u64::MAX, |u| u.session_resets_in_secs);
+                let ra = a.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
+                let rb = b.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
                 ra.cmp(&rb)
                     .then_with(|| {
                         state
@@ -187,6 +187,7 @@ mod tests {
         session_used_pct: u32,
         session_resets_in_secs: u64,
         weekly_used_pct: u32,
+        weekly_resets_in_secs: u64,
     ) -> AccountUsage {
         AccountUsage {
             plan: "test".into(),
@@ -195,22 +196,23 @@ mod tests {
             session_resets_in_secs,
             weekly_used_pct,
             weekly_remaining_pct: 100u32.saturating_sub(weekly_used_pct),
-            weekly_resets_in_secs: 0,
+            weekly_resets_in_secs,
             limit_reached: false,
         }
     }
 
     #[test]
-    fn soonest_session_reset_wins_above_floor() {
+    fn soonest_weekly_reset_wins_above_floor() {
         let a = make_account("fast-reset", Provider::Claude);
         let b = make_account("slow-reset", Provider::Claude);
         let state = QuotaState::default();
 
-        // fast-reset: 60% session, resets in 600s, 50% weekly
-        // slow-reset: 30% session, resets in 3600s, 50% weekly
+        // fast-reset: weekly resets in 3600s (1h)
+        // slow-reset: weekly resets in 86400s (24h)
+        // Both above 15% weekly floor
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(60, 600, 50))),
-            (&b, Some(make_usage(30, 3600, 50))),
+            (&a, Some(make_usage(60, 600, 50, 3600))),
+            (&b, Some(make_usage(30, 3600, 50, 86400))),
         ];
 
         let selected = pick_best(&scored, &state);
@@ -225,8 +227,8 @@ mod tests {
 
         // Both below 15% weekly; low-b has more remaining
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(50, 600, 92))),
-            (&b, Some(make_usage(50, 3600, 88))),
+            (&a, Some(make_usage(50, 600, 92, 0))),
+            (&b, Some(make_usage(50, 3600, 88, 0))),
         ];
 
         let selected = pick_best(&scored, &state);
@@ -242,8 +244,8 @@ mod tests {
         // healthy: 20% weekly remaining (above 15%), resets in 3600s
         // depleted: 5% weekly remaining (below 15%), resets in 100s
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(50, 3600, 80))),
-            (&b, Some(make_usage(50, 100, 95))),
+            (&a, Some(make_usage(50, 3600, 80, 86400))),
+            (&b, Some(make_usage(50, 100, 95, 3600))),
         ];
 
         let selected = pick_best(&scored, &state);
@@ -257,7 +259,7 @@ mod tests {
         let state = QuotaState::default();
 
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(90, 100, 50))),
+            (&a, Some(make_usage(90, 100, 50, 86400))),
             (&b, None),
         ];
 
@@ -291,10 +293,10 @@ mod tests {
         state.mark_used("alpha", t2); // more recent
         state.mark_used("beta", t1); // less recent
 
-        // Same reset time, both above floor
+        // Same weekly reset time, both above floor
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(50, 1000, 50))),
-            (&b, Some(make_usage(50, 1000, 50))),
+            (&a, Some(make_usage(50, 1000, 50, 86400))),
+            (&b, Some(make_usage(50, 1000, 50, 86400))),
         ];
 
         let selected = pick_best(&scored, &state);
@@ -308,7 +310,7 @@ mod tests {
 
         // Exactly 15% weekly remaining = above floor
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
-            vec![(&a, Some(make_usage(50, 1000, 85)))];
+            vec![(&a, Some(make_usage(50, 1000, 85, 86400)))];
 
         let selected = pick_best(&scored, &state);
         assert_eq!(selected.entry.name, "edge");

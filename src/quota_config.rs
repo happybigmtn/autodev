@@ -200,7 +200,15 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let meta = match fs::symlink_metadata(&src_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&src_path) {
+                let _ = std::os::unix::fs::symlink(&target, &dst_path);
+            }
+        } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path).with_context(|| {

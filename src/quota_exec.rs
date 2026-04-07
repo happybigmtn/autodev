@@ -9,18 +9,16 @@ use crate::quota_patterns::{self, QuotaVerdict};
 use crate::quota_selector;
 use crate::quota_state::QuotaState;
 
-/// Guard that restores the original auth file on drop.
+/// Guard that restores original auth files on drop.
 struct AuthRestoreGuard {
-    backup_path: PathBuf,
-    target_path: PathBuf,
+    pairs: Vec<(PathBuf, PathBuf)>,
     active: bool,
 }
 
 impl AuthRestoreGuard {
-    fn new(backup_path: PathBuf, target_path: PathBuf) -> Self {
+    fn new(pairs: Vec<(PathBuf, PathBuf)>) -> Self {
         Self {
-            backup_path,
-            target_path,
+            pairs,
             active: true,
         }
     }
@@ -35,13 +33,15 @@ impl Drop for AuthRestoreGuard {
         if !self.active {
             return;
         }
-        if self.backup_path.exists() {
-            if self.backup_path.is_dir() {
-                let _ = remove_and_copy_dir(&self.backup_path, &self.target_path);
-            } else {
-                let _ = fs::copy(&self.backup_path, &self.target_path);
+        for (backup, target) in &self.pairs {
+            if backup.exists() {
+                if backup.is_dir() {
+                    let _ = remove_and_copy_dir(backup, target);
+                } else {
+                    let _ = fs::copy(backup, target);
+                }
+                let _ = remove_path(backup);
             }
-            let _ = remove_path(&self.backup_path);
         }
     }
 }
@@ -73,7 +73,16 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let meta = match fs::symlink_metadata(&src_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            // Preserve symlinks as-is; skip if we can't read the target path
+            if let Ok(target) = fs::read_link(&src_path) {
+                let _ = std::os::unix::fs::symlink(&target, &dst_path);
+            }
+        } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path).with_context(|| {
@@ -90,7 +99,7 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
     fs::create_dir_all(&backup_dir)
         .context("failed to create backup directory")?;
 
-    let backup_target = match provider {
+    let pairs = match provider {
         Provider::Codex => {
             let bp = backup_dir.join("codex-auth.json");
             if target.exists() {
@@ -106,7 +115,7 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                     target.display()
                 )
             })?;
-            bp
+            vec![(bp, target)]
         }
         Provider::Claude => {
             let bp = backup_dir.join("claude");
@@ -115,12 +124,35 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                 copy_dir_recursive(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
             }
+
+            let home = dirs::home_dir().expect("cannot resolve home directory");
+            let claude_json = home.join(".claude.json");
+            let claude_json_bp = backup_dir.join("claude.json");
+
+            // Backup ~/.claude.json separately (lives in home, not in ~/.claude)
+            if claude_json.exists() {
+                fs::copy(&claude_json, &claude_json_bp).with_context(|| {
+                    format!("failed to backup {}", claude_json.display())
+                })?;
+            }
+
+            // Copy profile credentials into ~/.claude, but skip .claude.json
+            // (it goes to ~/.claude.json instead)
             for entry in fs::read_dir(profile_dir)
                 .with_context(|| format!("failed to read profile {}", profile_dir.display()))?
             {
                 let entry = entry?;
+                let name = entry.file_name();
                 let src = entry.path();
-                let dst = target.join(entry.file_name());
+
+                if name == ".claude.json" {
+                    fs::copy(&src, &claude_json).with_context(|| {
+                        format!("failed to swap {} -> {}", src.display(), claude_json.display())
+                    })?;
+                    continue;
+                }
+
+                let dst = target.join(&name);
                 if src.is_dir() {
                     remove_and_copy_dir(&src, &dst)?;
                 } else {
@@ -129,11 +161,11 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                     })?;
                 }
             }
-            bp
+            vec![(bp, target), (claude_json_bp, claude_json)]
         }
     };
 
-    Ok(AuthRestoreGuard::new(backup_target, target))
+    Ok(AuthRestoreGuard::new(pairs))
 }
 
 fn acquire_swap_lock() -> Result<fd_lock::RwLock<fs::File>> {
@@ -275,4 +307,48 @@ pub(crate) fn is_quota_available(provider: Provider) -> bool {
         .ok()
         .flatten()
         .is_some_and(|c| !c.accounts_for_provider(provider).is_empty())
+}
+
+/// Select the best account, swap credentials, launch the provider CLI
+/// with the given args, wait for exit, and restore credentials.
+pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Result<i32> {
+    let config = QuotaConfig::load()?;
+    let mut state = QuotaState::load()?;
+    state.refresh_cooldowns(Utc::now());
+
+    let selected = quota_selector::select_account(&config, &state, provider).await?;
+    let account_name = selected.entry.name.clone();
+    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
+
+    if !profile_dir.exists() {
+        anyhow::bail!(
+            "profile directory for account '{account_name}' not found at {}. \
+             Run `auto quota accounts capture {account_name}` to fix.",
+            profile_dir.display()
+        );
+    }
+
+    eprintln!("[quota-router] selected account '{account_name}'");
+
+    let mut lock = acquire_swap_lock()?;
+    let _lock_guard = lock
+        .try_write()
+        .map_err(|_| anyhow::anyhow!("another quota-router instance holds the swap lock"))?;
+    let guard = swap_credentials(provider, &profile_dir)?;
+
+    let bin = provider.label();
+    let status = std::process::Command::new(bin)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to launch {bin}"))?;
+
+    drop(guard);
+
+    state.mark_used(&account_name, Utc::now());
+    if status.success() {
+        state.mark_success(&account_name, Utc::now());
+    }
+    state.save()?;
+
+    Ok(status.code().unwrap_or(1))
 }

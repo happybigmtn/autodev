@@ -99,7 +99,8 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
     let session_reset = usage.rate_limit.primary_window.reset_after_seconds;
     let (weekly_used, weekly_reset) = match &usage.rate_limit.secondary_window {
         Some(w) => (w.used_percent, w.reset_after_seconds),
-        None => (0, 0),
+        // No weekly window means no weekly budget — treat as fully consumed
+        None => (100, 0),
     };
 
     Ok(AccountUsage {

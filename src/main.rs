@@ -84,6 +84,17 @@ enum QuotaSubcommand {
     Accounts(AccountsSubcommand),
     /// Force-clear exhausted status (all accounts, or one by name)
     Reset(QuotaResetArgs),
+    /// Select the best account and launch the provider CLI
+    Open(QuotaOpenArgs),
+}
+
+#[derive(Args, Clone)]
+struct QuotaOpenArgs {
+    /// Provider: "claude" or "codex"
+    provider: String,
+    /// Arguments passed through to the provider CLI
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 #[derive(Args, Clone)]
@@ -583,6 +594,11 @@ async fn main() -> Result<()> {
                 QuotaSubcommand::Status => quota_status::run_status().await,
                 QuotaSubcommand::Reset(args) => {
                     quota_status::run_reset(args.name.as_deref())
+                }
+                QuotaSubcommand::Open(args) => {
+                    let provider: quota_config::Provider = args.provider.parse()?;
+                    let code = quota_exec::run_quota_open(provider, &args.args).await?;
+                    std::process::exit(code);
                 }
                 QuotaSubcommand::Accounts(a) => match a.command {
                     AccountsCommand::Add(args) => {
