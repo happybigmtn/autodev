@@ -10,6 +10,14 @@ mod nemesis;
 mod pi_backend;
 mod qa_command;
 mod qa_only_command;
+mod quota_accounts;
+mod quota_config;
+mod quota_exec;
+mod quota_patterns;
+mod quota_selector;
+mod quota_state;
+mod quota_status;
+mod quota_usage;
 mod review_command;
 mod ship_command;
 mod state;
@@ -58,6 +66,71 @@ enum Command {
     Ship(ShipArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
     Nemesis(NemesisArgs),
+    /// Manage quota-aware account multiplexing for Claude and Codex
+    Quota(QuotaArgs),
+}
+
+#[derive(Args, Clone)]
+struct QuotaArgs {
+    #[command(subcommand)]
+    command: QuotaSubcommand,
+}
+
+#[derive(Subcommand, Clone)]
+enum QuotaSubcommand {
+    /// Show quota status for all accounts
+    Status,
+    /// Manage accounts
+    Accounts(AccountsSubcommand),
+    /// Force-clear exhausted status (all accounts, or one by name)
+    Reset(QuotaResetArgs),
+}
+
+#[derive(Args, Clone)]
+struct QuotaResetArgs {
+    /// Account name to reset. Omit to reset all.
+    name: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct AccountsSubcommand {
+    #[command(subcommand)]
+    command: AccountsCommand,
+}
+
+#[derive(Subcommand, Clone)]
+enum AccountsCommand {
+    /// Add a new account profile
+    Add(AccountsAddArgs),
+    /// List all configured accounts
+    List,
+    /// Remove an account profile
+    Remove(AccountsRemoveArgs),
+    /// Re-capture credentials from the current session into a profile
+    Capture(AccountsCaptureArgs),
+}
+
+#[derive(Args, Clone)]
+struct AccountsAddArgs {
+    /// Account name (e.g., "work-codex-1")
+    name: String,
+    /// Provider: "claude" or "codex"
+    provider: String,
+}
+
+#[derive(Args, Clone)]
+struct AccountsRemoveArgs {
+    /// Account name to remove
+    name: String,
+    /// Skip confirmation prompt
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Clone)]
+struct AccountsCaptureArgs {
+    /// Account name to update credentials for
+    name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -501,5 +574,25 @@ async fn main() -> Result<()> {
         Command::Review(args) => review_command::run_review(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
+        Command::Quota(args) => {
+            match args.command {
+                QuotaSubcommand::Status => quota_status::run_status().await,
+                QuotaSubcommand::Reset(args) => {
+                    quota_status::run_reset(args.name.as_deref())
+                }
+                QuotaSubcommand::Accounts(a) => match a.command {
+                    AccountsCommand::Add(args) => {
+                        quota_accounts::run_accounts_add(&args.name, &args.provider)
+                    }
+                    AccountsCommand::List => quota_accounts::run_accounts_list(),
+                    AccountsCommand::Remove(args) => {
+                        quota_accounts::run_accounts_remove(&args.name, args.force)
+                    }
+                    AccountsCommand::Capture(args) => {
+                        quota_accounts::run_accounts_capture(&args.name)
+                    }
+                },
+            }
+        }
     }
 }
