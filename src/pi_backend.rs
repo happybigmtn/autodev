@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiProvider {
     Kimi,
@@ -79,29 +81,70 @@ pub(crate) fn resolve_pi_bin(configured: &Path) -> PathBuf {
 
 pub(crate) fn parse_pi_error(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if event.get("type").and_then(serde_json::Value::as_str) != Some("error") {
-            continue;
-        }
-        if let Some(message) = event
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-        {
-            return Some(message.to_string());
-        }
-        if let Some(detail) = serde_json::to_string(&event)
-            .ok()
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-        {
+        if let Some(detail) = parse_pi_error_event(&event) {
             return Some(detail);
         }
     }
     None
+}
+
+fn parse_pi_error_event(event: &Value) -> Option<String> {
+    if let Some(message) = json_string_field(event, "errorMessage") {
+        return Some(message);
+    }
+
+    if event.get("type").and_then(Value::as_str) == Some("error") {
+        if let Some(message) = json_string_field(event, "message").or_else(|| {
+            event
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        }) {
+            return Some(message);
+        }
+        return serde_json::to_string(event)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+    }
+
+    if event.get("stopReason").and_then(Value::as_str) == Some("error") {
+        if let Some(message) = event
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_string)
+        {
+            return Some(message);
+        }
+        return serde_json::to_string(event)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+    }
+
+    for key in ["message", "assistantMessageEvent", "partial"] {
+        if let Some(detail) = event.get(key).and_then(parse_pi_error_event) {
+            return Some(detail);
+        }
+    }
+
+    None
+}
+
+fn json_string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
 }
 
 fn map_minimax_model_name(model: &str) -> String {
@@ -121,7 +164,7 @@ fn map_minimax_model_name(model: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::PiProvider;
+    use super::{parse_pi_error, PiProvider};
 
     #[test]
     fn minimax_alias_defaults_to_m27_highspeed() {
@@ -137,5 +180,29 @@ mod tests {
             PiProvider::Kimi.resolve_model("kimi", "gpt-5.4"),
             "kimi-coding/k2p5"
         );
+    }
+
+    #[test]
+    fn parse_pi_error_reads_top_level_error_message() {
+        let stdout = r#"{"role":"assistant","stopReason":"error","errorMessage":"context window exceeds limit"}"#;
+        assert_eq!(
+            parse_pi_error(stdout).as_deref(),
+            Some("context window exceeds limit")
+        );
+    }
+
+    #[test]
+    fn parse_pi_error_reads_nested_message_error() {
+        let stdout = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"provider rejected request"}}"#;
+        assert_eq!(
+            parse_pi_error(stdout).as_deref(),
+            Some("provider rejected request")
+        );
+    }
+
+    #[test]
+    fn parse_pi_error_reads_api_error_payload() {
+        let stdout = r#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid params"}}"#;
+        assert_eq!(parse_pi_error(stdout).as_deref(), Some("invalid params"));
     }
 }
