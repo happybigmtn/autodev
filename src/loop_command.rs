@@ -15,15 +15,16 @@ use crate::LoopArgs;
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
 pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
-0b. Study `IMPLEMENTATION_PLAN.md` and identify the first unchecked task whose explicit dependencies are already satisfied.
+0b. Study `IMPLEMENTATION_PLAN.md` and identify the first pending task marked `- [ ]` whose explicit dependencies are already satisfied. Treat tasks marked `- [!]` as blocked and skip them unless they are later unblocked.
 0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
 0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
 0e. For every current-state fact, trust the live codebase over planning artifacts unless the code is plainly stale and the repo includes stronger primary-source evidence.
 0f. When additional repositories are listed below, inspect and edit them directly when the current task's owned surfaces, acceptance criteria, or blocker evidence point there. Read each touched repo's own `AGENTS.md` and operational docs before editing it.
 
 1. Your task is to implement functionality per the specifications using the full repository context.
-   - Follow `IMPLEMENTATION_PLAN.md` in order and take the next unchecked task from top to bottom.
+   - Follow `IMPLEMENTATION_PLAN.md` in order and take the next pending `- [ ]` task from top to bottom.
    - Do not reprioritize the queue yourself.
+   - Do not stop on earlier `- [!]` tasks; they are blocked and not runnable in this iteration.
    - Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.
    - If the current task's owned surfaces live in an additional listed repo, do the code change there while keeping this queue repo's planning artifacts truthful.
    - Build a short task brief for yourself before editing: task id, spec refs, owned surfaces, integration touchpoints, scope boundary, acceptance criteria, verification, and any assumptions you are relying on.
@@ -50,6 +51,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 4. Keep the planning artifacts current:
    - When you discover important implementation facts, blockers, or scope corrections, update `IMPLEMENTATION_PLAN.md`.
    - When you finish a task, remove its entry from `IMPLEMENTATION_PLAN.md` so the plan remains an active queue of unfinished work only.
+   - When a task is blocked by an external dependency or owner decision, mark it as `- [!]` and record the blocker under that task.
    - Append a concise record to `COMPLETED.md` with task id, what was completed, the validation command(s), and commit sha.
    - If you notice worthwhile out-of-scope work, append a concise item to `WORKLIST.md` instead of quietly broadening scope.
    - Update `AGENTS.md` only when you learn something operational that will help future loops run or validate the repo correctly.
@@ -64,13 +66,14 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
    - Push the queue repo directly to `origin/{branch}` after the commit. For additional listed repos, push the currently checked-out branch unless that repo's own instructions require something else.
 
 6. If you hit a real blocker after genuine debugging:
-   - Record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
+   - Convert the task marker from `- [ ]` to `- [!]` and record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
    - Commit the planning update if it materially changes the execution record.
-   - Move to the next ready task instead of repeating the same failed attempt.
+   - Move to the next pending `- [ ]` task instead of repeating the same failed attempt.
 
 7. Task-order rule:
    - Treat the order in `IMPLEMENTATION_PLAN.md` as authoritative.
-   - Work on the first unchecked task unless its explicit dependencies are still unchecked.
+   - Work on the first pending `- [ ]` task unless its explicit dependencies are still unchecked.
+   - Treat `- [!]` tasks as blocked and skip them while selecting work.
    - If the current task is already satisfied, remove it from `IMPLEMENTATION_PLAN.md`, append a truthful note to `COMPLETED.md`, and continue downward.
 
 8. Branch rule:
@@ -113,8 +116,6 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         }
         None => render_default_loop_prompt(&target_branch, &reference_repos),
     };
-    let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
-
     let run_root = args
         .run_root
         .unwrap_or_else(|| repo_root.join(".auto").join("loop"));
@@ -175,6 +176,27 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             );
             break;
         }
+
+        let queue = inspect_loop_queue(&repo_root)?;
+        if queue.pending_ids.is_empty() {
+            if queue.blocked_ids.is_empty() {
+                println!("no pending `- [ ]` tasks remain; stopping.");
+            } else {
+                println!(
+                    "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
+                    queue.blocked_ids.join(", ")
+                );
+            }
+            break;
+        }
+
+        let current_task = queue.pending_ids[0].clone();
+        println!("next task:   {}", current_task);
+        if !queue.blocked_ids.is_empty() {
+            println!("blocked:     {}", queue.blocked_ids.join(", "));
+        }
+
+        let full_prompt = build_iteration_prompt(&prompt_template, &queue);
 
         let prompt_path = repo_root
             .join(".auto")
@@ -293,6 +315,62 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LoopQueueSnapshot {
+    pending_ids: Vec<String>,
+    blocked_ids: Vec<String>,
+}
+
+fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> String {
+    let blocked_clause = if queue.blocked_ids.is_empty() {
+        "Blocked tasks marked `- [!]`: none".to_string()
+    } else {
+        format!(
+            "Blocked tasks marked `- [!]` to skip this iteration: {}",
+            queue.blocked_ids.join(", ")
+        )
+    };
+    format!(
+        "{prompt_template}\n\nCurrent queue state for this iteration:\n- First actionable task marked `- [ ]`: `{}`\n- Pending task count: {}\n- {}\n\nExecute the instructions above.",
+        queue.pending_ids[0],
+        queue.pending_ids.len(),
+        blocked_clause
+    )
+}
+
+fn inspect_loop_queue(repo_root: &Path) -> Result<LoopQueueSnapshot> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(LoopQueueSnapshot::default());
+    }
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    Ok(parse_loop_queue(&plan))
+}
+
+fn parse_loop_queue(plan: &str) -> LoopQueueSnapshot {
+    let mut queue = LoopQueueSnapshot::default();
+    for line in plan.lines() {
+        let trimmed = line.trim_start();
+        if let Some(task) = trimmed.strip_prefix("- [ ] ") {
+            if let Some(task_id) = extract_task_id(task) {
+                queue.pending_ids.push(task_id);
+            }
+        } else if let Some(task) = trimmed.strip_prefix("- [!] ") {
+            if let Some(task_id) = extract_task_id(task) {
+                queue.blocked_ids.push(task_id);
+            }
+        }
+    }
+    queue
+}
+
+fn extract_task_id(task_line: &str) -> Option<String> {
+    let rest = task_line.strip_prefix('`')?;
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
 }
 
 fn render_default_loop_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
@@ -584,8 +662,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        discover_sibling_git_repos, parse_origin_head_branch, pick_loop_branch,
-        render_default_loop_prompt, resolve_reference_repos, summarize_repo_progress, RepoProgress,
+        build_iteration_prompt, discover_sibling_git_repos, parse_loop_queue,
+        parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt,
+        resolve_reference_repos, summarize_repo_progress, LoopQueueSnapshot, RepoProgress,
         TrackedRepoState,
     };
 
@@ -600,6 +679,8 @@ mod tests {
         assert!(prompt.contains("simplification pass"));
         assert!(prompt.contains("newest spec referenced by the current unchecked task"));
         assert!(prompt.contains("historical context only"));
+        assert!(prompt.contains("Treat tasks marked `- [!]` as blocked"));
+        assert!(prompt.contains("next pending `- [ ]` task"));
     }
 
     #[test]
@@ -687,6 +768,39 @@ mod tests {
             progress,
             RepoProgress::DirtyChanges(vec!["robopokermulti".to_string()])
         );
+    }
+
+    #[test]
+    fn parse_loop_queue_separates_pending_and_blocked_tasks() {
+        let queue = parse_loop_queue(
+            r#"
+- [!] `DEC-001` Choose project license
+- [ ] `META-001` Add LICENSE file and Cargo license metadata
+- [x] `DONE-001` Finished already
+- [ ] `GATE-P4` Phase 4 checkpoint
+"#,
+        );
+
+        assert_eq!(
+            queue,
+            LoopQueueSnapshot {
+                pending_ids: vec!["META-001".to_string(), "GATE-P4".to_string()],
+                blocked_ids: vec!["DEC-001".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn iteration_prompt_injects_actionable_and_blocked_tasks() {
+        let queue = LoopQueueSnapshot {
+            pending_ids: vec!["META-001".to_string(), "GATE-P4".to_string()],
+            blocked_ids: vec!["DEC-001".to_string()],
+        };
+        let prompt = build_iteration_prompt("base prompt", &queue);
+
+        assert!(prompt.contains("First actionable task marked `- [ ]`: `META-001`"));
+        assert!(prompt.contains("Pending task count: 2"));
+        assert!(prompt.contains("Blocked tasks marked `- [!]` to skip this iteration: DEC-001"));
     }
 
     #[test]

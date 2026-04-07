@@ -449,7 +449,8 @@ What it actually does:
 - Selects the branch it is allowed to operate on
 - Rebases onto `origin/<branch>` before work starts when that remote branch exists, so a behind
   local branch does not fail only at push time
-- Reads the next unchecked task from the top of the plan
+- Reads the next pending `- [ ]` task from the top of the plan
+- Treats `- [!]` tasks in `IMPLEMENTATION_PLAN.md` as blocked and skips them during task selection
 - Auto-discovers sibling git repos under the same parent directory and treats them as valid
   implementation surfaces when the task contract points there
 - Merges any `--reference-repo <dir>` entries on top of that default sibling repo set
@@ -493,6 +494,12 @@ Useful flags:
 - `--branch <name>` to lock the loop to a specific branch
 - `--run-root <dir>` to change where loop logs are stored
 - `--model` and `--reasoning-effort` to tune the worker
+
+Queue markers:
+
+- `- [ ]` means pending and runnable when dependencies are satisfied
+- `- [!]` means blocked and skipped by `auto loop` until you explicitly unblock or rewrite it
+- `- [x]` means completed
 
 ### `auto qa`
 
