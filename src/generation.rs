@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 
+use crate::codex_exec::run_codex_exec;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state};
 use crate::util::{
@@ -39,6 +40,13 @@ impl GenerationMode {
         match self {
             Self::Gen => "gen-plan",
             Self::Reverse => "reverse-plan",
+        }
+    }
+
+    fn codex_review_phase_slug(self) -> &'static str {
+        match self {
+            Self::Gen => "gen-codex-review",
+            Self::Reverse => "reverse-codex-review",
         }
     }
 }
@@ -91,6 +99,24 @@ const REQUIRED_PLAN_TASK_FIELDS: [&str; 12] = [
     "Estimated scope:",
     "Completion signal:",
 ];
+const CORPUS_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
+    "## Purpose / Big Picture",
+    "## Requirements Trace",
+    "## Scope Boundaries",
+    "## Progress",
+    "## Surprises & Discoveries",
+    "## Decision Log",
+    "## Outcomes & Retrospective",
+    "## Context and Orientation",
+    "## Plan of Work",
+    "## Implementation Units",
+    "## Concrete Steps",
+    "## Validation and Acceptance",
+    "## Idempotence and Recovery",
+    "## Artifacts and Notes",
+    "## Interfaces and Dependencies",
+];
+const CODEX_SKILL_BOUNDARY: &str = "IMPORTANT: Do NOT read or execute any SKILL.md files or files in skill definition directories (paths containing skills/gstack). These are AI assistant skill definitions meant for a different system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Stay focused on the repository code only.";
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let run_started_at = Instant::now();
@@ -127,6 +153,17 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         }
     }
     println!("model:       {}", args.model);
+    println!(
+        "codex review:{}",
+        if args.skip_codex_review {
+            " skipped".to_string()
+        } else {
+            format!(
+                " {} ({})",
+                args.codex_review_model, args.codex_review_effort
+            )
+        }
+    );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     if args.dry_run {
@@ -180,6 +217,27 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", response_path.display()))?;
     }
 
+    let codex_review = if args.skip_codex_review {
+        None
+    } else {
+        print_stage("run corpus codex review", run_started_at);
+        let report_path = codex_review_report_path(&repo_root, "corpus-codex-review");
+        let review_prompt =
+            build_corpus_codex_review_prompt(&repo_root, &planning_root, &report_path);
+        Some(
+            run_logged_codex_review(
+                &repo_root,
+                "corpus-codex-review",
+                &review_prompt,
+                &args.codex_review_model,
+                &args.codex_review_effort,
+                &args.codex_bin,
+                &report_path,
+            )
+            .await?,
+        )
+    };
+
     print_stage("verify corpus outputs", run_started_at);
     let summary = verify_corpus_outputs(&planning_root, args.focus.is_some())?;
     print_stage("save corpus state", run_started_at);
@@ -209,6 +267,11 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     println!("prompt log:  {}", prompt_path.display());
     if response_path.exists() {
         println!("model log:   {}", response_path.display());
+    }
+    if let Some(review) = codex_review {
+        println!("codex prompt: {}", review.prompt_path.display());
+        println!("codex stderr: {}", review.stderr_log_path.display());
+        println!("codex report: {}", review.report_path.display());
     }
     println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
@@ -253,6 +316,17 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     );
     println!("output dir:  {}", output_dir.display());
     println!("model:       {}", args.model);
+    println!(
+        "codex review:{}",
+        if args.skip_codex_review {
+            " skipped".to_string()
+        } else {
+            format!(
+                " {} ({})",
+                args.codex_review_model, args.codex_review_effort
+            )
+        }
+    );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
@@ -285,7 +359,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         )
     })?;
 
-    let generated_specs = if args.plan_only {
+    let mut generated_specs = if args.plan_only {
         print_stage("reuse existing generated specs", run_started_at);
         verify_generated_specs(&output_dir)?
     } else {
@@ -313,7 +387,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         specs
     };
 
-    let (implementation_plan, plan_phase) = if args.plan_only {
+    let (mut implementation_plan, plan_phase) = if args.plan_only {
         if output_dir.join("IMPLEMENTATION_PLAN.md").exists() {
             print_stage("reuse existing generated plan", run_started_at);
             (verify_generated_implementation_plan(&output_dir)?, None)
@@ -359,6 +433,32 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             Some(plan_phase),
         )
     };
+    let codex_review = if args.skip_codex_review {
+        None
+    } else {
+        print_stage("run generation codex review", run_started_at);
+        let report_path = codex_review_report_path(&repo_root, mode.codex_review_phase_slug());
+        let review_prompt = build_generation_codex_review_prompt(
+            mode,
+            &repo_root,
+            &planning_root,
+            &output_dir,
+            &report_path,
+        );
+        let review = run_logged_codex_review(
+            &repo_root,
+            mode.codex_review_phase_slug(),
+            &review_prompt,
+            &args.codex_review_model,
+            &args.codex_review_effort,
+            &args.codex_bin,
+            &report_path,
+        )
+        .await?;
+        generated_specs = verify_generated_specs(&output_dir)?;
+        implementation_plan = verify_generated_implementation_plan(&output_dir)?;
+        Some(review)
+    };
     print_stage("sync generated specs to root", run_started_at);
     let root_specs = sync_generated_specs_to_root(&repo_root, &generated_specs)?;
     rewrite_generated_plan_spec_refs(&implementation_plan, &root_specs)?;
@@ -382,6 +482,17 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("planning:    {}", planning_root.display());
     println!("output dir:  {}", output_dir.display());
     println!("model:       {}", args.model);
+    println!(
+        "codex review:{}",
+        if args.skip_codex_review {
+            " skipped".to_string()
+        } else {
+            format!(
+                " {} ({})",
+                args.codex_review_model, args.codex_review_effort
+            )
+        }
+    );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("specs:       {}", generated_specs.len());
@@ -403,6 +514,11 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         }
     } else {
         println!("plan prompt: reused existing generated plan");
+    }
+    if let Some(review) = codex_review {
+        println!("codex prompt: {}", review.prompt_path.display());
+        println!("codex stderr: {}", review.stderr_log_path.display());
+        println!("codex report: {}", review.report_path.display());
     }
     println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
@@ -534,6 +650,91 @@ fn prepare_generation_output_dir(output_dir: &Path) -> Result<()> {
 struct PhaseRunSummary {
     prompt_path: PathBuf,
     response_path: Option<PathBuf>,
+}
+
+struct CodexReviewRunSummary {
+    prompt_path: PathBuf,
+    stderr_log_path: PathBuf,
+    report_path: PathBuf,
+}
+
+fn codex_review_report_path(repo_root: &Path, phase_slug: &str) -> PathBuf {
+    repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("{phase_slug}-{}-report.md", timestamp_slug()))
+}
+
+async fn run_logged_codex_review(
+    repo_root: &Path,
+    phase_slug: &str,
+    prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+    report_path: &Path,
+) -> Result<CodexReviewRunSummary> {
+    let prompt_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("{phase_slug}-{}-prompt.md", timestamp_slug()));
+    let stderr_log_path = prompt_path.with_file_name(
+        prompt_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("codex-review-prompt.md")
+            .replace("-prompt.md", "-stderr.log"),
+    );
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!("phase:       {phase_slug}");
+    println!("model:       {model}");
+    println!("effort:      {reasoning_effort}");
+    println!("codex bin:   {}", codex_bin.display());
+    println!("prompt log:  {}", prompt_path.display());
+    println!("stderr log:  {}", stderr_log_path.display());
+    println!("report path: {}", report_path.display());
+
+    let status = run_codex_exec(
+        repo_root,
+        prompt,
+        model,
+        reasoning_effort,
+        codex_bin,
+        &stderr_log_path,
+        phase_slug,
+    )
+    .await?;
+    if !status.success() {
+        bail!(
+            "Codex review phase `{phase_slug}` failed with status {status}; see {}",
+            stderr_log_path.display()
+        );
+    }
+    verify_codex_review_report(report_path)?;
+    Ok(CodexReviewRunSummary {
+        prompt_path,
+        stderr_log_path,
+        report_path: report_path.to_path_buf(),
+    })
+}
+
+fn verify_codex_review_report(report_path: &Path) -> Result<()> {
+    if !report_path.exists() {
+        bail!(
+            "Codex review completed but did not write required report {}",
+            report_path.display()
+        );
+    }
+    let report = fs::read_to_string(report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+    if report.trim().is_empty() {
+        bail!(
+            "Codex review report {} must not be empty",
+            report_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_logged_claude_phase(
@@ -692,12 +893,15 @@ fn verify_corpus_outputs(
             bail!("corpus generation did not write {}", path.display());
         }
     }
-    let plan_count = list_markdown_files(&plans_dir)?.len();
-    if plan_count == 0 {
+    let plan_files = list_markdown_files(&plans_dir)?;
+    if plan_files.is_empty() {
         bail!(
             "corpus generation did not write any plans under {}",
             plans_dir.display()
         );
+    }
+    for plan_path in &plan_files {
+        verify_corpus_execplan(plan_path)?;
     }
     if focus_requested && !focus_path.exists() {
         bail!("corpus generation did not write {}", focus_path.display());
@@ -713,8 +917,82 @@ fn verify_corpus_outputs(
             .join("IDEA.md")
             .exists()
             .then_some(planning_root.join("IDEA.md")),
-        plan_count,
+        plan_count: plan_files.len(),
     })
+}
+
+fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
+    let markdown = fs::read_to_string(plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let trimmed = markdown.trim_start();
+    if trimmed.starts_with("```") {
+        bail!(
+            "corpus plan {} must be a markdown file containing the ExecPlan directly, not a fenced code block",
+            plan_path.display()
+        );
+    }
+    if !trimmed.starts_with("# ") {
+        bail!(
+            "corpus plan {} must start with a markdown title",
+            plan_path.display()
+        );
+    }
+    for section in CORPUS_EXECPLAN_REQUIRED_SECTIONS {
+        if !markdown_section_has_nonempty_body(&markdown, section) {
+            bail!(
+                "corpus plan {} is missing non-empty ExecPlan section `{}`",
+                plan_path.display(),
+                section
+            );
+        }
+    }
+    if !markdown_section_contains(&markdown, "## Progress", |line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]")
+    }) {
+        bail!(
+            "corpus plan {} must include at least one checkbox item in `## Progress`",
+            plan_path.display()
+        );
+    }
+    for required_fragment in ["goal", "files", "test"] {
+        if !markdown_section_contains(&markdown, "## Implementation Units", |line| {
+            line.to_ascii_lowercase().contains(required_fragment)
+        }) {
+            bail!(
+                "corpus plan {} must describe {} in `## Implementation Units`",
+                plan_path.display(),
+                required_fragment
+            );
+        }
+    }
+    Ok(())
+}
+
+fn markdown_section_has_nonempty_body(markdown: &str, heading: &str) -> bool {
+    markdown_section_contains(markdown, heading, |line| !line.trim().is_empty())
+}
+
+fn markdown_section_contains(
+    markdown: &str,
+    heading: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> bool {
+    let mut in_section = false;
+    for line in markdown.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end == heading {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed_end.starts_with("## ") {
+            return false;
+        }
+        if in_section && predicate(line) {
+            return true;
+        }
+    }
+    false
 }
 
 fn build_corpus_prompt(
@@ -861,6 +1139,14 @@ Review the actual codebase first, not just docs:
   - hypothesis / open question
 - Do not present guessed values as settled requirements.
 - For future phases with unresolved feasibility, keep the artifacts at research/design level instead of pretending the implementation details are already locked.
+- Apply the current gstack `/autoplan` review discipline while authoring the corpus:
+  - Run the review in the sequence CEO -> Design when UI/UX is in scope -> Eng -> DX when the repo is developer-facing or has meaningful setup/API/operator experience.
+  - CEO review must challenge the premise, map existing code leverage before proposing new work, compare plausible future states, state alternatives considered, preserve a real Not Doing list, and capture major failure modes and rescue paths.
+  - Design review must cover information architecture, state coverage, user journeys, accessibility, responsive behavior, and AI-slop risk when the repo has user-facing surfaces; if it does not, say why the design pass is not applicable.
+  - Eng review must cover architecture, dependency order, data flow, integration seams, persistence/migrations, error handling, observability, performance, and testing; every no-issue conclusion must still say what was examined and why it is acceptable.
+  - DX review must cover first-run developer/operator experience, learn-by-doing paths, error clarity, time-to-hello-world, honest examples, and uncertainty-reducing docs or tooling when applicable.
+  - Classify important planning decisions as `Mechanical`, `Taste`, or `User Challenge`. Treat model disagreements and close alternatives as taste decisions that need a short rationale. Treat any point that would change the operator's stated direction as a user challenge instead of silently auto-deciding it.
+  - Use these decision principles: choose completeness, inspect broadly when the problem requires it, stay pragmatic, avoid redundant artifacts, prefer explicit contracts over clever prose, and bias toward action when evidence is sufficient.
 
 {idea_context_clause}
 {focus_context_clause}
@@ -882,38 +1168,57 @@ ASSESSMENT.md must include:
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
-PLANS.md must index the plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives.
+`{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard.
 
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
+GENESIS-REPORT.md must also include a concise decision audit trail with `Mechanical`, `Taste`, and `User Challenge` classifications for major scope and sequencing choices.
 
-Each numbered plan under `{planning_root}/plans/` must be implementation-ready, explicit about owned surfaces, vertically sliced where possible, and scoped to a concrete deliverable that a single focused worker can close truthfully.
-Future-phase plans with unresolved feasibility must say so clearly and center research gates before implementation promises.
-Model every numbered plan after a strong task-breakdown document:
-- each plan should describe one concrete slice or research gate, not a vague epic
-- prefer vertical slices over horizontal layer dumps
-- if a task feels larger than one focused implementation session, break it down further
-- make dependencies explicit instead of burying them in prose
-- include crisp checkpoints that a worker or reviewer can actually verify
+Each numbered plan under `{planning_root}/plans/` must be a full ExecPlan, not a high-level task stub. The generated plan file itself is the ExecPlan, so omit surrounding triple-backtick fences and do not nest fenced code blocks inside it; use indented command blocks when examples are needed.
+
+ExecPlan requirements for every numbered plan:
+- start with a markdown H1 title
+- include the living-document paragraph from the root `PLANS.md` skeleton: "This ExecPlan is a living document..." and say it must be maintained in accordance with root `PLANS.md` when that file exists
+- be fully self-contained for a novice who has only the current working tree and that single plan file
+- define every non-obvious term in plain language and tie it to concrete repo files or commands
+- describe one concrete vertical slice or research gate, not a vague epic
+- if a slice feels larger than one focused implementation session, split it into additional numbered plans
+- keep future-phase plans with unresolved feasibility research-shaped, with explicit decision gates before implementation promises
 - after every 2-3 numbered plans or at meaningful phase boundaries, include an explicit checkpoint or decision-gate plan file that says what must be true before later work proceeds
 
-Each numbered plan under `{planning_root}/plans/` must include:
-- a markdown title
-- a short description or objective
-- `## Acceptance Criteria`
-- `## Verification`
-- `## Dependencies`
+Every numbered plan under `{planning_root}/plans/` must include these non-empty sections, using these exact headings:
+- `## Purpose / Big Picture`
+- `## Requirements Trace`
+- `## Scope Boundaries`
+- `## Progress`
+- `## Surprises & Discoveries`
+- `## Decision Log`
+- `## Outcomes & Retrospective`
+- `## Context and Orientation`
+- `## Plan of Work`
+- `## Implementation Units`
+- `## Concrete Steps`
+- `## Validation and Acceptance`
+- `## Idempotence and Recovery`
+- `## Artifacts and Notes`
+- `## Interfaces and Dependencies`
 
-`## Acceptance Criteria` requirements for numbered plans:
-- use flat bullet points
-- express specific, testable observable outcomes
-- avoid vague language like "supports", "handles", or "is robust" without saying how that is proven
-- keep acceptance criteria concrete enough that a future worker knows when to stop
+Section requirements for numbered ExecPlans:
+- `## Purpose / Big Picture` explains what a user or operator gains and how they can see it working
+- `## Requirements Trace` uses requirement labels such as `R1`, `R2`, and states the contracts or success criteria the work must satisfy
+- `## Scope Boundaries` states what the plan intentionally does not change and what adjacent surfaces remain unchanged
+- `## Progress` uses checkbox bullets with timestamps; unchecked items are allowed for newly generated plans, but the section must reflect the current state truthfully
+- `## Surprises & Discoveries`, `## Decision Log`, and `## Outcomes & Retrospective` must exist even before implementation starts; use "None yet" only when that is true, and include the rationale for initial plan-shaping decisions in the decision log
+- `## Context and Orientation` names the relevant repository-relative files, functions, modules, commands, and current behavior so a novice can navigate without prior context
+- `## Plan of Work` describes the sequence of edits and additions in prose, with file paths and concrete locations where possible
+- `## Implementation Units` breaks work into independently verifiable units; each unit must name the goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only or checkpoint plans, include the artifact to create and write `Test expectation: none -- <reason>` only when no code behavior changes.
+- `## Concrete Steps` gives exact commands to run from the repository root and short expected observations where useful
+- `## Validation and Acceptance` phrases acceptance as observable behavior with specific inputs, commands, outputs, or artifacts; name tests that should fail before the work and pass after when applicable
+- `## Idempotence and Recovery` explains how to rerun steps safely and how to recover from partial completion
+- `## Artifacts and Notes` captures concise evidence snippets, logs, or diffs that prove success or will be filled in as work proceeds
+- `## Interfaces and Dependencies` names the concrete modules, APIs, traits, commands, services, or external dependencies the plan uses or changes
 
-`## Verification` requirements for numbered plans:
-- name the concrete commands, runtime checks, benchmarks, or review steps
-- if a plan is research-only, say exactly what artifact or decision closes it
-- if a plan is implementation-oriented, say how the slice will be tested or demonstrated
+Do not use the short `## Objective` / `## Description` / `## Acceptance Criteria` / `## Verification` / `## Dependencies` shape for numbered plans. That shape is too high-level for this corpus. Use the full ExecPlan envelope above.
 
 Never trust docs over code. If docs claim something the code does not support, say so clearly."#,
         target_repo = repo_root.display(),
@@ -925,6 +1230,157 @@ Never trust docs over code. If docs claim something the code does not support, s
         focus_output_clause = focus_output_clause,
         idea_context_clause = idea_context_clause,
         focus_context_clause = focus_context_clause,
+    )
+}
+
+fn build_corpus_codex_review_prompt(
+    repo_root: &Path,
+    planning_root: &Path,
+    report_path: &Path,
+) -> String {
+    format!(
+        r#"{skill_boundary}
+
+You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `auto corpus`.
+
+Claude Opus 4.6 has already produced the initial planning corpus under `{planning_root}` for the repository at `{repo_root}`. Your job is to conduct an independent review and validation pass, then amend the generated corpus in place when the documents fall short.
+
+Edit boundary:
+- You may read the repository at `{repo_root}` and the generated corpus at `{planning_root}`.
+- You may edit only markdown files under `{planning_root}` and the review report at `{report_path}`.
+- Do not edit source code, root specs, root implementation plans, generated output dirs outside `{planning_root}`, or any skill definition directory.
+- Do not ask the user questions. Make conservative, code-grounded decisions and record uncertainty.
+
+Review method adapted from the latest gstack `/autoplan` workflow:
+- Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
+- Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
+- Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
+- Treat a `User Challenge` as any point where both the Opus output and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in `GENESIS-REPORT.md`, `ASSESSMENT.md`, or `{report_path}`.
+- Treat Codex-vs-Opus disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend the corpus only when the repository evidence supports the change.
+
+CEO review pass:
+- Re-test the premise, product direction, opportunity cost, and "Not Doing" list against the actual code.
+- Map existing code leverage before recommending new work.
+- Check that alternatives were considered and rejected for concrete reasons.
+- Look for hidden assumptions, failure modes, rescue paths, and unclear scope boundaries.
+
+Design review pass, when applicable:
+- Check information architecture, user journeys, empty/loading/error/success states, accessibility, responsive behavior, and AI-slop risk.
+- If the repo has no meaningful UI, say that in the report and skip UI-specific rewrites.
+
+Eng review pass:
+- Check architecture, data flow, dependency order, integration points, migrations/persistence, error handling, observability, performance risks, and test strategy.
+- Verify current-state claims against files, commands, or code structure. Docs are claims, not truth.
+
+DX review pass, when applicable:
+- Check first-run developer/operator experience, learn-by-doing path, error clarity, time-to-hello-world, honest examples, and uncertainty-reducing docs or tooling.
+- If the repo is not developer-facing, say that in the report and skip DX-specific rewrites.
+
+Corpus-specific validation:
+- `ASSESSMENT.md` must say what was actually inspected, separate verified facts from assumptions, and call out stale doc claims.
+- `SPEC.md` must describe concrete current behavior and intended near-term direction without presenting guesses as settled facts.
+- `PLANS.md` under `{planning_root}` must be an index to the generated plan set, not a substitute for the repo root ExecPlan standard.
+- Every numbered plan under `{planning_root}/plans/` must be a full ExecPlan rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape.
+- Numbered ExecPlans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
+- Every numbered ExecPlan must include non-empty sections for `Purpose / Big Picture`, `Requirements Trace`, `Scope Boundaries`, `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, `Context and Orientation`, `Plan of Work`, `Implementation Units`, `Concrete Steps`, `Validation and Acceptance`, `Idempotence and Recovery`, `Artifacts and Notes`, and `Interfaces and Dependencies`.
+- `Progress` must include checkbox bullets. `Implementation Units` must name goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only work, name the artifact and explain why no code test is expected.
+- Add checkpoint or decision-gate plans after each risky cluster or every 2-3 numbered plans when later work depends on unresolved evidence.
+
+Validation expectations:
+- Use lightweight local inspection commands as needed, such as `rg`, `ls`, and targeted file reads. Do not run long integration suites or production-affecting commands for this document review pass.
+- After edits, re-check the generated corpus shape yourself before finishing.
+- Write `{report_path}` with these sections: `# Codex Corpus Review`, `## Summary`, `## Files Reviewed`, `## Changes Made`, `## Decision Audit Trail`, `## User Challenges`, `## Taste Decisions`, `## Validation`, and `## Remaining Risks`.
+- If no corpus edits are needed, still write the report and explain what you checked.
+"#,
+        skill_boundary = CODEX_SKILL_BOUNDARY,
+        repo_root = repo_root.display(),
+        planning_root = planning_root.display(),
+        report_path = report_path.display(),
+    )
+}
+
+fn build_generation_codex_review_prompt(
+    mode: GenerationMode,
+    repo_root: &Path,
+    planning_root: &Path,
+    output_dir: &Path,
+    report_path: &Path,
+) -> String {
+    let mode_clause = match mode {
+        GenerationMode::Gen => {
+            "This is an `auto gen` review. The corpus represents intended future direction, but current code remains authoritative for every current-state fact. Preserve future intent only when it is labeled as a recommendation, hypothesis, or decision gate until evidence proves it."
+        }
+        GenerationMode::Reverse => {
+            "This is an `auto reverse` review. The live codebase is the source of truth, and the corpus is supporting context only."
+        }
+    };
+    format!(
+        r#"{skill_boundary}
+
+You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `{command_label}`.
+
+Claude Opus 4.6 has already produced initial generated specs and an implementation plan in `{output_dir}` for the repository at `{repo_root}`.
+
+{mode_clause}
+
+Edit boundary:
+- You may read the repository at `{repo_root}`, the planning corpus at `{planning_root}`, and generated outputs at `{output_dir}`.
+- You may edit only `{output_dir}/specs/*.md`, `{output_dir}/IMPLEMENTATION_PLAN.md`, and the review report at `{report_path}`.
+- Do not edit root `specs/`, root `IMPLEMENTATION_PLAN.md`, source code, the planning corpus, or any skill definition directory. The generator will sync reviewed outputs to the root after your pass.
+- Do not ask the user questions. Make conservative, code-grounded decisions and record uncertainty.
+
+Review method adapted from the latest gstack `/autoplan` workflow:
+- Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
+- Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
+- Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
+- Treat a `User Challenge` as any point where both the Opus output and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in the generated docs or `{report_path}`.
+- Treat Codex-vs-Opus disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend generated docs only when repository evidence supports the change.
+
+CEO review pass:
+- Check whether the generated specs and plan preserve the right product/system direction, scope boundaries, non-goals, alternatives, and hidden assumptions.
+- Ensure future-facing recommendations do not outrun evidence or dependency order.
+
+Design review pass, when applicable:
+- Check whether specs and plan tasks account for information architecture, user journeys, empty/loading/error/success states, accessibility, responsive behavior, and AI-slop risk.
+- If the repo has no meaningful UI, say that in the report and skip UI-specific rewrites.
+
+Eng review pass:
+- Check architecture, data flow, dependency order, integration points, persistence/migrations, error handling, observability, performance risks, and test strategy.
+- Verify exact current-state claims against files, commands, or code structure. Docs are claims, not truth.
+- Ensure implementation tasks are dependency-ordered, small enough for one focused worker session where possible, and include explicit checkpoint tasks after risky clusters or every 2-3 priority tasks.
+
+DX review pass, when applicable:
+- Check first-run developer/operator experience, learn-by-doing path, error clarity, time-to-hello-world, honest examples, and uncertainty-reducing docs or tooling.
+- If the repo is not developer-facing, say that in the report and skip DX-specific rewrites.
+
+Generated spec validation:
+- Every spec under `{output_dir}/specs/` must start with `# Specification:`.
+- Every spec must include non-empty `## Objective`, `## Evidence Status`, `## Acceptance Criteria`, `## Verification`, and `## Open Questions`.
+- `## Evidence Status` must separate verified code facts from recommendations, hypotheses, and unresolved questions.
+- Acceptance criteria must be observable, testable outcomes, not vague capability prose.
+- Specs must cite concrete files, commands, APIs, or primary-source documentation for exact current-state claims.
+
+Generated implementation plan validation:
+- `{output_dir}/IMPLEMENTATION_PLAN.md` must start with `# IMPLEMENTATION_PLAN`.
+- It must include `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`.
+- Every unfinished task must include `Spec:`, `Why now:`, `Codebase evidence:`, `Owns:`, `Integration touchpoints:`, `Scope boundary:`, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
+- Every `Spec:` reference must point to a spec file that exists under `{output_dir}/specs/`.
+- Behavior-changing tasks should prefer a prove-it validation path: failing test or repro first, green proof, then broader regression check.
+- Research or design tasks must name the closing artifact or decision and must not promise implementation details before the prerequisite evidence exists.
+
+Validation expectations:
+- Use lightweight local inspection commands as needed, such as `rg`, `ls`, and targeted file reads. Do not run long integration suites or production-affecting commands for this document review pass.
+- After edits, re-check the generated docs' shape yourself before finishing.
+- Write `{report_path}` with these sections: `# Codex Generation Review`, `## Summary`, `## Files Reviewed`, `## Changes Made`, `## Decision Audit Trail`, `## User Challenges`, `## Taste Decisions`, `## Validation`, and `## Remaining Risks`.
+- If no generated-doc edits are needed, still write the report and explain what you checked.
+"#,
+        skill_boundary = CODEX_SKILL_BOUNDARY,
+        command_label = mode.command_label(),
+        mode_clause = mode_clause,
+        repo_root = repo_root.display(),
+        planning_root = planning_root.display(),
+        output_dir = output_dir.display(),
+        report_path = report_path.display(),
     )
 }
 
@@ -2010,13 +2466,14 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_corpus_prompt, build_implementation_plan_prompt,
+        build_corpus_codex_review_prompt, build_corpus_prompt,
+        build_generation_codex_review_prompt, build_implementation_plan_prompt,
         generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
         normalize_generated_implementation_plan, normalize_generated_spec_markdown,
         rewrite_plan_spec_refs_to_root, sync_generated_specs_to_root_for_date,
-        verify_generated_implementation_plan, GeneratedSpecDocument, GenerationMode,
-        SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        verify_corpus_execplan, verify_generated_implementation_plan, GeneratedSpecDocument,
+        GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use chrono::NaiveDate;
     use std::fs;
@@ -2285,6 +2742,17 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("alternatives considered"));
         assert!(prompt.contains("explicit checkpoint or decision-gate plan file"));
         assert!(prompt.contains("prefer `AGENTS.md`"));
+        assert!(prompt.contains("must be a full ExecPlan"));
+        assert!(prompt.contains("## Purpose / Big Picture"));
+        assert!(prompt.contains("## Requirements Trace"));
+        assert!(prompt.contains("## Implementation Units"));
+        assert!(prompt.contains("Do not use the short `## Objective`"));
+        assert!(prompt.contains("current gstack `/autoplan` review discipline"));
+        assert!(prompt.contains("CEO -> Design"));
+        assert!(prompt.contains(
+            "Classify important planning decisions as `Mechanical`, `Taste`, or `User Challenge`"
+        ));
+        assert!(prompt.contains("concise decision audit trail"));
     }
 
     #[test]
@@ -2302,6 +2770,169 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("`genesis/FOCUS.md`"));
         assert!(prompt.contains("Still perform a wide repo sweep"));
         assert!(prompt.contains("attention and prioritization signal"));
+    }
+
+    #[test]
+    fn codex_review_prompts_encode_autoplan_boundary_and_edit_scope() {
+        let corpus_prompt = build_corpus_codex_review_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            std::path::Path::new("/tmp/repo/.auto/logs/corpus-report.md"),
+        );
+
+        assert!(corpus_prompt.contains("GPT-5.4 xhigh Codex outside-voice review"));
+        assert!(corpus_prompt.contains("Do NOT read or execute any SKILL.md files"));
+        assert!(
+            corpus_prompt.contains("You may edit only markdown files under `/tmp/repo/genesis`")
+        );
+        assert!(corpus_prompt.contains("Run review phases in order: CEO, Design"));
+        assert!(corpus_prompt.contains("`Mechanical`, `Taste`, or `User Challenge`"));
+        assert!(corpus_prompt.contains(
+            "Every numbered plan under `/tmp/repo/genesis/plans/` must be a full ExecPlan"
+        ));
+        assert!(corpus_prompt.contains("# Codex Corpus Review"));
+
+        let generation_prompt = build_generation_codex_review_prompt(
+            GenerationMode::Gen,
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            std::path::Path::new("/tmp/repo/gen-010203"),
+            std::path::Path::new("/tmp/repo/.auto/logs/gen-report.md"),
+        );
+
+        assert!(generation_prompt.contains("outside-voice review step for `auto gen`"));
+        assert!(generation_prompt.contains("Do NOT read or execute any SKILL.md files"));
+        assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
+        assert!(generation_prompt
+            .contains("The generator will sync reviewed outputs to the root after your pass"));
+        assert!(generation_prompt.contains("Run review phases in order: CEO, Design"));
+        assert!(generation_prompt.contains("# Codex Generation Review"));
+    }
+
+    #[test]
+    fn corpus_execplan_validator_accepts_full_plans_md_shape() {
+        let root = temp_dir("corpus-execplan-ok");
+        let plan_path = root.join("001-example.md");
+        fs::write(
+            &plan_path,
+            r#"# Example Slice
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+After this change, an operator can run a concrete proof and observe the generated artifact.
+
+## Requirements Trace
+
+R1: The proof artifact is generated from the live repo state.
+
+## Scope Boundaries
+
+This plan does not change production runtime behavior.
+
+## Progress
+
+- [ ] (2026-04-10 00:00Z) Implement the proof artifact.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep the first slice bounded to one artifact.
+  Rationale: It gives a reviewer a concrete proof before runtime changes.
+  Date/Author: 2026-04-10 / auto corpus
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+The relevant files are `docs/example.md` and `crates/example/src/lib.rs`.
+
+## Plan of Work
+
+Update `docs/example.md`, then add a focused regression test in `crates/example/src/lib.rs`.
+
+## Implementation Units
+
+Unit 1: Proof artifact.
+Goal: Create the proof artifact.
+Requirements advanced: R1.
+Dependencies: none.
+Files to create or modify: `docs/example.md`, `crates/example/src/lib.rs`.
+Tests to add or modify: add `example_proof_is_generated`.
+Approach: write the artifact first, then cover it with the focused test.
+Specific test scenarios: invoke the proof function and expect the artifact path to be returned.
+
+## Concrete Steps
+
+From the repository root, run:
+
+    cargo test -p example example_proof_is_generated -- --nocapture
+
+## Validation and Acceptance
+
+The focused test passes and prints the generated artifact path.
+
+## Idempotence and Recovery
+
+Rerunning the test overwrites the same deterministic artifact.
+
+## Artifacts and Notes
+
+Add the final test transcript here after implementation.
+
+## Interfaces and Dependencies
+
+Use the existing `example::proof` module; no new external service is required.
+"#,
+        )
+        .unwrap();
+
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_execplan_validator_rejects_old_task_stub_shape() {
+        let root = temp_dir("corpus-execplan-stub");
+        let plan_path = root.join("004-autonomous-evidence-retention-dr.md");
+        fs::write(
+            &plan_path,
+            r#"# 004 - Autonomous Evidence Retention And DR
+
+## Objective
+
+Add backup, retention, and disaster-recovery treatment.
+
+## Description
+
+This is too high level to guide a novice implementation.
+
+## Acceptance Criteria
+
+- Backup is documented.
+
+## Verification
+
+    cargo test -p bitino-house ops_event -- --nocapture
+
+## Dependencies
+
+- 002 local validation baseline.
+"#,
+        )
+        .unwrap();
+
+        let error = verify_corpus_execplan(&plan_path)
+            .expect_err("expected old high-level plan shape to be rejected");
+
+        assert!(error.to_string().contains("Purpose / Big Picture"));
     }
 
     #[test]

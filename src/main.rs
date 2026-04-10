@@ -183,6 +183,22 @@ pub(crate) struct CorpusArgs {
     #[arg(long, default_value = "claude-opus-4-6")]
     model: String,
 
+    /// Model used for the independent Codex review pass after corpus authoring
+    #[arg(long, default_value = "gpt-5.4")]
+    codex_review_model: String,
+
+    /// Reasoning effort used for the independent Codex review pass
+    #[arg(long, default_value = "xhigh")]
+    codex_review_effort: String,
+
+    /// Codex executable to invoke for the independent review pass
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Skip the independent Codex review pass
+    #[arg(long)]
+    skip_codex_review: bool,
+
     /// Maximum Claude turns
     #[arg(long, default_value_t = 200)]
     max_turns: usize,
@@ -209,6 +225,22 @@ pub(crate) struct GenerationArgs {
     /// Model used for spec and plan authoring
     #[arg(long, default_value = "claude-opus-4-6")]
     model: String,
+
+    /// Model used for the independent Codex review pass after generation
+    #[arg(long, default_value = "gpt-5.4")]
+    codex_review_model: String,
+
+    /// Reasoning effort used for the independent Codex review pass
+    #[arg(long, default_value = "xhigh")]
+    codex_review_effort: String,
+
+    /// Codex executable to invoke for the independent review pass
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Skip the independent Codex review pass
+    #[arg(long)]
+    skip_codex_review: bool,
 
     /// Maximum Claude turns
     #[arg(long, default_value_t = 200)]
