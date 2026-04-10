@@ -224,19 +224,32 @@ where
             attempt + 1,
         );
 
-        let mut lock = acquire_provider_lock(provider)?;
-        let _lock_guard = lock.try_write().map_err(|_| {
-            anyhow::anyhow!(
-                "another {provider} quota-router instance is swapping credentials"
-            )
-        })?;
-        let mut guard = swap_credentials(provider, &profile_dir)?;
+        // Hold the per-provider lock only during credential swap,
+        // not during the entire child process execution.
+        let mut guard = {
+            let mut lock = acquire_provider_lock(provider)?;
+            let _write = lock.try_write().map_err(|_| {
+                anyhow::anyhow!(
+                    "another {provider} quota-router instance is swapping credentials"
+                )
+            })?;
+            swap_credentials(provider, &profile_dir)?
+        };
 
         let result = exec_fn().await;
 
-        guard.disarm();
-        drop(guard);
-        restore_credentials(provider)?;
+        // Re-acquire lock for the restore phase.
+        {
+            let mut lock = acquire_provider_lock(provider)?;
+            let _write = lock.write().map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to acquire {provider} lock for credential restore: {e}"
+                )
+            })?;
+            guard.disarm();
+            drop(guard);
+            restore_credentials(provider)?;
+        }
 
         match result {
             Ok((status, stderr_text)) => {

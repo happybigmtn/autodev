@@ -408,8 +408,10 @@ fn collect_tracked_repo_states(
 
     let mut states = Vec::with_capacity(repos.len());
     for path in repos {
-        let head = git_stdout(&path, ["rev-parse", "HEAD"])?;
-        let status = git_stdout(&path, ["status", "--short"])?;
+        let Ok(head) = git_stdout(&path, ["rev-parse", "HEAD"]) else {
+            continue;
+        };
+        let status = git_stdout(&path, ["status", "--short"]).unwrap_or_default();
         states.push(TrackedRepoState {
             name: path
                 .file_name()
@@ -579,9 +581,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        append_reference_repo_clause, discover_sibling_git_repos, ensure_review_docs,
-        extract_review_items, resolve_reference_repos, summarize_repo_progress, RepoProgress,
-        TrackedRepoState, ARCHIVED_HEADER, REVIEW_HEADER,
+        append_reference_repo_clause, collect_tracked_repo_states, discover_sibling_git_repos,
+        ensure_review_docs, extract_review_items, resolve_reference_repos,
+        summarize_repo_progress, RepoProgress, TrackedRepoState, ARCHIVED_HEADER, REVIEW_HEADER,
     };
 
     #[test]
@@ -725,6 +727,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_tracked_repo_states_skips_unborn_reference_repo() {
+        let workspace = unique_temp_dir();
+        let repo_root = workspace.join("bitpoker");
+        let unborn_reference = workspace.join("hermes-autodev-framework");
+
+        init_git_repo(&repo_root);
+        commit_empty_change(&repo_root);
+        init_git_repo(&unborn_reference);
+
+        let states = collect_tracked_repo_states(&repo_root, &[unborn_reference.clone()])
+            .expect("collect repo states");
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].path, repo_root);
+
+        fs::remove_dir_all(&workspace).expect("cleanup workspace");
+    }
+
     fn init_git_repo(path: &PathBuf) {
         fs::create_dir_all(path).expect("failed to create repo dir");
         let status = std::process::Command::new("git")
@@ -733,6 +754,24 @@ mod tests {
             .status()
             .expect("failed to run git init");
         assert!(status.success(), "git init should succeed");
+    }
+
+    fn commit_empty_change(path: &PathBuf) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Autodev Tests",
+                "-c",
+                "user.email=autodev-tests@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial commit",
+            ])
+            .current_dir(path)
+            .status()
+            .expect("failed to run git commit");
+        assert!(status.success(), "git commit should succeed");
     }
 
     fn unique_temp_dir() -> PathBuf {
