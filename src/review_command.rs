@@ -171,7 +171,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
 
     let mut iteration = 0usize;
-    while iteration < args.max_iterations {
+    while args.max_iterations == 0 || iteration < args.max_iterations {
         let prompt_path = repo_root
             .join(".auto")
             .join("logs")
@@ -737,7 +737,7 @@ mod tests {
         commit_empty_change(&repo_root);
         init_git_repo(&unborn_reference);
 
-        let states = collect_tracked_repo_states(&repo_root, &[unborn_reference.clone()])
+        let states = collect_tracked_repo_states(&repo_root, std::slice::from_ref(&unborn_reference))
             .expect("collect repo states");
 
         assert_eq!(states.len(), 1);

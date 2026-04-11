@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDate};
 
 use crate::codex_exec::run_codex_exec;
-use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
+use crate::corpus::{PlanningCorpus, emit_corpus_snapshot, load_planning_corpus};
 use crate::state::{load_state, save_state};
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
@@ -60,6 +60,35 @@ struct SpecSyncSummary {
 struct GeneratedSpecDocument {
     path: PathBuf,
     text: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ActivePlanSurface {
+    root_plan_standard_path: Option<String>,
+    active_plan_paths: Vec<String>,
+}
+
+impl ActivePlanSurface {
+    fn has_active_plans(&self) -> bool {
+        !self.active_plan_paths.is_empty()
+    }
+
+    fn primary_plan_path(&self) -> Option<&str> {
+        self.active_plan_paths
+            .iter()
+            .find(|path| path.ends_with("001-master-plan.md"))
+            .or_else(|| self.active_plan_paths.first())
+            .map(String::as_str)
+    }
+}
+
+struct CorpusPromptInputs<'a> {
+    previous_planning_snapshot: Option<&'a Path>,
+    parallelism: usize,
+    idea: Option<&'a str>,
+    focus: Option<&'a str>,
+    reference_repos: &'a [PathBuf],
+    active_plan_surface: &'a ActivePlanSurface,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +152,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
     let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
+    let active_plan_surface = discover_active_plan_surface(&repo_root)?;
     let planning_root = args
         .planning_root
         .unwrap_or_else(|| repo_root.join("genesis"));
@@ -150,6 +180,15 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         println!("references:  {}", reference_repos.len());
         for path in &reference_repos {
             println!("  - {}", path.display());
+        }
+    }
+    if active_plan_surface.has_active_plans() {
+        println!(
+            "active plans: {}",
+            active_plan_surface.active_plan_paths.len()
+        );
+        if let Some(primary) = active_plan_surface.primary_plan_path() {
+            println!("primary plan: {}", primary);
         }
     }
     println!("model:       {}", args.model);
@@ -182,11 +221,14 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let prompt = build_corpus_prompt(
         &repo_root,
         &planning_root,
-        previous_snapshot.as_deref(),
-        args.parallelism.clamp(1, 10),
-        args.idea.as_deref(),
-        args.focus.as_deref(),
-        &reference_repos,
+        CorpusPromptInputs {
+            previous_planning_snapshot: previous_snapshot.as_deref(),
+            parallelism: args.parallelism.clamp(1, 10),
+            idea: args.idea.as_deref(),
+            focus: args.focus.as_deref(),
+            reference_repos: &reference_repos,
+            active_plan_surface: &active_plan_surface,
+        },
     );
     let prompt_path = repo_root
         .join(".auto")
@@ -222,8 +264,13 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     } else {
         print_stage("run corpus codex review", run_started_at);
         let report_path = codex_review_report_path(&repo_root, "corpus-codex-review");
-        let review_prompt =
-            build_corpus_codex_review_prompt(&repo_root, &planning_root, &report_path);
+        let review_prompt = build_corpus_codex_review_prompt(
+            &repo_root,
+            &planning_root,
+            &report_path,
+            &reference_repos,
+            &active_plan_surface,
+        );
         Some(
             run_logged_codex_review(
                 &repo_root,
@@ -239,7 +286,12 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     };
 
     print_stage("verify corpus outputs", run_started_at);
-    let summary = verify_corpus_outputs(&planning_root, args.focus.is_some())?;
+    let summary = verify_corpus_outputs(
+        &repo_root,
+        &planning_root,
+        args.focus.is_some(),
+        &active_plan_surface,
+    )?;
     print_stage("save corpus state", run_started_at);
     let mut state = load_state(&repo_root)?;
     state.planning_root = Some(planning_root.clone());
@@ -570,6 +622,31 @@ fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<Pa
     Ok(resolved)
 }
 
+fn discover_active_plan_surface(repo_root: &Path) -> Result<ActivePlanSurface> {
+    let root_plan_standard_path = repo_root
+        .join("PLANS.md")
+        .exists()
+        .then_some("PLANS.md".to_string());
+    let plans_dir = repo_root.join("plans");
+    let active_plan_paths = if plans_dir.is_dir() {
+        list_markdown_files(&plans_dir)?
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(repo_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(ActivePlanSurface {
+        root_plan_standard_path,
+        active_plan_paths,
+    })
+}
+
 fn ensure_planning_root_exists(planning_root: &Path) -> Result<()> {
     if planning_root.exists() {
         return Ok(());
@@ -860,6 +937,7 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
+#[derive(Debug)]
 struct CorpusOutputSummary {
     assessment_path: PathBuf,
     spec_path: PathBuf,
@@ -872,8 +950,10 @@ struct CorpusOutputSummary {
 }
 
 fn verify_corpus_outputs(
+    repo_root: &Path,
     planning_root: &Path,
     focus_requested: bool,
+    active_plan_surface: &ActivePlanSurface,
 ) -> Result<CorpusOutputSummary> {
     let assessment_path = planning_root.join("ASSESSMENT.md");
     let spec_path = planning_root.join("SPEC.md");
@@ -906,6 +986,13 @@ fn verify_corpus_outputs(
     if focus_requested && !focus_path.exists() {
         bail!("corpus generation did not write {}", focus_path.display());
     }
+    verify_corpus_semantics(
+        repo_root,
+        planning_root,
+        &plans_index_path,
+        &report_path,
+        active_plan_surface,
+    )?;
     Ok(CorpusOutputSummary {
         assessment_path,
         spec_path,
@@ -919,6 +1006,64 @@ fn verify_corpus_outputs(
             .then_some(planning_root.join("IDEA.md")),
         plan_count: plan_files.len(),
     })
+}
+
+fn verify_corpus_semantics(
+    repo_root: &Path,
+    planning_root: &Path,
+    plans_index_path: &Path,
+    report_path: &Path,
+    active_plan_surface: &ActivePlanSurface,
+) -> Result<()> {
+    let repo_root_literal = repo_root.display().to_string();
+    for path in list_markdown_files(planning_root)? {
+        let markdown = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if markdown.contains(&repo_root_literal) {
+            bail!(
+                "corpus document {} contains absolute repo-root path {}; use repo-relative paths or links",
+                path.display(),
+                repo_root_literal
+            );
+        }
+    }
+
+    if !active_plan_surface.has_active_plans() {
+        return Ok(());
+    }
+
+    let plans_index = fs::read_to_string(plans_index_path)
+        .with_context(|| format!("failed to read {}", plans_index_path.display()))?;
+    let report = fs::read_to_string(report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+    let primary_plan_path = active_plan_surface.primary_plan_path().unwrap_or("plans/");
+
+    if !plans_index.contains(primary_plan_path) && !report.contains(primary_plan_path) {
+        bail!(
+            "corpus must explicitly reference the active root planning surface at `{}` when the repo already has active plans",
+            primary_plan_path
+        );
+    }
+
+    let combined = format!("{plans_index}\n{report}").to_ascii_lowercase();
+    let acknowledges_subordination = [
+        "subordinate",
+        "reconcile",
+        "reconciled",
+        "active planning surface",
+        "active master plan",
+        "not a parallel control plane",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle));
+
+    if !acknowledges_subordination {
+        bail!(
+            "corpus must explicitly state that generated plans reconcile to the active root planning surface instead of creating a parallel plan universe"
+        );
+    }
+
+    Ok(())
 }
 
 fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
@@ -998,12 +1143,16 @@ fn markdown_section_contains(
 fn build_corpus_prompt(
     repo_root: &Path,
     planning_root: &Path,
-    previous_planning_snapshot: Option<&Path>,
-    parallelism: usize,
-    idea: Option<&str>,
-    focus: Option<&str>,
-    reference_repos: &[PathBuf],
+    inputs: CorpusPromptInputs<'_>,
 ) -> String {
+    let CorpusPromptInputs {
+        previous_planning_snapshot,
+        parallelism,
+        idea,
+        focus,
+        reference_repos,
+        active_plan_surface,
+    } = inputs;
     let planning_root = planning_root
         .strip_prefix(repo_root)
         .unwrap_or(planning_root)
@@ -1037,6 +1186,31 @@ fn build_corpus_prompt(
             .join("\n");
         format!(
             "Reference repositories to inspect as required input:\n{listing}\n\nWhen reference repos are listed:\n- Inspect them directly; do not treat them as optional background.\n- Use them to distinguish reusable code, architectural inspiration, and non-reusable coupling.\n- Be explicit about which conclusions came from the target repo vs the reference repos.\n\n"
+        )
+    };
+    let active_plan_clause = if active_plan_surface.root_plan_standard_path.is_none()
+        && !active_plan_surface.has_active_plans()
+    {
+        String::new()
+    } else {
+        let root_standard = active_plan_surface
+            .root_plan_standard_path
+            .as_deref()
+            .map(|path| format!("- Root ExecPlan standard: `{path}`\n"))
+            .unwrap_or_default();
+        let active_plans = if active_plan_surface.has_active_plans() {
+            let listing = active_plan_surface
+                .active_plan_paths
+                .iter()
+                .map(|path| format!("- Active root plan: `{path}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{listing}\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "Existing active planning surfaces to inspect as first-class inputs:\n{root_standard}{active_plans}\nWhen active root planning surfaces exist:\n- Treat them as the current control plane for planning intent and sequencing.\n- Do not create a second active master plan or competing queue inside `{planning_root}`.\n- Generated corpus files must explicitly describe themselves as subordinate reconciliations, decompositions, or review overlays on top of the active root planning surface.\n- If you disagree with an active root plan, record that disagreement explicitly as `Mechanical`, `Taste`, or `User Challenge`; do not silently replace the plan hierarchy.\n- Reuse shared interface names and planning vocabulary from the active root surface unless code evidence proves they are wrong.\n\n"
         )
     };
     let idea_context_clause = idea
@@ -1105,6 +1279,7 @@ Use up to {parallelism} parallel subagents when helpful for code review, repo-hi
 Additional operator-provided context:
 {previous_snapshot_clause}
 {reference_repo_clause}
+{active_plan_clause}
 
 Mandatory output files:
 - `{planning_root}/ASSESSMENT.md`
@@ -1122,6 +1297,7 @@ Review the actual codebase first, not just docs:
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
 - If an idea seed is present, use it as intentional product direction, then reconcile it against repo reality, reusable assets, and the actual gaps.
 - If a focus seed is present, use it to bias depth and plan ordering while still preserving full-repo coverage.
+- If active root planning surfaces already exist under `plans/`, reconcile to them explicitly instead of inventing a parallel planning universe in `{planning_root}`.
 - The current codebase is still the truth for current state, constraints, and what can be reused.
 - When the repo needs an agent-instruction file, prefer the repo's actual primary convention.
   - In Codex-first repos, prefer `AGENTS.md`.
@@ -1168,7 +1344,7 @@ ASSESSMENT.md must include:
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
-`{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard.
+`{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard. If the target repo already has active root plans under `plans/`, the generated index must explicitly say those root plans remain the active planning surface and that the generated corpus is subordinate to them.
 
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
@@ -1226,6 +1402,7 @@ Never trust docs over code. If docs claim something the code does not support, s
         parallelism = parallelism,
         previous_snapshot_clause = previous_snapshot_clause,
         reference_repo_clause = reference_repo_clause,
+        active_plan_clause = active_plan_clause,
         idea_output_clause = idea_output_clause,
         focus_output_clause = focus_output_clause,
         idea_context_clause = idea_context_clause,
@@ -1237,7 +1414,52 @@ fn build_corpus_codex_review_prompt(
     repo_root: &Path,
     planning_root: &Path,
     report_path: &Path,
+    reference_repos: &[PathBuf],
+    active_plan_surface: &ActivePlanSurface,
 ) -> String {
+    let reference_repo_clause = if reference_repos.is_empty() {
+        String::new()
+    } else {
+        let listing = reference_repos
+            .iter()
+            .map(|path| {
+                format!(
+                    "- Reference repo available to inspect: `{}`",
+                    path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Reference repositories already supplied to the corpus run:\n{listing}\n- Inspect them directly before calling cross-repo work ungrounded.\n- Be explicit about which findings came from the target repo vs a reference repo.\n\n"
+        )
+    };
+    let active_plan_clause = if active_plan_surface.root_plan_standard_path.is_none()
+        && !active_plan_surface.has_active_plans()
+    {
+        String::new()
+    } else {
+        let root_standard = active_plan_surface
+            .root_plan_standard_path
+            .as_deref()
+            .map(|path| format!("- Root ExecPlan standard: `{path}`\n"))
+            .unwrap_or_default();
+        let active_plans = if active_plan_surface.has_active_plans() {
+            let listing = active_plan_surface
+                .active_plan_paths
+                .iter()
+                .map(|path| format!("- Active root plan: `{path}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{listing}\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "Active root planning surfaces already exist:\n{root_standard}{active_plans}\n- The generated corpus must reconcile to these surfaces explicitly.\n- Reject any corpus that creates a second active master plan or competing control plane.\n- Require `GENESIS-REPORT.md` or `{planning_root}/PLANS.md` to say the generated corpus is subordinate to or reconciled against the active root planning surface.\n\n",
+            planning_root = planning_root.display(),
+        )
+    };
     format!(
         r#"{skill_boundary}
 
@@ -1250,6 +1472,8 @@ Edit boundary:
 - You may edit only markdown files under `{planning_root}` and the review report at `{report_path}`.
 - Do not edit source code, root specs, root implementation plans, generated output dirs outside `{planning_root}`, or any skill definition directory.
 - Do not ask the user questions. Make conservative, code-grounded decisions and record uncertainty.
+
+{reference_repo_clause}{active_plan_clause}
 
 Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
@@ -1280,6 +1504,7 @@ Corpus-specific validation:
 - `ASSESSMENT.md` must say what was actually inspected, separate verified facts from assumptions, and call out stale doc claims.
 - `SPEC.md` must describe concrete current behavior and intended near-term direction without presenting guesses as settled facts.
 - `PLANS.md` under `{planning_root}` must be an index to the generated plan set, not a substitute for the repo root ExecPlan standard.
+- If active root plans already exist under `plans/`, the generated corpus must explicitly reconcile to them and must not present itself as a second active planning surface.
 - Every numbered plan under `{planning_root}/plans/` must be a full ExecPlan rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape.
 - Numbered ExecPlans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
 - Every numbered ExecPlan must include non-empty sections for `Purpose / Big Picture`, `Requirements Trace`, `Scope Boundaries`, `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, `Context and Orientation`, `Plan of Work`, `Implementation Units`, `Concrete Steps`, `Validation and Acceptance`, `Idempotence and Recovery`, `Artifacts and Notes`, and `Interfaces and Dependencies`.
@@ -1296,6 +1521,8 @@ Validation expectations:
         repo_root = repo_root.display(),
         planning_root = planning_root.display(),
         report_path = report_path.display(),
+        reference_repo_clause = reference_repo_clause,
+        active_plan_clause = active_plan_clause,
     )
 }
 
@@ -2466,14 +2693,15 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_corpus_codex_review_prompt, build_corpus_prompt,
-        build_generation_codex_review_prompt, build_implementation_plan_prompt,
-        generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
-        lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
-        normalize_generated_implementation_plan, normalize_generated_spec_markdown,
-        rewrite_plan_spec_refs_to_root, sync_generated_specs_to_root_for_date,
-        verify_corpus_execplan, verify_generated_implementation_plan, GeneratedSpecDocument,
-        GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
+        IMPLEMENTATION_PLAN_HEADER, SpecSyncSummary, build_corpus_codex_review_prompt,
+        build_corpus_prompt, build_generation_codex_review_prompt,
+        build_implementation_plan_prompt, generated_spec_has_acceptance_criteria,
+        lint_session_resume_wire_contract, lint_signature_policy_consistency,
+        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
+        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root,
+        sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
+        verify_generated_implementation_plan,
     };
     use chrono::NaiveDate;
     use std::fs;
@@ -2731,11 +2959,14 @@ Spec: `specs/050426-deterministic-transcripts.md`
         let prompt = build_corpus_prompt(
             std::path::Path::new("/tmp/repo"),
             std::path::Path::new("/tmp/repo/genesis"),
-            None,
-            4,
-            Some("build a thing"),
-            None,
-            &[],
+            CorpusPromptInputs {
+                previous_planning_snapshot: None,
+                parallelism: 4,
+                idea: Some("build a thing"),
+                focus: None,
+                reference_repos: &[],
+                active_plan_surface: &ActivePlanSurface::default(),
+            },
         );
 
         assert!(prompt.contains("key assumptions to validate next"));
@@ -2760,11 +2991,14 @@ Spec: `specs/050426-deterministic-transcripts.md`
         let prompt = build_corpus_prompt(
             std::path::Path::new("/tmp/repo"),
             std::path::Path::new("/tmp/repo/genesis"),
-            None,
-            4,
-            None,
-            Some("wire reconnects, TLS failures, session-token handling"),
-            &[],
+            CorpusPromptInputs {
+                previous_planning_snapshot: None,
+                parallelism: 4,
+                idea: None,
+                focus: Some("wire reconnects, TLS failures, session-token handling"),
+                reference_repos: &[],
+                active_plan_surface: &ActivePlanSurface::default(),
+            },
         );
 
         assert!(prompt.contains("`genesis/FOCUS.md`"));
@@ -2778,6 +3012,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
             std::path::Path::new("/tmp/repo"),
             std::path::Path::new("/tmp/repo/genesis"),
             std::path::Path::new("/tmp/repo/.auto/logs/corpus-report.md"),
+            &[],
+            &ActivePlanSurface::default(),
         );
 
         assert!(corpus_prompt.contains("GPT-5.4 xhigh Codex outside-voice review"));
@@ -2803,10 +3039,56 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(generation_prompt.contains("outside-voice review step for `auto gen`"));
         assert!(generation_prompt.contains("Do NOT read or execute any SKILL.md files"));
         assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
-        assert!(generation_prompt
-            .contains("The generator will sync reviewed outputs to the root after your pass"));
+        assert!(
+            generation_prompt
+                .contains("The generator will sync reviewed outputs to the root after your pass")
+        );
         assert!(generation_prompt.contains("Run review phases in order: CEO, Design"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
+    }
+
+    #[test]
+    fn corpus_prompt_reconciles_to_existing_active_root_plans() {
+        let prompt = build_corpus_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            CorpusPromptInputs {
+                previous_planning_snapshot: None,
+                parallelism: 4,
+                idea: None,
+                focus: None,
+                reference_repos: &[PathBuf::from("/tmp/bitino")],
+                active_plan_surface: &ActivePlanSurface {
+                    root_plan_standard_path: Some("PLANS.md".to_string()),
+                    active_plan_paths: vec!["plans/001-master-plan.md".to_string()],
+                },
+            },
+        );
+
+        assert!(prompt.contains("Existing active planning surfaces"));
+        assert!(prompt.contains("Do not create a second active master plan"));
+        assert!(prompt.contains("subordinate reconciliations"));
+        assert!(prompt.contains("Reference repositories to inspect as required input"));
+        assert!(prompt.contains("Mandatory reference repo: `/tmp/bitino`"));
+    }
+
+    #[test]
+    fn codex_review_prompt_inherits_reference_repos_and_active_plan_surface() {
+        let corpus_prompt = build_corpus_codex_review_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            std::path::Path::new("/tmp/repo/.auto/logs/corpus-report.md"),
+            &[PathBuf::from("/tmp/bitino")],
+            &ActivePlanSurface {
+                root_plan_standard_path: Some("PLANS.md".to_string()),
+                active_plan_paths: vec!["plans/001-master-plan.md".to_string()],
+            },
+        );
+
+        assert!(corpus_prompt.contains("Reference repo available to inspect"));
+        assert!(corpus_prompt.contains("before calling cross-repo work ungrounded"));
+        assert!(corpus_prompt.contains("must reconcile to these surfaces explicitly"));
+        assert!(corpus_prompt.contains("second active master plan"));
     }
 
     #[test]
@@ -2933,6 +3215,154 @@ This is too high level to guide a novice implementation.
             .expect_err("expected old high-level plan shape to be rejected");
 
         assert!(error.to_string().contains("Purpose / Big Picture"));
+    }
+
+    #[test]
+    fn corpus_output_validator_rejects_parallel_plan_universe_and_absolute_paths() {
+        let repo_root = temp_dir("corpus-semantic-guard");
+        fs::write(repo_root.join("PLANS.md"), "# root plans\n").unwrap();
+        let root_plans_dir = repo_root.join("plans");
+        fs::create_dir_all(&root_plans_dir).unwrap();
+        fs::write(
+            root_plans_dir.join("001-master-plan.md"),
+            "# Active Root Plan\n",
+        )
+        .unwrap();
+
+        let planning_root = repo_root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        fs::write(planning_root.join("ASSESSMENT.md"), "# Assessment\n").unwrap();
+        fs::write(planning_root.join("SPEC.md"), "# Spec\n").unwrap();
+        fs::write(
+            planning_root.join("PLANS.md"),
+            "# Genesis Plan Index\n\nThis index points to generated plans only.\n",
+        )
+        .unwrap();
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            "# Report\n\nThe corpus is ready.\n",
+        )
+        .unwrap();
+        fs::write(
+            plans_dir.join("001-example.md"),
+            r#"# Example Slice
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Do a thing.
+
+## Requirements Trace
+
+R1: Do a thing.
+
+## Scope Boundaries
+
+No runtime behavior changes.
+
+## Progress
+
+- [ ] Start.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep it small.
+  Rationale: Easier to verify.
+  Date/Author: 2026-04-11 / test
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+Look at `docs/example.md`.
+
+## Plan of Work
+
+Edit one file.
+
+## Implementation Units
+
+Unit 1.
+Goal: Do the thing.
+Requirements advanced: R1.
+Dependencies: none.
+Files to create or modify: `docs/example.md`.
+Tests to add or modify: add one focused test.
+Approach: change the file.
+Specific test scenarios: test the thing.
+
+## Concrete Steps
+
+    cargo test
+
+## Validation and Acceptance
+
+The test passes.
+
+## Idempotence and Recovery
+
+Rerun safely.
+
+## Artifacts and Notes
+
+No notes.
+
+## Interfaces and Dependencies
+
+No external dependencies.
+"#,
+        )
+        .unwrap();
+
+        let error = verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface {
+                root_plan_standard_path: Some("PLANS.md".to_string()),
+                active_plan_paths: vec!["plans/001-master-plan.md".to_string()],
+            },
+        )
+        .expect_err("expected active-plan semantic guard to fail");
+
+        assert!(error.to_string().contains("active root planning surface"));
+
+        fs::write(
+            planning_root.join("PLANS.md"),
+            "# Genesis Plan Index\n\nThis index is subordinate to `plans/001-master-plan.md` and not a parallel control plane.\n",
+        )
+        .unwrap();
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            format!(
+                "# Report\n\nThe corpus is reconciled against `plans/001-master-plan.md`.\n\nBad link: {}\n",
+                repo_root.display()
+            ),
+        )
+        .unwrap();
+
+        let error = verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface {
+                root_plan_standard_path: Some("PLANS.md".to_string()),
+                active_plan_paths: vec!["plans/001-master-plan.md".to_string()],
+            },
+        )
+        .expect_err("expected absolute path semantic guard to fail");
+
+        assert!(error.to_string().contains("absolute repo-root path"));
     }
 
     #[test]

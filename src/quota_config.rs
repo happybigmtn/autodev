@@ -59,6 +59,10 @@ pub(crate) struct AccountEntry {
 pub(crate) struct QuotaConfig {
     #[serde(default)]
     pub(crate) accounts: Vec<AccountEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_codex_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_claude_account: Option<String>,
 }
 
 impl QuotaConfig {
@@ -86,8 +90,7 @@ impl QuotaConfig {
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     pub(crate) fn load_or_none() -> Result<Option<Self>> {
@@ -101,10 +104,8 @@ impl QuotaConfig {
     pub(crate) fn save(&self) -> Result<()> {
         let path = Self::config_path();
         let dir = Self::config_dir();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        let text = toml::to_string_pretty(self)
-            .context("failed to serialize quota config")?;
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let text = toml::to_string_pretty(self).context("failed to serialize quota config")?;
         fs::write(&path, text.as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))
     }
@@ -120,11 +121,49 @@ impl QuotaConfig {
             .collect()
     }
 
+    pub(crate) fn selected_account_name(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Codex => self.selected_codex_account.as_deref(),
+            Provider::Claude => self.selected_claude_account.as_deref(),
+        }
+    }
+
+    pub(crate) fn set_selected_account(&mut self, provider: Provider, name: &str) -> Result<()> {
+        if !self
+            .accounts
+            .iter()
+            .any(|a| a.provider == provider && a.name == name)
+        {
+            bail!("account '{name}' not found for provider '{provider}'");
+        }
+
+        match provider {
+            Provider::Codex => self.selected_codex_account = Some(name.to_owned()),
+            Provider::Claude => self.selected_claude_account = Some(name.to_owned()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_selected_account_if_matches(&mut self, provider: Provider, name: &str) {
+        let selected = match provider {
+            Provider::Codex => &mut self.selected_codex_account,
+            Provider::Claude => &mut self.selected_claude_account,
+        };
+        if selected.as_deref() == Some(name) {
+            *selected = None;
+        }
+    }
+
     pub(crate) fn add_account(&mut self, entry: AccountEntry) -> Result<()> {
         if self.accounts.iter().any(|a| a.name == entry.name) {
             bail!("account '{}' already exists", entry.name);
         }
+        let provider = entry.provider;
+        let name = entry.name.clone();
         self.accounts.push(entry);
+        if self.selected_account_name(provider).is_none() {
+            self.set_selected_account(provider, &name)?;
+        }
         Ok(())
     }
 
@@ -134,7 +173,9 @@ impl QuotaConfig {
             .iter()
             .position(|a| a.name == name)
             .with_context(|| format!("account '{name}' not found"))?;
-        Ok(self.accounts.remove(idx))
+        let removed = self.accounts.remove(idx);
+        self.clear_selected_account_if_matches(removed.provider, name);
+        Ok(removed)
     }
 }
 
@@ -182,9 +223,8 @@ pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Re
             let home = dirs::home_dir().expect("cannot resolve home directory");
             let claude_json = home.join(".claude.json");
             if claude_json.exists() {
-                fs::copy(&claude_json, profile_dir.join(".claude.json")).with_context(|| {
-                    format!("failed to copy {}", claude_json.display())
-                })?;
+                fs::copy(&claude_json, profile_dir.join(".claude.json"))
+                    .with_context(|| format!("failed to copy {}", claude_json.display()))?;
             }
         }
     }
@@ -192,10 +232,9 @@ pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Re
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("failed to create {}", dst.display()))?;
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read directory {}", src.display()))?
+    fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).with_context(|| format!("failed to read directory {}", src.display()))?
     {
         let entry = entry?;
         let src_path = entry.path();
@@ -240,6 +279,8 @@ mod tests {
                     provider: Provider::Claude,
                 },
             ],
+            selected_codex_account: Some("work-codex".into()),
+            selected_claude_account: Some("personal-claude".into()),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: QuotaConfig = toml::from_str(&text).unwrap();
@@ -256,10 +297,12 @@ mod tests {
             provider: Provider::Codex,
         };
         config.add_account(entry.clone()).unwrap();
-        assert!(config.add_account(AccountEntry {
-            name: "test".into(),
-            provider: Provider::Codex,
-        }).is_err());
+        assert!(config
+            .add_account(AccountEntry {
+                name: "test".into(),
+                provider: Provider::Codex,
+            })
+            .is_err());
     }
 
     #[test]
@@ -285,6 +328,8 @@ mod tests {
                     provider: Provider::Codex,
                 },
             ],
+            selected_codex_account: Some("c1".into()),
+            selected_claude_account: Some("cl1".into()),
         };
         let codex_accounts = config.accounts_for_provider(Provider::Codex);
         assert_eq!(codex_accounts.len(), 2);

@@ -1748,9 +1748,21 @@ fn json_repair_candidate(content: &str) -> String {
 }
 
 fn repair_llm_json_candidate(candidate: &str, original: &str) -> Option<String> {
-    let escaped = escape_unescaped_quotes_in_json_strings(&candidate);
-    let repaired = normalize_bug_pipeline_json_shapes(&escaped).unwrap_or(escaped);
+    let escaped = escape_unescaped_quotes_in_json_strings(candidate);
+    let candidate = extract_complete_json_value_prefix(&escaped).unwrap_or(escaped);
+    let repaired = normalize_bug_pipeline_json_shapes(&candidate).unwrap_or(candidate);
     (repaired != original).then_some(repaired)
+}
+
+fn extract_complete_json_value_prefix(content: &str) -> Option<String> {
+    let content = content.trim_start();
+    let mut stream = serde_json::Deserializer::from_str(content).into_iter::<serde_json::Value>();
+    stream.next()?.ok()?;
+    let end = stream.byte_offset();
+    if content[end..].trim().is_empty() {
+        return None;
+    }
+    Some(content[..end].trim_end().to_string())
 }
 
 fn normalize_bug_pipeline_json_shapes(content: &str) -> Option<String> {
@@ -2623,6 +2635,30 @@ mod tests {
             .expect("repaired JSON should parse");
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].counter_argument.contains("\\u12G4"));
+    }
+
+    #[test]
+    fn repairs_trailing_backend_wrapper_after_json_array() {
+        let invalid = r#"[
+  {
+    "bug_id": "BUG-011-01",
+    "decision": "accepted",
+    "confidence_percent": 95,
+    "counter_argument": "The generated verdict is valid JSON.",
+    "risk_calculation": "The backend wrapper should not abort the run.",
+    "follow_up_checks": ["Resume the bug pipeline"]
+  }
+]
+</invoke>"#;
+
+        assert!(serde_json::from_str::<Vec<SkepticVerdict>>(invalid).is_err());
+
+        let repaired = repair_llm_json(invalid).expect("repair should trim backend wrapper");
+        assert!(!repaired.contains("</invoke>"));
+        let parsed = serde_json::from_str::<Vec<SkepticVerdict>>(&repaired)
+            .expect("repaired JSON should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].bug_id, "BUG-011-01");
     }
 
     #[test]

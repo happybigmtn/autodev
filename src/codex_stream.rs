@@ -857,9 +857,7 @@ fn track_claude_tool_futility(value: &Value, state: &mut ClaudeRenderState) -> O
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array);
-    let Some(blocks) = blocks else {
-        return None;
-    };
+    let blocks = blocks?;
     let mut emit_search_hint = false;
     for block in blocks {
         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
@@ -1558,8 +1556,10 @@ mod tests {
     #[test]
     fn renders_claude_result_summary() {
         console::set_colors_enabled(false);
-        let mut state = ClaudeRenderState::default();
-        state.tool_count = 5;
+        let mut state = ClaudeRenderState {
+            tool_count: 5,
+            ..Default::default()
+        };
         let event = r#"{"type":"result","cost_usd":0.42,"duration_ms":30000,"num_turns":3,"total_input_tokens":10000,"total_output_tokens":2000}"#;
 
         let rendered = render_claude_stream_line(event, &mut state);
@@ -1652,8 +1652,10 @@ mod tests {
     #[test]
     fn benign_search_misses_do_not_count_toward_futility() {
         console::set_colors_enabled(false);
-        let mut state = ClaudeRenderState::default();
-        state.current_tool_name = Some("Grep".to_string());
+        let mut state = ClaudeRenderState {
+            current_tool_name: Some("Grep".to_string()),
+            ..Default::default()
+        };
 
         let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"No matches found","is_error":false}]}}"#;
 
@@ -1669,8 +1671,10 @@ mod tests {
     #[test]
     fn repeated_search_misses_emit_recovery_hint() {
         console::set_colors_enabled(false);
-        let mut state = ClaudeRenderState::default();
-        state.current_tool_name = Some("Grep".to_string());
+        let mut state = ClaudeRenderState {
+            current_tool_name: Some("Grep".to_string()),
+            ..Default::default()
+        };
 
         let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"No matches found","is_error":false}]}}"#;
 

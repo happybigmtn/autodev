@@ -8,13 +8,14 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns eleven commands:
+`auto` owns twelve commands:
 
 - `auto corpus`
 - `auto gen`
 - `auto reverse`
 - `auto bug`
 - `auto nemesis`
+- `auto quota`
 - `auto loop`
 - `auto qa`
 - `auto qa-only`
@@ -36,7 +37,7 @@ need to pass directories in the normal case.
 - Nemesis audit output defaults to `<repo>/nemesis`
 - `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `high`
   implementation pass by default
-- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `high`
+- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
 - `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and the
   `standard` tier
 - `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and
@@ -65,12 +66,13 @@ The commands form one opinionated lifecycle:
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
 
-The other four commands are side lanes:
+The other five commands are side lanes:
 
 - `auto reverse` documents current behavior from code reality.
 - `auto bug` runs a bug-finding and implementation pipeline.
 - `auto nemesis` runs a deeper audit, applies bounded hardening fixes, and appends unresolved
   findings back into specs and plan.
+- `auto quota` manages quota-aware account routing for Codex and Claude sessions.
 - `auto qa-only` runs runtime QA without fixing anything.
 
 ## Detailed Command Guide
@@ -87,6 +89,8 @@ What it reads:
 
 - The live repository
 - Existing `genesis/` only as optional historical context
+- Existing active root planning surfaces such as `PLANS.md` and `plans/*.md`
+  as first-class control-plane inputs when they exist
 
 What it writes:
 
@@ -105,6 +109,8 @@ What it actually does:
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
 - Reviews the repo as the primary truth source
+- Reconciles against any already-active root planning surface instead of
+  quietly creating a second master plan inside `genesis/`
 - Uses the repo's real agent-instruction convention in generated docs and plans; for Codex-first
   repos that means `AGENTS.md`, regardless of which planning model ran `auto corpus`
 - When `--focus "..."` is supplied, writes the normalized steering brief to `genesis/FOCUS.md`
@@ -155,7 +161,7 @@ Useful flags:
   coverage
 - `--idea "..."` to seed the corpus from a desired product direction or greenfield-style concept
 - `--reference-repo <dir>` to require inspection of sibling or external repos as first-class
-  reference inputs during corpus authoring
+  reference inputs during corpus authoring and the mandatory Codex review pass
 - `--model <name>` to pick a different Claude model
 - `--max-turns <n>` to raise or lower the planning budget
 - `--parallelism <n>` to encourage more or less parallel planning work
@@ -420,6 +426,46 @@ Useful flags:
 - `--branch <name>` to require a specific checked-out branch for implementation
 - `--dry-run` to preview without invoking models
 - `--codex-bin` and `--pi-bin` to point at non-default executables
+
+### `auto quota`
+
+Purpose:
+
+- Manage quota-aware account routing for Codex and Claude
+
+What it reads:
+
+- local quota-router config and state under the OS config directory
+- captured Codex and Claude profile credentials
+
+What it writes:
+
+- quota-router config updates
+- quota-router cooldown and selection state
+- active provider credentials when you explicitly select or open an account
+
+What it actually does:
+
+- stores multiple named account profiles per provider
+- captures credentials from the currently logged-in Codex or Claude session
+- shows live session and weekly usage where the upstream provider API allows it
+- lets you manually choose the primary account for `codex` or `claude` with
+  `auto quota select <provider>`
+- honors that primary account by default, but falls through to the next candidate when the
+  selected account drops below 25% session or 5h remaining
+- rotates on quota-exhaustion signals during quota-routed Codex and Claude executions
+- exposes an `open` mode that launches the provider CLI with the currently selected account active
+
+Useful subcommands:
+
+- `auto quota status`
+- `auto quota select <codex|claude>`
+- `auto quota open <codex|claude> [args...]`
+- `auto quota reset [account-name]`
+- `auto quota accounts add <name> <codex|claude>`
+- `auto quota accounts list`
+- `auto quota accounts capture <name>`
+- `auto quota accounts remove <name>`
 
 ### `auto loop`
 
@@ -836,6 +882,7 @@ workflow.
 - `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
 - `codex` on `PATH` for `auto nemesis`, `auto loop`, `auto qa`, `auto qa-only`, `auto health`,
   `auto review`, and `auto ship`
+- `codex` and `claude` logged in locally if you want `auto quota` to capture and rotate accounts
 - `codex` on `PATH` for any `auto bug` phase using a non-PI model
 - `pi` on `PATH` for `auto bug` MiniMax/Kimi passes and both default `auto nemesis` audit passes
 - `gh` on `PATH` if you want `auto ship` to create or refresh pull requests
@@ -952,6 +999,14 @@ Review completed work:
 auto review
 ```
 
+Inspect or switch quota-routed accounts:
+
+```bash
+auto quota status
+auto quota select codex
+auto quota select claude
+```
+
 Prepare the branch to land:
 
 ```bash
@@ -961,5 +1016,5 @@ auto ship
 ## Design Goal
 
 This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`,
-`bug`, `nemesis`, `loop`, `qa`, `qa-only`, `health`, `review`, or `ship`, it probably does not
-belong here.
+`bug`, `nemesis`, `quota`, `loop`, `qa`, `qa-only`, `health`, `review`, or `ship`, it probably
+does not belong here.

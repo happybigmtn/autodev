@@ -1229,7 +1229,19 @@ fn repair_nemesis_json(content: &str) -> Option<String> {
         return None;
     }
     let repaired = escape_unescaped_quotes_in_json_strings(&candidate);
+    let repaired = extract_complete_json_value_prefix(&repaired).unwrap_or(repaired);
     (repaired != content).then_some(repaired)
+}
+
+fn extract_complete_json_value_prefix(content: &str) -> Option<String> {
+    let content = content.trim_start();
+    let mut stream = serde_json::Deserializer::from_str(content).into_iter::<serde_json::Value>();
+    stream.next()?.ok()?;
+    let end = stream.byte_offset();
+    if content[end..].trim().is_empty() {
+        return None;
+    }
+    Some(content[..end].trim_end().to_string())
 }
 
 async fn repair_nemesis_implementation_outputs(
@@ -2245,6 +2257,32 @@ Spec: specs/020426-nemesis-audit.md
         let results = load_nemesis_fix_results(&path).expect("repair should recover JSON");
         assert_eq!(results.len(), 1);
         assert!(results[0].summary.contains("\\d+\\_suffix"));
+    }
+
+    #[test]
+    fn load_nemesis_fix_results_repairs_trailing_backend_wrapper() {
+        let path = temp_repo_path("nemesis-trailing-wrapper").join("implementation-results.json");
+        fs::create_dir_all(path.parent().expect("temp file should have a parent"))
+            .expect("failed to create temp dir");
+        fs::write(
+            &path,
+            r#"[
+  {
+    "task_id": "NEM-001",
+    "status": "blocked",
+    "summary": "The implementation stopped before editing code.",
+    "validation_commands": [],
+    "touched_files": [],
+    "residual_risks": ["Needs a follow-up run"]
+  }
+]
+</invoke>"#,
+        )
+        .expect("failed to write invalid json");
+
+        let results = load_nemesis_fix_results(&path).expect("repair should recover JSON");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, "NEM-001");
     }
 
     #[test]

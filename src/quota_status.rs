@@ -37,11 +37,19 @@ pub(crate) async fn run_status() -> Result<()> {
                     green.apply_to("ok").to_string()
                 };
 
+                let primary_marker = if config.selected_account_name(account.provider)
+                    == Some(account.name.as_str())
+                {
+                    " primary"
+                } else {
+                    ""
+                };
                 println!(
-                    "  {} ({} {}) {}",
+                    "  {} ({} {}{}) {}",
                     bold.apply_to(&account.name),
                     account.provider.label(),
                     usage.plan,
+                    primary_marker,
                     status,
                 );
 
@@ -49,17 +57,13 @@ pub(crate) async fn run_status() -> Result<()> {
                 let session_reset = format_secs(usage.session_resets_in_secs);
                 print!("  session  ");
                 print_bar(usage.session_used_pct, &green, &red, &yellow);
-                println!(
-                    " {session_remaining:>3}% remaining  {session_reset}",
-                );
+                println!(" {session_remaining:>3}% remaining  {session_reset}",);
 
                 let weekly_remaining = 100u32.saturating_sub(usage.weekly_used_pct);
                 let weekly_reset = format_secs(usage.weekly_resets_in_secs);
                 print!("  weekly   ");
                 print_bar(usage.weekly_used_pct, &green, &red, &yellow);
-                println!(
-                    " {weekly_remaining:>3}% remaining  {weekly_reset}",
-                );
+                println!(" {weekly_remaining:>3}% remaining  {weekly_reset}",);
             }
             Err(e) => {
                 println!(

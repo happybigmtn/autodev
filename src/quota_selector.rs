@@ -7,6 +7,8 @@ use crate::quota_usage::{self, AccountUsage};
 
 /// Accounts with less than this weekly remaining are in the "low" tier.
 const WEEKLY_FLOOR_PCT: u32 = 15;
+/// Accounts with less than this session remaining are avoided when possible.
+const SESSION_FLOOR_PCT: u32 = 25;
 
 #[derive(Debug)]
 pub(crate) struct SelectedAccount<'a> {
@@ -16,11 +18,14 @@ pub(crate) struct SelectedAccount<'a> {
 /// Select the best account for the given provider.
 ///
 /// Strategy:
-/// 1. Among non-exhausted accounts with ≥15% weekly quota remaining,
+/// 1. Prefer accounts with ≥25% session quota remaining.
+/// 2. Among those, prefer accounts with ≥15% weekly quota remaining,
 ///    pick the one whose weekly quota resets soonest.
-/// 2. If all accounts have <15% weekly remaining, pick the one with
+/// 3. If all session-healthy accounts have <15% weekly remaining, pick the one with
 ///    the highest weekly remaining percentage.
-/// 3. Accounts whose usage could not be fetched are used only as a
+/// 4. If every known account is below the session floor, pick the one with
+///    the highest session remaining percentage.
+/// 5. Accounts whose usage could not be fetched are used only as a
 ///    last resort.
 pub(crate) async fn select_account<'a>(
     config: &'a QuotaConfig,
@@ -60,7 +65,7 @@ pub(crate) async fn select_account<'a>(
         }
     }
 
-    let selected = pick_best(&scored, state);
+    let selected = pick_best(&scored, state, config.selected_account_name(provider));
     log_selection(selected.entry, &scored);
     Ok(selected)
 }
@@ -69,8 +74,84 @@ pub(crate) async fn select_account<'a>(
 fn pick_best<'a>(
     scored: &[(&'a AccountEntry, Option<AccountUsage>)],
     state: &QuotaState,
+    preferred_name: Option<&str>,
 ) -> SelectedAccount<'a> {
-    let above_floor: Vec<_> = scored
+    if let Some(preferred_name) = preferred_name {
+        if let Some((entry, usage)) = scored
+            .iter()
+            .find(|(entry, _)| entry.name == preferred_name)
+        {
+            let preferred_is_healthy = usage
+                .as_ref()
+                .is_none_or(|u| u.session_remaining_pct >= SESSION_FLOOR_PCT);
+            if preferred_is_healthy {
+                return SelectedAccount { entry };
+            }
+        }
+    }
+
+    let scored_refs: Vec<_> = if let Some(preferred_name) = preferred_name {
+        let non_preferred: Vec<_> = scored
+            .iter()
+            .filter(|(entry, _)| entry.name != preferred_name)
+            .collect();
+        if non_preferred.is_empty() {
+            scored.iter().collect()
+        } else {
+            non_preferred
+        }
+    } else {
+        scored.iter().collect()
+    };
+
+    let session_healthy: Vec<_> = scored_refs
+        .iter()
+        .copied()
+        .filter(|(_, u)| {
+            u.as_ref()
+                .is_some_and(|u| u.session_remaining_pct >= SESSION_FLOOR_PCT)
+        })
+        .collect();
+
+    if !session_healthy.is_empty() {
+        return pick_best_by_weekly(&session_healthy, state);
+    }
+
+    let known_usage: Vec<_> = scored_refs
+        .iter()
+        .copied()
+        .filter(|(_, u)| u.is_some())
+        .collect();
+    if !known_usage.is_empty() {
+        let (entry, _) = known_usage
+            .iter()
+            .max_by(|a, b| {
+                let sa = a.1.as_ref().map_or(0, |u| u.session_remaining_pct);
+                let sb = b.1.as_ref().map_or(0, |u| u.session_remaining_pct);
+                let wa = a.1.as_ref().map_or(0, |u| u.weekly_remaining_pct);
+                let wb = b.1.as_ref().map_or(0, |u| u.weekly_remaining_pct);
+                sa.cmp(&sb)
+                    .then_with(|| wa.cmp(&wb))
+                    .then_with(|| compare_lru_desc(a.0, b.0, state))
+                    .then_with(|| b.0.name.cmp(&a.0.name))
+            })
+            .unwrap();
+        return SelectedAccount { entry };
+    }
+
+    let (entry, _) = scored_refs
+        .iter()
+        .max_by(|a, b| compare_lru_then_name_desc(a.0, b.0, state))
+        .unwrap();
+
+    SelectedAccount { entry }
+}
+
+fn pick_best_by_weekly<'a>(
+    candidates: &[&(&'a AccountEntry, Option<AccountUsage>)],
+    state: &QuotaState,
+) -> SelectedAccount<'a> {
+    let above_weekly_floor: Vec<_> = candidates
         .iter()
         .filter(|(_, u)| {
             u.as_ref()
@@ -78,39 +159,27 @@ fn pick_best<'a>(
         })
         .collect();
 
-    if !above_floor.is_empty() {
-        // Soonest weekly reset wins; tiebreak by LRU then name
-        let (entry, _) = above_floor
+    if !above_weekly_floor.is_empty() {
+        let (entry, _) = above_weekly_floor
             .iter()
             .min_by(|a, b| {
                 let ra = a.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
                 let rb = b.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
                 ra.cmp(&rb)
-                    .then_with(|| {
-                        state
-                            .get(&a.0.name)
-                            .last_used
-                            .cmp(&state.get(&b.0.name).last_used)
-                    })
+                    .then_with(|| compare_lru_asc(a.0, b.0, state))
                     .then_with(|| a.0.name.cmp(&b.0.name))
             })
             .unwrap();
         return SelectedAccount { entry };
     }
 
-    // All below floor (or no usage data): pick highest weekly remaining
-    let (entry, _) = scored
+    let (entry, _) = candidates
         .iter()
         .max_by(|a, b| {
             let ra = a.1.as_ref().map_or(0, |u| u.weekly_remaining_pct);
             let rb = b.1.as_ref().map_or(0, |u| u.weekly_remaining_pct);
             ra.cmp(&rb)
-                .then_with(|| {
-                    // Reversed: prefer least-recently-used
-                    let la = state.get(&a.0.name).last_used;
-                    let lb = state.get(&b.0.name).last_used;
-                    lb.cmp(&la)
-                })
+                .then_with(|| compare_lru_desc(a.0, b.0, state))
                 .then_with(|| b.0.name.cmp(&a.0.name))
         })
         .unwrap();
@@ -118,10 +187,26 @@ fn pick_best<'a>(
     SelectedAccount { entry }
 }
 
-fn log_selection(
-    chosen: &AccountEntry,
-    scored: &[(&AccountEntry, Option<AccountUsage>)],
-) {
+fn compare_lru_asc(a: &AccountEntry, b: &AccountEntry, state: &QuotaState) -> std::cmp::Ordering {
+    state
+        .get(&a.name)
+        .last_used
+        .cmp(&state.get(&b.name).last_used)
+}
+
+fn compare_lru_desc(a: &AccountEntry, b: &AccountEntry, state: &QuotaState) -> std::cmp::Ordering {
+    compare_lru_asc(b, a, state)
+}
+
+fn compare_lru_then_name_desc(
+    a: &AccountEntry,
+    b: &AccountEntry,
+    state: &QuotaState,
+) -> std::cmp::Ordering {
+    compare_lru_desc(a, b, state).then_with(|| b.name.cmp(&a.name))
+}
+
+fn log_selection(chosen: &AccountEntry, scored: &[(&AccountEntry, Option<AccountUsage>)]) {
     for (entry, usage) in scored {
         let marker = if entry.name == chosen.name {
             " ← selected"
@@ -192,6 +277,7 @@ mod tests {
         AccountUsage {
             plan: "test".into(),
             session_used_pct,
+            session_remaining_pct: 100u32.saturating_sub(session_used_pct),
             session_resets_in_secs,
             weekly_used_pct,
             weekly_remaining_pct: 100u32.saturating_sub(weekly_used_pct),
@@ -214,7 +300,7 @@ mod tests {
             (&b, Some(make_usage(30, 3600, 50, 86400))),
         ];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "fast-reset");
     }
 
@@ -230,7 +316,7 @@ mod tests {
             (&b, Some(make_usage(50, 3600, 88, 0))),
         ];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "low-b"); // 12% > 8%
     }
 
@@ -247,7 +333,7 @@ mod tests {
             (&b, Some(make_usage(50, 100, 95, 3600))),
         ];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "healthy");
     }
 
@@ -257,12 +343,10 @@ mod tests {
         let b = make_account("unknown", Provider::Claude);
         let state = QuotaState::default();
 
-        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(90, 100, 50, 86400))),
-            (&b, None),
-        ];
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
+            vec![(&a, Some(make_usage(90, 100, 50, 86400))), (&b, None)];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "known");
     }
 
@@ -273,7 +357,7 @@ mod tests {
 
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![(&a, None)];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "mystery");
     }
 
@@ -298,7 +382,7 @@ mod tests {
             (&b, Some(make_usage(50, 1000, 50, 86400))),
         ];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "beta"); // LRU wins
     }
 
@@ -311,7 +395,67 @@ mod tests {
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
             vec![(&a, Some(make_usage(50, 1000, 85, 86400)))];
 
-        let selected = pick_best(&scored, &state);
+        let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "edge");
+    }
+
+    #[test]
+    fn session_floor_skips_low_five_hour_candidate() {
+        let a = make_account("low-session", Provider::Claude);
+        let b = make_account("healthy-session", Provider::Claude);
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&a, Some(make_usage(80, 600, 10, 3600))), // 20% session remaining
+            (&b, Some(make_usage(60, 600, 30, 7200))), // 40% session remaining
+        ];
+
+        let selected = pick_best(&scored, &state, None);
+        assert_eq!(selected.entry.name, "healthy-session");
+    }
+
+    #[test]
+    fn highest_session_remaining_wins_when_all_below_session_floor() {
+        let a = make_account("almost-spent", Provider::Claude);
+        let b = make_account("less-spent", Provider::Claude);
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&a, Some(make_usage(95, 600, 5, 3600))), // 5% session remaining
+            (&b, Some(make_usage(78, 600, 80, 86400))), // 22% session remaining
+        ];
+
+        let selected = pick_best(&scored, &state, None);
+        assert_eq!(selected.entry.name, "less-spent");
+    }
+
+    #[test]
+    fn preferred_account_wins_while_session_is_healthy() {
+        let a = make_account("preferred", Provider::Claude);
+        let b = make_account("other", Provider::Claude);
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&a, Some(make_usage(50, 600, 95, 3600))),
+            (&b, Some(make_usage(40, 600, 50, 7200))),
+        ];
+
+        let selected = pick_best(&scored, &state, Some("preferred"));
+        assert_eq!(selected.entry.name, "preferred");
+    }
+
+    #[test]
+    fn preferred_account_is_skipped_below_session_floor() {
+        let a = make_account("preferred", Provider::Claude);
+        let b = make_account("other", Provider::Claude);
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&a, Some(make_usage(80, 600, 10, 3600))),
+            (&b, Some(make_usage(40, 600, 50, 7200))),
+        ];
+
+        let selected = pick_best(&scored, &state, Some("preferred"));
+        assert_eq!(selected.entry.name, "other");
     }
 }

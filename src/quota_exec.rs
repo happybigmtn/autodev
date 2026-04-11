@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,28 +49,22 @@ impl Drop for AuthRestoreGuard {
 
 fn remove_path(path: &Path) -> Result<()> {
     if path.is_dir() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("failed to remove {}", path.display()))
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
     } else {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to remove {}", path.display()))
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
     }
 }
 
 fn remove_and_copy_dir(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
-        fs::remove_dir_all(dst)
-            .with_context(|| format!("failed to remove {}", dst.display()))?;
+        fs::remove_dir_all(dst).with_context(|| format!("failed to remove {}", dst.display()))?;
     }
     copy_dir_recursive(src, dst)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("failed to create {}", dst.display()))?;
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read {}", src.display()))?
-    {
+    fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
@@ -86,27 +81,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path).with_context(|| {
-                format!("failed to copy {} -> {}", src_path.display(), dst_path.display())
+                format!(
+                    "failed to copy {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
             })?;
         }
     }
     Ok(())
 }
 
-fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestoreGuard> {
+fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result<()> {
     let target = provider.auth_source();
-    let backup_dir = QuotaConfig::config_dir().join("backup");
-    fs::create_dir_all(&backup_dir)
-        .context("failed to create backup directory")?;
 
-    let pairs = match provider {
+    match provider {
         Provider::Codex => {
-            let bp = backup_dir.join("codex-auth.json");
-            if target.exists() {
-                fs::copy(&target, &bp).with_context(|| {
-                    format!("failed to backup {}", target.display())
-                })?;
-            }
             let profile_auth = profile_dir.join("auth.json");
             fs::copy(&profile_auth, &target).with_context(|| {
                 format!(
@@ -115,29 +105,11 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                     target.display()
                 )
             })?;
-            vec![(bp, target)]
         }
         Provider::Claude => {
-            let bp = backup_dir.join("claude");
-            if target.exists() {
-                let _ = remove_path(&bp);
-                copy_dir_recursive(&target, &bp)
-                    .with_context(|| format!("failed to backup {}", target.display()))?;
-            }
-
             let home = dirs::home_dir().expect("cannot resolve home directory");
             let claude_json = home.join(".claude.json");
-            let claude_json_bp = backup_dir.join("claude.json");
 
-            // Backup ~/.claude.json separately (lives in home, not in ~/.claude)
-            if claude_json.exists() {
-                fs::copy(&claude_json, &claude_json_bp).with_context(|| {
-                    format!("failed to backup {}", claude_json.display())
-                })?;
-            }
-
-            // Copy profile credentials into ~/.claude, but skip .claude.json
-            // (it goes to ~/.claude.json instead)
             for entry in fs::read_dir(profile_dir)
                 .with_context(|| format!("failed to read profile {}", profile_dir.display()))?
             {
@@ -147,7 +119,11 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
 
                 if name == ".claude.json" {
                     fs::copy(&src, &claude_json).with_context(|| {
-                        format!("failed to swap {} -> {}", src.display(), claude_json.display())
+                        format!(
+                            "failed to swap {} -> {}",
+                            src.display(),
+                            claude_json.display()
+                        )
                     })?;
                     continue;
                 }
@@ -161,6 +137,46 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                     })?;
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestoreGuard> {
+    let target = provider.auth_source();
+    let backup_dir = QuotaConfig::config_dir().join("backup");
+    fs::create_dir_all(&backup_dir).context("failed to create backup directory")?;
+
+    let pairs = match provider {
+        Provider::Codex => {
+            let bp = backup_dir.join("codex-auth.json");
+            if target.exists() {
+                fs::copy(&target, &bp)
+                    .with_context(|| format!("failed to backup {}", target.display()))?;
+            }
+            copy_profile_to_active_auth(provider, profile_dir)?;
+            vec![(bp, target)]
+        }
+        Provider::Claude => {
+            let bp = backup_dir.join("claude");
+            if target.exists() {
+                let _ = remove_path(&bp);
+                copy_dir_recursive(&target, &bp)
+                    .with_context(|| format!("failed to backup {}", target.display()))?;
+            }
+
+            let claude_json_bp = backup_dir.join("claude.json");
+            let home = dirs::home_dir().expect("cannot resolve home directory");
+            let claude_json = home.join(".claude.json");
+
+            // Backup ~/.claude.json separately (lives in home, not in ~/.claude)
+            if claude_json.exists() {
+                fs::copy(&claude_json, &claude_json_bp)
+                    .with_context(|| format!("failed to backup {}", claude_json.display()))?;
+            }
+
+            copy_profile_to_active_auth(provider, profile_dir)?;
             vec![(bp, target), (claude_json_bp, claude_json)]
         }
     };
@@ -379,4 +395,75 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
     state.save()?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
+    let mut config = QuotaConfig::load()?;
+    let accounts = config.accounts_for_provider(provider);
+    if accounts.is_empty() {
+        anyhow::bail!(
+            "no {provider} accounts configured. \
+             Run `auto quota accounts add` to set one up."
+        );
+    }
+
+    let selected_name = if accounts.len() == 1 {
+        accounts[0].name.clone()
+    } else {
+        eprintln!("Select the primary {provider} account:");
+        for (idx, account) in accounts.iter().enumerate() {
+            let marker = if config.selected_account_name(provider) == Some(account.name.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            eprintln!("  {}. {}{}", idx + 1, account.name, marker);
+        }
+        eprint!("Enter selection [1-{}]: ", accounts.len());
+        io::stderr().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let choice = input
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|choice| (1..=accounts.len()).contains(choice))
+            .ok_or_else(|| anyhow::anyhow!("invalid selection"))?;
+        accounts[choice - 1].name.clone()
+    };
+
+    config.set_selected_account(provider, &selected_name)?;
+    config.save()?;
+
+    let mut state = QuotaState::load()?;
+    state.refresh_cooldowns(Utc::now());
+
+    let selected = quota_selector::select_account(&config, &state, provider).await?;
+    let account_name = selected.entry.name.clone();
+    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
+
+    if !profile_dir.exists() {
+        anyhow::bail!(
+            "profile directory for account '{account_name}' not found at {}. \
+             Run `auto quota accounts capture {account_name}` to fix.",
+            profile_dir.display()
+        );
+    }
+
+    let mut lock = acquire_provider_lock(provider)?;
+    let _lock_guard = lock.try_write().map_err(|_| {
+        anyhow::anyhow!(
+            "another {provider} quota-router instance is swapping credentials"
+        )
+    })?;
+    copy_profile_to_active_auth(provider, &profile_dir)?;
+
+    state.mark_used(&account_name, Utc::now());
+    state.save()?;
+
+    eprintln!(
+        "[quota-router] primary {provider} account set to '{selected_name}'; active account is '{account_name}'"
+    );
+    Ok(())
 }

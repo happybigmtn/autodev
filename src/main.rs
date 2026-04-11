@@ -80,6 +80,8 @@ struct QuotaArgs {
 enum QuotaSubcommand {
     /// Show quota status for all accounts
     Status,
+    /// Select the best account and activate its credentials for the provider
+    Select(QuotaSelectArgs),
     /// Manage accounts
     Accounts(AccountsSubcommand),
     /// Force-clear exhausted status (all accounts, or one by name)
@@ -95,6 +97,12 @@ struct QuotaOpenArgs {
     /// Arguments passed through to the provider CLI
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+#[derive(Args, Clone)]
+struct QuotaSelectArgs {
+    /// Provider: "claude" or "codex"
+    provider: String,
 }
 
 #[derive(Args, Clone)]
@@ -341,7 +349,7 @@ pub(crate) struct LoopArgs {
     model: String,
 
     /// Reasoning effort to pass through to the Codex worker
-    #[arg(long, default_value = "high")]
+    #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
     /// Branch that the loop is allowed to run on. Defaults to the repo's primary branch.
@@ -379,8 +387,9 @@ pub(crate) struct LoopArgs {
 
 #[derive(Args, Clone)]
 pub(crate) struct ReviewArgs {
-    /// Stop after this many successful review iterations. Default is 1.
-    #[arg(long, default_value_t = 1)]
+    /// Stop after this many successful review iterations. 0 means run until
+    /// the review queue is empty.
+    #[arg(long, default_value_t = 0)]
     max_iterations: usize,
 
     /// Optional override for the review prompt template
@@ -625,30 +634,28 @@ async fn main() -> Result<()> {
         Command::Review(args) => review_command::run_review(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
-        Command::Quota(args) => {
-            match args.command {
-                QuotaSubcommand::Status => quota_status::run_status().await,
-                QuotaSubcommand::Reset(args) => {
-                    quota_status::run_reset(args.name.as_deref())
-                }
-                QuotaSubcommand::Open(args) => {
-                    let provider: quota_config::Provider = args.provider.parse()?;
-                    let code = quota_exec::run_quota_open(provider, &args.args).await?;
-                    std::process::exit(code);
-                }
-                QuotaSubcommand::Accounts(a) => match a.command {
-                    AccountsCommand::Add(args) => {
-                        quota_accounts::run_accounts_add(&args.name, &args.provider)
-                    }
-                    AccountsCommand::List => quota_accounts::run_accounts_list(),
-                    AccountsCommand::Remove(args) => {
-                        quota_accounts::run_accounts_remove(&args.name, args.force)
-                    }
-                    AccountsCommand::Capture(args) => {
-                        quota_accounts::run_accounts_capture(&args.name)
-                    }
-                },
+        Command::Quota(args) => match args.command {
+            QuotaSubcommand::Status => quota_status::run_status().await,
+            QuotaSubcommand::Select(args) => {
+                let provider: quota_config::Provider = args.provider.parse()?;
+                quota_exec::run_quota_select(provider).await
             }
-        }
+            QuotaSubcommand::Reset(args) => quota_status::run_reset(args.name.as_deref()),
+            QuotaSubcommand::Open(args) => {
+                let provider: quota_config::Provider = args.provider.parse()?;
+                let code = quota_exec::run_quota_open(provider, &args.args).await?;
+                std::process::exit(code);
+            }
+            QuotaSubcommand::Accounts(a) => match a.command {
+                AccountsCommand::Add(args) => {
+                    quota_accounts::run_accounts_add(&args.name, &args.provider)
+                }
+                AccountsCommand::List => quota_accounts::run_accounts_list(),
+                AccountsCommand::Remove(args) => {
+                    quota_accounts::run_accounts_remove(&args.name, args.force)
+                }
+                AccountsCommand::Capture(args) => quota_accounts::run_accounts_capture(&args.name),
+            },
+        },
     }
 }

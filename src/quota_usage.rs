@@ -57,6 +57,7 @@ pub(crate) struct ClaudeWindow {
 pub(crate) struct AccountUsage {
     pub(crate) plan: String,
     pub(crate) session_used_pct: u32,
+    pub(crate) session_remaining_pct: u32,
     pub(crate) session_resets_in_secs: u64,
     pub(crate) weekly_used_pct: u32,
     pub(crate) weekly_remaining_pct: u32,
@@ -279,6 +280,7 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
     Ok(AccountUsage {
         plan: usage.plan_type,
         session_used_pct: session_used,
+        session_remaining_pct: 100u32.saturating_sub(session_used),
         session_resets_in_secs: session_reset,
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),
@@ -339,6 +341,7 @@ pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsag
     Ok(AccountUsage {
         plan: "max".into(),
         session_used_pct: session_used,
+        session_remaining_pct: 100u32.saturating_sub(session_used),
         session_resets_in_secs: session_reset_secs,
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),
@@ -347,10 +350,7 @@ pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsag
     })
 }
 
-pub(crate) async fn fetch_usage(
-    provider: Provider,
-    profile_dir: &Path,
-) -> Result<AccountUsage> {
+pub(crate) async fn fetch_usage(provider: Provider, profile_dir: &Path) -> Result<AccountUsage> {
     match provider {
         Provider::Codex => fetch_codex_usage(profile_dir).await,
         Provider::Claude => fetch_claude_usage(profile_dir).await,
