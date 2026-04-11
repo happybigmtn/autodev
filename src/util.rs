@@ -132,9 +132,15 @@ pub(crate) fn auto_checkpoint_if_needed(
     stage_checkpoint_changes(repo_root)?;
     let message = format!("{}: {message_suffix}", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
-    push_branch_with_remote_sync(repo_root, branch)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
-    Ok(Some(commit.trim().to_string()))
+    let commit = commit.trim().to_string();
+    if let Err(err) = push_branch_with_remote_sync(repo_root, branch) {
+        bail!(
+            "created checkpoint commit {} but failed to sync/push: {err}",
+            commit
+        );
+    }
+    Ok(Some(commit))
 }
 
 pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<bool> {
@@ -164,10 +170,18 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
         return Ok(false);
     }
 
+    let aborted_conflicted_rebase = abort_rebase_if_in_progress(repo_root).unwrap_or(false);
+    let conflict_note = if aborted_conflicted_rebase {
+        " (aborted conflicted rebase and restored the local branch state)"
+    } else {
+        ""
+    };
+
     bail!(
-        "git command failed in {}: {}",
+        "git command failed in {}: {}{}",
         repo_root.display(),
-        stderr.trim()
+        stderr.trim(),
+        conflict_note
     );
 }
 
@@ -192,6 +206,27 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
         );
     }
     Ok(!output.stdout.is_empty())
+}
+
+fn abort_rebase_if_in_progress(repo_root: &Path) -> Result<bool> {
+    let rebase_merge = git_stdout(repo_root, ["rev-parse", "--git-path", "rebase-merge"])?;
+    let rebase_apply = git_stdout(repo_root, ["rev-parse", "--git-path", "rebase-apply"])?;
+    let rebase_merge = resolve_git_path(repo_root, rebase_merge.trim());
+    let rebase_apply = resolve_git_path(repo_root, rebase_apply.trim());
+    if !rebase_merge.exists() && !rebase_apply.exists() {
+        return Ok(false);
+    }
+    run_git(repo_root, ["rebase", "--abort"])?;
+    Ok(true)
+}
+
+fn resolve_git_path(repo_root: &Path, git_path: &str) -> PathBuf {
+    let path = PathBuf::from(git_path);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
 }
 
 fn stage_checkpoint_changes(repo_root: &Path) -> Result<()> {
@@ -836,12 +871,40 @@ mod tests {
             .expect("checkpoint should succeed")
             .expect("checkpoint commit should be created");
 
-        assert_eq!(commit, run_git_in(&worker, ["rev-parse", "HEAD"]).trim());
+        assert!(!commit.is_empty());
         assert!(worker.join("UPSTREAM.md").exists());
         assert!(worker.join("notes").join("draft.md").exists());
         assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
         let log = run_git_in(&worker, ["log", "--format=%s", "-2"]);
         assert_eq!(log, "worker: auto loop checkpoint\nupstream change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn auto_checkpoint_if_needed_aborts_conflicted_rebase_and_reports_checkpoint_commit() {
+        let (root, _remote, upstream, worker) =
+            init_remote_and_clones("checkpoint-conflict-sync", "trunk");
+
+        fs::write(upstream.join("README.md"), "upstream change\n")
+            .expect("failed to write upstream change");
+        run_git_in(&upstream, ["add", "README.md"]);
+        run_git_in(&upstream, ["commit", "-m", "upstream readme change"]);
+        run_git_in(&upstream, ["push", "origin", "trunk"]);
+
+        fs::write(worker.join("README.md"), "worker change\n").expect("failed to write worker");
+
+        let err = auto_checkpoint_if_needed(&worker, "trunk", "auto loop checkpoint")
+            .expect_err("checkpoint sync should report the rebase conflict");
+
+        assert!(err.to_string().contains("created checkpoint commit"));
+        assert!(err.to_string().contains("aborted conflicted rebase"));
+        assert_eq!(run_git_in(&worker, ["branch", "--show-current"]), "trunk\n");
+        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        let readme = fs::read_to_string(worker.join("README.md")).expect("failed to read README");
+        assert_eq!(readme, "worker change\n");
+        let log = run_git_in(&worker, ["log", "--format=%s", "-1"]);
+        assert_eq!(log, "worker: auto loop checkpoint\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
