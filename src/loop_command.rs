@@ -2,15 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
-use crate::claude_exec::{run_claude_exec, FUTILITY_EXIT_MARKER};
+use crate::LoopArgs;
+use crate::claude_exec::{FUTILITY_EXIT_MARKER, run_claude_exec};
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, repo_name, sync_branch_with_remote, timestamp_slug,
 };
-use crate::LoopArgs;
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
@@ -156,14 +156,12 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .unwrap_or_else(|| "built-in Ralph worker".to_string())
     );
 
-    if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
-        println!("remote sync: rebased onto origin/{}", target_branch);
-    }
-
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
     {
         println!("checkpoint:  committed pre-existing changes at {commit}");
+    } else if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", target_branch);
     }
 
     let mut iteration = 0usize;
@@ -662,10 +660,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_iteration_prompt, discover_sibling_git_repos, parse_loop_queue,
-        parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt,
-        resolve_reference_repos, summarize_repo_progress, LoopQueueSnapshot, RepoProgress,
-        TrackedRepoState,
+        LoopQueueSnapshot, RepoProgress, TrackedRepoState, build_iteration_prompt,
+        discover_sibling_git_repos, parse_loop_queue, parse_origin_head_branch, pick_loop_branch,
+        render_default_loop_prompt, resolve_reference_repos, summarize_repo_progress,
     };
 
     #[test]

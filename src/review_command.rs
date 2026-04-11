@@ -1,15 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
+use crate::ReviewArgs;
 use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
-use crate::ReviewArgs;
 
 pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` if they exist.
@@ -160,14 +160,12 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
     println!("run root:    {}", run_root.display());
 
-    if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
-        println!("remote sync: rebased onto origin/{}", push_branch);
-    }
-
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "review checkpoint")?
     {
         println!("checkpoint:  committed pre-existing review changes at {commit}");
+    } else if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", push_branch);
     }
 
     let mut iteration = 0usize;
@@ -581,9 +579,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
+        ARCHIVED_HEADER, REVIEW_HEADER, RepoProgress, TrackedRepoState,
         append_reference_repo_clause, collect_tracked_repo_states, discover_sibling_git_repos,
-        ensure_review_docs, extract_review_items, resolve_reference_repos,
-        summarize_repo_progress, RepoProgress, TrackedRepoState, ARCHIVED_HEADER, REVIEW_HEADER,
+        ensure_review_docs, extract_review_items, resolve_reference_repos, summarize_repo_progress,
     };
 
     #[test]
@@ -737,8 +735,9 @@ mod tests {
         commit_empty_change(&repo_root);
         init_git_repo(&unborn_reference);
 
-        let states = collect_tracked_repo_states(&repo_root, std::slice::from_ref(&unborn_reference))
-            .expect("collect repo states");
+        let states =
+            collect_tracked_repo_states(&repo_root, std::slice::from_ref(&unborn_reference))
+                .expect("collect repo states");
 
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].path, repo_root);

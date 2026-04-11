@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 pub(crate) const CLI_LONG_VERSION: &str = concat!(
@@ -129,7 +129,6 @@ pub(crate) fn auto_checkpoint_if_needed(
         return Ok(None);
     }
 
-    sync_branch_with_remote(repo_root, branch)?;
     stage_checkpoint_changes(repo_root)?;
     let message = format!("{}: {message_suffix}", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
@@ -530,9 +529,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        atomic_write, checkpoint_status, clip_line_for_display, ensure_repo_layout_with,
-        is_checkpoint_excluded_path, prune_old_entries, push_branch_with_remote_sync,
-        stage_checkpoint_changes, sync_branch_with_remote, truncate_file_to_max_bytes,
+        atomic_write, auto_checkpoint_if_needed, checkpoint_status, clip_line_for_display,
+        ensure_repo_layout_with, is_checkpoint_excluded_path, prune_old_entries,
+        push_branch_with_remote_sync, stage_checkpoint_changes, sync_branch_with_remote,
+        truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -814,6 +814,34 @@ mod tests {
         assert!(status.contains(" M README.md"));
         let readme = fs::read_to_string(worker.join("README.md")).expect("failed to read README");
         assert_eq!(readme, "# dirty\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn auto_checkpoint_if_needed_commits_untracked_changes_before_remote_sync() {
+        let (root, _remote, upstream, worker) =
+            init_remote_and_clones("checkpoint-untracked-sync", "trunk");
+
+        fs::write(upstream.join("UPSTREAM.md"), "upstream\n").expect("failed to write upstream");
+        run_git_in(&upstream, ["add", "UPSTREAM.md"]);
+        run_git_in(&upstream, ["commit", "-m", "upstream change"]);
+        run_git_in(&upstream, ["push", "origin", "trunk"]);
+
+        fs::create_dir_all(worker.join("notes")).expect("failed to create notes dir");
+        fs::write(worker.join("notes").join("draft.md"), "draft\n")
+            .expect("failed to write local draft");
+
+        let commit = auto_checkpoint_if_needed(&worker, "trunk", "auto loop checkpoint")
+            .expect("checkpoint should succeed")
+            .expect("checkpoint commit should be created");
+
+        assert_eq!(commit, run_git_in(&worker, ["rev-parse", "HEAD"]).trim());
+        assert!(worker.join("UPSTREAM.md").exists());
+        assert!(worker.join("notes").join("draft.md").exists());
+        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        let log = run_git_in(&worker, ["log", "--format=%s", "-2"]);
+        assert_eq!(log, "worker: auto loop checkpoint\nupstream change\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }

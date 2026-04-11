@@ -1,6 +1,6 @@
 use std::fs;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
@@ -121,14 +121,12 @@ pub(crate) async fn run_qa(args: QaArgs) -> Result<()> {
     println!("reasoning:   {}", args.reasoning_effort);
     println!("run root:    {}", run_root.display());
 
-    if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
-        println!("remote sync: rebased onto origin/{}", push_branch);
-    }
-
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "qa checkpoint")?
     {
         println!("checkpoint:  committed pre-existing QA changes at {commit}");
+    } else if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", push_branch);
     }
 
     let mut iteration = 0usize;

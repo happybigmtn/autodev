@@ -2,14 +2,14 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
+use crate::ShipArgs;
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
-use crate::ShipArgs;
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
@@ -114,14 +114,12 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
     println!("reasoning:   {}", args.reasoning_effort);
     println!("run root:    {}", run_root.display());
 
-    if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
-        println!("remote sync: rebased onto origin/{}", push_branch);
-    }
-
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "ship checkpoint")?
     {
         println!("checkpoint:  committed pre-existing ship changes at {commit}");
+    } else if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", push_branch);
     }
 
     let mut iteration = 0usize;

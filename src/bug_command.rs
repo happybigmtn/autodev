@@ -3,21 +3,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
+use crate::BugArgs;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
-use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::pi_backend::{PiProvider, parse_pi_error, resolve_pi_bin};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
     sync_branch_with_remote, timestamp_slug, truncate_file_to_max_bytes,
 };
-use crate::BugArgs;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
@@ -235,18 +235,21 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         }
         return Ok(());
     }
-    if !args.report_only
-        && !current_branch.is_empty()
-        && sync_branch_with_remote(&repo_root, current_branch.as_str())?
-    {
-        println!("remote sync: rebased onto origin/{}", current_branch);
-    }
     if !args.report_only && !args.allow_dirty {
         if let Some(commit) =
             auto_checkpoint_if_needed(&repo_root, current_branch.as_str(), "auto bug checkpoint")?
         {
             println!("checkpoint:  committed pre-existing changes at {commit}");
+        } else if !current_branch.is_empty()
+            && sync_branch_with_remote(&repo_root, current_branch.as_str())?
+        {
+            println!("remote sync: rebased onto origin/{}", current_branch);
         }
+    } else if !args.report_only
+        && !current_branch.is_empty()
+        && sync_branch_with_remote(&repo_root, current_branch.as_str())?
+    {
+        println!("remote sync: rebased onto origin/{}", current_branch);
     }
 
     let mut outcomes = Vec::new();
@@ -2442,11 +2445,7 @@ trait EmptyFallback {
 
 impl EmptyFallback for str {
     fn if_empty_then<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() {
-            fallback
-        } else {
-            self
-        }
+        if self.is_empty() { fallback } else { self }
     }
 }
 
@@ -2460,9 +2459,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_fix_prompt, collect_repo_chunks, escape_unescaped_quotes_in_json_strings,
-        load_json_file, repair_llm_json, run_backend_prompt, should_audit_path, slugify,
-        validate_accepted_findings, AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict,
+        AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict, build_fix_prompt,
+        collect_repo_chunks, escape_unescaped_quotes_in_json_strings, load_json_file,
+        repair_llm_json, run_backend_prompt, should_audit_path, slugify,
+        validate_accepted_findings,
     };
     use crate::pi_backend::PiProvider;
 
@@ -2588,9 +2588,11 @@ mod tests {
         let parsed = serde_json::from_str::<Vec<SkepticVerdict>>(&repaired)
             .expect("repaired JSON should parse");
         assert_eq!(parsed.len(), 1);
-        assert!(parsed[0]
-            .counter_argument
-            .contains("\"message\":\"bitino-house live funding*"));
+        assert!(
+            parsed[0]
+                .counter_argument
+                .contains("\"message\":\"bitino-house live funding*")
+        );
     }
 
     #[test]
