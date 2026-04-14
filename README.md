@@ -488,8 +488,7 @@ What it writes:
 
 - updates to code and tests
 - `IMPLEMENTATION_PLAN.md`
-- `COMPLETED.md`
-- `WORKLIST.md` when useful out-of-scope follow-ups are found
+- `REVIEW.md` completion handoffs
 - `AGENTS.md` only when operational run/build knowledge improves
 - logs, parallel bucket plans, worker state, and tmux run files under `.auto/loop/` and `.auto/logs/`
 
@@ -524,7 +523,7 @@ What it actually does:
 - Does not default to broad workspace validation; it only runs broad suites when the current task
   explicitly requires them or when the repo offers no narrower truthful proof
 - Removes finished tasks from `IMPLEMENTATION_PLAN.md`
-- Appends a completion record to `COMPLETED.md`
+- Appends a completion record to `REVIEW.md`
 - Commits and pushes truthful increments to the allowed branch
 - Treats a commit in the queue repo or any declared reference repo as real loop progress
 - Fails loudly if a declared reference repo was changed but left uncommitted at the end of an
