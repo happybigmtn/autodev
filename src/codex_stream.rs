@@ -852,7 +852,10 @@ fn render_claude_tool_results(value: &Value, out: &mut String, green: &Style, re
     }
 }
 
-fn track_claude_tool_futility(value: &Value, state: &mut ClaudeRenderState) -> Option<&'static str> {
+fn track_claude_tool_futility(
+    value: &Value,
+    state: &mut ClaudeRenderState,
+) -> Option<&'static str> {
     let blocks = value
         .get("message")
         .and_then(|m| m.get("content"))
@@ -902,9 +905,7 @@ fn is_empty_tool_result(block: &Value) -> bool {
         None | Some(Value::Null) => true,
         Some(Value::String(s)) => {
             let t = s.trim();
-            t.is_empty()
-                || t.starts_with("No matches found")
-                || t.starts_with("No files found")
+            t.is_empty() || t.starts_with("No matches found") || t.starts_with("No files found")
         }
         Some(Value::Array(arr)) => arr.iter().all(|item| {
             item.get("text")
@@ -1605,8 +1606,7 @@ mod tests {
         console::set_colors_enabled(false);
         let mut state = ClaudeRenderState::default();
 
-        let empty_result =
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
+        let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
 
         for _ in 0..CLAUDE_FUTILITY_THRESHOLD - 1 {
             render_claude_stream_line(empty_result, &mut state);
@@ -1622,8 +1622,7 @@ mod tests {
         console::set_colors_enabled(false);
         let mut state = ClaudeRenderState::default();
 
-        let empty_result =
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
+        let empty_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"","is_error":false}]}}"#;
         let good_result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_2","content":"fn main() { println!(\"hello\"); }","is_error":false}]}}"#;
 
         for _ in 0..5 {
@@ -1665,7 +1664,10 @@ mod tests {
 
         assert!(!state.futility_detected);
         assert_eq!(state.consecutive_empty_results, 0);
-        assert_eq!(state.consecutive_search_misses, CLAUDE_FUTILITY_THRESHOLD + 2);
+        assert_eq!(
+            state.consecutive_search_misses,
+            CLAUDE_FUTILITY_THRESHOLD + 2
+        );
     }
 
     #[test]

@@ -36,7 +36,9 @@ pub(crate) fn run_accounts_list() -> Result<()> {
     let dim = Style::new().dim();
 
     if config.accounts.is_empty() {
-        eprintln!("No accounts configured. Run `auto quota accounts add <name> <provider>` to get started.");
+        eprintln!(
+            "No accounts configured. Run `auto quota accounts add <name> <provider>` to get started."
+        );
         return Ok(());
     }
 
@@ -50,7 +52,11 @@ pub(crate) fn run_accounts_list() -> Result<()> {
 
     for account in &config.accounts {
         let profile_dir = QuotaConfig::profile_dir(account.provider, &account.name);
-        let exists = if profile_dir.exists() { "ok" } else { "MISSING" };
+        let exists = if profile_dir.exists() {
+            "ok"
+        } else {
+            "MISSING"
+        };
         println!(
             "{:<20} {:<10} {}",
             account.name,

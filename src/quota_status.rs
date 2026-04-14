@@ -9,7 +9,9 @@ pub(crate) async fn run_status() -> Result<()> {
     let config = QuotaConfig::load()?;
 
     if config.accounts.is_empty() {
-        eprintln!("No accounts configured. Run `auto quota accounts add <name> <provider>` to get started.");
+        eprintln!(
+            "No accounts configured. Run `auto quota accounts add <name> <provider>` to get started."
+        );
         return Ok(());
     }
 

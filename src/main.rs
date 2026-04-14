@@ -52,7 +52,7 @@ enum Command {
     Reverse(GenerationArgs),
     /// Run a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline
     Bug(BugArgs),
-    /// Run the single-worker implementation loop on the repo's primary branch
+    /// Run the implementation loop on the repo's primary branch
     Loop(LoopArgs),
     /// Run a runtime QA and ship-readiness pass on the current branch
     Qa(QaArgs),
@@ -340,6 +340,18 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     max_iterations: Option<usize>,
 
+    /// Maximum concurrent implementation workers. Values above 1 use isolated git worktrees.
+    #[arg(long, default_value_t = 1, alias = "jobs")]
+    threads: usize,
+
+    /// Override CARGO_BUILD_JOBS for loop workers. Defaults to a conservative automatic cap.
+    #[arg(long)]
+    cargo_build_jobs: Option<usize>,
+
+    /// In parallel mode, launch the currently ready lanes once, integrate them, then stop.
+    #[arg(long)]
+    drain_after_current_wave: bool,
+
     /// Optional override for the worker prompt template
     #[arg(long)]
     prompt_file: Option<PathBuf>,
@@ -583,7 +595,7 @@ pub(crate) struct NemesisArgs {
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
 
-    /// Use PI with the Kimi 2.5 model for the initial Nemesis audit pass
+    /// Use PI with the current Kimi coding model for the initial Nemesis audit pass
     #[arg(long, conflicts_with = "minimax")]
     kimi: bool,
 

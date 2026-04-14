@@ -18,7 +18,7 @@ impl PiProvider {
 
     pub(crate) fn default_model(self) -> &'static str {
         match self {
-            Self::Kimi => "kimi-coding/k2p5",
+            Self::Kimi => "kimi-coding/k2p6",
             Self::Minimax => "minimax/MiniMax-M2.7-highspeed",
         }
     }
@@ -45,7 +45,11 @@ impl PiProvider {
         match self {
             Self::Kimi => {
                 let model = match normalized {
-                    "kimi" | "kimi-k2.5" | "kimi-2.5" | "kimi-for-coding" => "k2p5",
+                    "kimi" | "kimi-k2.6" | "kimi-2.6" | "kimi-for-coding" => "k2p6",
+                    "kimi-k2.6-code-preview" | "kimi-2.6-code-preview" | "k2.6-code-preview" => {
+                        "k2p6"
+                    }
+                    "kimi-k2.5" | "kimi-2.5" => "k2p5",
                     "kimi-k2-thinking" => "kimi-k2-thinking",
                     other => other,
                 };
@@ -175,10 +179,26 @@ mod tests {
     }
 
     #[test]
-    fn kimi_alias_defaults_to_k2p5() {
+    fn kimi_alias_defaults_to_k2p6() {
         assert_eq!(
             PiProvider::Kimi.resolve_model("kimi", "gpt-5.4"),
+            "kimi-coding/k2p6"
+        );
+    }
+
+    #[test]
+    fn kimi_k25_aliases_still_resolve_to_legacy_k2p5() {
+        assert_eq!(
+            PiProvider::Kimi.resolve_model("kimi-k2.5", "gpt-5.4"),
             "kimi-coding/k2p5"
+        );
+    }
+
+    #[test]
+    fn kimi_k26_preview_aliases_resolve_to_k2p6() {
+        assert_eq!(
+            PiProvider::Kimi.resolve_model("kimi-k2.6-code-preview", "gpt-5.4"),
+            "kimi-coding/k2p6"
         );
     }
 

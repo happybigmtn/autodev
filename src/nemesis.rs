@@ -2,21 +2,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
-use crate::NemesisArgs;
 use crate::codex_exec::run_codex_exec;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
-use crate::pi_backend::{PiProvider, parse_pi_error, resolve_pi_bin};
+use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, push_branch_with_remote_sync, repo_name, run_git,
     sync_branch_with_remote, timestamp_slug,
 };
+use crate::NemesisArgs;
 
 const DEFAULT_NEMESIS_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, and any security- or audit-related docs already present.
@@ -1940,11 +1940,12 @@ mod tests {
     use chrono::{Local, TimeZone};
 
     use super::{
-        PhaseConfig, annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
+        annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
         build_nemesis_results_repair_prompt, commit_nemesis_outputs_if_needed,
         ensure_nemesis_fixer_config, ensure_pi_phase_config, load_nemesis_fix_results,
         maybe_prepare_output_dir, next_nemesis_spec_destination, prepare_output_dir,
         resolve_auditor_model, select_backend, unchecked_nemesis_task_ids, verify_nemesis_outputs,
+        PhaseConfig,
     };
     use crate::NemesisArgs;
 
@@ -2152,7 +2153,7 @@ Spec: specs/020426-nemesis-audit.md
             Path::new("pi"),
         );
         assert_eq!(backend.label(), "pi-kimi");
-        assert_eq!(backend.model(), "kimi-coding/k2p5");
+        assert_eq!(backend.model(), "kimi-coding/k2p6");
         assert_eq!(backend.variant(), "high");
     }
 
@@ -2313,16 +2314,14 @@ Spec: specs/020426-nemesis-audit.md
         let message = format!("{annotated:#}");
         assert!(message.contains("simulated model failure"));
         assert!(message.contains("Previous outputs were archived at"));
-        assert!(
-            message.contains(
-                archived
-                    .as_ref()
-                    .expect("snapshot should exist")
-                    .display()
-                    .to_string()
-                    .as_str()
-            )
-        );
+        assert!(message.contains(
+            archived
+                .as_ref()
+                .expect("snapshot should exist")
+                .display()
+                .to_string()
+                .as_str()
+        ));
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
@@ -2403,23 +2402,19 @@ Spec: nemesis/nemesis-audit.md
             .expect("timestamp should exist");
 
         let first = next_nemesis_spec_destination(&specs_dir, &spec_path, timestamp);
-        assert!(
-            first
-                .file_name()
-                .and_then(|value| value.to_str())
-                .expect("file name should be utf-8")
-                .starts_with("050426-123456-nemesis-audit")
-        );
+        assert!(first
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("file name should be utf-8")
+            .starts_with("050426-123456-nemesis-audit"));
         fs::write(&first, "# existing\n").expect("failed to create existing collision file");
         let second = next_nemesis_spec_destination(&specs_dir, &spec_path, timestamp);
         assert_ne!(first, second);
-        assert!(
-            second
-                .file_name()
-                .and_then(|value| value.to_str())
-                .expect("file name should be utf-8")
-                .contains("-2.")
-        );
+        assert!(second
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("file name should be utf-8")
+            .contains("-2."));
 
         fs::remove_dir_all(&root).expect("failed to remove temp dir");
     }

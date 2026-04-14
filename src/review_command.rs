@@ -1,15 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
-use crate::ReviewArgs;
 use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
+use crate::ReviewArgs;
 
 pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` if they exist.
@@ -77,6 +77,21 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";
 const REVIEW_HEADER: &str = "# REVIEW";
 const ARCHIVED_HEADER: &str = "# ARCHIVED";
+const DIRECT_REVIEW_QUEUE_REVIEW_CLAUSE: &str = r#"
+
+Repo-specific direct `REVIEW.md` mode:
+- This repo forbids root `COMPLETED.md`, `WORKLIST.md`, and `ARCHIVED.md`.
+  These bullets override any generic tracker instructions above.
+- Review the items already in `REVIEW.md`; do not create or hand off from
+  `COMPLETED.md`.
+- If a review item passes, remove it from `REVIEW.md`. Git history is the
+  archive.
+- If a review item fails and cannot be fixed in this pass, leave it in
+  `REVIEW.md` or add an explicit unchecked `IMPLEMENTATION_PLAN.md` follow-up.
+  Do not write `WORKLIST.md`.
+- Stage only files relevant to review fixes plus `REVIEW.md`,
+  `IMPLEMENTATION_PLAN.md`, `LEARNINGS.md`, and `AGENTS.md` when they changed.
+  Do not create or stage `COMPLETED.md`, `WORKLIST.md`, or `ARCHIVED.md`."#;
 
 pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
@@ -86,8 +101,14 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let completed_path = repo_root.join("COMPLETED.md");
     let review_path = repo_root.join("REVIEW.md");
     let archived_path = repo_root.join("ARCHIVED.md");
-    ensure_review_docs(&review_path, &archived_path)?;
-    let moved_items = handoff_completed_items_to_review_queue(&completed_path, &review_path)?;
+    let direct_review_queue = repo_forbids_legacy_review_trackers(&repo_root);
+    let moved_items = if direct_review_queue {
+        ensure_review_doc(&review_path)?;
+        0
+    } else {
+        ensure_review_docs(&review_path, &archived_path)?;
+        handoff_completed_items_to_review_queue(&completed_path, &review_path)?
+    };
     if !review_path.exists() || !has_reviewable_items(&review_path)? {
         println!("auto review");
         println!("repo root:   {}", repo_root.display());
@@ -117,7 +138,13 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
                 .with_context(|| format!("failed to read prompt file {}", path.display()))?;
             append_reference_repo_clause(prompt, &reference_repos)
         }
-        None => append_reference_repo_clause(DEFAULT_REVIEW_PROMPT.to_string(), &reference_repos),
+        None => {
+            let mut prompt = DEFAULT_REVIEW_PROMPT.to_string();
+            if direct_review_queue {
+                prompt.push_str(DIRECT_REVIEW_QUEUE_REVIEW_CLAUSE);
+            }
+            append_reference_repo_clause(prompt, &reference_repos)
+        }
     };
     let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
 
@@ -157,6 +184,8 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             "handoff:     moved {} item(s) from COMPLETED.md",
             moved_items
         );
+    } else if direct_review_queue {
+        println!("handoff:     direct REVIEW.md mode");
     }
     println!("run root:    {}", run_root.display());
 
@@ -278,6 +307,18 @@ fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> 
     format!(
         "{prompt}\n\nAdditional repositories you may inspect or edit when the review contract points there:\n{listing}\n\nRepository-crossing rules:\n- If a reviewed item's owned or changed surfaces live in one of these repos, review and fix that repo directly instead of pretending the queue repo owns it.\n- Keep `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` truthful in the queue repo even when code lands in another repo.\n- Read each touched repo's `AGENTS.md`, tests, and operational docs before editing it.\n- Commit and push each touched repo separately.\n"
     )
+}
+
+fn repo_forbids_legacy_review_trackers(repo_root: &Path) -> bool {
+    ["AGENTS.md", "WORKFLOW.md"].iter().any(|relative| {
+        fs::read_to_string(repo_root.join(relative)).is_ok_and(|content| {
+            content.contains("Do not restore")
+                && content.contains("COMPLETED.md")
+                && content.contains("WORKLIST.md")
+                && content.contains("ARCHIVED.md")
+                && content.contains("REVIEW.md")
+        })
+    })
 }
 
 fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -520,11 +561,16 @@ fn write_queue(path: &Path, title: &str, items: &[String]) -> Result<()> {
     atomic_write(path, content.as_bytes())
 }
 
-fn ensure_review_docs(review_path: &Path, archived_path: &Path) -> Result<()> {
+fn ensure_review_doc(review_path: &Path) -> Result<()> {
     if !review_path.exists() {
         atomic_write(review_path, format!("{REVIEW_HEADER}\n\n").as_bytes())
             .with_context(|| format!("failed to initialize {}", review_path.display()))?;
     }
+    Ok(())
+}
+
+fn ensure_review_docs(review_path: &Path, archived_path: &Path) -> Result<()> {
+    ensure_review_doc(review_path)?;
     if !archived_path.exists() {
         atomic_write(archived_path, format!("{ARCHIVED_HEADER}\n\n").as_bytes())
             .with_context(|| format!("failed to initialize {}", archived_path.display()))?;
@@ -579,9 +625,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ARCHIVED_HEADER, REVIEW_HEADER, RepoProgress, TrackedRepoState,
         append_reference_repo_clause, collect_tracked_repo_states, discover_sibling_git_repos,
-        ensure_review_docs, extract_review_items, resolve_reference_repos, summarize_repo_progress,
+        ensure_review_docs, extract_review_items, repo_forbids_legacy_review_trackers,
+        resolve_reference_repos, summarize_repo_progress, RepoProgress, TrackedRepoState,
+        ARCHIVED_HEADER, REVIEW_HEADER,
     };
 
     #[test]
@@ -637,6 +684,21 @@ mod tests {
         assert!(prompt.contains("Additional repositories you may inspect or edit"));
         assert!(prompt.contains("/home/r/coding/robopokermulti"));
         assert!(prompt.contains("owned or changed surfaces live in one of these repos"));
+    }
+
+    #[test]
+    fn detects_direct_review_queue_policy() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        fs::write(
+            temp.join("AGENTS.md"),
+            "Do not restore `COMPLETED.md`, `WORKLIST.md`, or `ARCHIVED.md`; use `REVIEW.md`.",
+        )
+        .expect("write policy");
+
+        assert!(repo_forbids_legacy_review_trackers(&temp));
+
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

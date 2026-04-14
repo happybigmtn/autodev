@@ -222,10 +222,7 @@ fn log_selection(chosen: &AccountEntry, scored: &[(&AccountEntry, Option<Account
                 u.weekly_resets_in_secs,
                 u.session_resets_in_secs,
             ),
-            None => eprintln!(
-                "[quota-router]   {} (no usage data){marker}",
-                entry.name,
-            ),
+            None => eprintln!("[quota-router]   {} (no usage data){marker}", entry.name,),
         }
     }
 }

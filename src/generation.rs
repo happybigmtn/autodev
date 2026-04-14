@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 
 use crate::codex_exec::run_codex_exec;
-use crate::corpus::{PlanningCorpus, emit_corpus_snapshot, load_planning_corpus};
+use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state};
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
@@ -285,6 +285,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         )
     };
 
+    print_stage("sanitize corpus outputs", run_started_at);
+    sanitize_corpus_repo_root_paths(&repo_root, &planning_root)?;
+
     print_stage("verify corpus outputs", run_started_at);
     let summary = verify_corpus_outputs(
         &repo_root,
@@ -439,32 +442,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         specs
     };
 
-    let (mut implementation_plan, plan_phase) = if args.plan_only {
-        if output_dir.join("IMPLEMENTATION_PLAN.md").exists() {
-            print_stage("reuse existing generated plan", run_started_at);
-            (verify_generated_implementation_plan(&output_dir)?, None)
-        } else {
-            print_stage("generate implementation plan", run_started_at);
-            let plan_prompt = build_implementation_plan_prompt(
-                mode,
-                &repo_root,
-                &output_dir,
-                &generated_specs,
-                args.parallelism.clamp(1, 10),
-            );
-            let plan_phase = run_logged_claude_phase(
-                &repo_root,
-                mode.plan_phase_slug(),
-                &plan_prompt,
-                &args.model,
-                args.max_turns,
-            )?;
-            (
-                verify_generated_implementation_plan(&output_dir)?,
-                Some(plan_phase),
-            )
-        }
-    } else {
+    let (mut implementation_plan, plan_phase) = {
         print_stage("generate implementation plan", run_started_at);
         let plan_prompt = build_implementation_plan_prompt(
             mode,
@@ -973,10 +951,13 @@ fn verify_corpus_outputs(
             bail!("corpus generation did not write {}", path.display());
         }
     }
-    let plan_files = list_markdown_files(&plans_dir)?;
+    let plan_files = list_markdown_files(&plans_dir)?
+        .into_iter()
+        .filter(|path| is_numbered_corpus_plan_file(path))
+        .collect::<Vec<_>>();
     if plan_files.is_empty() {
         bail!(
-            "corpus generation did not write any plans under {}",
+            "corpus generation did not write any numbered plans under {}",
             plans_dir.display()
         );
     }
@@ -1006,6 +987,46 @@ fn verify_corpus_outputs(
             .then_some(planning_root.join("IDEA.md")),
         plan_count: plan_files.len(),
     })
+}
+
+fn is_numbered_corpus_plan_file(path: &Path) -> bool {
+    let Some(filename) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(stem) = filename.strip_suffix(".md") else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    bytes.len() > 4 && bytes[..3].iter().all(|byte| byte.is_ascii_digit()) && bytes[3] == b'-'
+}
+
+fn sanitize_corpus_repo_root_paths(repo_root: &Path, planning_root: &Path) -> Result<()> {
+    let repo_root_literal = repo_root.display().to_string();
+    for path in list_markdown_files(planning_root)? {
+        let markdown = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let sanitized = sanitize_markdown_repo_root_paths(&markdown, &repo_root_literal);
+        if sanitized != markdown {
+            atomic_write(&path, sanitized.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_markdown_repo_root_paths(markdown: &str, repo_root_literal: &str) -> String {
+    let repo_root_shell = "\"$(git rev-parse --show-toplevel)\"";
+    let mut sanitized = markdown.replace(
+        &format!("cd {repo_root_literal}"),
+        &format!("cd {repo_root_shell}"),
+    );
+    sanitized = sanitized.replace(
+        &format!("cd `{repo_root_literal}`"),
+        &format!("cd `{repo_root_shell}`"),
+    );
+    sanitized = sanitized.replace(&format!("`{repo_root_literal}`"), "the repository root");
+    sanitized = sanitized.replace(&format!("{repo_root_literal}/"), "<repo-root>/");
+    sanitized.replace(repo_root_literal, "<repo-root>")
 }
 
 fn verify_corpus_semantics(
@@ -1192,25 +1213,28 @@ fn build_corpus_prompt(
         && !active_plan_surface.has_active_plans()
     {
         String::new()
-    } else {
+    } else if active_plan_surface.has_active_plans() {
         let root_standard = active_plan_surface
             .root_plan_standard_path
             .as_deref()
             .map(|path| format!("- Root ExecPlan standard: `{path}`\n"))
             .unwrap_or_default();
-        let active_plans = if active_plan_surface.has_active_plans() {
-            let listing = active_plan_surface
-                .active_plan_paths
-                .iter()
-                .map(|path| format!("- Active root plan: `{path}`"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{listing}\n")
-        } else {
-            String::new()
-        };
+        let active_plans = active_plan_surface
+            .active_plan_paths
+            .iter()
+            .map(|path| format!("- Active root plan: `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
-            "Existing active planning surfaces to inspect as first-class inputs:\n{root_standard}{active_plans}\nWhen active root planning surfaces exist:\n- Treat them as the current control plane for planning intent and sequencing.\n- Do not create a second active master plan or competing queue inside `{planning_root}`.\n- Generated corpus files must explicitly describe themselves as subordinate reconciliations, decompositions, or review overlays on top of the active root planning surface.\n- If you disagree with an active root plan, record that disagreement explicitly as `Mechanical`, `Taste`, or `User Challenge`; do not silently replace the plan hierarchy.\n- Reuse shared interface names and planning vocabulary from the active root surface unless code evidence proves they are wrong.\n\n"
+            "Existing root planning surfaces to inspect as first-class inputs:\n{root_standard}{active_plans}\nWhen root plans already exist:\n- Treat them as strong evidence about current planning intent and sequencing.\n- Before calling them the active control plane, inspect repo-root instruction files such as `AGENTS.md` or `CLAUDE.md` and any control docs that may explicitly designate a different active planning root.\n- Do not create a second active master plan or competing queue inside `{planning_root}` unless the repo's own instructions explicitly say `{planning_root}` is the active planning corpus.\n- If repo instructions say another planning root is active, preserve that relationship explicitly instead of forcing subordination to the root plans.\n- If you disagree with an active plan, record that disagreement explicitly as `Mechanical`, `Taste`, or `User Challenge`; do not silently replace the plan hierarchy.\n- Reuse shared interface names and planning vocabulary from the established planning surface unless code evidence proves they are wrong.\n\n"
+        )
+    } else {
+        let root_standard = active_plan_surface
+            .root_plan_standard_path
+            .as_deref()
+            .unwrap_or("PLANS.md");
+        format!(
+            "Existing planning-standard input to inspect:\n- Root ExecPlan standard: `{root_standard}`\nWhen only a root planning standard exists:\n- Read it fully and follow its ExecPlan shape for any generated numbered plans.\n- Do not infer from `{root_standard}` alone that root backlog files own the active control plane.\n- Inspect repo-root instruction files such as `AGENTS.md` or `CLAUDE.md` to determine whether a different planning root such as `{planning_root}` is explicitly designated as active.\n- If repo instructions designate `{planning_root}` or another planning root as active, preserve that relationship explicitly in the generated corpus.\n\n"
         )
     };
     let idea_context_clause = idea
@@ -1297,8 +1321,10 @@ Review the actual codebase first, not just docs:
 - If an archived previous planning snapshot exists, use it only as historical context, not truth
 - If an idea seed is present, use it as intentional product direction, then reconcile it against repo reality, reusable assets, and the actual gaps.
 - If a focus seed is present, use it to bias depth and plan ordering while still preserving full-repo coverage.
-- If active root planning surfaces already exist under `plans/`, reconcile to them explicitly instead of inventing a parallel planning universe in `{planning_root}`.
+- If root plans already exist under `plans/`, reconcile to them explicitly unless repo-root instructions clearly designate `{planning_root}` or another planning root as the active control corpus.
 - The current codebase is still the truth for current state, constraints, and what can be reused.
+- Read repo-root instruction files such as `AGENTS.md` or `CLAUDE.md` before deciding which planning surface is active.
+- Never emit the absolute repository-root path in generated markdown. In prose say "the repository root"; in shell examples either assume the command starts at repo root or use `cd "$(git rev-parse --show-toplevel)"` when a directory change is required.
 - When the repo needs an agent-instruction file, prefer the repo's actual primary convention.
   - In Codex-first repos, prefer `AGENTS.md`.
   - Do not choose the instruction filename based on which planning model ran the corpus pass.
@@ -1344,7 +1370,7 @@ ASSESSMENT.md must include:
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
-`{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard. If the target repo already has active root plans under `plans/`, the generated index must explicitly say those root plans remain the active planning surface and that the generated corpus is subordinate to them.
+`{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard. Determine the active planning surface from the repo's own instructions and control docs rather than assuming it from filename alone. If the target repo already has active root plans under `plans/` and no repo instruction overrides that, the generated index must say those root plans remain the active planning surface and that the generated corpus is subordinate to them. If repo instructions designate `{planning_root}` as the active planning corpus, the generated index must say that explicitly instead of inventing root-level primacy.
 
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
@@ -1438,26 +1464,29 @@ fn build_corpus_codex_review_prompt(
         && !active_plan_surface.has_active_plans()
     {
         String::new()
-    } else {
+    } else if active_plan_surface.has_active_plans() {
         let root_standard = active_plan_surface
             .root_plan_standard_path
             .as_deref()
             .map(|path| format!("- Root ExecPlan standard: `{path}`\n"))
             .unwrap_or_default();
-        let active_plans = if active_plan_surface.has_active_plans() {
-            let listing = active_plan_surface
-                .active_plan_paths
-                .iter()
-                .map(|path| format!("- Active root plan: `{path}`"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{listing}\n")
-        } else {
-            String::new()
-        };
+        let active_plans = active_plan_surface
+            .active_plan_paths
+            .iter()
+            .map(|path| format!("- Active root plan: `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
-            "Active root planning surfaces already exist:\n{root_standard}{active_plans}\n- The generated corpus must reconcile to these surfaces explicitly.\n- Reject any corpus that creates a second active master plan or competing control plane.\n- Require `GENESIS-REPORT.md` or `{planning_root}/PLANS.md` to say the generated corpus is subordinate to or reconciled against the active root planning surface.\n\n",
+            "Root planning inputs already exist:\n{root_standard}{active_plans}\n- The generated corpus must reconcile to these surfaces explicitly unless repo-root instructions designate another planning root as active.\n- Reject any corpus that creates a second active master plan or competing control plane without an explicit repo-instruction basis.\n- Require `GENESIS-REPORT.md` or `{planning_root}/PLANS.md` to explain the actual planning relationship the repo declares, whether that means subordination to root plans or an explicitly active `{planning_root}` corpus.\n\n",
             planning_root = planning_root.display(),
+        )
+    } else {
+        let root_standard = active_plan_surface
+            .root_plan_standard_path
+            .as_deref()
+            .unwrap_or("PLANS.md");
+        format!(
+            "A root ExecPlan standard already exists:\n- Root ExecPlan standard: `{root_standard}`\n- The review must enforce that generated numbered plans follow this format.\n- The review must not assume from `{root_standard}` alone that root backlog files own the active control plane; inspect repo-root instruction files such as `AGENTS.md` or `CLAUDE.md` first.\n\n"
         )
     };
     format!(
@@ -1504,9 +1533,12 @@ Corpus-specific validation:
 - `ASSESSMENT.md` must say what was actually inspected, separate verified facts from assumptions, and call out stale doc claims.
 - `SPEC.md` must describe concrete current behavior and intended near-term direction without presenting guesses as settled facts.
 - `PLANS.md` under `{planning_root}` must be an index to the generated plan set, not a substitute for the repo root ExecPlan standard.
-- If active root plans already exist under `plans/`, the generated corpus must explicitly reconcile to them and must not present itself as a second active planning surface.
+- Determine the active planning surface from repo instructions and control docs, not from filenames alone.
+- If active root plans already exist under `plans/` and the repo's own instructions do not designate another active planning root, the generated corpus must explicitly reconcile to them and must not present itself as a second active planning surface.
+- If repo-root instructions explicitly designate `{planning_root}` as the active planning corpus, the generated corpus should say that plainly and should not invent root-level primacy.
 - Every numbered plan under `{planning_root}/plans/` must be a full ExecPlan rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape.
 - Numbered ExecPlans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
+- Reject or rewrite any absolute repo-root path that appears in the corpus. Use repository-relative references, "the repository root" in prose, or `cd "$(git rev-parse --show-toplevel)"` in shell examples instead.
 - Every numbered ExecPlan must include non-empty sections for `Purpose / Big Picture`, `Requirements Trace`, `Scope Boundaries`, `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, `Context and Orientation`, `Plan of Work`, `Implementation Units`, `Concrete Steps`, `Validation and Acceptance`, `Idempotence and Recovery`, `Artifacts and Notes`, and `Interfaces and Dependencies`.
 - `Progress` must include checkbox bullets. `Implementation Units` must name goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only work, name the artifact and explain why no code test is expected.
 - Add checkpoint or decision-gate plans after each risky cluster or every 2-3 numbered plans when later work depends on unresolved evidence.
@@ -1785,9 +1817,9 @@ Output requirements:
   - `## Priority Work`
   - `## Follow-On Work`
   - `## Completed / Already Satisfied`
-- Each actionable task must use this exact header format:
+- Every unfinished task in `## Priority Work` and `## Follow-On Work` must use this exact header format:
   - `- [ ] `TASK-ID` Short title`
-- Each task must include these exact fields:
+- Every unfinished task in `## Priority Work` and `## Follow-On Work` must include these exact fields, even when it is deferred, gated, research-shaped, or lower priority:
   - `Spec:`
   - `Why now:`
   - `Codebase evidence:`
@@ -1800,16 +1832,26 @@ Output requirements:
   - `Dependencies:`
   - `Estimated scope:`
   - `Completion signal:`
+- `## Follow-On Work` is not a shorthand backlog. If you list a follow-on item with `- [ ]`, give it the same full task contract as priority work. Do not create compact follow-on rows with only `Spec:`, `Why now:`, and `Dependencies:`.
 - `Spec:` values must point to `specs/*.md`
 - Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames
 - Keep the plan concrete, file-grounded, and executable
+- `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there
+- `Integration touchpoints:` should name concrete adjacent modules, route prefixes, commands, or config files; if none exist, write `none`
 - Do not include lane prose, staffing prose, or meta commentary
 - Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
+- Any prerequisite, expansion gate, or "after P-..." constraint mentioned in prose must also be encoded in the task's `Dependencies:` field; never rely on prose-only gates
 - Front-load risk where practical, but never at the cost of violating dependency order
 - `Acceptance criteria:` must be specific, testable, and truthful
 - `Verification:` must name the concrete commands or runtime checks a worker should run
 - For behavior-changing tasks, `Verification:` should prefer a prove-it path: failing test or repro first, then green proof, then broader regression checks
-- `Estimated scope:` should be `XS`, `S`, `M`, or `L`; avoid `L` unless the codebase reality truly leaves no smaller slice
+- `Estimated scope:` for every unfinished task must be exactly `XS`, `S`, or `M`
+- Do not emit `Estimated scope: L`; if the underlying spec implies larger work, decompose it into dependency-ordered child tasks yourself
+- Do not write `decomposition required`, `split before implementation`, or similar placeholders; the generated plan is responsible for doing that decomposition now
+- `Required tests:` must list concrete test names or an explicit `none` for docs-only tasks; never write `See spec`, `TBD`, or a broad module name
+- No unfinished task may list more than five required tests; split the task if it needs more
+- `Verification:` must stay narrow: prefer exact test-name filters and affected-crate checks; do not use `cargo check --workspace`, `cargo test --workspace`, `cargo test --all`, or equivalent broad workspace sweeps as the primary item verification
+- Every `cargo test` verification command must include a concrete test-name/filter token after package or target flags; reject package-wide commands such as `cargo test -p crate`, `cargo test -p crate --lib`, or `cargo test -p crate --test integration_file`
 - Put only unfinished work in the unchecked queue sections
 - Put already-satisfied items only in `## Completed / Already Satisfied`
 - Future-phase work with unresolved feasibility must stay in research-shaped tasks until the prerequisite evidence exists
@@ -2176,6 +2218,7 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
                 );
             }
         }
+        verify_generated_plan_task_is_scoped(block)?;
     }
     let available_specs = collect_available_spec_refs(&output_dir.join("specs"))?;
     validate_plan_spec_refs(
@@ -2188,6 +2231,332 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
             .with_context(|| format!("failed to normalize {}", plan_path.display()))?;
     }
     Ok(plan_path)
+}
+
+fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
+    if block
+        .markdown
+        .to_ascii_lowercase()
+        .contains("decomposition required")
+        || block
+            .markdown
+            .to_ascii_lowercase()
+            .contains("split before implementation")
+    {
+        bail!(
+            "generated implementation plan task `{}` must be decomposed by auto gen instead of using a decomposition placeholder",
+            block.task_id
+        );
+    }
+
+    let scope = plan_task_field_line_value(block, "Estimated scope:")
+        .with_context(|| format!("task `{}` missing `Estimated scope:`", block.task_id))?;
+    if !matches!(scope, "XS" | "S" | "M") {
+        bail!(
+            "generated implementation plan task `{}` must use `Estimated scope: XS`, `S`, or `M`; got `{scope}`",
+            block.task_id
+        );
+    }
+
+    let required_tests = plan_task_field_body(block, "Required tests:", "Dependencies:")
+        .with_context(|| format!("task `{}` missing `Required tests:` body", block.task_id))?;
+    verify_required_tests_are_scoped(block, &required_tests)?;
+
+    let verification = plan_task_field_body(block, "Verification:", "Required tests:")
+        .with_context(|| format!("task `{}` missing `Verification:` body", block.task_id))?;
+    verify_verification_commands_are_scoped(block, &verification)?;
+    verify_generated_plan_task_has_concrete_ownership(block)?;
+    verify_generated_plan_task_prose_gates_are_explicit(block)?;
+
+    Ok(())
+}
+
+fn plan_task_field_line_value<'a>(block: &'a PlanTaskBlock, field: &str) -> Option<&'a str> {
+    block.markdown.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .strip_prefix(field)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn plan_task_field_body(block: &PlanTaskBlock, field: &str, next_field: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut body = Vec::new();
+    for line in block.markdown.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(field) {
+            collecting = true;
+            if !rest.trim().is_empty() {
+                body.push(rest.trim().to_string());
+            }
+            continue;
+        }
+        if collecting && trimmed.starts_with(next_field) {
+            break;
+        }
+        if collecting {
+            body.push(line.to_string());
+        }
+    }
+    collecting.then(|| body.join("\n"))
+}
+
+fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result<()> {
+    let normalized = body.trim();
+    let lowercase = normalized.to_ascii_lowercase();
+    if lowercase.contains("see spec") {
+        bail!(
+            "generated implementation plan task `{}` has vague `Required tests:` content `See spec`",
+            block.task_id
+        );
+    }
+    for forbidden in ["TBD", "TODO"] {
+        if normalized.contains(forbidden) {
+            bail!(
+                "generated implementation plan task `{}` has vague `Required tests:` content `{forbidden}`",
+                block.task_id
+            );
+        }
+    }
+
+    let bullet_count = normalized
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ") || trimmed.starts_with("* ")
+        })
+        .count();
+    if bullet_count > 5 {
+        bail!(
+            "generated implementation plan task `{}` lists {bullet_count} required tests; split the task to keep at most five",
+            block.task_id
+        );
+    }
+    if bullet_count == 0 && normalized != "none" {
+        bail!(
+            "generated implementation plan task `{}` must list concrete required test names or `Required tests: none`",
+            block.task_id
+        );
+    }
+
+    Ok(())
+}
+
+fn verify_verification_commands_are_scoped(block: &PlanTaskBlock, body: &str) -> Result<()> {
+    let lowercase = body.to_ascii_lowercase();
+    for forbidden in [
+        "cargo check --workspace",
+        "cargo test --workspace",
+        "cargo check --all",
+        "cargo test --all",
+    ] {
+        if lowercase.contains(forbidden) {
+            bail!(
+                "generated implementation plan task `{}` uses broad verification `{forbidden}`; use exact or affected-scope checks",
+                block.task_id
+            );
+        }
+    }
+    for line in body.lines() {
+        if cargo_test_command_is_package_wide(line) {
+            bail!(
+                "generated implementation plan task `{}` uses package-wide cargo test verification `{}`; include a concrete test-name filter",
+                block.task_id,
+                line.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_generated_plan_task_has_concrete_ownership(block: &PlanTaskBlock) -> Result<()> {
+    let owns = plan_task_field_body(block, "Owns:", "Integration touchpoints:")
+        .with_context(|| format!("task `{}` missing `Owns:` body", block.task_id))?;
+    let normalized = owns.trim();
+    let lowercase = normalized.to_ascii_lowercase();
+    for forbidden in ["missing", "tbd", "unspecified"] {
+        if lowercase.contains(forbidden) {
+            bail!(
+                "generated implementation plan task `{}` has vague `Owns:` content `{forbidden}`",
+                block.task_id
+            );
+        }
+    }
+    if !body_contains_path_like_owner(normalized) {
+        bail!(
+            "generated implementation plan task `{}` must give concrete path-like ownership in `Owns:`",
+            block.task_id
+        );
+    }
+    Ok(())
+}
+
+fn body_contains_path_like_owner(body: &str) -> bool {
+    body.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')'))
+        .any(token_looks_like_plan_owner)
+}
+
+fn token_looks_like_plan_owner(token: &str) -> bool {
+    let token = token
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | ':' | '"' | '\'' | '`'))
+        .trim_end_matches('/');
+    if token.is_empty() || token.contains('*') || token.starts_with('-') || token.starts_with('$') {
+        return false;
+    }
+    if token.contains('/')
+        || token.ends_with(".rs")
+        || token.ends_with(".toml")
+        || token.ends_with(".md")
+    {
+        return true;
+    }
+    matches!(
+        token,
+        "docs"
+            | "specs"
+            | "plans"
+            | "scripts"
+            | "fixtures"
+            | "deploy"
+            | "ops"
+            | "src"
+            | "tests"
+            | "xtask"
+            | "types"
+            | "operator"
+            | "node"
+            | "indexer"
+    ) || (token.contains('-')
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')))
+}
+
+fn verify_generated_plan_task_prose_gates_are_explicit(block: &PlanTaskBlock) -> Result<()> {
+    let dependency_line = plan_task_field_line_value(block, "Dependencies:").unwrap_or("");
+    let explicit_dependencies = collect_plan_task_refs(dependency_line);
+    for line in block.markdown.lines() {
+        let lower = line.to_ascii_lowercase();
+        let line_has_gate_language = lower.contains("gated")
+            || lower.contains("blocked until")
+            || lower.contains("after ")
+            || lower.contains("depends on");
+        if !line_has_gate_language {
+            continue;
+        }
+        for task_ref in collect_plan_task_refs(line) {
+            if task_ref != block.task_id && !explicit_dependencies.contains(&task_ref) {
+                bail!(
+                    "generated implementation plan task `{}` mentions gated prerequisite `{}` in prose but omits it from `Dependencies:`",
+                    block.task_id,
+                    task_ref
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_plan_task_refs(text: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("P-") {
+        rest = &rest[start..];
+        let end = rest
+            .char_indices()
+            .find_map(|(index, ch)| {
+                if index > 0 && !(ch.is_ascii_alphanumeric() || ch == '-') {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(rest.len());
+        let candidate = &rest[..end];
+        if candidate.len() > 2
+            && candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            refs.push(candidate.to_string());
+        }
+        rest = &rest[end..];
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn cargo_test_command_is_package_wide(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty()
+        || trimmed.starts_with("```")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("//")
+    {
+        return false;
+    }
+    let Some(rest) = trimmed.strip_prefix("cargo test") else {
+        return false;
+    };
+
+    let tokens = rest.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return true;
+    }
+
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if token == "--" || token == "&&" || token == ";" || token == "||" {
+            break;
+        }
+        if cargo_option_takes_value(token) {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("-p") && token.len() > 2 {
+            index += 1;
+            continue;
+        }
+        if token.starts_with("--package=")
+            || token.starts_with("--manifest-path=")
+            || token.starts_with("--target=")
+            || token.starts_with("--features=")
+            || token.starts_with("--test=")
+            || token.starts_with("--bin=")
+            || token.starts_with("--example=")
+            || token.starts_with("--bench=")
+        {
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+
+    true
+}
+
+fn cargo_option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-p" | "--package"
+            | "--manifest-path"
+            | "--target"
+            | "--features"
+            | "-F"
+            | "--test"
+            | "--bin"
+            | "--example"
+            | "--bench"
+    )
 }
 
 fn normalize_generated_implementation_plan(markdown: &str) -> String {
@@ -2693,19 +3062,19 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
-        IMPLEMENTATION_PLAN_HEADER, SpecSyncSummary, build_corpus_codex_review_prompt,
-        build_corpus_prompt, build_generation_codex_review_prompt,
-        build_implementation_plan_prompt, generated_spec_has_acceptance_criteria,
-        lint_session_resume_wire_contract, lint_signature_policy_consistency,
-        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root,
+        build_corpus_codex_review_prompt, build_corpus_prompt,
+        build_generation_codex_review_prompt, build_implementation_plan_prompt,
+        generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
+        lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
+        normalize_generated_implementation_plan, normalize_generated_spec_markdown,
+        rewrite_plan_spec_refs_to_root, sanitize_corpus_repo_root_paths,
         sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
-        verify_generated_implementation_plan,
+        verify_generated_implementation_plan, ActivePlanSurface, CorpusPromptInputs,
+        GeneratedSpecDocument, GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use chrono::NaiveDate;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn generated_spec(slug: &str, text: &str) -> GeneratedSpecDocument {
@@ -2723,6 +3092,48 @@ mod tests {
         let path = std::env::temp_dir().join(format!("autodev-{label}-{suffix}"));
         fs::create_dir_all(&path).expect("failed to create temp dir");
         path
+    }
+
+    fn write_real_spec(root: &Path) {
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(
+            specs_dir.join("050426-real.md"),
+            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Evidence Status\n\n- ok\n\n## Open Questions\n\n- none\n",
+        )
+        .unwrap();
+    }
+
+    fn valid_generated_plan_task() -> String {
+        [
+            "Spec: `specs/050426-real.md`",
+            "Why now: needed",
+            "Codebase evidence: present",
+            "Owns: docs",
+            "Integration touchpoints: docs",
+            "Scope boundary: docs only",
+            "Acceptance criteria: docs land",
+            "Verification:",
+            "    ```",
+            "    cargo test -p docs exact_docs_test",
+            "    ```",
+            "Required tests:",
+            "    - `exact_docs_test`",
+            "Dependencies: none",
+            "Estimated scope: S",
+            "Completion signal: merged",
+        ]
+        .join("\n")
+    }
+
+    fn write_generated_plan(root: &Path, task_contract: &str) {
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!(
+                "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\n{task_contract}\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n"
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2980,6 +3391,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("Do not use the short `## Objective`"));
         assert!(prompt.contains("current gstack `/autoplan` review discipline"));
         assert!(prompt.contains("CEO -> Design"));
+        assert!(prompt.contains("Never emit the absolute repository-root path"));
+        assert!(prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(prompt.contains(
             "Classify important planning decisions as `Mechanical`, `Taste`, or `User Challenge`"
         ));
@@ -3026,6 +3439,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(corpus_prompt.contains(
             "Every numbered plan under `/tmp/repo/genesis/plans/` must be a full ExecPlan"
         ));
+        assert!(corpus_prompt.contains("Reject or rewrite any absolute repo-root path"));
+        assert!(corpus_prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(corpus_prompt.contains("# Codex Corpus Review"));
 
         let generation_prompt = build_generation_codex_review_prompt(
@@ -3039,10 +3454,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(generation_prompt.contains("outside-voice review step for `auto gen`"));
         assert!(generation_prompt.contains("Do NOT read or execute any SKILL.md files"));
         assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
-        assert!(
-            generation_prompt
-                .contains("The generator will sync reviewed outputs to the root after your pass")
-        );
+        assert!(generation_prompt
+            .contains("The generator will sync reviewed outputs to the root after your pass"));
         assert!(generation_prompt.contains("Run review phases in order: CEO, Design"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
@@ -3065,11 +3478,36 @@ Spec: `specs/050426-deterministic-transcripts.md`
             },
         );
 
-        assert!(prompt.contains("Existing active planning surfaces"));
+        assert!(prompt.contains("Existing root planning surfaces"));
         assert!(prompt.contains("Do not create a second active master plan"));
-        assert!(prompt.contains("subordinate reconciliations"));
+        assert!(prompt.contains("repo-root instruction files such as `AGENTS.md`"));
         assert!(prompt.contains("Reference repositories to inspect as required input"));
         assert!(prompt.contains("Mandatory reference repo: `/tmp/bitino`"));
+    }
+
+    #[test]
+    fn corpus_prompt_with_only_root_standard_does_not_force_root_control_plane() {
+        let prompt = build_corpus_prompt(
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/genesis"),
+            CorpusPromptInputs {
+                previous_planning_snapshot: None,
+                parallelism: 4,
+                idea: None,
+                focus: None,
+                reference_repos: &[],
+                active_plan_surface: &ActivePlanSurface {
+                    root_plan_standard_path: Some("PLANS.md".to_string()),
+                    active_plan_paths: vec![],
+                },
+            },
+        );
+
+        assert!(prompt.contains("Root ExecPlan standard: `PLANS.md`"));
+        assert!(prompt.contains("Do not infer from `PLANS.md` alone"));
+        assert!(prompt.contains(
+            "determine whether a different planning root such as `genesis` is explicitly designated as active"
+        ));
     }
 
     #[test]
@@ -3215,6 +3653,120 @@ This is too high level to guide a novice implementation.
             .expect_err("expected old high-level plan shape to be rejected");
 
         assert!(error.to_string().contains("Purpose / Big Picture"));
+    }
+
+    #[test]
+    fn corpus_output_validator_ignores_non_numbered_plan_markdown() {
+        let repo_root = temp_dir("corpus-plan-readme");
+        let planning_root = repo_root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        fs::write(planning_root.join("ASSESSMENT.md"), "# Assessment\n").unwrap();
+        fs::write(planning_root.join("SPEC.md"), "# Spec\n").unwrap();
+        fs::write(
+            planning_root.join("PLANS.md"),
+            "# Genesis Plan Index\n\nThis index points to generated numbered plans.\n",
+        )
+        .unwrap();
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            "# Report\n\nThe corpus is ready.\n",
+        )
+        .unwrap();
+        fs::write(
+            plans_dir.join("README.md"),
+            "# Genesis Plans Directory\n\nThis directory indexes numbered execution plans.\n",
+        )
+        .unwrap();
+        fs::write(
+            plans_dir.join("001-example.md"),
+            r#"# Example Slice
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Do a thing.
+
+## Requirements Trace
+
+R1: Do a thing.
+
+## Scope Boundaries
+
+No runtime behavior changes.
+
+## Progress
+
+- [ ] Start.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep it small.
+  Rationale: Easier to verify.
+  Date/Author: 2026-04-13 / test
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+Look at `docs/example.md`.
+
+## Plan of Work
+
+Edit one file.
+
+## Implementation Units
+
+Unit 1.
+Goal: Do the thing.
+Requirements advanced: R1.
+Dependencies: none.
+Files to create or modify: `docs/example.md`.
+Tests to add or modify: add one focused test.
+Approach: change the file.
+Specific test scenarios: test the thing.
+
+## Concrete Steps
+
+    cargo test
+
+## Validation and Acceptance
+
+The test passes.
+
+## Idempotence and Recovery
+
+Rerun safely.
+
+## Artifacts and Notes
+
+No notes.
+
+## Interfaces and Dependencies
+
+No external dependencies.
+"#,
+        )
+        .unwrap();
+
+        let summary = verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface::default(),
+        )
+        .expect("directory README should not be validated as an ExecPlan");
+
+        assert_eq!(summary.plan_count, 1);
     }
 
     #[test]
@@ -3366,6 +3918,131 @@ No external dependencies.
     }
 
     #[test]
+    fn corpus_repo_root_sanitizer_rewrites_absolute_repo_paths_before_verify() {
+        let repo_root = temp_dir("corpus-sanitize");
+        let planning_root = repo_root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+
+        fs::write(planning_root.join("ASSESSMENT.md"), "# Assessment\n").unwrap();
+        fs::write(planning_root.join("SPEC.md"), "# Spec\n").unwrap();
+        fs::write(
+            planning_root.join("PLANS.md"),
+            "# Genesis Plan Index\n\nThis index is the active planning surface.\n",
+        )
+        .unwrap();
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            format!(
+                "# Report\n\nWork from `{}` starts here.\n",
+                repo_root.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            plans_dir.join("001-example.md"),
+            format!(
+                r#"# Example Slice
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Do a thing from `{repo_root}`.
+
+## Requirements Trace
+
+R1: Do a thing.
+
+## Scope Boundaries
+
+No runtime behavior changes.
+
+## Progress
+
+- [ ] Start.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep it small.
+  Rationale: Easier to verify.
+  Date/Author: 2026-04-11 / test
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+Look at `<repo-root>/docs/example.md`.
+
+## Plan of Work
+
+Edit one file.
+
+## Implementation Units
+
+Unit 1.
+Goal: Do the thing.
+Requirements advanced: R1.
+Dependencies: none.
+Files to create or modify: `docs/example.md`.
+Tests to add or modify: add one focused test.
+Approach: change the file.
+Specific test scenarios: test the thing.
+
+## Concrete Steps
+
+    cd {repo_root}
+    cargo test
+
+## Validation and Acceptance
+
+The test passes.
+
+## Idempotence and Recovery
+
+Rerun safely.
+
+## Artifacts and Notes
+
+No notes.
+
+## Interfaces and Dependencies
+
+No external dependencies.
+"#,
+                repo_root = repo_root.display()
+            ),
+        )
+        .unwrap();
+
+        sanitize_corpus_repo_root_paths(&repo_root, &planning_root).unwrap();
+
+        let plan = fs::read_to_string(plans_dir.join("001-example.md")).unwrap();
+        assert!(plan.contains("cd \"$(git rev-parse --show-toplevel)\""));
+        assert!(!plan.contains(&repo_root.display().to_string()));
+
+        let report = fs::read_to_string(planning_root.join("GENESIS-REPORT.md")).unwrap();
+        assert!(!report.contains(&repo_root.display().to_string()));
+        assert!(report.contains("the repository root"));
+
+        verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface::default(),
+        )
+        .expect("sanitized corpus should verify successfully");
+    }
+
+    #[test]
     fn implementation_plan_prompt_requires_checkpoint_tasks_and_prove_it_verification() {
         let prompt = build_implementation_plan_prompt(
             GenerationMode::Gen,
@@ -3382,6 +4059,35 @@ No external dependencies.
         assert!(prompt.contains("failing test or repro first"));
         assert!(prompt.contains("generated spec paths listed for this run"));
         assert!(prompt.contains("verify every exact current-state fact"));
+        assert!(prompt.contains("must be exactly `XS`, `S`, or `M`"));
+        assert!(prompt.contains("decompose it into dependency-ordered child tasks yourself"));
+        assert!(prompt.contains("No unfinished task may list more than five required tests"));
+        assert!(prompt.contains("must include a concrete test-name/filter token"));
+        assert!(prompt.contains("must name concrete path-like owners"));
+        assert!(prompt.contains("must also be encoded in the task's `Dependencies:` field"));
+    }
+
+    #[test]
+    fn implementation_plan_prompt_requires_full_follow_on_task_contracts() {
+        let prompt = build_implementation_plan_prompt(
+            GenerationMode::Gen,
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/repo/gen-123"),
+            &[generated_spec(
+                "workspace-build-system",
+                "# Specification: Workspace Build System\n",
+            )],
+            4,
+        );
+
+        assert!(
+            prompt.contains("Every unfinished task in `## Priority Work` and `## Follow-On Work`")
+        );
+        assert!(
+            prompt.contains("even when it is deferred, gated, research-shaped, or lower priority")
+        );
+        assert!(prompt.contains("`## Follow-On Work` is not a shorthand backlog"));
+        assert!(prompt.contains("Do not create compact follow-on rows"));
     }
 
     #[test]
@@ -3422,6 +4128,127 @@ No external dependencies.
             verify_generated_implementation_plan(&root).expect_err("expected missing spec failure");
 
         assert!(error.to_string().contains("references missing spec"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_large_active_scope() {
+        let root = temp_dir("large-scope");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace("Estimated scope: S", "Estimated scope: L");
+        write_generated_plan(&root, &task);
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected scope failure");
+
+        assert!(error.to_string().contains("Estimated scope: XS"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_decomposition_placeholders() {
+        let root = temp_dir("decomposition-placeholder");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Scope boundary: docs only",
+            "Scope boundary: decomposition required before implementation",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected decomposition placeholder failure");
+
+        assert!(error.to_string().contains("must be decomposed by auto gen"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_required_tests_see_spec() {
+        let root = temp_dir("required-tests-see-spec");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `exact_docs_test`",
+            "Required tests: See spec",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected required-tests placeholder failure");
+
+        assert!(error.to_string().contains("vague `Required tests:`"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_more_than_five_required_tests() {
+        let root = temp_dir("too-many-required-tests");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `exact_docs_test`",
+            "Required tests:\n    - `t1`\n    - `t2`\n    - `t3`\n    - `t4`\n    - `t5`\n    - `t6`",
+        );
+        write_generated_plan(&root, &task);
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected test count failure");
+
+        assert!(error.to_string().contains("at most five"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_broad_workspace_verification() {
+        let root = temp_dir("broad-workspace-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    cargo test --workspace",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected broad verification failure");
+
+        assert!(error.to_string().contains("broad verification"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_package_wide_cargo_test_verification() {
+        let root = temp_dir("package-wide-cargo-test-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    cargo test -p barely-human --lib",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected package-wide cargo test failure");
+
+        assert!(error.to_string().contains("package-wide cargo test"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_vague_ownership() {
+        let root = temp_dir("vague-ownership");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace("Owns: docs", "Owns: missing/TBD");
+        write_generated_plan(&root, &task);
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected ownership failure");
+
+        assert!(error.to_string().contains("vague `Owns:`"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_prose_only_dependency_gates() {
+        let root = temp_dir("prose-only-gate");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Scope boundary: docs only",
+            "Scope boundary: docs only; expansion-gated until `P-999` lands.",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root).expect_err("expected gate failure");
+
+        assert!(error.to_string().contains("omits it from `Dependencies:`"));
     }
 
     #[test]

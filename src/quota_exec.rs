@@ -186,8 +186,7 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
 
 fn acquire_provider_lock(provider: Provider) -> Result<fd_lock::RwLock<fs::File>> {
     let lock_path = QuotaConfig::config_dir().join(format!("swap-{}.lock", provider.label()));
-    fs::create_dir_all(QuotaConfig::config_dir())
-        .context("failed to create quota config dir")?;
+    fs::create_dir_all(QuotaConfig::config_dir()).context("failed to create quota config dir")?;
 
     let file = fs::OpenOptions::new()
         .create(true)
@@ -245,9 +244,7 @@ where
         let mut guard = {
             let mut lock = acquire_provider_lock(provider)?;
             let _write = lock.try_write().map_err(|_| {
-                anyhow::anyhow!(
-                    "another {provider} quota-router instance is swapping credentials"
-                )
+                anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
             })?;
             swap_credentials(provider, &profile_dir)?
         };
@@ -258,9 +255,7 @@ where
         {
             let mut lock = acquire_provider_lock(provider)?;
             let _write = lock.write().map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to acquire {provider} lock for credential restore: {e}"
-                )
+                anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
             })?;
             guard.disarm();
             drop(guard);
@@ -274,11 +269,21 @@ where
 
                 match verdict {
                     QuotaVerdict::Exhausted => {
+                        state.mark_exhausted(&account_name, Utc::now());
+                        if quota_output_has_agent_progress(&stderr_text) {
+                            eprintln!(
+                                "[quota-router] account '{account_name}' quota exhausted after the worker made progress; not restarting the task on another account"
+                            );
+                            state.save()?;
+                            return Ok(QuotaExecResult {
+                                exit_status: status,
+                                stderr_text,
+                            });
+                        }
                         eprintln!(
                             "[quota-router] account '{account_name}' quota exhausted, \
                              trying next..."
                         );
-                        state.mark_exhausted(&account_name, Utc::now());
                         state.save()?;
                         continue;
                     }
@@ -306,6 +311,16 @@ where
         "all {provider} accounts exhausted after {max_attempts} attempts. \
          Run `auto quota reset` to force-clear."
     );
+}
+
+fn quota_output_has_agent_progress(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("agent-progress-detected=true")
+        || lower.contains("tokens used")
+        || lower.contains("\nexec\n")
+        || lower.contains("\napply_patch")
+        || lower.contains("patch applied")
+        || lower.contains("files changed")
 }
 
 fn restore_credentials(provider: Provider) -> Result<()> {
@@ -364,9 +379,7 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
     let mut restore_guard = {
         let mut lock = acquire_provider_lock(provider)?;
         let _write = lock.try_write().map_err(|_| {
-            anyhow::anyhow!(
-                "another {provider} quota-router instance is swapping credentials"
-            )
+            anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
         })?;
         swap_credentials(provider, &profile_dir)?
     };
@@ -453,9 +466,7 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 
     let mut lock = acquire_provider_lock(provider)?;
     let _lock_guard = lock.try_write().map_err(|_| {
-        anyhow::anyhow!(
-            "another {provider} quota-router instance is swapping credentials"
-        )
+        anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
     })?;
     copy_profile_to_active_auth(provider, &profile_dir)?;
 
@@ -466,4 +477,23 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
         "[quota-router] primary {provider} account set to '{selected_name}'; active account is '{account_name}'"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quota_output_has_agent_progress;
+
+    #[test]
+    fn detects_progress_sentinel_before_quota_failure() {
+        assert!(quota_output_has_agent_progress(
+            "[auto-loop] agent-progress-detected=true\nError: rate limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn immediate_quota_error_is_not_progress() {
+        assert!(!quota_output_has_agent_progress(
+            "Error: rate limit exceeded for this organization"
+        ));
+    }
 }

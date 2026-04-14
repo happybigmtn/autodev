@@ -3,21 +3,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
-use crate::BugArgs;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
-use crate::pi_backend::{PiProvider, parse_pi_error, resolve_pi_bin};
+use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
     sync_branch_with_remote, timestamp_slug, truncate_file_to_max_bytes,
 };
+use crate::BugArgs;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
@@ -197,9 +197,21 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     println!("repo root:   {}", repo_root.display());
     println!("output dir:  {}", output_dir.display());
     println!("chunks:      {}", chunks.len());
-    println!("finder:      {} ({})", finder.model, finder.effort);
-    println!("skeptic:     {} ({})", skeptic.model, skeptic.effort);
-    println!("reviewer:    {} ({})", reviewer.model, reviewer.effort);
+    println!(
+        "finder:      {} ({})",
+        display_phase_model(&finder),
+        finder.effort
+    );
+    println!(
+        "skeptic:     {} ({})",
+        display_phase_model(&skeptic),
+        skeptic.effort
+    );
+    println!(
+        "reviewer:    {} ({})",
+        display_phase_model(&reviewer),
+        reviewer.effort
+    );
     println!("implementer: {} ({})", fixer.model, fixer.effort);
     if !current_branch.is_empty() {
         println!("branch:      {}", current_branch);
@@ -837,6 +849,12 @@ fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) ->
         reasoning_effort: effort.to_string(),
         codex_bin: codex_bin.to_path_buf(),
     }
+}
+
+fn display_phase_model(config: &PhaseConfig) -> String {
+    PiProvider::detect(&config.model)
+        .map(|provider| provider.resolve_model(&config.model, DEFAULT_CODEX_MODEL))
+        .unwrap_or_else(|| config.model.clone())
 }
 
 fn ensure_code_writer_config(label: &str, config: &PhaseConfig) -> Result<()> {
@@ -2445,7 +2463,11 @@ trait EmptyFallback {
 
 impl EmptyFallback for str {
     fn if_empty_then<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() { fallback } else { self }
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
     }
 }
 
@@ -2459,10 +2481,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict, build_fix_prompt,
-        collect_repo_chunks, escape_unescaped_quotes_in_json_strings, load_json_file,
-        repair_llm_json, run_backend_prompt, should_audit_path, slugify,
-        validate_accepted_findings,
+        build_fix_prompt, collect_repo_chunks, escape_unescaped_quotes_in_json_strings,
+        load_json_file, repair_llm_json, run_backend_prompt, should_audit_path, slugify,
+        validate_accepted_findings, AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
 
@@ -2588,11 +2609,9 @@ mod tests {
         let parsed = serde_json::from_str::<Vec<SkepticVerdict>>(&repaired)
             .expect("repaired JSON should parse");
         assert_eq!(parsed.len(), 1);
-        assert!(
-            parsed[0]
-                .counter_argument
-                .contains("\"message\":\"bitino-house live funding*")
-        );
+        assert!(parsed[0]
+            .counter_argument
+            .contains("\"message\":\"bitino-house live funding*"));
     }
 
     #[test]
@@ -2705,7 +2724,7 @@ mod tests {
 
         let backend = LlmBackend::Pi {
             provider_label: "pi-kimi",
-            model: "kimi-coding/k2p5".to_string(),
+            model: "kimi-coding/k2p6".to_string(),
             thinking: "high".to_string(),
             pi_bin: fake_pi,
         };

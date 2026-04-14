@@ -89,8 +89,8 @@ What it reads:
 
 - The live repository
 - Existing `genesis/` only as optional historical context
-- Existing active root planning surfaces such as `PLANS.md` and `plans/*.md`
-  as first-class control-plane inputs when they exist
+- Existing planning standards and control docs such as `PLANS.md`,
+  `plans/*.md`, `AGENTS.md`, and `CLAUDE.md`
 
 What it writes:
 
@@ -109,8 +109,10 @@ What it actually does:
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
 - Reviews the repo as the primary truth source
-- Reconciles against any already-active root planning surface instead of
-  quietly creating a second master plan inside `genesis/`
+- Determines the active planning surface from the repo's own instructions and
+  control docs instead of assuming root-level primacy from filenames alone
+- Reconciles against any already-active planning surface instead of quietly
+  creating a second master plan inside `genesis/`
 - Uses the repo's real agent-instruction convention in generated docs and plans; for Codex-first
   repos that means `AGENTS.md`, regardless of which planning model ran `auto corpus`
 - When `--focus "..."` is supplied, writes the normalized steering brief to `genesis/FOCUS.md`
@@ -327,8 +329,8 @@ What it actually does:
 Default model layout:
 
 - finder: MiniMax `minimax/MiniMax-M2.7-highspeed` with `high`
-- skeptic: Kimi with `high`
-- reviewer: Kimi with `high`
+- skeptic: Kimi `kimi-coding/k2p6` with `high`
+- reviewer: Kimi `kimi-coding/k2p6` with `high`
 - implementer: `gpt-5.4` with `high`
 
 Safety behavior:
@@ -403,9 +405,9 @@ Important rule:
 Backend selection:
 
 - Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
-- Final reviewer default: PI with `kimi-coding/k2p5` and `high`
+- Final reviewer default: PI with `kimi-coding/k2p6` and `high`
 - Final implementer default: Codex `gpt-5.4` with `high`
-- `--kimi` switches the draft pass to Kimi
+- `--kimi` switches the draft pass to the current Kimi coding model
 - `--minimax` switches the draft pass to MiniMax
 - `--model kimi` and `--model minimax` do the same through the generic model flag
 - `--reviewer-model` and `--reviewer-effort` override the final synthesis pass
@@ -471,7 +473,8 @@ Useful subcommands:
 
 Purpose:
 
-- Run the single-worker implementation loop against the repo’s live execution queue
+- Run the implementation loop against the repo’s live execution queue, either with one worker or
+  with isolated parallel tmux lanes
 
 What it reads:
 
@@ -488,7 +491,7 @@ What it writes:
 - `COMPLETED.md`
 - `WORKLIST.md` when useful out-of-scope follow-ups are found
 - `AGENTS.md` only when operational run/build knowledge improves
-- logs under `.auto/loop/` and `.auto/logs/`
+- logs, parallel bucket plans, worker state, and tmux run files under `.auto/loop/` and `.auto/logs/`
 
 What it actually does:
 
@@ -497,6 +500,13 @@ What it actually does:
   local branch does not fail only at push time
 - Reads the next pending `- [ ]` task from the top of the plan
 - Treats `- [!]` tasks in `IMPLEMENTATION_PLAN.md` as blocked and skips them during task selection
+- With `--threads <n>`, writes a stable `.auto/loop/parallel-buckets.md` assignment before work
+  starts, launches one tmux window per lane, and replenishes each idle lane independently when its
+  next bucketed task is dependency-ready
+- Writes `.auto/loop/state.json` as the live run snapshot for lane status, active task ids, worktree
+  paths, completed tasks, failed tasks, and drain state
+- Stops launching new parallel work when `.auto/loop/drain` exists or when `--drain-after-current-wave`
+  is set, while still letting active lanes finish and integrate
 - Auto-discovers sibling git repos under the same parent directory and treats them as valid
   implementation surfaces when the task contract points there
 - Merges any `--reference-repo <dir>` entries on top of that default sibling repo set
@@ -518,6 +528,8 @@ What it actually does:
   iteration, instead of pretending nothing happened
 - Rebases onto `origin/<branch>` again before each push so direct-to-primary-branch loops tolerate
   remote fast-forwards instead of dying with a raw non-fast-forward error
+- Routes quota-limited Codex/Claude executions through configured accounts, but does not restart a
+  parallel task on another account after tmux output proves the worker already made progress
 
 Default branch resolution:
 
@@ -535,6 +547,10 @@ When to run it:
 Useful flags:
 
 - `--max-iterations <n>` to stop after a fixed number of completed task iterations
+- `--threads <n>` to run up to `n` isolated implementation lanes with stable bucket assignment
+- `--cargo-build-jobs <n>` to cap each worker’s nested Cargo build fanout
+- `--drain-after-current-wave` to launch the first ready parallel dispatch set, integrate it, then
+  stop without replenishing lanes
 - `--reference-repo <dir>` to add an external repo beyond the auto-discovered sibling repo set
 - `--prompt-file <path>` to override the loop prompt
 - `--branch <name>` to lock the loop to a specific branch

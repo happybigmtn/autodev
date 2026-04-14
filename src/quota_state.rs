@@ -38,17 +38,14 @@ impl QuotaState {
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     pub(crate) fn save(&self) -> Result<()> {
         let path = Self::state_path();
         let dir = QuotaConfig::config_dir();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        let text = serde_json::to_string_pretty(self)
-            .context("failed to serialize quota state")?;
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let text = serde_json::to_string_pretty(self).context("failed to serialize quota state")?;
         fs::write(&path, text.as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))
     }

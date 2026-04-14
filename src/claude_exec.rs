@@ -20,22 +20,50 @@ pub(crate) async fn run_claude_exec(
     stderr_log_path: &Path,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
+    run_claude_exec_with_env(
+        repo_root,
+        full_prompt,
+        max_turns,
+        stderr_log_path,
+        context_label,
+        &[],
+    )
+    .await
+}
+
+pub(crate) async fn run_claude_exec_with_env(
+    repo_root: &Path,
+    full_prompt: &str,
+    max_turns: Option<usize>,
+    stderr_log_path: &Path,
+    context_label: &str,
+    extra_env: &[(String, String)],
+) -> Result<std::process::ExitStatus> {
     let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Claude) {
         let repo_root = repo_root.to_owned();
         let full_prompt = full_prompt.to_owned();
         let context_label = context_label.to_owned();
+        let extra_env = extra_env.to_vec();
         let result = quota_exec::run_with_quota(Provider::Claude, move || {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
             let context_label = context_label.clone();
+            let extra_env = extra_env.clone();
             async move {
-                spawn_claude(&repo_root, &full_prompt, max_turns, &context_label).await
+                spawn_claude(
+                    &repo_root,
+                    &full_prompt,
+                    max_turns,
+                    &context_label,
+                    &extra_env,
+                )
+                .await
             }
         })
         .await?;
         (result.exit_status, result.stderr_text)
     } else {
-        spawn_claude(repo_root, full_prompt, max_turns, context_label).await?
+        spawn_claude(repo_root, full_prompt, max_turns, context_label, extra_env).await?
     };
     log_stderr(&stderr_text, stderr_log_path)?;
     Ok(status)
@@ -48,6 +76,7 @@ async fn spawn_claude(
     full_prompt: &str,
     max_turns: Option<usize>,
     context_label: &str,
+    extra_env: &[(String, String)],
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new("claude");
     command
@@ -64,6 +93,9 @@ async fn spawn_claude(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(repo_root);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
 
     let mut child = command
         .spawn()
@@ -89,9 +121,10 @@ async fn spawn_claude(
         .with_context(|| format!("Claude stderr should be piped for {context_label}"))?;
 
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
-    let stdout_task = tokio::spawn(async move {
-        codex_stream::stream_claude_output(stdout, Some(futility_tx)).await
-    });
+    let stdout_task =
+        tokio::spawn(
+            async move { codex_stream::stream_claude_output(stdout, Some(futility_tx)).await },
+        );
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = tokio::select! {

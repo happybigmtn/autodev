@@ -82,25 +82,37 @@ mod tests {
     #[test]
     fn detects_codex_rate_limit() {
         let stderr = "Error: rate limit exceeded for this organization";
-        assert_eq!(check_stderr(Provider::Codex, stderr), QuotaVerdict::Exhausted);
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::Exhausted
+        );
     }
 
     #[test]
     fn detects_codex_429() {
         let stderr = "HTTP 429: Too Many Requests";
-        assert_eq!(check_stderr(Provider::Codex, stderr), QuotaVerdict::Exhausted);
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::Exhausted
+        );
     }
 
     #[test]
     fn detects_claude_quota() {
         let stderr = "Error: quota exceeded, please try again later";
-        assert_eq!(check_stderr(Provider::Claude, stderr), QuotaVerdict::Exhausted);
+        assert_eq!(
+            check_stderr(Provider::Claude, stderr),
+            QuotaVerdict::Exhausted
+        );
     }
 
     #[test]
     fn generic_error_not_quota() {
         let stderr = "Error: connection refused";
-        assert_eq!(check_stderr(Provider::Codex, stderr), QuotaVerdict::OtherError);
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::OtherError
+        );
     }
 
     #[test]
@@ -113,6 +125,9 @@ mod tests {
     fn partial_match_no_false_positive() {
         let stderr = "Setting rate to unlimited mode";
         // "rate" alone doesn't match "rate.?limit.?exceeded"
-        assert_eq!(check_stderr(Provider::Codex, stderr), QuotaVerdict::OtherError);
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::OtherError
+        );
     }
 }
