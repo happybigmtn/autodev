@@ -478,7 +478,7 @@ Purpose:
 
 What it reads:
 
-- `AGENTS.md`
+- the essential build / validation / staging rules from `AGENTS.md`
 - `specs/*`
 - `IMPLEMENTATION_PLAN.md`
 - sibling git repos under the same parent directory, plus any extra repos passed via
@@ -520,6 +520,9 @@ What it actually does:
 - Runs a bounded simplification pass on touched code before commit when it improves clarity without
   widening scope
 - Runs the verification steps required by the task
+- Prefers task-scoped and affected-surface validation over workspace-wide or package-wide sweeps
+- Does not default to broad workspace validation; it only runs broad suites when the current task
+  explicitly requires them or when the repo offers no narrower truthful proof
 - Removes finished tasks from `IMPLEMENTATION_PLAN.md`
 - Appends a completion record to `COMPLETED.md`
 - Commits and pushes truthful increments to the allowed branch

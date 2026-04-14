@@ -60,7 +60,7 @@ Repo-specific direct `REVIEW.md` handoff:
   when they changed. Do not create or stage `COMPLETED.md`, `WORKLIST.md`, or
   `ARCHIVED.md`."#;
 
-pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
+pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Read only the minimum `AGENTS.md` content needed for repo-specific build, narrow validation, staging, and branch rules. Do not pull unrelated operational commentary into your working context unless the current task actually touches it.
 0b. Study `IMPLEMENTATION_PLAN.md` and identify the first pending task marked `- [ ]` whose explicit dependencies are already satisfied. Treat tasks marked `- [!]` as blocked and skip them unless they are later unblocked.
 0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
 0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
@@ -107,7 +107,8 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
    - Do not sweep unrelated pre-existing churn into the commit.
    - If you touch multiple repositories, commit and push each repository separately. Never try to mix files from different git repos into one commit.
    - Commit with a message like `repo-name: TASK-ID short description` using the actual repository name for each touched repo.
-   - Before committing, rerun the task's direct proof plus the strongest broad regression commands this repo honestly supports.
+   - Before committing, rerun the task's direct proof plus only the narrow additional regression commands explicitly required by the task contract or needed for the touched surfaces.
+   - Do not default to workspace-wide or package-wide validation suites. Run them only when the current task explicitly names them or there is no narrower truthful proof.
    - After committing, run `git status` in every touched repo to verify no implementation files were left unstaged. If any were, amend the relevant commit.
    - Push the queue repo directly to `origin/{branch}` after the commit. For additional listed repos, push the currently checked-out branch unless that repo's own instructions require something else.
 
@@ -2273,6 +2274,7 @@ mod tests {
         assert!(prompt.contains("origin/trunk"));
         assert!(prompt.contains("branch `trunk`"));
         assert!(!prompt.contains("origin/main"));
+        assert!(prompt.contains("Read only the minimum `AGENTS.md` content needed"));
         assert!(prompt.contains("RED/GREEN/REFACTOR"));
         assert!(prompt.contains("failing test"));
         assert!(prompt.contains("simplification pass"));
@@ -2280,6 +2282,7 @@ mod tests {
         assert!(prompt.contains("historical context only"));
         assert!(prompt.contains("Treat tasks marked `- [!]` as blocked"));
         assert!(prompt.contains("next pending `- [ ]` task"));
+        assert!(prompt.contains("Do not default to workspace-wide or package-wide validation suites"));
     }
 
     #[test]
