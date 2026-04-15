@@ -1,5 +1,4 @@
 use anyhow::{bail, Result};
-use chrono::Utc;
 
 use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
 use crate::quota_state::QuotaState;
@@ -40,14 +39,15 @@ pub(crate) async fn select_account<'a>(
         );
     }
 
-    let available: Vec<&AccountEntry> = candidates
-        .into_iter()
-        .filter(|a| !state.get(&a.name).exhausted)
-        .collect();
-
-    if available.is_empty() {
-        return Err(all_exhausted_error(config, state, provider));
-    }
+    let available = selectable_candidates(&candidates, state);
+    let available = if available.is_empty() {
+        eprintln!(
+            "[quota-router] every {provider} account is marked exhausted in local state; rechecking live usage before refusing to run"
+        );
+        candidates
+    } else {
+        available
+    };
 
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
         Vec::with_capacity(available.len());
@@ -68,6 +68,17 @@ pub(crate) async fn select_account<'a>(
     let selected = pick_best(&scored, state, config.selected_account_name(provider));
     log_selection(selected.entry, &scored);
     Ok(selected)
+}
+
+fn selectable_candidates<'a>(
+    candidates: &[&'a AccountEntry],
+    state: &QuotaState,
+) -> Vec<&'a AccountEntry> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|entry| !state.get(&entry.name).exhausted)
+        .collect()
 }
 
 /// Pure scoring logic, separated for testability.
@@ -227,33 +238,6 @@ fn log_selection(chosen: &AccountEntry, scored: &[(&AccountEntry, Option<Account
     }
 }
 
-fn all_exhausted_error(
-    config: &QuotaConfig,
-    state: &QuotaState,
-    provider: Provider,
-) -> anyhow::Error {
-    let all_accounts = config.accounts_for_provider(provider);
-    let soonest_recovery = all_accounts
-        .iter()
-        .filter_map(|a| state.get(&a.name).exhausted_at)
-        .min();
-
-    if let Some(earliest) = soonest_recovery {
-        let recovery = earliest + chrono::Duration::hours(1);
-        let wait = recovery.signed_duration_since(Utc::now());
-        let minutes = wait.num_minutes().max(0);
-        anyhow::anyhow!(
-            "all {provider} accounts exhausted. Earliest recovery in ~{minutes}m. \
-             Run `auto quota reset` to force-clear."
-        )
-    } else {
-        anyhow::anyhow!(
-            "all {provider} accounts exhausted. \
-             Run `auto quota reset` to force-clear."
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +265,19 @@ mod tests {
             weekly_resets_in_secs,
             limit_reached: false,
         }
+    }
+
+    #[test]
+    fn selectable_candidates_excludes_locally_exhausted_accounts() {
+        let a = make_account("healthy", Provider::Claude);
+        let b = make_account("cooling", Provider::Claude);
+        let mut state = QuotaState::default();
+        state.mark_exhausted("cooling", chrono::Utc::now());
+
+        let available = selectable_candidates(&[&a, &b], &state);
+
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].name, "healthy");
     }
 
     #[test]

@@ -22,6 +22,8 @@ fn codex_patterns() -> &'static [Regex] {
             r"(?i)too many requests",
             r"(?i)insufficient.?quota",
             r"(?i)usage.?limit.?reached",
+            r"(?i)hit your usage limit",
+            r"(?i)purchase more credits",
             r"(?i)exceeded.*rate.*limit",
             r"(?i)capacity.*limit",
             r"(?i)billing.*limit",
@@ -91,6 +93,15 @@ mod tests {
     #[test]
     fn detects_codex_429() {
         let stderr = "HTTP 429: Too Many Requests";
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn detects_codex_usage_limit_message() {
+        let stderr = "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Apr 16th, 2026 2:31 PM.";
         assert_eq!(
             check_stderr(Provider::Codex, stderr),
             QuotaVerdict::Exhausted

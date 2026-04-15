@@ -21,6 +21,7 @@ mod quota_usage;
 mod review_command;
 mod ship_command;
 mod state;
+mod symphony_command;
 mod util;
 
 use std::path::PathBuf;
@@ -68,12 +69,195 @@ enum Command {
     Nemesis(NemesisArgs),
     /// Manage quota-aware account multiplexing for Claude and Codex
     Quota(QuotaArgs),
+    /// Sync implementation-plan items into Linear and run the local Symphony runtime
+    Symphony(SymphonyArgs),
 }
 
 #[derive(Args, Clone)]
 struct QuotaArgs {
     #[command(subcommand)]
     command: QuotaSubcommand,
+}
+
+#[derive(Args, Clone)]
+struct SymphonyArgs {
+    #[command(subcommand)]
+    command: SymphonySubcommand,
+}
+
+#[derive(Subcommand, Clone)]
+enum SymphonySubcommand {
+    /// Sync unchecked implementation-plan items into a Linear project
+    Sync(SymphonySyncArgs),
+    /// Render a repo-specific Symphony WORKFLOW.md
+    Workflow(SymphonyWorkflowArgs),
+    /// Sync, render the workflow, then launch Symphony in the foreground
+    Run(SymphonyRunArgs),
+}
+
+#[derive(Args, Clone)]
+struct SymphonySyncArgs {
+    /// Repository root whose IMPLEMENTATION_PLAN.md should be synced. Defaults to the current git repo root.
+    #[arg(long)]
+    repo_root: Option<PathBuf>,
+
+    /// Linear project slug that should receive this repo's synced tasks. Defaults to the generated WORKFLOW.md after first setup.
+    #[arg(long)]
+    project_slug: Option<String>,
+
+    /// Linear state name used for newly created or reopened issues
+    #[arg(long, default_value = "Todo")]
+    todo_state: String,
+
+    /// Codex model used for sync planning analysis
+    #[arg(long, default_value = "gpt-5.4")]
+    planner_model: String,
+
+    /// Codex reasoning effort used for sync planning analysis
+    #[arg(long, default_value = "xhigh")]
+    planner_reasoning_effort: String,
+
+    /// Codex executable used for sync planning analysis
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Disable the Codex planner and fall back to deterministic dependency parsing only
+    #[arg(long)]
+    no_ai_planner: bool,
+}
+
+#[derive(Args, Clone)]
+struct SymphonyWorkflowArgs {
+    /// Repository root whose Symphony workflow should be rendered. Defaults to the current git repo root.
+    #[arg(long)]
+    repo_root: Option<PathBuf>,
+
+    /// Linear project slug used by Symphony for this repo. Defaults to the generated WORKFLOW.md after first setup.
+    #[arg(long)]
+    project_slug: Option<String>,
+
+    /// Output path for the generated WORKFLOW.md
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Root directory where Symphony should create per-issue workspaces for this repo
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
+
+    /// Branch that the generated workflow should treat as the integration branch
+    #[arg(long)]
+    base_branch: Option<String>,
+
+    /// Maximum concurrent Symphony agents for this repo
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_agents: usize,
+
+    /// Poll interval in milliseconds
+    #[arg(long, default_value_t = 5_000)]
+    poll_interval_ms: u64,
+
+    /// Model passed to Codex app-server through quota routing
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort passed to Codex app-server through quota routing
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Linear state name used when work begins
+    #[arg(long, default_value = "In Progress")]
+    in_progress_state: String,
+
+    /// Linear terminal state name used after successful landing
+    #[arg(long, default_value = "Done")]
+    done_state: String,
+
+    /// Optional non-active state name used when the worker encounters a true external blocker
+    #[arg(long)]
+    blocked_state: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct SymphonyRunArgs {
+    /// Repository root whose Symphony workflow should be rendered and run. Defaults to the current git repo root.
+    #[arg(long)]
+    repo_root: Option<PathBuf>,
+
+    /// Linear project slug used by Symphony for this repo. Defaults to the generated WORKFLOW.md after first setup.
+    #[arg(long)]
+    project_slug: Option<String>,
+
+    /// Output path for the generated WORKFLOW.md
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Root directory where Symphony should create per-issue workspaces for this repo
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
+
+    /// Branch that the generated workflow should treat as the integration branch
+    #[arg(long)]
+    base_branch: Option<String>,
+
+    /// Maximum concurrent Symphony agents for this repo
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_agents: usize,
+
+    /// Poll interval in milliseconds
+    #[arg(long, default_value_t = 5_000)]
+    poll_interval_ms: u64,
+
+    /// Model passed to Codex app-server through quota routing
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort passed to Codex app-server through quota routing
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Linear state name used for newly created or reopened issues
+    #[arg(long, default_value = "Todo")]
+    todo_state: String,
+
+    /// Codex model used for sync planning analysis
+    #[arg(long, default_value = "gpt-5.4")]
+    planner_model: String,
+
+    /// Codex reasoning effort used for sync planning analysis
+    #[arg(long, default_value = "xhigh")]
+    planner_reasoning_effort: String,
+
+    /// Codex executable used for sync planning analysis
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Disable the Codex planner and fall back to deterministic dependency parsing only
+    #[arg(long)]
+    no_ai_planner: bool,
+
+    /// Linear state name used when work begins
+    #[arg(long, default_value = "In Progress")]
+    in_progress_state: String,
+
+    /// Linear terminal state name used after successful landing
+    #[arg(long, default_value = "Done")]
+    done_state: String,
+
+    /// Optional non-active state name used when the worker encounters a true external blocker
+    #[arg(long)]
+    blocked_state: Option<String>,
+
+    /// Local Symphony Elixir root directory
+    #[arg(long, default_value = "/home/r/coding/symphony/elixir")]
+    symphony_root: PathBuf,
+
+    /// Directory where Symphony should write its own log files
+    #[arg(long)]
+    logs_root: Option<PathBuf>,
+
+    /// Optional Symphony dashboard port
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -340,17 +524,9 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     max_iterations: Option<usize>,
 
-    /// Maximum concurrent implementation workers. Values above 1 use isolated git worktrees.
-    #[arg(long, default_value_t = 1, alias = "jobs")]
-    threads: usize,
-
     /// Override CARGO_BUILD_JOBS for loop workers. Defaults to a conservative automatic cap.
     #[arg(long)]
     cargo_build_jobs: Option<usize>,
-
-    /// In parallel mode, launch the currently ready lanes once, integrate them, then stop.
-    #[arg(long)]
-    drain_after_current_wave: bool,
 
     /// Optional override for the worker prompt template
     #[arg(long)]
@@ -669,5 +845,6 @@ async fn main() -> Result<()> {
                 AccountsCommand::Capture(args) => quota_accounts::run_accounts_capture(&args.name),
             },
         },
+        Command::Symphony(args) => symphony_command::run_symphony(args).await,
     }
 }

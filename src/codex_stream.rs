@@ -74,6 +74,58 @@ where
     Ok(raw)
 }
 
+pub(crate) async fn capture_codex_output_with_heartbeat<R>(
+    stream: R,
+    heartbeat_label: &str,
+    heartbeat_secs: u64,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream).lines();
+    let mut raw = String::new();
+    let mut state = CodexRenderState::default();
+    let mut interval = time::interval(Duration::from_secs(heartbeat_secs.max(1)));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut saw_streamed_output = false;
+    let mut elapsed = 0u64;
+
+    loop {
+        tokio::select! {
+            line = reader.next_line() => {
+                let Some(line) = line.context("failed reading Codex JSON stream")? else {
+                    break;
+                };
+                raw.push_str(&line);
+                raw.push('\n');
+                let rendered = render_codex_stream_line(&line, &mut state);
+                if !rendered.is_empty() {
+                    saw_streamed_output = true;
+                    print!("{rendered}");
+                    let _ = io::stdout().flush();
+                }
+            }
+            _ = interval.tick() => {
+                elapsed += heartbeat_secs.max(1);
+                let message = if saw_streamed_output {
+                    format!("status: {heartbeat_label} still running ({elapsed}s elapsed)")
+                } else {
+                    format!(
+                        "status: {heartbeat_label} still running ({elapsed}s elapsed, waiting for streamed output)"
+                    )
+                };
+                let mut rendered = String::new();
+                push_styled_line(&mut rendered, &Style::new().dim(), message);
+                print!("{rendered}");
+                let _ = io::stdout().flush();
+            }
+        }
+    }
+
+    Ok(raw)
+}
+
 pub(crate) async fn stream_codex_output<R>(stream: R) -> Result<()>
 where
     R: AsyncRead + Unpin,

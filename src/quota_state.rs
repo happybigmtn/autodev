@@ -67,6 +67,8 @@ impl QuotaState {
 
     pub(crate) fn mark_success(&mut self, name: &str, now: DateTime<Utc>) {
         let state = self.accounts.entry(name.to_owned()).or_default();
+        state.exhausted = false;
+        state.exhausted_at = None;
         state.last_success = Some(now);
     }
 
@@ -160,5 +162,20 @@ mod tests {
         state.reset_all();
         assert!(!state.get("a").exhausted);
         assert!(!state.get("b").exhausted);
+    }
+
+    #[test]
+    fn mark_success_clears_exhaustion_state() {
+        let now = Utc::now();
+        let mut state = QuotaState::default();
+        state.mark_exhausted("test", now);
+        assert!(state.get("test").exhausted);
+
+        state.mark_success("test", now);
+
+        let account = state.get("test");
+        assert!(!account.exhausted);
+        assert!(account.exhausted_at.is_none());
+        assert_eq!(account.last_success, Some(now));
     }
 }

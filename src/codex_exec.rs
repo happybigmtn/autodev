@@ -118,6 +118,15 @@ pub(crate) async fn run_codex_exec_in_tmux_with_env(
         log_stderr(&stderr_text, stderr_log_path)?;
         return Ok(status);
     }
+    if tmux_worker_is_alive(&tmux.run_dir)? {
+        println!(
+            "tmux lane already running for {context_label}: tmux attach -t {}",
+            tmux.session_name
+        );
+        let (status, stderr_text) = wait_for_tmux_completion(&tmux.run_dir).await?;
+        log_stderr(&stderr_text, stderr_log_path)?;
+        return Ok(status);
+    }
 
     let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Codex) {
         let repo_root = repo_root.to_owned();
@@ -274,15 +283,12 @@ async fn spawn_codex_in_tmux(
     if status_path.exists() {
         remove_if_exists(&status_path)?;
     }
-    if let Some(pid) = read_pid(&pid_path)? {
-        if process_alive(pid) {
-            println!(
-                "tmux lane already running for {context_label}: tmux attach -t {}",
-                tmux.session_name
-            );
-            return wait_for_tmux_completion(&tmux.run_dir).await;
-        }
-        remove_if_exists(&pid_path)?;
+    if tmux_worker_is_alive(&tmux.run_dir)? {
+        println!(
+            "tmux lane already running for {context_label}: tmux attach -t {}",
+            tmux.session_name
+        );
+        return wait_for_tmux_completion(&tmux.run_dir).await;
     }
     remove_if_exists(&stdout_path)?;
     remove_if_exists(&stderr_path)?;
@@ -462,10 +468,23 @@ fn read_pid(path: &Path) -> Result<Option<u32>> {
     Ok(text.trim().parse::<u32>().ok())
 }
 
+fn tmux_worker_is_alive(run_dir: &Path) -> Result<bool> {
+    let pid_path = run_dir.join("pid");
+    if let Some(pid) = read_pid(&pid_path)? {
+        if process_alive(pid) {
+            return Ok(true);
+        }
+        remove_if_exists(&pid_path)?;
+    }
+    Ok(false)
+}
+
 fn process_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }

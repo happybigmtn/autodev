@@ -243,8 +243,8 @@ where
         // not during the entire child process execution.
         let mut guard = {
             let mut lock = acquire_provider_lock(provider)?;
-            let _write = lock.try_write().map_err(|_| {
-                anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
+            let _write = lock.write().map_err(|e| {
+                anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
             })?;
             swap_credentials(provider, &profile_dir)?
         };
@@ -270,18 +270,13 @@ where
                 match verdict {
                     QuotaVerdict::Exhausted => {
                         state.mark_exhausted(&account_name, Utc::now());
-                        if quota_output_has_agent_progress(&stderr_text) {
-                            eprintln!(
-                                "[quota-router] account '{account_name}' quota exhausted after the worker made progress; not restarting the task on another account"
-                            );
-                            state.save()?;
-                            return Ok(QuotaExecResult {
-                                exit_status: status,
-                                stderr_text,
-                            });
-                        }
+                        let progress_note = if quota_output_has_agent_progress(&stderr_text) {
+                            " after worker progress was detected"
+                        } else {
+                            ""
+                        };
                         eprintln!(
-                            "[quota-router] account '{account_name}' quota exhausted, \
+                            "[quota-router] account '{account_name}' quota exhausted{progress_note}, \
                              trying next..."
                         );
                         state.save()?;
@@ -378,8 +373,8 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
     // quota-routed commands (even same-provider) proceed concurrently.
     let mut restore_guard = {
         let mut lock = acquire_provider_lock(provider)?;
-        let _write = lock.try_write().map_err(|_| {
-            anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
+        let _write = lock.write().map_err(|e| {
+            anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
         })?;
         swap_credentials(provider, &profile_dir)?
     };
@@ -465,8 +460,8 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
     }
 
     let mut lock = acquire_provider_lock(provider)?;
-    let _lock_guard = lock.try_write().map_err(|_| {
-        anyhow::anyhow!("another {provider} quota-router instance is swapping credentials")
+    let _lock_guard = lock.write().map_err(|e| {
+        anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
     })?;
     copy_profile_to_active_auth(provider, &profile_dir)?;
 
