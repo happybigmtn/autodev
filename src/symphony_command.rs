@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -12,8 +11,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::oneshot;
-use tokio::time::{sleep, Duration};
 
 use crate::codex_stream::capture_codex_output_with_heartbeat;
 use crate::quota_config::Provider;
@@ -1119,6 +1116,56 @@ fn single_line_excerpt(value: Option<String>, max_chars: usize) -> String {
     normalized
 }
 
+fn task_field_excerpt(markdown: &str, field: &str, next_field: &str, max_chars: usize) -> String {
+    single_line_excerpt(task_field_body(markdown, field, next_field), max_chars)
+}
+
+fn render_issue_task_brief(task: &SymphonyTask) -> String {
+    let dependencies = if task.dependencies.is_empty() {
+        "none".to_string()
+    } else {
+        task.dependencies
+            .iter()
+            .map(|dependency| format!("`{dependency}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let why_now = single_line_excerpt(task_field_line_value(&task.markdown, "Why now:"), 260);
+    let owns = task_field_excerpt(&task.markdown, "Owns:", "Integration touchpoints:", 260);
+    let touchpoints = task_field_excerpt(
+        &task.markdown,
+        "Integration touchpoints:",
+        "Scope boundary:",
+        260,
+    );
+    let scope_boundary = task_field_excerpt(
+        &task.markdown,
+        "Scope boundary:",
+        "Acceptance criteria:",
+        260,
+    );
+    let acceptance =
+        task_field_excerpt(&task.markdown, "Acceptance criteria:", "Verification:", 260);
+    let verification = task_field_excerpt(&task.markdown, "Verification:", "Required tests:", 260);
+    let completion_signal = single_line_excerpt(
+        task_field_line_value(&task.markdown, "Completion signal:"),
+        260,
+    );
+    format!(
+        "## Task brief\n\
+- Explicit dependencies: {dependencies}\n\
+- Why now: {why_now}\n\
+- Owns: {owns}\n\
+- Integration touchpoints: {touchpoints}\n\
+- Scope boundary: {scope_boundary}\n\
+- Acceptance criteria: {acceptance}\n\
+- Verification: {verification}\n\
+- Completion signal: {completion_signal}\n\
+- Landing contract: complete only `{task_id}` in this workspace. If a small adjacent integration edit is required, keep it minimal and record it under `Scope exceptions:` in `REVIEW.md`.\n",
+        task_id = task.id
+    )
+}
+
 fn extract_agent_message_from_codex_stream(raw: &str) -> Option<String> {
     let mut last_message = None;
     for line in raw.lines() {
@@ -1396,16 +1443,18 @@ async fn render_workflow(args: SymphonyWorkflowArgs) -> Result<RenderedWorkflow>
 }
 
 async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
-    run_sync(SymphonySyncArgs {
-        repo_root: args.repo_root.clone(),
-        project_slug: args.project_slug.clone(),
-        todo_state: args.todo_state.clone(),
-        planner_model: args.planner_model.clone(),
-        planner_reasoning_effort: args.planner_reasoning_effort.clone(),
-        codex_bin: args.codex_bin.clone(),
-        no_ai_planner: args.no_ai_planner,
-    })
-    .await?;
+    if args.sync_first {
+        run_sync(SymphonySyncArgs {
+            repo_root: args.repo_root.clone(),
+            project_slug: args.project_slug.clone(),
+            todo_state: args.todo_state.clone(),
+            planner_model: args.planner_model.clone(),
+            planner_reasoning_effort: args.planner_reasoning_effort.clone(),
+            codex_bin: args.codex_bin.clone(),
+            no_ai_planner: args.no_ai_planner,
+        })
+        .await?;
+    }
 
     let rendered = render_workflow(SymphonyWorkflowArgs {
         repo_root: args.repo_root.clone(),
@@ -1439,7 +1488,11 @@ async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
     println!("workflow: {}", rendered.output_path.display());
     println!("logs root: {}", logs_root.display());
     println!("live log:  {}", live_log_path.display());
-    println!("tracking live Symphony log output below when available...");
+    if args.sync_first {
+        println!("sync:      completed before launch");
+    } else {
+        println!("sync:      skipped (use --sync-first to refresh Linear issues first)");
+    }
 
     let mut command = TokioCommand::new(&symphony_bin);
     command
@@ -1457,78 +1510,15 @@ async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch Symphony from {}", symphony_bin.display()))?;
-    let (stop_log_tx, stop_log_rx) = oneshot::channel();
-    let log_path_for_task = live_log_path.clone();
-    let log_task = tokio::spawn(async move {
-        if let Err(err) = stream_symphony_log(log_path_for_task, stop_log_rx).await {
-            eprintln!("warning: failed to stream Symphony log output: {err:#}");
-        }
-    });
     let status = child.wait().await.with_context(|| {
         format!(
             "failed waiting for Symphony process from {}",
             symphony_bin.display()
         )
     })?;
-    let _ = stop_log_tx.send(());
-    let _ = log_task.await;
     if !status.success() {
         bail!("Symphony exited with status {status}");
     }
-    Ok(())
-}
-
-async fn stream_symphony_log(log_path: PathBuf, mut stop: oneshot::Receiver<()>) -> Result<()> {
-    let mut offset = 0usize;
-    let mut announced_wait = false;
-    let mut announced_follow = false;
-
-    loop {
-        tokio::select! {
-            _ = &mut stop => {
-                flush_symphony_log_delta(&log_path, &mut offset, &mut announced_follow)?;
-                break;
-            }
-            _ = sleep(Duration::from_secs(1)) => {
-                if log_path.is_file() {
-                    flush_symphony_log_delta(&log_path, &mut offset, &mut announced_follow)?;
-                } else if !announced_wait {
-                    println!("waiting for Symphony log file at {} ...", log_path.display());
-                    announced_wait = true;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn flush_symphony_log_delta(
-    log_path: &Path,
-    offset: &mut usize,
-    announced_follow: &mut bool,
-) -> Result<()> {
-    let bytes = match fs::read(log_path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", log_path.display()));
-        }
-    };
-    if !*announced_follow {
-        println!("following Symphony log: {}", log_path.display());
-        *announced_follow = true;
-    }
-    if bytes.len() < *offset {
-        *offset = 0;
-    }
-    if bytes.len() == *offset {
-        return Ok(());
-    }
-    let delta = &bytes[*offset..];
-    print!("{}", String::from_utf8_lossy(delta));
-    let _ = io::stdout().flush();
-    *offset = bytes.len();
     Ok(())
 }
 
@@ -1592,12 +1582,14 @@ fn unquote_yamlish_scalar(value: &str) -> String {
     value
         .strip_prefix('"')
         .and_then(|trimmed| trimmed.strip_suffix('"'))
+        .map(|trimmed| trimmed.replace("\\\"", "\""))
         .or_else(|| {
             value
                 .strip_prefix('\'')
                 .and_then(|trimmed| trimmed.strip_suffix('\''))
+                .map(|trimmed| trimmed.replace("''", "'"))
         })
-        .unwrap_or(value)
+        .unwrap_or_else(|| value.to_string())
         .trim()
         .to_string()
 }
@@ -1759,18 +1751,21 @@ fn render_issue_title(task: &SymphonyTask) -> String {
 
 fn render_issue_description(repo_root: &Path, task: &SymphonyTask) -> String {
     let base_branch = resolve_base_branch(repo_root, None).unwrap_or_else(|_| "main".to_string());
+    let task_brief = render_issue_task_brief(task);
     format!(
         "{TASK_SENTINEL_PREFIX} repo={repo} task_id={task_id} base_branch={base_branch} -->\n\n\
 Repository: `{repo}`\n\
 Task ID: `{task_id}`\n\
 Base branch: `{base_branch}`\n\
 Synced from: `{plan_path}`\n\n\
+{task_brief}\n\
 This issue is auto-generated from the repository implementation plan. Re-run `auto symphony sync` to refresh the source-of-truth task body.\n\n\
 ---\n\n{markdown}\n",
         repo = repo_name(repo_root),
         task_id = task.id,
         base_branch = base_branch,
         plan_path = repo_root.join("IMPLEMENTATION_PLAN.md").display(),
+        task_brief = task_brief,
         markdown = task.markdown
     )
 }
@@ -1817,22 +1812,75 @@ struct WorkflowRenderSpec<'a> {
 }
 
 fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> String {
+    let shared_cargo_target_dir = shared_cargo_target_dir(spec.workspace_root);
+    let workspace_root_yaml = shell_safe_path(spec.workspace_root);
+    let shared_cargo_target_dir_yaml = shell_safe_path(&shared_cargo_target_dir);
     let blocked_state_line = spec
         .blocked_state
         .map(|state| format!("- If you hit a true external blocker (missing auth/permissions/secrets), add one precise Linear comment and move the issue to `{state}` before stopping.\n"))
         .unwrap_or_else(|| "- If you hit a true external blocker (missing auth/permissions/secrets), add one precise Linear comment describing the blocker before stopping.\n".to_string());
+    let before_run_hook = [
+        "set -eu".to_string(),
+        format!("mkdir -p {}", shell_safe_path(&shared_cargo_target_dir)),
+        "if [ -f .git/info/exclude ]; then".to_string(),
+        "  if ! grep -qxF '/.cargo-target' .git/info/exclude; then printf '/.cargo-target\\n' >> .git/info/exclude; fi".to_string(),
+        "  if ! grep -qxF '/.cargo-target*' .git/info/exclude; then printf '/.cargo-target*\\n' >> .git/info/exclude; fi".to_string(),
+        "fi".to_string(),
+        "for stale_cargo_target in .cargo-target .cargo-target-*; do".to_string(),
+        "  if [ -e \"$stale_cargo_target\" ] || [ -L \"$stale_cargo_target\" ]; then".to_string(),
+        "    echo \"before_run: removing repo-local cargo target path $stale_cargo_target\"".to_string(),
+        "    rm -rf \"$stale_cargo_target\"".to_string(),
+        "  fi".to_string(),
+        "done".to_string(),
+        "ln -s ../.cargo-target .cargo-target".to_string(),
+        format!("git fetch origin {}", spec.base_branch),
+        format!("git checkout {}", spec.base_branch),
+        "if [ -d .githooks ]; then".to_string(),
+        "  git config core.hooksPath .githooks".to_string(),
+        "fi".to_string(),
+        format!("ahead_commits=$(git rev-list --count origin/{}..HEAD)", spec.base_branch),
+        "should_rebase=1".to_string(),
+        "if [ \"$ahead_commits\" -gt 0 ]; then".to_string(),
+        format!("  merge_base=$(git merge-base HEAD origin/{})", spec.base_branch),
+        "  echo \"before_run: found $ahead_commits unpushed local commit(s), restoring them to workspace changes before continuing\"".to_string(),
+        "  git reset --mixed \"$merge_base\"".to_string(),
+        "  should_rebase=0".to_string(),
+        "fi".to_string(),
+        "if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ] || [ -f .git/CHERRY_PICK_HEAD ]; then".to_string(),
+        "  echo \"before_run: unfinished git operation detected, preserving workspace state and skipping rebase sync\"".to_string(),
+        "  should_rebase=0".to_string(),
+        "fi".to_string(),
+        "if git ls-files --unmerged | grep -q .; then".to_string(),
+        "  echo \"before_run: unmerged index entries detected, preserving workspace state for repair\"".to_string(),
+        "  should_rebase=0".to_string(),
+        "fi".to_string(),
+        "if ! git diff --quiet || ! git diff --cached --quiet; then".to_string(),
+        "  echo \"before_run: dirty worktree, skipping rebase sync to preserve local changes\""
+            .to_string(),
+        "  should_rebase=0".to_string(),
+        "fi".to_string(),
+        "if [ \"$should_rebase\" -eq 1 ]; then".to_string(),
+        format!("  git pull --rebase origin {}", spec.base_branch),
+        "fi".to_string(),
+    ]
+    .into_iter()
+    .map(|line| format!("    {line}"))
+    .collect::<Vec<_>>()
+    .join("\n");
     let codex_command = format!(
-        "auto quota open codex --config shell_environment_policy.inherit=all --config model_reasoning_effort={} --model {} app-server",
-        spec.reasoning_effort, spec.model
+        "env CARGO_TARGET_DIR={} auto quota open codex --config shell_environment_policy.inherit=all --config model_reasoning_effort={} --model {} app-server",
+        shell_quote(&shared_cargo_target_dir.display().to_string()),
+        spec.reasoning_effort,
+        spec.model
     );
     format!(
         "---\n\
 tracker:\n  kind: linear\n  api_key: $LINEAR_API_KEY\n  project_slug: \"{project_slug}\"\n  active_states:\n    - {todo_state}\n    - {in_progress_state}\n  terminal_states:\n    - Closed\n    - Cancelled\n    - Canceled\n    - Duplicate\n    - {done_state}\n\
 polling:\n  interval_ms: {poll_interval_ms}\n\
-workspace:\n  root: {workspace_root}\n\
-hooks:\n  after_create: |\n    git clone --depth 1 {remote_url} .\n  before_run: |\n    git fetch origin {base_branch}\n    git checkout {base_branch}\n    git pull --rebase origin {base_branch}\n  timeout_ms: 300000\n\
+workspace:\n  root: {workspace_root_yaml}\n\
+hooks:\n  after_create: |\n    git clone --depth 1 {remote_url} .\n  before_run: |\n{before_run_hook}\n  timeout_ms: 300000\n\
 agent:\n  max_concurrent_agents: {max_concurrent_agents}\n  max_turns: 20\n\
-codex:\n  command: {codex_command}\n  approval_policy: never\n  thread_sandbox: workspace-write\n  turn_sandbox_policy:\n    type: workspaceWrite\n---\n\n\
+codex:\n  command: >-\n    {codex_command}\n  approval_policy: never\n  thread_sandbox: workspace-write\n  turn_sandbox_policy:\n    type: workspaceWrite\n    writableRoots:\n      - {workspace_root_yaml}\n      - {shared_cargo_target_dir_yaml}\n  read_timeout_ms: 60000\n  max_turn_wall_clock_ms: 1800000\n  max_turn_total_tokens: 12000000\n---\n\n\
 You are running an unattended implementation-plan execution session for repository `{repo_label}`.\n\n\
 Repository root inside the workspace clone: `{repo_root}`\n\
 Integration branch: `{base_branch}`\n\
@@ -1842,7 +1890,9 @@ Continuation context:\n\n\
 - This is retry attempt #{{{{ attempt }}}} because the issue remained active.\n\
 - Resume from the current workspace state instead of restarting from scratch.\n\
 - Do not repeat already-finished investigation or validation unless your code changes require it.\n\
-{{% endif %}}\n\n\
+{{% if resume_reason %}}- Failure context from the previous attempt: {{{{ resume_reason }}}}\n\
+{{% endif %}}{{% if resume_guidance %}}- Recovery guidance: {{{{ resume_guidance }}}}\n\
+{{% endif %}}{{% endif %}}\n\n\
 Issue context:\n\
 Identifier: {{{{ issue.identifier }}}}\n\
 Title: {{{{ issue.title }}}}\n\
@@ -1859,16 +1909,40 @@ Operating rules:\n\n\
 - Read and follow the repository's `AGENTS.md` plus any directly referenced repo docs before editing code.\n\
 - Work only inside the provided repository clone.\n\
 - Use targeted validation only; do not widen scope with broad workspace tests.\n\
+- Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.\n\
+- Build a short task brief for yourself before editing: task id, spec refs, owned surfaces, integration touchpoints, scope boundary, acceptance criteria, verification, and any assumptions you are relying on.\n\
+- Restate the task's assumptions and success conditions from repo evidence before editing. If the task contract is ambiguous, resolve the ambiguity from repo evidence or leave a precise blocker instead of guessing.\n\
 - Keep changes scoped to the issue's task body. Do not silently take on unrelated cleanup.\n\
+- One issue = one task = one landing attempt. Never mark more than one plan task done, never append `REVIEW.md` handoff text for a second task, and never treat adjacent cleanup as free work.\n\
+- Do not mark adjacent tasks done just because the current diff incidentally helps them. Leave those tasks untouched for their own issue unless the plan contract explicitly says this issue owns them.\n\
 - Never ask a human to perform follow-up work during normal execution.\n\
 {blocked_state_line}\
 - Before editing, fetch the current issue via `linear_graphql`, inspect the team states, and if the issue is in `{todo_state}`, move it to `{in_progress_state}`.\n\
-- Work directly on `{base_branch}` in this clone. Keep it current with `origin/{base_branch}` before and after your code changes.\n\
+- Work directly on `{base_branch}` in this clone. Fresh workspaces are synced from `origin/{base_branch}` before the first turn.\n\
+- If you are resuming a dirty workspace after a retry or stall, preserve that local state instead of trying to rebase it before continuing.\n\
+- Never run `git fetch`, `git pull`, `git rebase`, `git push`, or branch-switching commands yourself in this workspace. Use `git status`, `git diff`, `git log`, and `git show` for inspection only; Symphony performs sync and landing host-side.\n\
+- Do not run the final `git add` or `git commit` flow yourself; Symphony performs landing host-side.\n\
+- Never request interactive user input or MCP elicitation. This is a non-interactive unattended run, so make the narrowest reasonable assumption from the issue, repo, and current workspace instead.\n\
+- Do not keep multiple long-running shell sessions alive at once. Finish or abandon one long-running `exec_command` session before starting another.\n\
+- For `cargo test`, `cargo check`, `cargo build`, `xtask`, and other compile-heavy commands, set the initial `yield_time_ms` high enough to cover the expected runtime instead of polling every few seconds or every minute.\n\
+- Do not babysit background compiles with repeated `write_stdin` polls when a single longer wait would do. Prefer one generous wait over many short polls.\n\
+- Do not start a second Cargo compile/test/check command while another Cargo command is still running in the same lane unless the issue explicitly requires it.\n\
+- If the workspace contains conflict markers, unmerged files, or other repair debt from a prior attempt, fix that workspace integrity problem first before resuming feature work.\n\
+- If `apply_patch` verification fails repeatedly, stop repeating the same patch shape. Re-read the file on disk and switch to smaller exact-context edits or a targeted full-file rewrite.\n\
 - Before changing task or issue completion state, run a targeted grep or equivalent acceptance check against each acceptance criterion so shipping status cannot outrun actual delivery.\n\
+- Never rewrite `IMPLEMENTATION_PLAN.md` prose. The only allowed plan edit is changing the matching task line from `- [ ]` or `- [!]` to `- [x]` when that task is actually complete. Do not edit repo-level rules, acceptance criteria, verification blocks, dependencies, scope boundaries, or unrelated task statuses.\n\
+- If you touch `IMPLEMENTATION_PLAN.md`, run `scripts/check-plan-integrity.sh` before landing and fix any reported drift.\n\
+- Use the inherited shared `CARGO_TARGET_DIR` from Symphony for Cargo commands. Do not override it with workspace-local or ad hoc temp paths, and do not create `/.cargo-target/` inside the repo clone. If that directory appears, delete it before landing.\n\
+- If repo docs mention a fresh isolated Cargo target dir for local development, that guidance is overridden in Symphony sessions. Never prefix Cargo with a different `CARGO_TARGET_DIR`, never invent `/.cargo-target*` variants such as `/.cargo-target-rso29/`, and if `/.cargo-target` is present in the repo clone it must remain the shared `../.cargo-target` symlink.\n\
+- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n\
+- Never hand-edit verification receipt files. They are execution evidence, not notes.\n\
+- If the repo provides verification receipt checks, landing is blocked until every `Verification:` command for the completed task has a passing receipt.\n\
+- If the repo contains `scripts/check-task-scope.py`, run `python3 scripts/check-task-scope.py --staged` before landing. If adjacent integration edits outside the owned or touchpoint surfaces are genuinely required, keep them minimal and record them under `Scope exceptions:` in the task's `REVIEW.md` handoff with a one-line reason per path.\n\
 - When the task is complete, mark the matching task in `IMPLEMENTATION_PLAN.md` as `- [x]` instead of deleting it so downstream dependency truth remains visible.\n\
-- Append a `REVIEW.md` handoff entry before committing. Preserve the existing file style when present; if `REVIEW.md` is missing, create it with a simple awaiting-review section. Include the task id, changed files or surfaces, the exact validation commands you actually ran, and any remaining blockers or `none`.\n\
-- When the task is complete, run the verification required by the issue description, commit the implementation plus the `IMPLEMENTATION_PLAN.md` and `REVIEW.md` artifact updates, and push directly to `origin/{base_branch}`.\n\
-- Only after the push succeeds, move the issue to `{done_state}`.\n\
+- Append a `REVIEW.md` handoff entry before landing. Preserve the existing file style when present; if `REVIEW.md` is missing, create it with a simple awaiting-review section. Include the task id, changed files or surfaces, `Scope exceptions: none` or the explicit exception list, the exact validation commands you actually ran, and any remaining blockers or `none`.\n\
+- When the task is complete, run the verification required by the issue description, then call `symphony_land_issue` with `{{\"baseBranch\":\"{base_branch}\",\"doneState\":\"{done_state}\"}}`. That host-side tool commits the implementation plus the `IMPLEMENTATION_PLAN.md` and `REVIEW.md` artifact updates, rebases onto `origin/{base_branch}`, pushes, and only then moves the issue to `{done_state}`.\n\
+- If `symphony_land_issue` reports a rebase conflict, stop retrying the same land immediately. Inspect the conflicting files against `origin/{base_branch}`, integrate the latest base-branch changes into your workspace, rerun targeted validation, and only then try landing again.\n\
+- Before starting another exploration turn, inspect the current diff and outstanding acceptance criteria. If the same blocker persists across two consecutive turns or a turn ends without new diff or verification progress, stop looping, leave one precise Linear comment, and move the issue to blocked if such a state exists.\n\
 - If validation fails, fix the issue instead of leaving partial work behind.\n\
 - Final response should contain only: changed files, validation run, and any remaining blockers.\n\n\
 Use these exact GraphQL operations when you need to inspect states or update the issue state:\n\n\
@@ -1911,19 +1985,25 @@ mutation AddComment($issueId: String!, $body: String!) {{\n\
         in_progress_state = spec.in_progress_state,
         done_state = spec.done_state,
         poll_interval_ms = spec.poll_interval_ms,
-        workspace_root = shell_safe_path(spec.workspace_root),
         remote_url = shell_quote(spec.remote_url),
         base_branch = spec.base_branch,
+        before_run_hook = before_run_hook,
         max_concurrent_agents = spec.max_concurrent_agents,
-        codex_command = shell_quote(&codex_command),
+        codex_command = codex_command,
         repo_label = spec.repo_label,
         repo_root = spec.repo_root.display(),
+        workspace_root_yaml = workspace_root_yaml,
+        shared_cargo_target_dir_yaml = shared_cargo_target_dir_yaml,
         blocked_state_line = blocked_state_line,
     )
 }
 
 fn shell_safe_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn shared_cargo_target_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".cargo-target")
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -2404,10 +2484,25 @@ Awaiting auto review:
             title: "Loan widget".to_string(),
             status: TaskStatus::Pending,
             dependencies: vec!["P-017B".to_string()],
-            markdown: "- [ ] `P-018` Loan widget".to_string(),
+            markdown: r#"- [ ] `P-018` Loan widget
+  Why now: Keep the borrowing flow unblocked.
+  Owns: `src/loan.rs`
+  Integration touchpoints: `src/app.rs`
+  Scope boundary: Does not change repayment rules.
+  Acceptance criteria:
+    - Loan widget renders the approved state.
+  Verification:
+    cargo test -p autonomy loan_widget
+  Required tests:
+    - `loan_widget`
+  Completion signal: Widget proof is green."#
+                .to_string(),
         };
         let description = render_issue_description(&repo_root, &task);
         assert!(description.contains("task_id=P-018"));
+        assert!(description.contains("## Task brief"));
+        assert!(description.contains("Owns: `src/loan.rs`"));
+        assert!(description.contains("Landing contract: complete only `P-018`"));
         assert_eq!(
             issue_task_id_from_description(&description),
             Some("P-018".to_string())
@@ -2434,10 +2529,66 @@ Awaiting auto review:
         });
         assert!(markdown.contains("project_slug: \"autonomy-symphony\""));
         assert!(markdown.contains("git clone --depth 1 'git@github.com:example/autonomy.git' ."));
+        assert!(markdown.contains("mkdir -p /tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains("printf '/.cargo-target\\n' >> .git/info/exclude"));
+        assert!(markdown.contains("printf '/.cargo-target*\\n' >> .git/info/exclude"));
+        assert!(markdown.contains("removing repo-local cargo target path $stale_cargo_target"));
+        assert!(markdown.contains("ln -s ../.cargo-target .cargo-target"));
         assert!(markdown.contains("git fetch origin trunk"));
+        assert!(markdown.contains("git config core.hooksPath .githooks"));
+        assert!(markdown.contains("git rev-list --count origin/trunk..HEAD"));
+        assert!(markdown.contains("should_rebase=1"));
+        assert!(markdown.contains("git reset --mixed \"$merge_base\""));
+        assert!(markdown.contains("unfinished git operation detected"));
+        assert!(markdown.contains("unmerged index entries detected"));
+        assert!(markdown.contains("if ! git diff --quiet || ! git diff --cached --quiet; then"));
+        assert!(markdown.contains("restoring them to workspace changes before continuing"));
+        assert!(markdown.contains("skipping rebase sync to preserve local changes"));
         assert!(markdown.contains("root: /tmp/symphony-workspaces/autonomy"));
+        assert!(markdown.contains("Failure context from the previous attempt"));
+        assert!(markdown.contains("Recovery guidance"));
         assert!(markdown.contains("mark the matching task in `IMPLEMENTATION_PLAN.md` as `- [x]`"));
-        assert!(markdown.contains("Append a `REVIEW.md` handoff entry before committing."));
+        assert!(markdown
+            .contains("Fresh workspaces are synced from `origin/trunk` before the first turn."));
+        assert!(markdown.contains("If you are resuming a dirty workspace after a retry or stall"));
+        assert!(markdown.contains("Never run `git fetch`, `git pull`, `git rebase`, `git push`, or branch-switching commands yourself"));
+        assert!(markdown.contains("Do not run the final `git add` or `git commit` flow yourself"));
+        assert!(markdown.contains("Never request interactive user input or MCP elicitation"));
+        assert!(markdown.contains("Do not keep multiple long-running shell sessions alive at once"));
+        assert!(markdown
+            .contains("Do not babysit background compiles with repeated `write_stdin` polls"));
+        assert!(markdown.contains("Do not start a second Cargo compile/test/check command"));
+        assert!(markdown.contains("Build a short task brief for yourself before editing"));
+        assert!(markdown.contains("One issue = one task = one landing attempt"));
+        assert!(markdown.contains("Do not mark adjacent tasks done"));
+        assert!(markdown.contains("If `apply_patch` verification fails repeatedly"));
+        assert!(markdown.contains("Never rewrite `IMPLEMENTATION_PLAN.md` prose"));
+        assert!(markdown.contains("run `scripts/check-plan-integrity.sh` before landing"));
+        assert!(markdown.contains("Use the inherited shared `CARGO_TARGET_DIR` from Symphony"));
+        assert!(markdown.contains("do not create `/.cargo-target/` inside the repo clone"));
+        assert!(markdown.contains("If repo docs mention a fresh isolated Cargo target dir"));
+        assert!(markdown.contains("never invent `/.cargo-target*` variants"));
+        assert!(markdown.contains("If the repo contains `scripts/run-task-verification.sh`"));
+        assert!(markdown.contains("Never hand-edit verification receipt files"));
+        assert!(markdown.contains("landing is blocked until every `Verification:` command"));
+        assert!(markdown.contains("If the repo contains `scripts/check-task-scope.py`"));
+        assert!(markdown.contains("Scope exceptions: none"));
+        assert!(markdown.contains("Append a `REVIEW.md` handoff entry before landing."));
+        assert!(markdown.contains("If the same blocker persists across two consecutive turns"));
+        assert!(markdown.contains("max_turn_wall_clock_ms: 1800000"));
+        assert!(markdown.contains("max_turn_total_tokens: 12000000"));
+        assert!(markdown.contains("read_timeout_ms: 60000"));
+        assert!(markdown.contains("command: >-"));
+        assert!(markdown.contains("turn_sandbox_policy:"));
+        assert!(markdown.contains("writableRoots:"));
+        assert!(markdown.contains("      - /tmp/symphony-workspaces/autonomy"));
+        assert!(markdown.contains("      - /tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains("env CARGO_TARGET_DIR="));
+        assert!(markdown.contains("/tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains(
+            "call `symphony_land_issue` with `{\"baseBranch\":\"trunk\",\"doneState\":\"Done\"}`"
+        ));
+        assert!(markdown.contains("If `symphony_land_issue` reports a rebase conflict"));
     }
 
     #[test]

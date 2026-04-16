@@ -53,7 +53,7 @@ pub(crate) struct ClaudeWindow {
 
 // ── Unified usage result ───────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AccountUsage {
     pub(crate) plan: String,
     pub(crate) session_used_pct: u32,

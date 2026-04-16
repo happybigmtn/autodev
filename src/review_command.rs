@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::claude_exec::run_claude_exec;
+use crate::claude_exec::{describe_claude_harness, run_claude_exec};
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
@@ -161,7 +161,10 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", push_branch);
     if args.claude {
-        println!("harness:     Claude (Opus 4.6 high)");
+        println!(
+            "harness:     {}",
+            describe_claude_harness(&args.model, &args.reasoning_effort)
+        );
         println!(
             "max turns:   {}",
             args.max_turns
@@ -215,6 +218,8 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             run_claude_exec(
                 &repo_root,
                 &full_prompt,
+                &args.model,
+                &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
                 "auto review",

@@ -126,17 +126,45 @@ where
     Ok(raw)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn stream_codex_output<R>(stream: R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    capture_codex_output(stream).await?;
+    capture_codex_output_prefixed(stream, None).await?;
     Ok(())
+}
+
+pub(crate) async fn capture_codex_output_prefixed<R>(
+    stream: R,
+    prefix: Option<&str>,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream).lines();
+    let mut raw = String::new();
+    let mut state = CodexRenderState::default();
+    while let Some(line) = reader
+        .next_line()
+        .await
+        .context("failed reading Codex JSON stream")?
+    {
+        raw.push_str(&line);
+        raw.push('\n');
+        let rendered = render_codex_stream_line(&line, &mut state);
+        if !rendered.is_empty() {
+            print!("{}", render_with_prefix(&rendered, prefix));
+            let _ = io::stdout().flush();
+        }
+    }
+    Ok(raw)
 }
 
 pub(crate) async fn stream_claude_output<R>(
     stream: R,
     futility_tx: Option<oneshot::Sender<()>>,
+    prefix: Option<&str>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -151,7 +179,7 @@ where
     {
         let rendered = render_claude_stream_line(&line, &mut state);
         if !rendered.is_empty() {
-            print!("{rendered}");
+            print!("{}", render_with_prefix(&rendered, prefix));
             let _ = io::stdout().flush();
         }
         if state.futility_detected {
@@ -161,6 +189,30 @@ where
         }
     }
     Ok(())
+}
+
+fn render_with_prefix(rendered: &str, prefix: Option<&str>) -> String {
+    let Some(prefix) = prefix.filter(|value| !value.is_empty()) else {
+        return rendered.to_string();
+    };
+    let prefix_text = format!("[{prefix}] ");
+    let mut out = String::with_capacity(rendered.len() + prefix_text.len() * 4);
+    for segment in rendered.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let body = segment.strip_suffix('\n').unwrap_or(segment);
+        if body.is_empty() {
+            if has_newline {
+                out.push('\n');
+            }
+            continue;
+        }
+        out.push_str(&prefix_text);
+        out.push_str(body);
+        if has_newline {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[allow(dead_code)]

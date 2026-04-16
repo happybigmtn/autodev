@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// Tmux-backed Codex lane helpers are staged for CLI integration but are not yet wired
+// into a live command path. Keep them compiling cleanly without blocking `clippy -D warnings`.
+
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -242,7 +246,10 @@ async fn spawn_codex(
         .take()
         .with_context(|| format!("Codex stderr should be piped for {context_label}"))?;
 
-    let stdout_task = tokio::spawn(async move { codex_stream::stream_codex_output(stdout).await });
+    let stream_label = context_label.to_string();
+    let stdout_task = tokio::spawn(async move {
+        codex_stream::capture_codex_output_prefixed(stdout, Some(stream_label.as_str())).await
+    });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for Codex")?;
@@ -572,17 +579,20 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn log_stderr(stderr_text: &str, stderr_log_path: &Path) -> Result<()> {
-    if !stderr_text.trim().is_empty() {
-        let entry = format!("\n===== {} =====\n{stderr_text}\n", timestamp_slug());
-        let mut existing = if stderr_log_path.exists() {
-            fs::read(stderr_log_path)
-                .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
-        } else {
-            Vec::new()
-        };
-        existing.extend_from_slice(entry.as_bytes());
-        atomic_write(stderr_log_path, &existing)?;
-    }
+    let rendered = if stderr_text.trim().is_empty() {
+        "[no stderr captured]"
+    } else {
+        stderr_text
+    };
+    let entry = format!("\n===== {} =====\n{rendered}\n", timestamp_slug());
+    let mut existing = if stderr_log_path.exists() {
+        fs::read(stderr_log_path)
+            .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
+    } else {
+        Vec::new()
+    };
+    existing.extend_from_slice(entry.as_bytes());
+    atomic_write(stderr_log_path, &existing)?;
     Ok(())
 }
 
@@ -601,7 +611,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::codex_stdout_has_agent_progress;
+    use std::fs;
+
+    use super::{codex_stdout_has_agent_progress, log_stderr};
+    use crate::util::timestamp_slug;
 
     #[test]
     fn detects_tmux_stdout_progress_for_quota_guard() {
@@ -615,5 +628,14 @@ mod tests {
         assert!(!codex_stdout_has_agent_progress(
             "[auto-loop] lane-1 P-015 starting"
         ));
+    }
+
+    #[test]
+    fn empty_stderr_still_writes_artifact() {
+        let path = std::env::temp_dir().join(format!("codex-stderr-{}.log", timestamp_slug()));
+        log_stderr("", &path).expect("write stderr log");
+        let written = fs::read_to_string(&path).expect("read stderr log");
+        assert!(written.contains("[no stderr captured]"));
+        let _ = fs::remove_file(path);
     }
 }

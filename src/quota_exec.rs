@@ -203,6 +203,74 @@ pub(crate) struct QuotaExecResult {
     pub(crate) stderr_text: String,
 }
 
+fn reserve_account_and_swap<'a>(
+    provider: Provider,
+    config: &'a QuotaConfig,
+    scored: &[(
+        &'a crate::quota_config::AccountEntry,
+        Option<crate::quota_usage::AccountUsage>,
+    )],
+) -> Result<(String, AuthRestoreGuard)> {
+    let mut lock = acquire_provider_lock(provider)?;
+    let _write = lock.write().map_err(|e| {
+        anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
+    })?;
+
+    let mut state = QuotaState::load()?;
+    state.refresh_cooldowns(Utc::now());
+
+    let selected = quota_selector::select_account_from_scores(config, &state, provider, scored)?;
+    let account_name = selected.entry.name.clone();
+    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
+
+    if !profile_dir.exists() {
+        anyhow::bail!(
+            "profile directory for account '{account_name}' not found at {}. \
+             Run `auto quota accounts capture {account_name}` to fix.",
+            profile_dir.display()
+        );
+    }
+
+    state.mark_selected(&account_name, Utc::now());
+    state.save()?;
+
+    match swap_credentials(provider, &profile_dir) {
+        Ok(guard) => Ok((account_name, guard)),
+        Err(error) => {
+            state.release_lease(&account_name);
+            state.save()?;
+            Err(error)
+        }
+    }
+}
+
+fn restore_and_update_state(
+    provider: Provider,
+    account_name: &str,
+    restore_guard: &mut AuthRestoreGuard,
+    update_state: impl FnOnce(&mut QuotaState, chrono::DateTime<Utc>),
+) -> Result<()> {
+    let mut lock = acquire_provider_lock(provider)?;
+    let _write = lock.write().map_err(|e| {
+        anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
+    })?;
+
+    restore_guard.disarm();
+    let restore_result = restore_credentials(provider);
+
+    let now = Utc::now();
+    let state_result = (|| -> Result<()> {
+        let mut state = QuotaState::load()?;
+        state.refresh_cooldowns(now);
+        state.release_lease(account_name);
+        update_state(&mut state, now);
+        state.save()
+    })();
+
+    restore_result?;
+    state_result
+}
+
 /// Run a CLI command with quota-aware account selection and failover.
 ///
 /// `exec_fn` is called with no arguments (credential swap happens before).
@@ -216,60 +284,36 @@ where
     Fut: std::future::Future<Output = Result<(std::process::ExitStatus, String)>> + Send,
 {
     let config = QuotaConfig::load()?;
-    let mut state = QuotaState::load()?;
-    state.refresh_cooldowns(Utc::now());
-
     let max_attempts = config.accounts_for_provider(provider).len();
 
     for attempt in 0..max_attempts {
-        let selected = quota_selector::select_account(&config, &state, provider).await?;
-        let account_name = selected.entry.name.clone();
-        let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
-
-        if !profile_dir.exists() {
-            anyhow::bail!(
-                "profile directory for account '{account_name}' not found at {}. \
-                 Run `auto quota accounts capture {account_name}` to fix.",
-                profile_dir.display()
-            );
-        }
+        let scored = quota_selector::score_accounts(&config, provider).await?;
+        let (account_name, mut guard) = reserve_account_and_swap(provider, &config, &scored)?;
 
         eprintln!(
             "[quota-router] attempt {}/{max_attempts}: using account '{account_name}'",
             attempt + 1,
         );
 
-        // Hold the per-provider lock only during credential swap,
-        // not during the entire child process execution.
-        let mut guard = {
-            let mut lock = acquire_provider_lock(provider)?;
-            let _write = lock.write().map_err(|e| {
-                anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
-            })?;
-            swap_credentials(provider, &profile_dir)?
-        };
-
         let result = exec_fn().await;
-
-        // Re-acquire lock for the restore phase.
-        {
-            let mut lock = acquire_provider_lock(provider)?;
-            let _write = lock.write().map_err(|e| {
-                anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
-            })?;
-            guard.disarm();
-            drop(guard);
-            restore_credentials(provider)?;
-        }
 
         match result {
             Ok((status, stderr_text)) => {
                 let verdict = quota_patterns::check_stderr(provider, &stderr_text);
-                state.mark_used(&account_name, Utc::now());
+                restore_and_update_state(provider, &account_name, &mut guard, |state, now| {
+                    state.mark_used(&account_name, now);
+                    match verdict {
+                        QuotaVerdict::Exhausted => state.mark_exhausted(&account_name, now),
+                        QuotaVerdict::Ok | QuotaVerdict::OtherError => {
+                            if status.success() {
+                                state.mark_success(&account_name, now);
+                            }
+                        }
+                    }
+                })?;
 
                 match verdict {
                     QuotaVerdict::Exhausted => {
-                        state.mark_exhausted(&account_name, Utc::now());
                         let progress_note = if quota_output_has_agent_progress(&stderr_text) {
                             " after worker progress was detected"
                         } else {
@@ -279,29 +323,23 @@ where
                             "[quota-router] account '{account_name}' quota exhausted{progress_note}, \
                              trying next..."
                         );
-                        state.save()?;
                         continue;
                     }
-                    QuotaVerdict::Ok | QuotaVerdict::OtherError => {
-                        if status.success() {
-                            state.mark_success(&account_name, Utc::now());
-                        }
-                        state.save()?;
-                        return Ok(QuotaExecResult {
-                            exit_status: status,
-                            stderr_text,
-                        });
-                    }
+                    QuotaVerdict::Ok | QuotaVerdict::OtherError => {}
                 }
+
+                return Ok(QuotaExecResult {
+                    exit_status: status,
+                    stderr_text,
+                });
             }
             Err(e) => {
-                state.save()?;
+                restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {})?;
                 return Err(e);
             }
         }
     }
 
-    state.save()?;
     anyhow::bail!(
         "all {provider} accounts exhausted after {max_attempts} attempts. \
          Run `auto quota reset` to force-clear."
@@ -351,33 +389,10 @@ pub(crate) fn is_quota_available(provider: Provider) -> bool {
 /// with the given args, wait for exit, and restore credentials.
 pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Result<i32> {
     let config = QuotaConfig::load()?;
-    let mut state = QuotaState::load()?;
-    state.refresh_cooldowns(Utc::now());
-
-    let selected = quota_selector::select_account(&config, &state, provider).await?;
-    let account_name = selected.entry.name.clone();
-    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
-
-    if !profile_dir.exists() {
-        anyhow::bail!(
-            "profile directory for account '{account_name}' not found at {}. \
-             Run `auto quota accounts capture {account_name}` to fix.",
-            profile_dir.display()
-        );
-    }
+    let scored = quota_selector::score_accounts(&config, provider).await?;
+    let (account_name, mut restore_guard) = reserve_account_and_swap(provider, &config, &scored)?;
 
     eprintln!("[quota-router] selected account '{account_name}'");
-
-    // Hold the per-provider lock only during the credential swap,
-    // not during the entire interactive session.  This lets other
-    // quota-routed commands (even same-provider) proceed concurrently.
-    let mut restore_guard = {
-        let mut lock = acquire_provider_lock(provider)?;
-        let _write = lock.write().map_err(|e| {
-            anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
-        })?;
-        swap_credentials(provider, &profile_dir)?
-    };
 
     let bin = provider.label();
     let status = std::process::Command::new(bin)
@@ -385,22 +400,12 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
         .status()
         .with_context(|| format!("failed to launch {bin}"))?;
 
-    // Re-acquire lock only for the restore.  Blocking write() is safe
-    // here because other holders only keep it during swap/restore (ms).
-    {
-        let mut lock = acquire_provider_lock(provider)?;
-        let _write = lock.write().map_err(|e| {
-            anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
-        })?;
-        restore_guard.disarm();
-        restore_credentials(provider)?;
-    }
-
-    state.mark_used(&account_name, Utc::now());
-    if status.success() {
-        state.mark_success(&account_name, Utc::now());
-    }
-    state.save()?;
+    restore_and_update_state(provider, &account_name, &mut restore_guard, |state, now| {
+        state.mark_used(&account_name, now);
+        if status.success() {
+            state.mark_success(&account_name, now);
+        }
+    })?;
 
     Ok(status.code().unwrap_or(1))
 }

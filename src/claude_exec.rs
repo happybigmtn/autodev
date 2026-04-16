@@ -13,9 +13,13 @@ use crate::quota_config::Provider;
 use crate::quota_exec;
 use crate::util::{atomic_write, timestamp_slug};
 
+const DEFAULT_CLAUDE_MODEL_ALIAS: &str = "opus";
+
 pub(crate) async fn run_claude_exec(
     repo_root: &Path,
     full_prompt: &str,
+    model: &str,
+    effort: &str,
     max_turns: Option<usize>,
     stderr_log_path: &Path,
     context_label: &str,
@@ -23,6 +27,8 @@ pub(crate) async fn run_claude_exec(
     run_claude_exec_with_env(
         repo_root,
         full_prompt,
+        model,
+        effort,
         max_turns,
         stderr_log_path,
         context_label,
@@ -34,25 +40,35 @@ pub(crate) async fn run_claude_exec(
 pub(crate) async fn run_claude_exec_with_env(
     repo_root: &Path,
     full_prompt: &str,
+    model: &str,
+    effort: &str,
     max_turns: Option<usize>,
     stderr_log_path: &Path,
     context_label: &str,
     extra_env: &[(String, String)],
 ) -> Result<std::process::ExitStatus> {
+    let resolved_model = resolve_claude_model(model);
+    let resolved_effort = resolve_claude_effort(effort);
     let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Claude) {
         let repo_root = repo_root.to_owned();
         let full_prompt = full_prompt.to_owned();
+        let resolved_model = resolved_model.clone();
+        let resolved_effort = resolved_effort.clone();
         let context_label = context_label.to_owned();
         let extra_env = extra_env.to_vec();
         let result = quota_exec::run_with_quota(Provider::Claude, move || {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
+            let resolved_model = resolved_model.clone();
+            let resolved_effort = resolved_effort.clone();
             let context_label = context_label.clone();
             let extra_env = extra_env.clone();
             async move {
                 spawn_claude(
                     &repo_root,
                     &full_prompt,
+                    &resolved_model,
+                    &resolved_effort,
                     max_turns,
                     &context_label,
                     &extra_env,
@@ -63,7 +79,16 @@ pub(crate) async fn run_claude_exec_with_env(
         .await?;
         (result.exit_status, result.stderr_text)
     } else {
-        spawn_claude(repo_root, full_prompt, max_turns, context_label, extra_env).await?
+        spawn_claude(
+            repo_root,
+            full_prompt,
+            &resolved_model,
+            &resolved_effort,
+            max_turns,
+            context_label,
+            extra_env,
+        )
+        .await?
     };
     log_stderr(&stderr_text, stderr_log_path)?;
     Ok(status)
@@ -74,6 +99,8 @@ pub(crate) const FUTILITY_EXIT_MARKER: i32 = 137;
 async fn spawn_claude(
     repo_root: &Path,
     full_prompt: &str,
+    model: &str,
+    effort: &str,
     max_turns: Option<usize>,
     context_label: &str,
     extra_env: &[(String, String)],
@@ -83,6 +110,10 @@ async fn spawn_claude(
         .arg("-p")
         .arg("--verbose")
         .arg("--dangerously-skip-permissions")
+        .arg("--model")
+        .arg(model)
+        .arg("--effort")
+        .arg(effort)
         .arg("--output-format")
         .arg("stream-json");
     if let Some(turns) = max_turns {
@@ -121,10 +152,11 @@ async fn spawn_claude(
         .with_context(|| format!("Claude stderr should be piped for {context_label}"))?;
 
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
-    let stdout_task =
-        tokio::spawn(
-            async move { codex_stream::stream_claude_output(stdout, Some(futility_tx)).await },
-        );
+    let stream_label = context_label.to_string();
+    let stdout_task = tokio::spawn(async move {
+        codex_stream::stream_claude_output(stdout, Some(futility_tx), Some(stream_label.as_str()))
+            .await
+    });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = tokio::select! {
@@ -155,18 +187,95 @@ async fn spawn_claude(
     Ok((status, stderr_text))
 }
 
-fn log_stderr(stderr_text: &str, stderr_log_path: &Path) -> Result<()> {
-    if !stderr_text.trim().is_empty() {
-        let entry = format!("\n===== {} =====\n{stderr_text}\n", timestamp_slug());
-        let mut existing = if stderr_log_path.exists() {
-            fs::read(stderr_log_path)
-                .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
-        } else {
-            Vec::new()
-        };
-        existing.extend_from_slice(entry.as_bytes());
-        atomic_write(stderr_log_path, &existing)?;
+pub(crate) fn resolve_claude_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_CLAUDE_MODEL_ALIAS.to_string();
     }
+    if looks_like_claude_model(trimmed) {
+        return trimmed.to_string();
+    }
+    DEFAULT_CLAUDE_MODEL_ALIAS.to_string()
+}
+
+pub(crate) fn resolve_claude_effort(effort: &str) -> String {
+    let trimmed = effort.trim();
+    if trimmed.is_empty() {
+        "high".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn describe_claude_harness(model: &str, effort: &str) -> String {
+    format!(
+        "Claude ({})",
+        [resolve_claude_model(model), resolve_claude_effort(effort)].join(" ")
+    )
+}
+
+fn looks_like_claude_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.starts_with("claude") || matches!(normalized.as_str(), "opus" | "sonnet" | "haiku")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{describe_claude_harness, log_stderr, resolve_claude_effort, resolve_claude_model};
+    use crate::util::timestamp_slug;
+
+    #[test]
+    fn non_claude_model_defaults_to_opus_alias() {
+        assert_eq!(resolve_claude_model("gpt-5.4"), "opus");
+        assert_eq!(resolve_claude_model(""), "opus");
+    }
+
+    #[test]
+    fn explicit_claude_settings_are_preserved() {
+        assert_eq!(resolve_claude_model("opus"), "opus");
+        assert_eq!(
+            resolve_claude_model("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(resolve_claude_effort("xhigh"), "xhigh");
+        assert_eq!(resolve_claude_effort(""), "high");
+    }
+
+    #[test]
+    fn harness_description_uses_resolved_settings() {
+        assert_eq!(
+            describe_claude_harness("gpt-5.4", "xhigh"),
+            "Claude (opus xhigh)"
+        );
+    }
+
+    #[test]
+    fn empty_stderr_still_writes_artifact() {
+        let path = std::env::temp_dir().join(format!("claude-stderr-{}.log", timestamp_slug()));
+        log_stderr("", &path).expect("write stderr log");
+        let written = fs::read_to_string(&path).expect("read stderr log");
+        assert!(written.contains("[no stderr captured]"));
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn log_stderr(stderr_text: &str, stderr_log_path: &Path) -> Result<()> {
+    let rendered = if stderr_text.trim().is_empty() {
+        "[no stderr captured]"
+    } else {
+        stderr_text
+    };
+    let entry = format!("\n===== {} =====\n{rendered}\n", timestamp_slug());
+    let mut existing = if stderr_log_path.exists() {
+        fs::read(stderr_log_path)
+            .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
+    } else {
+        Vec::new()
+    };
+    existing.extend_from_slice(entry.as_bytes());
+    atomic_write(stderr_log_path, &existing)?;
     Ok(())
 }
 

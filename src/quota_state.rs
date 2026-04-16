@@ -15,6 +15,8 @@ pub(crate) struct AccountState {
     pub(crate) exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exhausted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) active_leases: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_used: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,11 +67,22 @@ impl QuotaState {
         state.last_used = Some(now);
     }
 
+    pub(crate) fn mark_selected(&mut self, name: &str, now: DateTime<Utc>) {
+        let state = self.accounts.entry(name.to_owned()).or_default();
+        state.last_used = Some(now);
+        state.active_leases = state.active_leases.saturating_add(1);
+    }
+
     pub(crate) fn mark_success(&mut self, name: &str, now: DateTime<Utc>) {
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.exhausted = false;
         state.exhausted_at = None;
         state.last_success = Some(now);
+    }
+
+    pub(crate) fn release_lease(&mut self, name: &str) {
+        let state = self.accounts.entry(name.to_owned()).or_default();
+        state.active_leases = state.active_leases.saturating_sub(1);
     }
 
     /// Clear exhausted flag on accounts that have cooled down.
@@ -92,6 +105,7 @@ impl QuotaState {
         if let Some(state) = self.accounts.get_mut(name) {
             state.exhausted = false;
             state.exhausted_at = None;
+            state.active_leases = 0;
         }
     }
 
@@ -100,8 +114,13 @@ impl QuotaState {
         for state in self.accounts.values_mut() {
             state.exhausted = false;
             state.exhausted_at = None;
+            state.active_leases = 0;
         }
     }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -177,5 +196,23 @@ mod tests {
         assert!(!account.exhausted);
         assert!(account.exhausted_at.is_none());
         assert_eq!(account.last_success, Some(now));
+    }
+
+    #[test]
+    fn mark_selected_increments_and_release_lease_decrements() {
+        let now = Utc::now();
+        let mut state = QuotaState::default();
+
+        state.mark_selected("test", now);
+        state.mark_selected("test", now);
+        assert_eq!(state.get("test").active_leases, 2);
+        assert_eq!(state.get("test").last_used, Some(now));
+
+        state.release_lease("test");
+        assert_eq!(state.get("test").active_leases, 1);
+
+        state.release_lease("test");
+        state.release_lease("test");
+        assert_eq!(state.get("test").active_leases, 0);
     }
 }

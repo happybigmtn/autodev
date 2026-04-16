@@ -7,6 +7,7 @@ mod generation;
 mod health_command;
 mod loop_command;
 mod nemesis;
+mod parallel_command;
 mod pi_backend;
 mod qa_command;
 mod qa_only_command;
@@ -55,6 +56,8 @@ enum Command {
     Bug(BugArgs),
     /// Run the implementation loop on the repo's primary branch
     Loop(LoopArgs),
+    /// Run the experimental multi-lane implementation executor
+    Parallel(ParallelArgs),
     /// Run a runtime QA and ship-readiness pass on the current branch
     Qa(QaArgs),
     /// Run a report-only runtime QA pass on the current branch
@@ -91,7 +94,7 @@ enum SymphonySubcommand {
     Sync(SymphonySyncArgs),
     /// Render a repo-specific Symphony WORKFLOW.md
     Workflow(SymphonyWorkflowArgs),
-    /// Sync, render the workflow, then launch Symphony in the foreground
+    /// Render the workflow if needed, then launch Symphony in the foreground dashboard
     Run(SymphonyRunArgs),
 }
 
@@ -114,7 +117,7 @@ struct SymphonySyncArgs {
     planner_model: String,
 
     /// Codex reasoning effort used for sync planning analysis
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     planner_reasoning_effort: String,
 
     /// Codex executable used for sync planning analysis
@@ -161,7 +164,7 @@ struct SymphonyWorkflowArgs {
     model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Linear state name used when work begins
@@ -212,26 +215,30 @@ struct SymphonyRunArgs {
     model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
-    /// Linear state name used for newly created or reopened issues
+    /// Sync Linear issues from IMPLEMENTATION_PLAN.md before launching Symphony
+    #[arg(long)]
+    sync_first: bool,
+
+    /// Linear state name used for newly created or reopened issues when --sync-first is set
     #[arg(long, default_value = "Todo")]
     todo_state: String,
 
-    /// Codex model used for sync planning analysis
+    /// Codex model used for sync planning analysis when --sync-first is set
     #[arg(long, default_value = "gpt-5.4")]
     planner_model: String,
 
-    /// Codex reasoning effort used for sync planning analysis
-    #[arg(long, default_value = "xhigh")]
+    /// Codex reasoning effort used for sync planning analysis when --sync-first is set
+    #[arg(long, default_value = "high")]
     planner_reasoning_effort: String,
 
-    /// Codex executable used for sync planning analysis
+    /// Codex executable used for sync planning analysis when --sync-first is set
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Disable the Codex planner and fall back to deterministic dependency parsing only
+    /// Disable the Codex planner and fall back to deterministic dependency parsing only when --sync-first is set
     #[arg(long)]
     no_ai_planner: bool,
 
@@ -524,10 +531,6 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     max_iterations: Option<usize>,
 
-    /// Override CARGO_BUILD_JOBS for loop workers. Defaults to a conservative automatic cap.
-    #[arg(long)]
-    cargo_build_jobs: Option<usize>,
-
     /// Optional override for the worker prompt template
     #[arg(long)]
     prompt_file: Option<PathBuf>,
@@ -560,11 +563,70 @@ pub(crate) struct LoopArgs {
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Use Claude (Opus 4.6 high) instead of Codex
+    /// Use Claude instead of Codex
     #[arg(long)]
     claude: bool,
 
     /// Maximum Claude turns (only used with --claude). Omit for unlimited.
+    #[arg(long)]
+    max_turns: Option<usize>,
+
+    /// Maximum retries when Claude exits non-zero before bailing
+    #[arg(long, default_value_t = 2)]
+    max_retries: usize,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct ParallelArgs {
+    /// Stop after this many successful parallel lands. Default is unlimited.
+    #[arg(long)]
+    max_iterations: Option<usize>,
+
+    /// Maximum concurrent worker lanes.
+    #[arg(long = "threads", visible_alias = "max-concurrent-workers", default_value_t = 5)]
+    max_concurrent_workers: usize,
+
+    /// Override CARGO_BUILD_JOBS for parallel workers. Defaults to a conservative automatic cap.
+    #[arg(long)]
+    cargo_build_jobs: Option<usize>,
+
+    /// Optional override for the worker prompt template
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// Model to use for the implementation worker
+    #[arg(long, default_value = "gpt-5.4")]
+    model: String,
+
+    /// Reasoning effort to pass through to the Codex worker
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Branch that the parallel executor is allowed to run on. Defaults to the repo's primary branch.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Additional repository roots the parallel worker may inspect or edit
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
+    /// Auto-discover sibling git repos in the parent directory as reference repos
+    #[arg(long)]
+    include_siblings: bool,
+
+    /// Directory for parallel executor logs. Defaults to <repo>/.auto/parallel
+    #[arg(long)]
+    run_root: Option<PathBuf>,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Use Claude instead of Codex
+    #[arg(long)]
+    claude: bool,
+
+    /// Maximum Claude turns (only used with --claude). Omit for the parallel default cap.
     #[arg(long)]
     max_turns: Option<usize>,
 
@@ -608,7 +670,7 @@ pub(crate) struct ReviewArgs {
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Use Claude (Opus 4.6 high) instead of Codex
+    /// Use Claude instead of Codex
     #[arg(long)]
     claude: bool,
 
@@ -816,6 +878,7 @@ async fn main() -> Result<()> {
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
+        Command::Parallel(args) => parallel_command::run_parallel(args).await,
         Command::Qa(args) => qa_command::run_qa(args).await,
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
         Command::Health(args) => health_command::run_health(args).await,
@@ -846,5 +909,36 @@ async fn main() -> Result<()> {
             },
         },
         Command::Symphony(args) => symphony_command::run_symphony(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, SymphonySubcommand};
+    use clap::Parser;
+
+    #[test]
+    fn symphony_run_does_not_sync_by_default() {
+        let cli = Cli::try_parse_from(["auto", "symphony", "run"]).expect("cli parse");
+        let Command::Symphony(args) = cli.command else {
+            panic!("expected symphony command");
+        };
+        let SymphonySubcommand::Run(args) = args.command else {
+            panic!("expected symphony run");
+        };
+        assert!(!args.sync_first);
+    }
+
+    #[test]
+    fn symphony_run_accepts_sync_first_flag() {
+        let cli =
+            Cli::try_parse_from(["auto", "symphony", "run", "--sync-first"]).expect("cli parse");
+        let Command::Symphony(args) = cli.command else {
+            panic!("expected symphony command");
+        };
+        let SymphonySubcommand::Run(args) = args.command else {
+            panic!("expected symphony run");
+        };
+        assert!(args.sync_first);
     }
 }

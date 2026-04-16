@@ -4,8 +4,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::claude_exec::{run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
-use crate::codex_exec::run_codex_exec_with_env;
+use crate::claude_exec::{describe_claude_harness, run_claude_exec, FUTILITY_EXIT_MARKER};
+use crate::codex_exec::run_codex_exec;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, repo_name, sync_branch_with_remote, timestamp_slug,
@@ -13,22 +13,8 @@ use crate::util::{
 use crate::LoopArgs;
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
-const DIRECT_REVIEW_QUEUE_LOOP_CLAUSE: &str = r#"
 
-Repo-specific direct `REVIEW.md` handoff:
-- This repo forbids root `COMPLETED.md`, `WORKLIST.md`, and `ARCHIVED.md`.
-  These bullets override any generic tracker instructions above.
-- When a task finishes, remove it from `IMPLEMENTATION_PLAN.md` and append the
-  completion record directly to `REVIEW.md` with task id, changed surfaces,
-  validation commands, known failures, and commit sha when available.
-- If you find out-of-scope work, add an explicit unchecked
-  `IMPLEMENTATION_PLAN.md` item with spec linkage instead of writing
-  `WORKLIST.md`.
-- Stage `REVIEW.md` with the implementation files and `IMPLEMENTATION_PLAN.md`
-  when they changed. Do not create or stage `COMPLETED.md`, `WORKLIST.md`, or
-  `ARCHIVED.md`."#;
-
-pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Read only the minimum `AGENTS.md` content needed for repo-specific build, narrow validation, staging, and branch rules. Do not pull unrelated operational commentary into your working context unless the current task actually touches it.
+pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `IMPLEMENTATION_PLAN.md` and identify the first pending task marked `- [ ]` whose explicit dependencies are already satisfied. Treat tasks marked `- [!]` as blocked and skip them unless they are later unblocked.
 0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
 0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
@@ -64,7 +50,6 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Read only the minim
 
 4. Keep the planning artifacts current:
    - When you discover important implementation facts, blockers, or scope corrections, update `IMPLEMENTATION_PLAN.md`.
-   - Before changing plan status for a completed item, run a targeted grep or equivalent acceptance check against each acceptance criterion so shipping status cannot outrun actual delivery.
    - When you finish a task, remove its entry from `IMPLEMENTATION_PLAN.md` so the plan remains an active queue of unfinished work only.
    - When a task is blocked by an external dependency or owner decision, mark it as `- [!]` and record the blocker under that task.
    - Append a concise record to `COMPLETED.md` with task id, what was completed, the validation command(s), and commit sha.
@@ -76,8 +61,7 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Read only the minim
    - Do not sweep unrelated pre-existing churn into the commit.
    - If you touch multiple repositories, commit and push each repository separately. Never try to mix files from different git repos into one commit.
    - Commit with a message like `repo-name: TASK-ID short description` using the actual repository name for each touched repo.
-   - Before committing, rerun the task's direct proof plus only the narrow additional regression commands explicitly required by the task contract or needed for the touched surfaces.
-   - Do not default to workspace-wide or package-wide validation suites. Run them only when the current task explicitly names them or there is no narrower truthful proof.
+   - Before committing, rerun the task's direct proof plus the strongest broad regression commands this repo honestly supports.
    - After committing, run `git status` in every touched repo to verify no implementation files were left unstaged. If any were, amend the relevant commit.
    - Push the queue repo directly to `origin/{branch}` after the commit. For additional listed repos, push the currently checked-out branch unless that repo's own instructions require something else.
 
@@ -124,8 +108,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         );
     }
 
-    let using_default_prompt = args.prompt_file.is_none();
-    let mut prompt_template = match &args.prompt_file {
+    let prompt_template = match &args.prompt_file {
         Some(path) => {
             let prompt = fs::read_to_string(path)
                 .with_context(|| format!("failed to read prompt file {}", path.display()))?;
@@ -133,16 +116,11 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         }
         None => render_default_loop_prompt(&target_branch, &reference_repos),
     };
-    if using_default_prompt && repo_forbids_legacy_review_trackers(&repo_root) {
-        prompt_template.push_str(DIRECT_REVIEW_QUEUE_LOOP_CLAUSE);
-    }
     let run_root = args
         .run_root
-        .clone()
         .unwrap_or_else(|| repo_root.join(".auto").join("loop"));
     fs::create_dir_all(&run_root)
         .with_context(|| format!("failed to create {}", run_root.display()))?;
-    let worker_env = build_loop_worker_env(&args)?;
     let stderr_log_path = run_root.join("codex.stderr.log");
 
     let harness = if args.claude { "Claude" } else { "Codex" };
@@ -151,7 +129,10 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", target_branch);
     if args.claude {
-        println!("harness:     Claude (Opus 4.6 high)");
+        println!(
+            "harness:     {}",
+            describe_claude_harness(&args.model, &args.reasoning_effort)
+        );
         println!(
             "max turns:   {}",
             args.max_turns
@@ -164,8 +145,6 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         println!("reasoning:   {}", args.reasoning_effort);
     }
     println!("run root:    {}", run_root.display());
-    println!("mode:        serial auto loop");
-    println!("cargo jobs:  {}", worker_env.cargo_jobs_summary);
     if !reference_repos.is_empty() {
         println!("references:  {}", reference_repos.len());
         for path in &reference_repos {
@@ -180,12 +159,14 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             .unwrap_or_else(|| "built-in Ralph worker".to_string())
     );
 
+    if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
+        println!("remote sync: rebased onto origin/{}", target_branch);
+    }
+
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, target_branch.as_str(), "auto loop checkpoint")?
     {
         println!("checkpoint:  committed pre-existing changes at {commit}");
-    } else if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
-        println!("remote sync: rebased onto origin/{}", target_branch);
     }
 
     let mut iteration = 0usize;
@@ -233,17 +214,18 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         println!("running {harness} iteration {}", iteration + 1);
 
         let exit_status = if args.claude {
-            run_claude_exec_with_env(
+            run_claude_exec(
                 &repo_root,
                 &full_prompt,
+                &args.model,
+                &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
                 "auto loop",
-                &worker_env.extra_env,
             )
             .await?
         } else {
-            run_codex_exec_with_env(
+            run_codex_exec(
                 &repo_root,
                 &full_prompt,
                 &args.model,
@@ -251,7 +233,6 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
                 &args.codex_bin,
                 &stderr_log_path,
                 "auto loop",
-                &worker_env.extra_env,
             )
             .await?
         };
@@ -341,12 +322,6 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LoopWorkerEnv {
-    extra_env: Vec<(String, String)>,
-    cargo_jobs_summary: String,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LoopQueueSnapshot {
     pending_ids: Vec<String>,
@@ -370,70 +345,14 @@ fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> S
     )
 }
 
-fn build_loop_worker_env(args: &LoopArgs) -> Result<LoopWorkerEnv> {
-    let inherited = std::env::var("CARGO_BUILD_JOBS").ok();
-    let parallelism = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4);
-    resolve_loop_worker_env(args.cargo_build_jobs, inherited.as_deref(), parallelism)
-}
-
-fn resolve_loop_worker_env(
-    cargo_build_jobs: Option<usize>,
-    inherited_cargo_build_jobs: Option<&str>,
-    available_parallelism: usize,
-) -> Result<LoopWorkerEnv> {
-    if let Some(jobs) = cargo_build_jobs {
-        if jobs == 0 {
-            bail!("--cargo-build-jobs must be greater than 0");
-        }
-        return Ok(cargo_build_jobs_env(
-            jobs,
-            format!("override CARGO_BUILD_JOBS={jobs}"),
-        ));
-    }
-
-    if let Some(value) = inherited_cargo_build_jobs {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Ok(LoopWorkerEnv {
-                extra_env: Vec::new(),
-                cargo_jobs_summary: format!("inherited CARGO_BUILD_JOBS={value}"),
-            });
-        }
-    }
-
-    let jobs = default_cargo_build_jobs_for(available_parallelism);
-    Ok(cargo_build_jobs_env(
-        jobs,
-        format!("auto CARGO_BUILD_JOBS={jobs}"),
-    ))
-}
-
-fn cargo_build_jobs_env(jobs: usize, cargo_jobs_summary: String) -> LoopWorkerEnv {
-    LoopWorkerEnv {
-        extra_env: vec![("CARGO_BUILD_JOBS".to_string(), jobs.to_string())],
-        cargo_jobs_summary,
-    }
-}
-
-fn default_cargo_build_jobs_for(available_parallelism: usize) -> usize {
-    let available_parallelism = available_parallelism.max(1);
-    (available_parallelism / 3).clamp(1, 4)
-}
-
 fn inspect_loop_queue(repo_root: &Path) -> Result<LoopQueueSnapshot> {
-    let plan = read_loop_plan(repo_root)?;
-    Ok(parse_loop_queue(&plan))
-}
-
-fn read_loop_plan(repo_root: &Path) -> Result<String> {
     let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
     if !plan_path.exists() {
-        return Ok(String::new());
+        return Ok(LoopQueueSnapshot::default());
     }
-    fs::read_to_string(&plan_path)
-        .with_context(|| format!("failed to read {}", plan_path.display()))
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    Ok(parse_loop_queue(&plan))
 }
 
 fn parse_loop_queue(plan: &str) -> LoopQueueSnapshot {
@@ -464,18 +383,6 @@ fn render_default_loop_prompt(branch: &str, reference_repos: &[PathBuf]) -> Stri
         DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch),
         reference_repos,
     )
-}
-
-fn repo_forbids_legacy_review_trackers(repo_root: &Path) -> bool {
-    ["AGENTS.md", "WORKFLOW.md"].iter().any(|relative| {
-        fs::read_to_string(repo_root.join(relative)).is_ok_and(|content| {
-            content.contains("Do not restore")
-                && content.contains("COMPLETED.md")
-                && content.contains("WORKLIST.md")
-                && content.contains("ARCHIVED.md")
-                && content.contains("REVIEW.md")
-        })
-    })
 }
 
 fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> String {
@@ -597,6 +504,19 @@ struct TrackedRepoState {
     head: String,
     status: String,
 }
+
+impl TrackedRepoState {
+    #[cfg(test)]
+    fn new(name: &str, path: &str, head: &str, status: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            head: head.to_string(),
+            status: status.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RepoProgress {
     None,
@@ -747,9 +667,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_iteration_prompt, default_cargo_build_jobs_for, discover_sibling_git_repos,
-        render_default_loop_prompt, repo_forbids_legacy_review_trackers, resolve_loop_worker_env,
-        resolve_reference_repos, LoopQueueSnapshot,
+        build_iteration_prompt, discover_sibling_git_repos, parse_loop_queue,
+        parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt,
+        resolve_reference_repos, summarize_repo_progress, LoopQueueSnapshot, RepoProgress,
+        TrackedRepoState,
     };
 
     #[test]
@@ -758,7 +679,6 @@ mod tests {
         assert!(prompt.contains("origin/trunk"));
         assert!(prompt.contains("branch `trunk`"));
         assert!(!prompt.contains("origin/main"));
-        assert!(prompt.contains("Read only the minimum `AGENTS.md` content needed"));
         assert!(prompt.contains("RED/GREEN/REFACTOR"));
         assert!(prompt.contains("failing test"));
         assert!(prompt.contains("simplification pass"));
@@ -766,9 +686,6 @@ mod tests {
         assert!(prompt.contains("historical context only"));
         assert!(prompt.contains("Treat tasks marked `- [!]` as blocked"));
         assert!(prompt.contains("next pending `- [ ]` task"));
-        assert!(
-            prompt.contains("Do not default to workspace-wide or package-wide validation suites")
-        );
     }
 
     #[test]
@@ -781,53 +698,101 @@ mod tests {
     }
 
     #[test]
-    fn detects_direct_review_queue_policy() {
-        let temp = unique_temp_dir("loop-direct-review-policy");
-        fs::create_dir_all(&temp).expect("failed to create temp dir");
-        fs::write(
-            temp.join("WORKFLOW.md"),
-            "Do not restore `COMPLETED.md`, `WORKLIST.md`, or `ARCHIVED.md`; use `REVIEW.md`.",
-        )
-        .expect("failed to write policy");
-
-        assert!(repo_forbids_legacy_review_trackers(&temp));
-
-        fs::remove_dir_all(&temp).expect("failed to remove temp dir");
+    fn branch_picker_prefers_explicit_branch() {
+        let branch =
+            pick_loop_branch(Some("release"), "main", Some("origin/trunk"), &["trunk"]).unwrap();
+        assert_eq!(branch, "release");
     }
 
     #[test]
-    fn default_cargo_build_jobs_caps_nested_parallelism() {
-        assert_eq!(default_cargo_build_jobs_for(22), 4);
-        assert_eq!(default_cargo_build_jobs_for(12), 4);
-        assert_eq!(default_cargo_build_jobs_for(3), 1);
-        assert_eq!(default_cargo_build_jobs_for(1), 1);
+    fn branch_picker_uses_origin_head_when_available() {
+        let branch = pick_loop_branch(None, "feature/test", Some("origin/master"), &[]).unwrap();
+        assert_eq!(branch, "master");
     }
 
     #[test]
-    fn loop_worker_env_respects_override_and_inherited_cargo_jobs() {
-        let inherited = resolve_loop_worker_env(None, Some("8"), 22).unwrap();
-        assert!(inherited.extra_env.is_empty());
-        assert_eq!(inherited.cargo_jobs_summary, "inherited CARGO_BUILD_JOBS=8");
+    fn branch_picker_prefers_current_primary_branch_over_origin_head() {
+        let branch =
+            pick_loop_branch(None, "main", Some("origin/master"), &["main", "master"]).unwrap();
+        assert_eq!(branch, "main");
+    }
 
-        let overridden = resolve_loop_worker_env(Some(3), Some("8"), 22).unwrap();
+    #[test]
+    fn branch_picker_falls_back_to_current_primary_branch() {
+        let branch = pick_loop_branch(None, "trunk", None, &[]).unwrap();
+        assert_eq!(branch, "trunk");
+    }
+
+    #[test]
+    fn branch_picker_falls_back_to_known_available_branch() {
+        let branch = pick_loop_branch(None, "feature/test", None, &["master"]).unwrap();
+        assert_eq!(branch, "master");
+    }
+
+    #[test]
+    fn parses_origin_head_branch() {
         assert_eq!(
-            overridden.extra_env,
-            vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())]
+            parse_origin_head_branch("origin/trunk"),
+            Some("trunk".to_string())
         );
-        assert_eq!(overridden.cargo_jobs_summary, "override CARGO_BUILD_JOBS=3");
-
-        let automatic = resolve_loop_worker_env(None, None, 22).unwrap();
-        assert_eq!(
-            automatic.extra_env,
-            vec![("CARGO_BUILD_JOBS".to_string(), "4".to_string())]
-        );
-        assert_eq!(automatic.cargo_jobs_summary, "auto CARGO_BUILD_JOBS=4");
     }
 
     #[test]
-    fn loop_worker_env_rejects_zero_cargo_jobs_override() {
-        let err = resolve_loop_worker_env(Some(0), None, 22).unwrap_err();
-        assert!(err.to_string().contains("--cargo-build-jobs"));
+    fn repo_progress_detects_reference_repo_commit() {
+        let before = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+        let after = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb222", ""),
+        ];
+
+        let progress = summarize_repo_progress(&before, &after);
+        assert_eq!(progress, RepoProgress::NewCommits);
+    }
+
+    #[test]
+    fn repo_progress_flags_dirty_reference_repo_without_commit() {
+        let before = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+        let after = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new(
+                "robopokermulti",
+                "/tmp/robopokermulti",
+                "bbb111",
+                " M src/lib.rs",
+            ),
+        ];
+
+        let progress = summarize_repo_progress(&before, &after);
+        assert_eq!(
+            progress,
+            RepoProgress::DirtyChanges(vec!["robopokermulti".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_loop_queue_separates_pending_and_blocked_tasks() {
+        let queue = parse_loop_queue(
+            r#"
+- [!] `DEC-001` Choose project license
+- [ ] `META-001` Add LICENSE file and Cargo license metadata
+- [x] `DONE-001` Finished already
+- [ ] `GATE-P4` Phase 4 checkpoint
+"#,
+        );
+
+        assert_eq!(
+            queue,
+            LoopQueueSnapshot {
+                pending_ids: vec!["META-001".to_string(), "GATE-P4".to_string()],
+                blocked_ids: vec!["DEC-001".to_string()],
+            }
+        );
     }
 
     #[test]
