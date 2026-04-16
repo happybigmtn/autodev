@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use regex::Regex;
 use tokio::task::JoinSet;
 
 use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
@@ -84,6 +88,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         .unwrap_or_else(|| repo_root.join(".auto").join("parallel"));
     fs::create_dir_all(&run_root)
         .with_context(|| format!("failed to create {}", run_root.display()))?;
+    let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
         let status = git_stdout(&repo_root, ["status", "--short"])?;
         if !status.trim().is_empty() {
@@ -175,6 +180,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
             &run_root,
             &worker_env,
             &mut linear_tracker,
+            &parallel_logger,
         )
         .await
     } else {
@@ -540,7 +546,31 @@ fn parse_task_dependencies(markdown: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    collect_task_refs(&body)
+    dedup_task_refs(
+        body.lines()
+            .flat_map(task_dependency_refs_from_line)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
+    let without_parens = strip_parenthetical_groups(line);
+    let narrative_cut = without_parens.split(['.', ';']).next().unwrap_or("").trim();
+    collect_task_refs(narrative_cut)
+}
+
+fn strip_parenthetical_groups(text: &str) -> String {
+    let mut depth = 0usize;
+    let mut rendered = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => rendered.push(ch),
+            _ => {}
+        }
+    }
+    rendered
 }
 
 fn task_field_line_value(markdown: &str, field: &str) -> Option<String> {
@@ -639,6 +669,7 @@ struct ActiveLaneAssignment {
     lane_root: PathBuf,
     lane_repo_root: PathBuf,
     base_commit: String,
+    stdout_log_path: PathBuf,
     stderr_log_path: PathBuf,
     worker_pid_path: PathBuf,
     clean_commit_since: Option<Instant>,
@@ -652,6 +683,7 @@ struct LaneResumeCandidate {
     lane_root: PathBuf,
     lane_repo_root: PathBuf,
     base_commit: String,
+    stdout_log_path: PathBuf,
     stderr_log_path: PathBuf,
     worker_pid_path: PathBuf,
 }
@@ -668,6 +700,106 @@ enum LaneRepoProgress {
     None,
     Dirty(String),
     NewCommits,
+}
+
+#[derive(Clone, Debug)]
+struct ParallelEventLogger {
+    live_log_path: PathBuf,
+}
+
+impl ParallelEventLogger {
+    fn new(run_root: &Path) -> Result<Self> {
+        let live_log_path = run_root.join("live.log");
+        fs::write(&live_log_path, b"")
+            .with_context(|| format!("failed to initialize {}", live_log_path.display()))?;
+        Ok(Self { live_log_path })
+    }
+
+    fn info(&self, message: impl AsRef<str>) {
+        let message = message.as_ref();
+        println!("{message}");
+        if let Err(err) = self.append(message) {
+            eprintln!("warning: failed writing parallel live log: {err:#}");
+        }
+    }
+
+    fn warn(&self, message: impl AsRef<str>) {
+        let message = message.as_ref();
+        eprintln!("{message}");
+        if let Err(err) = self.append(message) {
+            eprintln!("warning: failed writing parallel live log: {err:#}");
+        }
+    }
+
+    fn append(&self, message: &str) -> Result<()> {
+        let normalized = normalize_parallel_live_log_message(message);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        let redacted = redact_parallel_live_log_message(&normalized);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.live_log_path)
+            .with_context(|| format!("failed to open {}", self.live_log_path.display()))?;
+        writeln!(file, "{redacted}")
+            .with_context(|| format!("failed to append {}", self.live_log_path.display()))
+    }
+}
+
+fn append_lane_host_event(log_path: &Path, lane_index: usize, task_id: &str, message: &str) {
+    let rendered = format!(
+        "[auto parallel host lane-{lane_index} {task_id}] {message}",
+        lane_index = lane_index,
+        task_id = task_id,
+        message = message.trim()
+    );
+    if let Err(err) = append_lane_log_line(log_path, &rendered) {
+        eprintln!(
+            "warning: failed appending lane host event to {}: {err:#}",
+            log_path.display()
+        );
+    }
+}
+
+fn append_lane_log_line(log_path: &Path, line: &str) -> Result<()> {
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("failed to append {}", log_path.display()))
+}
+
+fn append_idle_status_to_free_lanes(
+    run_root: &Path,
+    max_concurrent_workers: usize,
+    active_lanes: &BTreeMap<usize, ActiveLaneAssignment>,
+    summary: &str,
+) {
+    for lane_index in 1..=max_concurrent_workers {
+        if active_lanes.contains_key(&lane_index) {
+            continue;
+        }
+        let lane_root = run_root.join("lanes").join(format!("lane-{lane_index}"));
+        let task_id = read_lane_task_id(&lane_root)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "[idle]".to_string());
+        append_lane_host_event(
+            &lane_root.join("stdout.log"),
+            lane_index,
+            &task_id,
+            &format!("idle: {summary}"),
+        );
+    }
 }
 
 async fn run_serial_loop(
@@ -754,6 +886,7 @@ async fn run_serial_loop(
                 &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
+                None,
                 "auto parallel",
                 &worker_env.extra_env,
                 None,
@@ -767,6 +900,7 @@ async fn run_serial_loop(
                 &args.reasoning_effort,
                 &args.codex_bin,
                 &stderr_log_path,
+                None,
                 "auto parallel",
                 &worker_env.extra_env,
                 None,
@@ -867,6 +1001,7 @@ async fn run_parallel_loop(
     run_root: &Path,
     worker_env: &LoopWorkerEnv,
     linear_tracker: &mut Option<LinearTracker>,
+    parallel_logger: &ParallelEventLogger,
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
     let lane_config = LaneRunConfig::new(args, worker_env);
@@ -875,21 +1010,26 @@ async fn run_parallel_loop(
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
     let mut landed = 0usize;
-    let mut plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+    let mut plan = refresh_parallel_plan(repo_root, linear_tracker, parallel_logger).await?;
     let mut resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
     landed += harvest_resumable_lane_results(
         repo_root,
         target_branch,
         &mut resumable_lanes,
         linear_tracker,
+        parallel_logger,
     )
     .await?;
-    plan = refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
+    plan =
+        refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger).await;
     resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    let mut last_idle_summary = None::<String>;
 
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes);
-        plan = refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
+        plan =
+            refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger)
+                .await;
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
                 .iter()
@@ -934,12 +1074,31 @@ async fn run_parallel_loop(
                 .filter(|task| !shelved_tasks.contains_key(&task.id))
                 .collect::<Vec<_>>();
             if ready.is_empty() {
+                if active_lanes.len() < args.max_concurrent_workers {
+                    let idle_summary =
+                        describe_parallel_idle_state(&plan, &active_tasks, &shelved_tasks);
+                    if last_idle_summary.as_deref() != Some(idle_summary.as_str()) {
+                        parallel_logger.info(format!(
+                            "idle:        {} of {} lanes active; {}",
+                            active_lanes.len(),
+                            args.max_concurrent_workers,
+                            idle_summary
+                        ));
+                        append_idle_status_to_free_lanes(
+                            run_root,
+                            args.max_concurrent_workers,
+                            &active_lanes,
+                            &idle_summary,
+                        );
+                        last_idle_summary = Some(idle_summary);
+                    }
+                }
                 break;
             }
             let (verification_only, executable_ready): (Vec<_>, Vec<_>) =
                 ready.into_iter().partition(is_verification_only_task);
             if executable_ready.is_empty() {
-                println!(
+                let message = format!(
                     "no executable dependency-ready tasks remain; manual verification-only checkpoints must be cleared before continuing: {}",
                     verification_only
                         .iter()
@@ -947,6 +1106,7 @@ async fn run_parallel_loop(
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                parallel_logger.info(&message);
                 break;
             }
 
@@ -972,11 +1132,11 @@ async fn run_parallel_loop(
             ) {
                 Ok(assignment) => assignment,
                 Err(err) => {
-                    eprintln!(
+                    parallel_logger.warn(format!(
                         "warning: failed preparing lane-{} for `{}`; shelving for the rest of this run: {err:#}",
                         lane_index,
                         task.id
-                    );
+                    ));
                     shelved_tasks.insert(task.id.clone(), task.markdown.clone());
                     continue;
                 }
@@ -989,10 +1149,10 @@ async fn run_parallel_loop(
                 &mut assignment,
                 target_branch,
             ) {
-                eprintln!(
+                parallel_logger.warn(format!(
                     "warning: failed starting lane-{} for `{}`; shelving for the rest of this run: {err:#}",
                     assignment.lane_index, assignment.task.id
-                );
+                ));
                 shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                 continue;
             }
@@ -1004,32 +1164,45 @@ async fn run_parallel_loop(
                     );
                 }
             }
-            println!(
-                "dispatch:    lane-{} -> {} {}{}",
+            parallel_logger.info(format!(
+                "dispatch:    [{}] lane-{} -> {} {}{}",
+                classify_task_execution_kind(&assignment.task),
                 lane_index,
                 assignment.task.id,
                 assignment.task.title,
                 if assignment.resumed { " [resume]" } else { "" }
+            ));
+            let dispatch_message = if assignment.resumed {
+                format!("dispatch: resumed `{}`", assignment.task.title)
+            } else {
+                format!("dispatch: started `{}`", assignment.task.title)
+            };
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                lane_index,
+                &assignment.task.id,
+                &dispatch_message,
             );
             active_tasks.insert(assignment.task.id.clone());
             active_lanes.insert(lane_index, assignment);
+            last_idle_summary = None;
         }
 
         if active_lanes.is_empty() {
             let queue = plan.queue_snapshot();
             if queue.pending_ids.is_empty() {
                 if queue.blocked_ids.is_empty() {
-                    println!("no pending `- [ ]` tasks remain; stopping.");
+                    parallel_logger.info("no pending `- [ ]` tasks remain; stopping.");
                 } else {
-                    println!(
+                    parallel_logger.info(format!(
                         "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
                         queue.blocked_ids.join(", ")
-                    );
+                    ));
                 }
                 break;
             }
 
-            println!(
+            parallel_logger.info(format!(
                 "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}",
                 queue.pending_ids.join(", "),
                 if queue.blocked_ids.is_empty() {
@@ -1037,7 +1210,7 @@ async fn run_parallel_loop(
                 } else {
                     queue.blocked_ids.join(", ")
                 }
-            );
+            ));
             break;
         }
 
@@ -1056,6 +1229,12 @@ async fn run_parallel_loop(
                 "warning: lane-{} `{}` failed before producing an exit status; shelving for the rest of this run: {}",
                 assignment.lane_index, assignment.task.id, error
             );
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!("shelved: host failure before exit status: {error}"),
+            );
             shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
             continue;
         }
@@ -1070,10 +1249,10 @@ async fn run_parallel_loop(
                     if let Err(err) =
                         land_parallel_lane_result(repo_root, target_branch, &assignment)
                     {
-                        eprintln!(
+                        parallel_logger.warn(format!(
                             "warning: failed landing lane-{} `{}` after non-zero worker exit: {err:#}",
                             assignment.lane_index, assignment.task.id
-                        );
+                        ));
                         shelved_tasks
                             .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                         continue;
@@ -1087,10 +1266,18 @@ async fn run_parallel_loop(
                         }
                     }
                     landed += 1;
-                    println!(
-                        "landed:      {} via lane-{} after non-zero worker exit (total landed: {})",
+                    parallel_logger.info(format!(
+                        "landed:      [{}] {} via lane-{} after non-zero worker exit (total landed: {})",
+                        classify_task_execution_kind(&assignment.task),
                         assignment.task.id, assignment.lane_index, landed
+                    ));
+                    append_lane_host_event(
+                        &assignment.stdout_log_path,
+                        assignment.lane_index,
+                        &assignment.task.id,
+                        "landed: host harvested committed work after non-zero worker exit",
                     );
+                    last_idle_summary = None;
                     continue;
                 }
                 LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {}
@@ -1098,7 +1285,7 @@ async fn run_parallel_loop(
             let exit_code = exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
             if assignment.attempts > args.max_retries {
-                eprintln!(
+                parallel_logger.warn(format!(
                     "warning: {} lane-{} (`{}`) exited with status {} after {} attempts; shelving for the rest of this run. see {}",
                     harness,
                     assignment.lane_index,
@@ -1110,12 +1297,26 @@ async fn run_parallel_loop(
                     },
                     assignment.attempts,
                     assignment.stderr_log_path.display()
+                ));
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    &format!(
+                        "shelved: worker exited {} after {} attempts",
+                        if is_futility {
+                            "with futility spiral".to_string()
+                        } else {
+                            format!("with code {exit_code}")
+                        },
+                        assignment.attempts
+                    ),
                 );
                 shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                 continue;
             }
 
-            println!(
+            parallel_logger.info(format!(
                 "warning: lane-{} `{}` exited non-zero ({}), retrying attempt {}/{}",
                 assignment.lane_index,
                 assignment.task.id,
@@ -1126,9 +1327,29 @@ async fn run_parallel_loop(
                 },
                 assignment.attempts,
                 args.max_retries + 1
+            ));
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!(
+                    "retrying: worker exited {} on attempt {}/{}",
+                    if is_futility {
+                        "with futility spiral".to_string()
+                    } else {
+                        format!("with code {exit_code}")
+                    },
+                    assignment.attempts,
+                    args.max_retries + 1
+                ),
             );
-            let plan_for_prompt =
-                refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
+            let plan_for_prompt = refresh_parallel_plan_or_last_good(
+                repo_root,
+                linear_tracker,
+                &plan,
+                parallel_logger,
+            )
+            .await;
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -1137,10 +1358,10 @@ async fn run_parallel_loop(
                 &mut assignment,
                 target_branch,
             ) {
-                eprintln!(
+                parallel_logger.warn(format!(
                     "warning: failed restarting lane-{} `{}`; shelving for the rest of this run: {err:#}",
                     assignment.lane_index, assignment.task.id
-                );
+                ));
                 shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                 continue;
             }
@@ -1151,32 +1372,43 @@ async fn run_parallel_loop(
 
         match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
             LaneRepoProgress::Dirty(status) => {
-                eprintln!(
+                parallel_logger.warn(format!(
                     "warning: parallel lane-{} (`{}`) exited cleanly but left uncommitted changes; shelving for the rest of this run:\n{}",
                     assignment.lane_index,
                     assignment.task.id,
                     status
+                ));
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    "shelved: worker exited cleanly but left uncommitted changes",
                 );
                 shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                 continue;
             }
             LaneRepoProgress::None => {
-                eprintln!(
+                parallel_logger.warn(format!(
                     "warning: parallel lane-{} (`{}`) exited cleanly without producing a local commit; shelving for the rest of this run. see {}",
                     assignment.lane_index,
                     assignment.task.id,
                     assignment.stderr_log_path.display()
+                ));
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    "shelved: worker exited cleanly without producing a local commit",
                 );
                 shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                 continue;
             }
             LaneRepoProgress::NewCommits => {
-                if let Err(err) = land_parallel_lane_result(repo_root, target_branch, &assignment)
-                {
-                    eprintln!(
+                if let Err(err) = land_parallel_lane_result(repo_root, target_branch, &assignment) {
+                    parallel_logger.warn(format!(
                         "warning: failed landing lane-{} `{}`; shelving for the rest of this run: {err:#}",
                         assignment.lane_index, assignment.task.id
-                    );
+                    ));
                     shelved_tasks
                         .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                     continue;
@@ -1190,10 +1422,20 @@ async fn run_parallel_loop(
                     }
                 }
                 landed += 1;
-                println!(
-                    "landed:      {} via lane-{} (total landed: {})",
-                    assignment.task.id, assignment.lane_index, landed
+                parallel_logger.info(format!(
+                    "landed:      [{}] {} via lane-{} (total landed: {})",
+                    classify_task_execution_kind(&assignment.task),
+                    assignment.task.id,
+                    assignment.lane_index,
+                    landed
+                ));
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    "landed: host harvested committed work",
                 );
+                last_idle_summary = None;
             }
         }
     }
@@ -1209,6 +1451,7 @@ fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
 async fn refresh_parallel_plan(
     repo_root: &Path,
     linear_tracker: &mut Option<LinearTracker>,
+    parallel_logger: &ParallelEventLogger,
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
     if let Some(tracker) = linear_tracker.as_mut() {
@@ -1227,10 +1470,10 @@ async fn refresh_parallel_plan(
                 if !drift.terminal_task_ids.is_empty() {
                     reasons.push(format!("terminal {}", drift.terminal_task_ids.join(", ")));
                 }
-                println!(
+                parallel_logger.info(format!(
                     "linear drift: {}. running `auto symphony sync --no-ai-planner` before dispatch",
                     reasons.join(" | ")
-                );
+                ));
                 tracker.mark_auto_sync_attempt(&plan_text);
                 if let Err(err) = run_sync(SymphonySyncArgs {
                     repo_root: Some(repo_root.to_path_buf()),
@@ -1243,14 +1486,18 @@ async fn refresh_parallel_plan(
                 })
                 .await
                 {
-                    eprintln!(
+                    parallel_logger.warn(format!(
                         "warning: automatic `auto symphony sync --no-ai-planner` failed; continuing without refreshed Linear coverage: {err:#}"
-                    );
+                    ));
                 } else {
                     plan_text = read_loop_plan(repo_root)?;
                     if let Err(err) = tracker.refresh_after_sync(&plan_text).await {
-                        eprintln!(
+                        parallel_logger.warn(format!(
                             "warning: failed refreshing Linear cache after automatic sync: {err:#}"
+                        ));
+                    } else {
+                        parallel_logger.info(
+                            "linear:      automatic `auto symphony sync --no-ai-planner` completed",
                         );
                     }
                 }
@@ -1264,13 +1511,14 @@ async fn refresh_parallel_plan_or_last_good(
     repo_root: &Path,
     linear_tracker: &mut Option<LinearTracker>,
     last_good_plan: &LoopPlanSnapshot,
+    parallel_logger: &ParallelEventLogger,
 ) -> LoopPlanSnapshot {
-    match refresh_parallel_plan(repo_root, linear_tracker).await {
+    match refresh_parallel_plan(repo_root, linear_tracker, parallel_logger).await {
         Ok(plan) => plan,
         Err(err) => {
-            eprintln!(
+            parallel_logger.warn(format!(
                 "warning: failed to refresh IMPLEMENTATION_PLAN.md; continuing with the last good queue snapshot: {err:#}"
-            );
+            ));
             last_good_plan.clone()
         }
     }
@@ -1284,10 +1532,6 @@ fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> 
         return Ok(());
     }
 
-    let live_log_path = run_root.join("live.log");
-    fs::write(&live_log_path, b"")
-        .with_context(|| format!("failed to initialize {}", live_log_path.display()))?;
-
     let pane_target = tmux_pane
         .into_string()
         .map_err(|_| anyhow::anyhow!("TMUX_PANE contained invalid UTF-8"))?;
@@ -1297,16 +1541,6 @@ fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> 
         "-t",
         &pane_target,
         "#{session_name}",
-    ])?;
-
-    run_tmux([
-        "pipe-pane",
-        "-t",
-        &pane_target,
-        &format!(
-            "cat >> {}",
-            shell_quote(&live_log_path.display().to_string())
-        ),
     ])?;
 
     for window_name in tmux_window_names(&session_name)? {
@@ -1319,15 +1553,16 @@ fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> 
         }
     }
 
-    let live_log = shell_quote(&live_log_path.display().to_string());
     for lane in 1..=lanes {
         let window_name = format!("parallel-lane-{lane}");
-        let filter = format!("^\\[auto parallel lane-{lane} ");
+        let lane_root = run_root.join("lanes").join(format!("lane-{lane}"));
+        let stdout_log = shell_quote(&lane_root.join("stdout.log").display().to_string());
+        let stderr_log = shell_quote(&lane_root.join("stderr.log").display().to_string());
         let script = format!(
-            "mkdir -p {run_root}; touch {live_log}; tail --pid={host_pid} -n +1 -F {live_log} | grep --line-buffered -E {filter} || true; printf '\\n[auto parallel lane-{lane}] host process {host_pid} exited; log tail stopped.\\n'; exec bash",
-            run_root = shell_quote(&run_root.display().to_string()),
-            live_log = live_log,
-            filter = shell_quote(&filter),
+            "mkdir -p {lane_root}; touch {stdout_log} {stderr_log}; tail -q --pid={host_pid} -n +1 -F {stdout_log} {stderr_log} || true; printf '\\n[auto parallel lane-{lane}] host process {host_pid} exited; log tail stopped.\\n'; exec bash",
+            lane_root = shell_quote(&lane_root.display().to_string()),
+            stdout_log = stdout_log,
+            stderr_log = stderr_log,
             host_pid = host_pid,
             lane = lane,
         );
@@ -1392,6 +1627,110 @@ fn shell_quote(raw: &str) -> String {
     format!("'{escaped}'")
 }
 
+fn normalize_parallel_live_log_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn redact_parallel_live_log_message(message: &str) -> String {
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    static ASSIGNMENT_RE: OnceLock<Regex> = OnceLock::new();
+
+    let bearer_re = BEARER_RE.get_or_init(|| {
+        Regex::new(r"(?i)(authorization:\s*bearer\s+)([^\s]+)")
+            .expect("valid bearer-token redaction regex")
+    });
+    let assignment_re = ASSIGNMENT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|API_KEY|PRIVATE_KEY|ACCESS_KEY))=([^\s]+)",
+        )
+        .expect("valid env-assignment redaction regex")
+    });
+
+    let redacted = bearer_re.replace_all(message, "$1[REDACTED]");
+    assignment_re
+        .replace_all(&redacted, "$1=[REDACTED]")
+        .into_owned()
+}
+
+fn classify_task_execution_kind(task: &LoopTask) -> &'static str {
+    let text = format!("{} {}", task.id, task.title).to_ascii_uppercase();
+    if text.contains("DEPLOY") || text.contains("MONITOR") || text.contains("OPS") {
+        "ops"
+    } else if text.contains("AUDIT")
+        || text.contains("CHECKPOINT")
+        || text.contains("SMOKE")
+        || text.contains("COVERAGE")
+    {
+        "verification"
+    } else {
+        "code"
+    }
+}
+
+fn describe_parallel_idle_state(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+) -> String {
+    let ready = plan
+        .ready_tasks(active_tasks)
+        .into_iter()
+        .filter(|task| !shelved_tasks.contains_key(&task.id))
+        .collect::<Vec<_>>();
+    let (verification_only, executable_ready): (Vec<_>, Vec<_>) =
+        ready.into_iter().partition(is_verification_only_task);
+    if executable_ready.is_empty() && !verification_only.is_empty() {
+        return format!(
+            "manual verification-only checkpoints are ready: {}",
+            verification_only
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let unresolved = plan
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                LoopTaskStatus::Pending | LoopTaskStatus::Blocked
+            )
+        })
+        .map(|task| task.id.as_str())
+        .chain(active_tasks.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let waiting_on = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .filter(|task| !active_tasks.contains(&task.id))
+        .filter(|task| !shelved_tasks.contains_key(&task.id))
+        .flat_map(|task| {
+            task.dependencies
+                .iter()
+                .filter(|dep| unresolved.contains(dep.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    if waiting_on.is_empty() {
+        "no dependency-ready task is currently available".to_string()
+    } else {
+        format!(
+            "waiting on dependencies: {}",
+            waiting_on.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 fn next_free_lane_index(
     max_concurrent_workers: usize,
     active_lanes: &BTreeMap<usize, ActiveLaneAssignment>,
@@ -1417,6 +1756,7 @@ fn prepare_parallel_lane_assignment(
             lane_root: candidate.lane_root,
             lane_repo_root: candidate.lane_repo_root,
             base_commit: candidate.base_commit,
+            stdout_log_path: candidate.stdout_log_path,
             stderr_log_path: candidate.stderr_log_path,
             worker_pid_path: candidate.worker_pid_path,
             clean_commit_since: None,
@@ -1438,6 +1778,7 @@ fn prepare_parallel_lane_assignment(
         lane_root: lane_root.clone(),
         lane_repo_root,
         base_commit: base_commit.trim().to_string(),
+        stdout_log_path: lane_root.join("stdout.log"),
         stderr_log_path: lane_root.join("stderr.log"),
         worker_pid_path: lane_root.join("worker.pid"),
         clean_commit_since: None,
@@ -1529,6 +1870,7 @@ fn discover_resume_candidates(
             continue;
         };
 
+        let stdout_log_path = lane_root.join("stdout.log");
         let stderr_log_path = lane_root.join("stderr.log");
         let worker_pid_path = lane_root.join("worker.pid");
         if let Err(err) = clear_stale_worker_pid(&worker_pid_path) {
@@ -1606,6 +1948,7 @@ fn discover_resume_candidates(
                 lane_root,
                 lane_repo_root,
                 base_commit,
+                stdout_log_path,
                 stderr_log_path,
                 worker_pid_path,
             },
@@ -1620,25 +1963,26 @@ async fn harvest_resumable_lane_results(
     target_branch: &str,
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
     linear_tracker: &mut Option<LinearTracker>,
+    parallel_logger: &ParallelEventLogger,
 ) -> Result<usize> {
     let mut landed = 0usize;
     let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
     for lane_index in lane_indexes {
         let should_land = match resumable_lanes.get(&lane_index) {
-            Some(candidate) => match inspect_lane_repo_progress(
-                &candidate.lane_repo_root,
-                &candidate.base_commit,
-            ) {
-                Ok(LaneRepoProgress::NewCommits) => true,
-                Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::None) => false,
-                Err(err) => {
-                    eprintln!(
+            Some(candidate) => {
+                match inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)
+                {
+                    Ok(LaneRepoProgress::NewCommits) => true,
+                    Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::None) => false,
+                    Err(err) => {
+                        eprintln!(
                         "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
                         lane_index
                     );
-                    false
+                        false
+                    }
                 }
-            },
+            }
             None => false,
         };
         if !should_land {
@@ -1655,6 +1999,7 @@ async fn harvest_resumable_lane_results(
             lane_root: candidate.lane_root,
             lane_repo_root: candidate.lane_repo_root,
             base_commit: candidate.base_commit,
+            stdout_log_path: candidate.stdout_log_path,
             stderr_log_path: candidate.stderr_log_path,
             worker_pid_path: candidate.worker_pid_path,
             clean_commit_since: None,
@@ -1671,16 +2016,16 @@ async fn harvest_resumable_lane_results(
                     }
                 }
                 landed += 1;
-                println!(
+                parallel_logger.info(format!(
                     "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
                     assignment.task.id, assignment.lane_index, landed
-                );
+                ));
             }
             Err(error) => {
-                println!(
+                parallel_logger.warn(format!(
                     "warning: resume harvest for lane-{} `{}` failed; keeping lane resumable instead: {error:#}",
                     assignment.lane_index, assignment.task.id
-                );
+                ));
                 resumable_lanes.insert(
                     lane_index,
                     LaneResumeCandidate {
@@ -1689,6 +2034,7 @@ async fn harvest_resumable_lane_results(
                         lane_root: assignment.lane_root,
                         lane_repo_root: assignment.lane_repo_root,
                         base_commit: assignment.base_commit,
+                        stdout_log_path: assignment.stdout_log_path,
                         stderr_log_path: assignment.stderr_log_path,
                         worker_pid_path: assignment.worker_pid_path,
                     },
@@ -1774,6 +2120,7 @@ fn spawn_parallel_lane_attempt(
     ));
     let repo_root = assignment.lane_repo_root.clone();
     let stderr_log_path = assignment.stderr_log_path.clone();
+    let stdout_log_path = assignment.stdout_log_path.clone();
     let worker_pid_path = assignment.worker_pid_path.clone();
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
@@ -1798,6 +2145,7 @@ fn spawn_parallel_lane_attempt(
                 &lane_config.reasoning_effort,
                 lane_config.max_turns,
                 &stderr_log_path,
+                Some(&stdout_log_path),
                 &context_label,
                 &lane_config.extra_env,
                 Some(&worker_pid_path),
@@ -1811,6 +2159,7 @@ fn spawn_parallel_lane_attempt(
                 &lane_config.reasoning_effort,
                 &lane_config.codex_bin,
                 &stderr_log_path,
+                Some(&stdout_log_path),
                 &context_label,
                 &lane_config.extra_env,
                 Some(&worker_pid_path),
@@ -1849,19 +2198,21 @@ fn refresh_assignment_task_from_plan(
 
 fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLaneAssignment>) {
     for assignment in active_lanes.values_mut() {
-        let progress =
-            match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit) {
-                Ok(progress) => progress,
-                Err(err) => {
-                    eprintln!(
+        let progress = match inspect_lane_repo_progress(
+            &assignment.lane_repo_root,
+            &assignment.base_commit,
+        ) {
+            Ok(progress) => progress,
+            Err(err) => {
+                eprintln!(
                         "warning: failed inspecting lane-{} `{}` while checking for harvestable commits: {err:#}",
                         assignment.lane_index, assignment.task.id
                     );
-                    assignment.clean_commit_since = None;
-                    assignment.terminate_requested_at = None;
-                    continue;
-                }
-            };
+                assignment.clean_commit_since = None;
+                assignment.terminate_requested_at = None;
+                continue;
+            }
+        };
         match progress {
             LaneRepoProgress::NewCommits => {
                 let pid = match read_worker_pid(&assignment.worker_pid_path) {
@@ -1911,9 +2262,17 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
                             );
                         } else {
                             println!(
-                                "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
-                                assignment.lane_index, assignment.task.id, pid
-                            );
+                            "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                            assignment.lane_index, assignment.task.id, pid
+                        );
+                            append_lane_host_event(
+                            &assignment.stdout_log_path,
+                            assignment.lane_index,
+                            &assignment.task.id,
+                            &format!(
+                                "harvest: sent SIGKILL to lingering worker pid {pid} after clean commit"
+                            ),
+                        );
                         }
                         assignment.terminate_requested_at = None;
                     }
@@ -1931,6 +2290,14 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
                         println!(
                             "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
                             assignment.lane_index, assignment.task.id, pid
+                        );
+                        append_lane_host_event(
+                            &assignment.stdout_log_path,
+                            assignment.lane_index,
+                            &assignment.task.id,
+                            &format!(
+                                "harvest: sent SIGTERM to lingering worker pid {pid} after clean commit"
+                            ),
                         );
                         assignment.terminate_requested_at = Some(Instant::now());
                     }
@@ -2116,15 +2483,13 @@ fn build_parallel_lane_prompt(
         "Do not edit these shared queue files in this lane. The host owns queue reconciliation in parallel mode: {}.",
         protected_files
     );
-    let scope_budget = render_lane_scope_budget(task);
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Keep the final diff within this task's scope budget ({scope_budget}). If the real fix needs more than that, stop and report the blocker instead of widening scope.\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
         branch = branch,
         protected_clause = protected_clause,
-        scope_budget = scope_budget,
         pending_count = queue.pending_ids.len(),
         blocked_clause = blocked_clause,
         markdown = task.markdown
@@ -2146,12 +2511,14 @@ fn inspect_lane_repo_progress(repo_root: &Path, base_commit: &str) -> Result<Lan
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 struct LaneScopeBudget {
     max_changed_files: usize,
     max_package_roots: usize,
     max_area_roots: usize,
 }
 
+#[allow(dead_code)]
 fn render_lane_scope_budget(task: &LoopTask) -> String {
     let budget = lane_scope_budget(task);
     let scope_label = task
@@ -2172,6 +2539,7 @@ fn is_verification_only_task(task: &LoopTask) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn lane_scope_budget(task: &LoopTask) -> LaneScopeBudget {
     let scope = task
         .estimated_scope
@@ -2833,6 +3201,7 @@ mod tests {
                 lane_root: PathBuf::from("/tmp/lane-2"),
                 lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
                 base_commit: "abc123".to_string(),
+                stdout_log_path: PathBuf::from("/tmp/lane-2/stdout.log"),
                 stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
                 worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
             },
@@ -2845,6 +3214,7 @@ mod tests {
                 lane_root: PathBuf::from("/tmp/lane-5"),
                 lane_repo_root: PathBuf::from("/tmp/lane-5/repo"),
                 base_commit: "def456".to_string(),
+                stdout_log_path: PathBuf::from("/tmp/lane-5/stdout.log"),
                 stderr_log_path: PathBuf::from("/tmp/lane-5/stderr.log"),
                 worker_pid_path: PathBuf::from("/tmp/lane-5/worker.pid"),
             },
@@ -2872,6 +3242,7 @@ mod tests {
                 lane_root: PathBuf::from("/tmp/lane-2"),
                 lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
                 base_commit: "abc123".to_string(),
+                stdout_log_path: PathBuf::from("/tmp/lane-2/stdout.log"),
                 stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
                 worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
                 clean_commit_since: None,
@@ -3004,6 +3375,61 @@ mod tests {
                 .map(|task| task.id)
                 .collect::<Vec<_>>(),
             vec!["WEB-HOUSE-AUDIT"]
+        );
+    }
+
+    #[test]
+    fn parse_loop_plan_ignores_parallelism_notes_in_dependency_lines() {
+        let plan = r#"
+- [x] `WEB-HOUSE-AUDIT` Audit
+  Dependencies: none
+  Estimated scope: S
+- [x] `WEB-CHANNEL-COVERAGE` Coverage
+  Dependencies: none
+  Estimated scope: S
+- [ ] `WEB-CODEGEN-A` Codegen
+  Dependencies: `WEB-HOUSE-AUDIT`, `WEB-CHANNEL-COVERAGE`
+  Estimated scope: L
+- [ ] `WEB-CLIENT-BUILD` Build
+  Dependencies: `WEB-HOUSE-AUDIT`, `WEB-CHANNEL-COVERAGE` (Wave 0 gate — finding #3; parallel with `WEB-CODEGEN-A` + `WEB-DESIGN-SYSTEM`)
+  Estimated scope: M
+- [ ] `WEB-DESIGN-SYSTEM` Design
+  Dependencies: `WEB-CLIENT-BUILD` (need bundle for shell exports), `WEB-HOUSE-AUDIT`, `WEB-CHANNEL-COVERAGE` (Wave 0 gate — finding #3). Parallel with `WEB-CODEGEN-A`.
+  Estimated scope: L
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let codegen = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == "WEB-CODEGEN-A")
+            .expect("WEB-CODEGEN-A present");
+        let build = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == "WEB-CLIENT-BUILD")
+            .expect("WEB-CLIENT-BUILD present");
+        let design = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == "WEB-DESIGN-SYSTEM")
+            .expect("WEB-DESIGN-SYSTEM present");
+
+        assert_eq!(
+            codegen.dependencies,
+            vec!["WEB-HOUSE-AUDIT", "WEB-CHANNEL-COVERAGE"]
+        );
+        assert_eq!(
+            build.dependencies,
+            vec!["WEB-HOUSE-AUDIT", "WEB-CHANNEL-COVERAGE"]
+        );
+        assert_eq!(
+            design.dependencies,
+            vec![
+                "WEB-CLIENT-BUILD",
+                "WEB-HOUSE-AUDIT",
+                "WEB-CHANNEL-COVERAGE"
+            ]
         );
     }
 

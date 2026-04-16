@@ -88,6 +88,7 @@ pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
         &args.reasoning_effort,
         &args.codex_bin,
         &stderr_log_path,
+        None,
         "auto health",
     )
     .await?;

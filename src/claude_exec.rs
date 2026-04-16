@@ -22,6 +22,7 @@ pub(crate) async fn run_claude_exec(
     effort: &str,
     max_turns: Option<usize>,
     stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
     run_claude_exec_with_env(
@@ -31,6 +32,7 @@ pub(crate) async fn run_claude_exec(
         effort,
         max_turns,
         stderr_log_path,
+        stdout_log_path,
         context_label,
         &[],
         None,
@@ -45,6 +47,7 @@ pub(crate) async fn run_claude_exec_with_env(
     effort: &str,
     max_turns: Option<usize>,
     stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
@@ -58,6 +61,7 @@ pub(crate) async fn run_claude_exec_with_env(
         let resolved_effort = resolved_effort.clone();
         let context_label = context_label.to_owned();
         let extra_env = extra_env.to_vec();
+        let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
         let result = quota_exec::run_with_quota(Provider::Claude, move || {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
@@ -65,6 +69,7 @@ pub(crate) async fn run_claude_exec_with_env(
             let resolved_effort = resolved_effort.clone();
             let context_label = context_label.clone();
             let extra_env = extra_env.clone();
+            let stdout_log_path = stdout_log_path.clone();
             async move {
                 spawn_claude(
                     &repo_root,
@@ -72,6 +77,7 @@ pub(crate) async fn run_claude_exec_with_env(
                     &resolved_model,
                     &resolved_effort,
                     max_turns,
+                    stdout_log_path.as_deref(),
                     &context_label,
                     &extra_env,
                     worker_pid_path,
@@ -88,6 +94,7 @@ pub(crate) async fn run_claude_exec_with_env(
             &resolved_model,
             &resolved_effort,
             max_turns,
+            stdout_log_path,
             context_label,
             extra_env,
             worker_pid_path,
@@ -106,6 +113,7 @@ async fn spawn_claude(
     model: &str,
     effort: &str,
     max_turns: Option<usize>,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
@@ -159,9 +167,15 @@ async fn spawn_claude(
 
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
     let stream_label = context_label.to_string();
+    let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
     let stdout_task = tokio::spawn(async move {
-        codex_stream::stream_claude_output(stdout, Some(futility_tx), Some(stream_label.as_str()))
-            .await
+        codex_stream::stream_claude_output(
+            stdout,
+            Some(futility_tx),
+            Some(stream_label.as_str()),
+            stdout_log_path.as_deref(),
+        )
+        .await
     });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 

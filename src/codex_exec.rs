@@ -33,6 +33,7 @@ pub(crate) async fn run_codex_exec(
     reasoning_effort: &str,
     codex_bin: &Path,
     stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
     run_codex_exec_with_env(
@@ -42,6 +43,7 @@ pub(crate) async fn run_codex_exec(
         reasoning_effort,
         codex_bin,
         stderr_log_path,
+        stdout_log_path,
         context_label,
         &[],
         None,
@@ -57,6 +59,7 @@ pub(crate) async fn run_codex_exec_with_env(
     reasoning_effort: &str,
     codex_bin: &Path,
     stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
@@ -69,6 +72,7 @@ pub(crate) async fn run_codex_exec_with_env(
         let codex_bin = codex_bin.to_owned();
         let context_label = context_label.to_owned();
         let extra_env = extra_env.to_vec();
+        let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
         let result = quota_exec::run_with_quota(Provider::Codex, move || {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
@@ -77,6 +81,7 @@ pub(crate) async fn run_codex_exec_with_env(
             let codex_bin = codex_bin.clone();
             let context_label = context_label.clone();
             let extra_env = extra_env.clone();
+            let stdout_log_path = stdout_log_path.clone();
             async move {
                 spawn_codex(
                     &repo_root,
@@ -84,6 +89,7 @@ pub(crate) async fn run_codex_exec_with_env(
                     &model,
                     &reasoning_effort,
                     &codex_bin,
+                    stdout_log_path.as_deref(),
                     &context_label,
                     &extra_env,
                     worker_pid_path,
@@ -100,6 +106,7 @@ pub(crate) async fn run_codex_exec_with_env(
             model,
             reasoning_effort,
             codex_bin,
+            stdout_log_path,
             context_label,
             extra_env,
             worker_pid_path,
@@ -200,6 +207,7 @@ async fn spawn_codex(
     model: &str,
     reasoning_effort: &str,
     codex_bin: &Path,
+    stdout_log_path: Option<&Path>,
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
@@ -253,8 +261,14 @@ async fn spawn_codex(
         .with_context(|| format!("Codex stderr should be piped for {context_label}"))?;
 
     let stream_label = context_label.to_string();
+    let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
     let stdout_task = tokio::spawn(async move {
-        codex_stream::capture_codex_output_prefixed(stdout, Some(stream_label.as_str())).await
+        codex_stream::capture_codex_output_prefixed(
+            stdout,
+            Some(stream_label.as_str()),
+            stdout_log_path.as_deref(),
+        )
+        .await
     });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 

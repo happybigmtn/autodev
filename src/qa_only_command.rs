@@ -108,6 +108,7 @@ pub(crate) async fn run_qa_only(args: QaOnlyArgs) -> Result<()> {
         &args.reasoning_effort,
         &args.codex_bin,
         &stderr_log_path,
+        None,
         "auto qa-only",
     )
     .await?;

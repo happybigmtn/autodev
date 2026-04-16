@@ -221,6 +221,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
                 &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
+                None,
                 "auto loop",
             )
             .await?
@@ -232,6 +233,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
                 &args.reasoning_effort,
                 &args.codex_bin,
                 &stderr_log_path,
+                None,
                 "auto loop",
             )
             .await?

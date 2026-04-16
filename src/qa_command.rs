@@ -150,6 +150,7 @@ pub(crate) async fn run_qa(args: QaArgs) -> Result<()> {
             &args.reasoning_effort,
             &args.codex_bin,
             &stderr_log_path,
+            None,
             "auto qa",
         )
         .await?;

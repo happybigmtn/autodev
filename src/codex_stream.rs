@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use console::Style;
@@ -131,13 +133,14 @@ pub(crate) async fn stream_codex_output<R>(stream: R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    capture_codex_output_prefixed(stream, None).await?;
+    capture_codex_output_prefixed(stream, None, None).await?;
     Ok(())
 }
 
 pub(crate) async fn capture_codex_output_prefixed<R>(
     stream: R,
     prefix: Option<&str>,
+    rendered_log_path: Option<&Path>,
 ) -> Result<String>
 where
     R: AsyncRead + Unpin,
@@ -145,6 +148,7 @@ where
     let mut reader = BufReader::new(stream).lines();
     let mut raw = String::new();
     let mut state = CodexRenderState::default();
+    let mut rendered_log = open_rendered_log(rendered_log_path)?;
     while let Some(line) = reader
         .next_line()
         .await
@@ -156,6 +160,11 @@ where
         if !rendered.is_empty() {
             print!("{}", render_with_prefix(&rendered, prefix));
             let _ = io::stdout().flush();
+            if let Some(file) = rendered_log.as_mut() {
+                file.write_all(rendered.as_bytes())
+                    .context("failed writing Codex rendered output log")?;
+                let _ = file.flush();
+            }
         }
     }
     Ok(raw)
@@ -165,6 +174,7 @@ pub(crate) async fn stream_claude_output<R>(
     stream: R,
     futility_tx: Option<oneshot::Sender<()>>,
     prefix: Option<&str>,
+    rendered_log_path: Option<&Path>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -172,6 +182,7 @@ where
     let mut reader = BufReader::new(stream).lines();
     let mut state = ClaudeRenderState::default();
     let mut futility_tx = futility_tx;
+    let mut rendered_log = open_rendered_log(rendered_log_path)?;
     while let Some(line) = reader
         .next_line()
         .await
@@ -181,6 +192,11 @@ where
         if !rendered.is_empty() {
             print!("{}", render_with_prefix(&rendered, prefix));
             let _ = io::stdout().flush();
+            if let Some(file) = rendered_log.as_mut() {
+                file.write_all(rendered.as_bytes())
+                    .context("failed writing Claude rendered output log")?;
+                let _ = file.flush();
+            }
         }
         if state.futility_detected {
             if let Some(tx) = futility_tx.take() {
@@ -189,6 +205,18 @@ where
         }
     }
     Ok(())
+}
+
+fn open_rendered_log(path: Option<&Path>) -> Result<Option<std::fs::File>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open rendered output log {}", path.display()))?;
+    Ok(Some(file))
 }
 
 fn render_with_prefix(rendered: &str, prefix: Option<&str>) -> String {

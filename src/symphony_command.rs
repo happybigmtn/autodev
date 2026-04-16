@@ -344,6 +344,7 @@ struct PlannerResponse {
 struct PlannerTask {
     task_id: String,
     priority: i64,
+    #[allow(dead_code)]
     #[serde(default)]
     dependencies: Vec<String>,
     #[serde(default)]
@@ -680,14 +681,16 @@ This is a concrete planning deliverable, not a quick heuristic pass. Treat it li
 Constraints:
 - `IMPLEMENTATION_PLAN.md` is the primary source of truth, but you may inspect the live repo to resolve ambiguous shared surfaces or blocker language.
 - Preserve every explicit prerequisite from the plan.
-- Add missing blockers when the plan's gating language, integration touchpoints, or shared owned surfaces imply that parallel execution would be unsafe.
+- Treat each task's `Dependencies:` block as the authoritative machine blocker set for repo-local scheduling.
+- Do not invent new repo-local `dependencies` from critical-path prose, parenthetical notes, "parallel with" commentary, merge-conflict caution, or broad shared-surface anxiety. Use `priority` and `rationale` to shape waves instead.
+- If prose gating looks real but is not encoded in the task contract, reflect it in `priority`/`rationale` rather than smuggling in a hidden blocker. That kind of fix belongs in the plan itself.
 - Be conservative about merge-conflict risk, but do not serialize unrelated work unnecessarily.
 - Use `priority` values `1` through `4`, where `1` is the first work Symphony should prefer.
 - Treat `priority: 1` as the immediate first-wave launch set for a 5-lane run, not a broad bucket for every early task.
 - Prefer roughly 3-7 tasks at `priority: 1`. If more tasks are technically runnable, push the less urgent ones to `priority: 2` or add blockers so the top wave stays intentional.
 - Use `priority: 2` for the immediate next wave after the first launch set, `priority: 3` for post-foundation or expansion-gated work, and `priority: 4` for late, conditional, or externally blocked work.
 - When two tasks are both early but one is clearly more central to shared foundations, MVP gating, or unblock sequencing, do not leave them tied at `priority: 1` just because both are runnable.
-- `dependencies` must list task IDs that should block the task inside the same repo queue.
+- `dependencies` must list task IDs already present in that task's explicit dependency contract after normalizing obvious narrative wrappers.
 - Put cross-repo or otherwise unsynced blockers in `external_dependencies`.
 - Return every pending task exactly once. Do not omit any task and do not invent new task IDs.
 - Before finalizing, do at least one concrete verification pass with tools so the run stays observable and grounded.
@@ -854,7 +857,6 @@ fn normalize_planner_response(
             .remove(&task.id)
             .with_context(|| format!("Codex planner omitted task `{}`", task.id))?;
         let mut dependencies = task.dependencies.clone();
-        dependencies.extend(planned.dependencies);
         dependencies.retain(|dependency| dependency != &task.id);
         dependencies = dedup_task_refs(dependencies);
 
@@ -1708,9 +1710,51 @@ fn parse_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
 }
 
 fn parse_task_dependencies(markdown: &str) -> Vec<String> {
-    task_field_body(markdown, "Dependencies:", "Estimated scope:")
-        .map(|body| collect_task_refs(&body))
-        .unwrap_or_default()
+    let Some(body) = task_field_body(markdown, "Dependencies:", "Estimated scope:") else {
+        return Vec::new();
+    };
+
+    let first_meaningful = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('-').trim().to_ascii_lowercase());
+    if first_meaningful
+        .as_deref()
+        .is_some_and(|line| line.starts_with("none"))
+    {
+        return Vec::new();
+    }
+
+    dedup_task_refs(
+        body.lines()
+            .flat_map(task_dependency_refs_from_line)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if trimmed.to_ascii_lowercase().starts_with("external dependency:") {
+        return collect_task_refs(trimmed);
+    }
+    let without_parens = strip_parenthetical_groups(trimmed);
+    let narrative_cut = without_parens.split(['.', ';']).next().unwrap_or("").trim();
+    collect_task_refs(narrative_cut)
+}
+
+fn strip_parenthetical_groups(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => result.push(ch),
+            _ => {}
+        }
+    }
+    result
 }
 
 fn task_field_body(markdown: &str, field: &str, next_field: &str) -> Option<String> {
@@ -1759,11 +1803,23 @@ pub(crate) fn render_issue_title(task: &SymphonyTask) -> String {
     format!("[{}] {}", task.id, task.title)
 }
 
+pub(crate) fn task_contract_fingerprint(task: &SymphonyTask) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    task.id.hash(&mut hasher);
+    task.title.hash(&mut hasher);
+    task.markdown.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub(crate) fn render_issue_description(repo_root: &Path, task: &SymphonyTask) -> String {
     let base_branch = resolve_base_branch(repo_root, None).unwrap_or_else(|_| "main".to_string());
     let task_brief = render_issue_task_brief(task);
+    let fingerprint = task_contract_fingerprint(task);
     format!(
-        "{TASK_SENTINEL_PREFIX} repo={repo} task_id={task_id} base_branch={base_branch} -->\n\n\
+        "{TASK_SENTINEL_PREFIX} repo={repo} task_id={task_id} base_branch={base_branch} fingerprint={fingerprint:016x} -->\n\n\
 Repository: `{repo}`\n\
 Task ID: `{task_id}`\n\
 Base branch: `{base_branch}`\n\
@@ -1774,6 +1830,7 @@ This issue is auto-generated from the repository implementation plan. Re-run `au
         repo = repo_name(repo_root),
         task_id = task.id,
         base_branch = base_branch,
+        fingerprint = fingerprint,
         plan_path = repo_root.join("IMPLEMENTATION_PLAN.md").display(),
         task_brief = task_brief,
         markdown = task.markdown
@@ -2363,8 +2420,9 @@ mod tests {
     use super::{
         extract_agent_message_from_codex_stream, fallback_task_priorities,
         issue_task_id_from_description, mark_tasks_done_in_plan, markdown_front_matter,
-        parse_tasks, render_issue_description, render_workflow_markdown, review_contains_task,
-        shell_quote, single_line_excerpt, SymphonyTask, TaskStatus, WorkflowRenderSpec,
+        normalize_planner_response, parse_tasks, render_issue_description,
+        render_workflow_markdown, review_contains_task, shell_quote, single_line_excerpt,
+        PlannerResponse, PlannerTask, SymphonyTask, TaskStatus, WorkflowRenderSpec,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -2407,6 +2465,42 @@ mod tests {
                 "P-015J".to_string(),
                 "GCRAPS-003".to_string(),
                 "GCRAPS-006".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tasks_treats_none_dependencies_as_empty() {
+        let plan = r#"
+- [ ] `WEB-HOUSE-AUDIT` Audit
+  Dependencies: none (Wave 0 foundation; parallel with `WEB-CODEGEN-A`)
+  Estimated scope: M
+"#;
+        let tasks = parse_tasks(plan);
+        assert!(tasks[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn parse_tasks_ignores_parallelism_notes_in_dependency_lines() {
+        let plan = r#"
+- [ ] `WEB-HOUSE-AUDIT` Foundation
+  Dependencies: none
+  Estimated scope: S
+
+- [ ] `WEB-CHANNEL-COVERAGE` Coverage
+  Dependencies: none
+  Estimated scope: S
+
+- [ ] `WEB-CLIENT-BUILD` Bundle
+  Dependencies: `WEB-HOUSE-AUDIT`, `WEB-CHANNEL-COVERAGE` (Wave 0 gate — finding #3; parallel with `WEB-CODEGEN-A` + `WEB-DESIGN-SYSTEM`)
+  Estimated scope: M
+"#;
+        let tasks = parse_tasks(plan);
+        assert_eq!(
+            tasks[2].dependencies,
+            vec![
+                "WEB-HOUSE-AUDIT".to_string(),
+                "WEB-CHANNEL-COVERAGE".to_string(),
             ]
         );
     }
@@ -2471,6 +2565,55 @@ Awaiting auto review:
         assert_eq!(priorities.get("P-001"), Some(&1));
         assert_eq!(priorities.get("P-002"), Some(&2));
         assert_eq!(priorities.get("P-003"), Some(&3));
+    }
+
+    #[test]
+    fn normalize_planner_response_keeps_explicit_machine_dependencies() {
+        let tasks = vec![
+            SymphonyTask {
+                id: "P-001".to_string(),
+                title: "foundation".to_string(),
+                status: TaskStatus::Pending,
+                dependencies: Vec::new(),
+                markdown: String::new(),
+            },
+            SymphonyTask {
+                id: "P-002".to_string(),
+                title: "feature".to_string(),
+                status: TaskStatus::Pending,
+                dependencies: vec!["P-001".to_string()],
+                markdown: String::new(),
+            },
+        ];
+        let response = PlannerResponse {
+            strategy_summary: "test".to_string(),
+            tasks: vec![
+                PlannerTask {
+                    task_id: "P-001".to_string(),
+                    priority: 1,
+                    dependencies: Vec::new(),
+                    external_dependencies: Vec::new(),
+                    rationale: "foundation".to_string(),
+                },
+                PlannerTask {
+                    task_id: "P-002".to_string(),
+                    priority: 2,
+                    dependencies: vec!["P-003".to_string()],
+                    external_dependencies: vec!["EXT-1".to_string()],
+                    rationale: "feature".to_string(),
+                },
+            ],
+        };
+
+        let normalized = normalize_planner_response(&tasks, response).expect("planner response");
+        assert_eq!(
+            normalized.task_plans["P-002"].dependencies,
+            vec!["P-001".to_string()]
+        );
+        assert_eq!(
+            normalized.task_plans["P-002"].external_dependencies,
+            vec!["EXT-1".to_string()]
+        );
     }
 
     #[test]

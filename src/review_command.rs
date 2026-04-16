@@ -222,6 +222,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
                 &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
+                None,
                 "auto review",
             )
             .await?
@@ -233,6 +234,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
                 &args.reasoning_effort,
                 &args.codex_bin,
                 &stderr_log_path,
+                None,
                 "auto review",
             )
             .await?

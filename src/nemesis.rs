@@ -474,6 +474,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
                 &fixer.effort,
                 &args.codex_bin,
                 &output_dir.join("codex.stderr.log"),
+                None,
                 "auto nemesis implementation",
             )
             .await?;

@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::symphony_command::{parse_tasks, render_issue_title, TaskStatus};
+use crate::symphony_command::{parse_tasks, task_contract_fingerprint, TaskStatus};
 
 const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const TASK_SENTINEL_PREFIX: &str = "<!-- auto-symphony:";
@@ -225,10 +225,7 @@ impl LinearTracker {
         Ok(())
     }
 
-    pub(crate) fn coverage_drift(
-        &self,
-        plan_text: &str,
-    ) -> LinearCoverageDrift {
+    pub(crate) fn coverage_drift(&self, plan_text: &str) -> LinearCoverageDrift {
         let mut drift = LinearCoverageDrift::default();
         for task in parse_tasks(plan_text)
             .into_iter()
@@ -246,8 +243,8 @@ impl LinearTracker {
                 drift.terminal_task_ids.push(task.id);
                 continue;
             }
-            let expected_title = render_issue_title(&task);
-            if issue.title != expected_title {
+            let expected_fingerprint = task_contract_fingerprint(&task);
+            if issue_contract_fingerprint(&issue.description) != Some(expected_fingerprint) {
                 drift.stale_task_ids.push(task.id);
             }
         }
@@ -628,13 +625,22 @@ fn issue_task_id(issue: &LinearIssue) -> Option<String> {
 }
 
 fn issue_task_id_from_description(description: &str) -> Option<String> {
+    issue_sentinel_field(description, "task_id")
+}
+
+fn issue_contract_fingerprint(description: &str) -> Option<u64> {
+    let raw = issue_sentinel_field(description, "fingerprint")?;
+    u64::from_str_radix(raw.trim(), 16).ok()
+}
+
+fn issue_sentinel_field(description: &str, field: &str) -> Option<String> {
     description
         .lines()
         .find(|line| line.starts_with(TASK_SENTINEL_PREFIX))
         .and_then(|line| {
             line.split_whitespace().find_map(|segment| {
                 segment
-                    .strip_prefix("task_id=")
+                    .strip_prefix(&format!("{field}="))
                     .map(|value| value.trim_end_matches("-->").to_string())
             })
         })
@@ -675,12 +681,14 @@ fn plan_fingerprint(plan_text: &str) -> u64 {
 mod tests {
     use super::{
         derive_done_state_name, derive_in_progress_state_name, front_matter_list,
-        front_matter_scalar, issue_task_id_from_description, plan_fingerprint, LinearGraphqlClient,
-        LinearProject, LinearTeam, LinearTracker, TrackedIssue, WorkflowConfig,
+        front_matter_scalar, issue_contract_fingerprint, issue_task_id_from_description,
+        plan_fingerprint, LinearGraphqlClient, LinearProject, LinearTeam, LinearTracker,
+        TrackedIssue, WorkflowConfig,
     };
-    use crate::symphony_command::{parse_tasks, render_issue_title};
+    use crate::symphony_command::{parse_tasks, render_issue_description};
     use reqwest::Client;
     use std::collections::{HashMap, HashSet};
+    use std::path::Path;
 
     #[test]
     fn parses_workflow_scalar_and_lists() {
@@ -717,10 +725,14 @@ mod tests {
     #[test]
     fn description_task_id_parser_reads_symphony_sentinel() {
         let description =
-            "<!-- auto-symphony: repo=autonomy task_id=P-021 base_branch=trunk -->\n\nBody";
+            "<!-- auto-symphony: repo=autonomy task_id=P-021 base_branch=trunk fingerprint=0123456789abcdef -->\n\nBody";
         assert_eq!(
             issue_task_id_from_description(description),
             Some("P-021".to_string())
+        );
+        assert_eq!(
+            issue_contract_fingerprint(description),
+            Some(0x0123456789abcdef)
         );
     }
 
@@ -742,8 +754,8 @@ mod tests {
             "WEB-CRAPS-D".to_string(),
             TrackedIssue {
                 id: "issue-1".to_string(),
-                title: render_issue_title(&task),
-                description: "stale body".to_string(),
+                title: "stale title".to_string(),
+                description: render_issue_description(Path::new("/repo"), &task),
                 state: Some("Todo".to_string()),
             },
         );

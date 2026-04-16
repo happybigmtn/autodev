@@ -143,6 +143,7 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
             &args.reasoning_effort,
             &args.codex_bin,
             &stderr_log_path,
+            None,
             "auto ship",
         )
         .await?;
