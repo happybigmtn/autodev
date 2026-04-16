@@ -247,10 +247,7 @@ impl LinearTracker {
                 continue;
             }
             let expected_title = render_issue_title(&task);
-            let expected_markdown_block = format!("\n---\n\n{}\n", task.markdown);
-            if issue.title != expected_title
-                || !issue.description.contains(&expected_markdown_block)
-            {
+            if issue.title != expected_title {
                 drift.stale_task_ids.push(task.id);
             }
         }
@@ -678,8 +675,12 @@ fn plan_fingerprint(plan_text: &str) -> u64 {
 mod tests {
     use super::{
         derive_done_state_name, derive_in_progress_state_name, front_matter_list,
-        front_matter_scalar, issue_task_id_from_description, plan_fingerprint, WorkflowConfig,
+        front_matter_scalar, issue_task_id_from_description, plan_fingerprint, LinearGraphqlClient,
+        LinearProject, LinearTeam, LinearTracker, TrackedIssue, WorkflowConfig,
     };
+    use crate::symphony_command::{parse_tasks, render_issue_title};
+    use reqwest::Client;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parses_workflow_scalar_and_lists() {
@@ -727,5 +728,49 @@ mod tests {
     fn plan_fingerprint_changes_with_content() {
         assert_ne!(plan_fingerprint("a"), plan_fingerprint("b"));
         assert_eq!(plan_fingerprint("same"), plan_fingerprint("same"));
+    }
+
+    #[test]
+    fn coverage_drift_ignores_description_only_changes() {
+        let plan = r#"- [ ] `WEB-CRAPS-D` Snapshot-driven browser state and JS engine deletion
+  Dependencies:
+    - `WEB-CRAPS-C`
+"#;
+        let task = parse_tasks(plan).into_iter().next().expect("task");
+        let mut issues_by_task_id = HashMap::new();
+        issues_by_task_id.insert(
+            "WEB-CRAPS-D".to_string(),
+            TrackedIssue {
+                id: "issue-1".to_string(),
+                title: render_issue_title(&task),
+                description: "stale body".to_string(),
+                state: Some("Todo".to_string()),
+            },
+        );
+        let tracker = LinearTracker {
+            client: LinearGraphqlClient {
+                http: Client::new(),
+                api_key: "test".to_string(),
+            },
+            project: LinearProject {
+                slug: "proj".to_string(),
+                team: LinearTeam {
+                    id: "team".to_string(),
+                    states: Vec::new(),
+                },
+            },
+            in_progress_state_id: "s1".to_string(),
+            in_progress_state_name: "In Progress".to_string(),
+            done_state_id: "s2".to_string(),
+            done_state_name: "Done".to_string(),
+            terminal_state_names: HashSet::new(),
+            issues_by_task_id,
+            last_plan_fingerprint: None,
+            last_auto_sync_attempt_fingerprint: None,
+        };
+        let drift = tracker.coverage_drift(plan);
+        assert!(drift.missing_task_ids.is_empty());
+        assert!(drift.terminal_task_ids.is_empty());
+        assert!(drift.stale_task_ids.is_empty());
     }
 }
