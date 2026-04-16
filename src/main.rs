@@ -5,6 +5,7 @@ mod codex_stream;
 mod corpus;
 mod generation;
 mod health_command;
+mod linear_tracker;
 mod loop_command;
 mod nemesis;
 mod parallel_command;

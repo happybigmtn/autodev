@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec_with_env;
+use crate::linear_tracker::LinearTracker;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, clear_and_recreate_dir, ensure_repo_layout,
     git_repo_root, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
@@ -92,6 +93,14 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;
     }
     let worker_env = build_loop_worker_env(&args, &run_root)?;
+    let mut linear_tracker = match LinearTracker::maybe_from_repo(&repo_root).await {
+        Ok(Some(tracker)) => Some(tracker),
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("warning: Linear adapter disabled: {err:#}");
+            None
+        }
+    };
 
     println!("auto parallel");
     println!("repo root:   {}", repo_root.display());
@@ -125,6 +134,13 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if let Some(target_summary) = &worker_env.cargo_target_summary {
         println!("cargo target: {}", target_summary);
     }
+    println!(
+        "linear:      {}",
+        linear_tracker
+            .as_ref()
+            .map(LinearTracker::summary)
+            .unwrap_or_else(|| "disabled".to_string())
+    );
     if !reference_repos.is_empty() {
         println!("references:  {}", reference_repos.len());
         for path in &reference_repos {
@@ -157,6 +173,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
             &prompt_template,
             &run_root,
             &worker_env,
+            &mut linear_tracker,
         )
         .await
     } else {
@@ -810,6 +827,7 @@ async fn run_parallel_loop(
     prompt_template: &str,
     run_root: &Path,
     worker_env: &LoopWorkerEnv,
+    linear_tracker: &mut Option<LinearTracker>,
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
     let lane_config = LaneRunConfig::new(args, worker_env);
@@ -817,14 +835,21 @@ async fn run_parallel_loop(
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut landed = 0usize;
-    let mut resumable_lanes =
-        discover_resume_candidates(run_root, target_branch, &inspect_loop_plan(repo_root)?)?;
-    landed += harvest_resumable_lane_results(repo_root, target_branch, &mut resumable_lanes)?;
-    resumable_lanes =
-        discover_resume_candidates(run_root, target_branch, &inspect_loop_plan(repo_root)?)?;
+    let mut plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+    let mut resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    landed += harvest_resumable_lane_results(
+        repo_root,
+        target_branch,
+        &mut resumable_lanes,
+        linear_tracker,
+    )
+    .await?;
+    plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+    resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
 
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes)?;
+        plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
 
         if args
             .max_iterations
@@ -852,7 +877,6 @@ async fn run_parallel_loop(
                 break;
             }
 
-            let plan = inspect_loop_plan(repo_root)?;
             let queue = plan.queue_snapshot();
             if queue.pending_ids.is_empty() {
                 break;
@@ -876,16 +900,13 @@ async fn run_parallel_loop(
                 break;
             }
 
-            let (task, lane_index, resume_candidate) = if let Some((lane_index, candidate)) =
-                take_matching_resume_candidate(
-                    &mut resumable_lanes,
-                    &executable_ready,
-                    &active_lanes,
-                ) {
-                (candidate.task.clone(), lane_index, Some(candidate))
+            let task = executable_ready[0].clone();
+            let (lane_index, resume_candidate) = if let Some((lane_index, candidate)) =
+                take_resume_candidate_for_task(&mut resumable_lanes, &task.id, &active_lanes)
+            {
+                (lane_index, Some(candidate))
             } else {
                 (
-                    executable_ready[0].clone(),
                     next_free_lane_index(args.max_concurrent_workers, &active_lanes)
                         .context("failed to find a free loop lane")?,
                     None,
@@ -899,15 +920,22 @@ async fn run_parallel_loop(
                 task,
                 resume_candidate,
             )?;
-            let plan_for_prompt = inspect_loop_plan(repo_root)?;
             spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
                 prompt_template,
-                &plan_for_prompt,
+                &plan,
                 &mut assignment,
                 target_branch,
             )?;
+            if let Some(tracker) = linear_tracker.as_mut() {
+                if let Err(err) = tracker.note_dispatch(&assignment.task.id).await {
+                    eprintln!(
+                        "warning: failed to move `{}` to in-progress in Linear: {err:#}",
+                        assignment.task.id
+                    );
+                }
+            }
             println!(
                 "dispatch:    lane-{} -> {} {}{}",
                 lane_index,
@@ -920,7 +948,6 @@ async fn run_parallel_loop(
         }
 
         if active_lanes.is_empty() {
-            let plan = inspect_loop_plan(repo_root)?;
             let queue = plan.queue_snapshot();
             if queue.pending_ids.is_empty() {
                 if queue.blocked_ids.is_empty() {
@@ -960,6 +987,14 @@ async fn run_parallel_loop(
             match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
                 LaneRepoProgress::NewCommits => {
                     land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+                    if let Some(tracker) = linear_tracker.as_mut() {
+                        if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                            eprintln!(
+                                "warning: failed to move `{}` to done in Linear: {err:#}",
+                                assignment.task.id
+                            );
+                        }
+                    }
                     landed += 1;
                     println!(
                         "landed:      {} via lane-{} after non-zero worker exit (total landed: {})",
@@ -999,7 +1034,7 @@ async fn run_parallel_loop(
                 assignment.attempts,
                 args.max_retries + 1
             );
-            let plan_for_prompt = inspect_loop_plan(repo_root)?;
+            let plan_for_prompt = refresh_parallel_plan(repo_root, linear_tracker).await?;
             spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -1032,6 +1067,14 @@ async fn run_parallel_loop(
             }
             LaneRepoProgress::NewCommits => {
                 land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+                if let Some(tracker) = linear_tracker.as_mut() {
+                    if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                        eprintln!(
+                            "warning: failed to move `{}` to done in Linear: {err:#}",
+                            assignment.task.id
+                        );
+                    }
+                }
                 landed += 1;
                 println!(
                     "landed:      {} via lane-{} (total landed: {})",
@@ -1047,6 +1090,19 @@ async fn run_parallel_loop(
 fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
     let plan = read_loop_plan(repo_root)?;
     Ok(parse_loop_plan(&plan))
+}
+
+async fn refresh_parallel_plan(
+    repo_root: &Path,
+    linear_tracker: &mut Option<LinearTracker>,
+) -> Result<LoopPlanSnapshot> {
+    let plan_text = read_loop_plan(repo_root)?;
+    if let Some(tracker) = linear_tracker.as_mut() {
+        if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
+            eprintln!("warning: failed to refresh Linear task cache from updated plan: {err:#}");
+        }
+    }
+    Ok(parse_loop_plan(&plan_text))
 }
 
 fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> Result<()> {
@@ -1305,10 +1361,11 @@ fn discover_resume_candidates(
     Ok(candidates)
 }
 
-fn harvest_resumable_lane_results(
+async fn harvest_resumable_lane_results(
     repo_root: &Path,
     target_branch: &str,
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
+    linear_tracker: &mut Option<LinearTracker>,
 ) -> Result<usize> {
     let mut landed = 0usize;
     let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
@@ -1343,6 +1400,14 @@ fn harvest_resumable_lane_results(
         };
         match land_parallel_lane_result(repo_root, target_branch, &assignment) {
             Ok(()) => {
+                if let Some(tracker) = linear_tracker.as_mut() {
+                    if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                        eprintln!(
+                            "warning: failed to move `{}` to done in Linear: {err:#}",
+                            assignment.task.id
+                        );
+                    }
+                }
                 landed += 1;
                 println!(
                     "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
@@ -1372,25 +1437,19 @@ fn harvest_resumable_lane_results(
     Ok(landed)
 }
 
-fn take_matching_resume_candidate(
+fn take_resume_candidate_for_task(
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
-    ready_tasks: &[LoopTask],
+    task_id: &str,
     active_lanes: &BTreeMap<usize, ActiveLaneAssignment>,
 ) -> Option<(usize, LaneResumeCandidate)> {
-    for task in ready_tasks {
-        let lane_index = resumable_lanes
-            .iter()
-            .find(|(lane_index, candidate)| {
-                !active_lanes.contains_key(lane_index) && candidate.task.id == task.id
-            })
-            .map(|(lane_index, _)| *lane_index);
-        let Some(lane_index) = lane_index else {
-            continue;
-        };
-        let candidate = resumable_lanes.remove(&lane_index)?;
-        return Some((lane_index, candidate));
-    }
-    None
+    let lane_index = resumable_lanes
+        .iter()
+        .find(|(lane_index, candidate)| {
+            !active_lanes.contains_key(lane_index) && candidate.task.id == task_id
+        })
+        .map(|(lane_index, _)| *lane_index)?;
+    let candidate = resumable_lanes.remove(&lane_index)?;
+    Some((lane_index, candidate))
 }
 
 fn clone_loop_lane_repo(
@@ -1444,6 +1503,7 @@ fn spawn_parallel_lane_attempt(
     assignment.attempts += 1;
     assignment.clean_commit_since = None;
     assignment.terminate_requested_at = None;
+    refresh_assignment_task_from_plan(plan, assignment);
     let full_prompt =
         build_parallel_lane_prompt(prompt_template, plan, &assignment.task, target_branch);
     let prompt_path = assignment.lane_root.join(format!(
@@ -1494,6 +1554,20 @@ fn spawn_parallel_lane_attempt(
         })
     });
     Ok(())
+}
+
+fn refresh_assignment_task_from_plan(
+    plan: &LoopPlanSnapshot,
+    assignment: &mut ActiveLaneAssignment,
+) {
+    if let Some(task) = plan
+        .tasks
+        .iter()
+        .find(|task| task.id == assignment.task.id)
+        .cloned()
+    {
+        assignment.task = task;
+    }
 }
 
 fn nudge_lingering_committed_lanes(
@@ -2624,7 +2698,7 @@ mod tests {
         effective_parallel_claude_max_turns, is_verification_only_task, lane_scope_budget,
         parse_loop_plan, read_lane_task_id, remove_task_from_plan_text,
         render_default_parallel_prompt, repo_forbids_legacy_review_trackers,
-        resolve_loop_worker_env, resolve_reference_repos, take_matching_resume_candidate,
+        resolve_loop_worker_env, resolve_reference_repos, take_resume_candidate_for_task,
         task_id_from_prompt_filename, ActiveLaneAssignment, LaneResumeCandidate, LoopQueueSnapshot,
         LoopTask, LoopTaskStatus,
     };
@@ -2814,7 +2888,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_resume_candidate_uses_ready_task_order() {
+    fn resume_candidate_matches_requested_task() {
         let ready_tasks = vec![
             LoopTask {
                 id: "P-019D".to_string(),
@@ -2859,9 +2933,9 @@ mod tests {
             },
         );
 
-        let matched = take_matching_resume_candidate(
+        let matched = take_resume_candidate_for_task(
             &mut resumable,
-            &ready_tasks,
+            &ready_tasks[0].id,
             &BTreeMap::<usize, ActiveLaneAssignment>::new(),
         )
         .expect("expected a matching resumable lane");
@@ -2887,7 +2961,9 @@ mod tests {
                 terminate_requested_at: None,
             },
         );
-        assert!(take_matching_resume_candidate(&mut resumable, &ready_tasks, &active).is_none());
+        assert!(
+            take_resume_candidate_for_task(&mut resumable, &ready_tasks[1].id, &active).is_none()
+        );
     }
 
     #[test]
