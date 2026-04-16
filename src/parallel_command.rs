@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tokio::task::JoinSet;
@@ -24,6 +25,9 @@ const SHARED_QUEUE_FILES: [&str; 5] = [
     "REVIEW.md",
     "AGENTS.md",
 ];
+const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(15);
+const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
 const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
 Repo-specific direct `REVIEW.md` handoff:
@@ -581,6 +585,9 @@ struct ActiveLaneAssignment {
     lane_repo_root: PathBuf,
     base_commit: String,
     stderr_log_path: PathBuf,
+    worker_pid_path: PathBuf,
+    clean_commit_since: Option<Instant>,
+    terminate_requested_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -682,6 +689,7 @@ async fn run_serial_loop(
                 &stderr_log_path,
                 "auto parallel",
                 &worker_env.extra_env,
+                None,
             )
             .await?
         } else {
@@ -694,6 +702,7 @@ async fn run_serial_loop(
                 &stderr_log_path,
                 "auto parallel",
                 &worker_env.extra_env,
+                None,
             )
             .await?
         };
@@ -800,6 +809,8 @@ async fn run_parallel_loop(
     let mut landed = 0usize;
 
     loop {
+        nudge_lingering_committed_lanes(&mut active_lanes)?;
+
         if args
             .max_iterations
             .is_some_and(|limit| landed >= limit && active_lanes.is_empty())
@@ -904,10 +915,10 @@ async fn run_parallel_loop(
             break;
         }
 
-        let joined = join_set
-            .join_next()
-            .await
-            .context("parallel lane join set unexpectedly empty")?;
+        let joined = match tokio::time::timeout(LANE_POLL_INTERVAL, join_set.join_next()).await {
+            Ok(result) => result.context("parallel lane join set unexpectedly empty")?,
+            Err(_) => continue,
+        };
         let lane_result = joined.context("parallel lane task panicked")??;
         let mut assignment = active_lanes
             .remove(&lane_result.lane_index)
@@ -1138,6 +1149,9 @@ fn prepare_parallel_lane_assignment(
         lane_repo_root,
         base_commit: base_commit.trim().to_string(),
         stderr_log_path: lane_root.join("stderr.log"),
+        worker_pid_path: lane_root.join("worker.pid"),
+        clean_commit_since: None,
+        terminate_requested_at: None,
     })
 }
 
@@ -1190,6 +1204,8 @@ fn spawn_parallel_lane_attempt(
     target_branch: &str,
 ) -> Result<()> {
     assignment.attempts += 1;
+    assignment.clean_commit_since = None;
+    assignment.terminate_requested_at = None;
     let full_prompt =
         build_parallel_lane_prompt(prompt_template, plan, &assignment.task, target_branch);
     let prompt_path = assignment.lane_root.join(format!(
@@ -1198,6 +1214,7 @@ fn spawn_parallel_lane_attempt(
     ));
     let repo_root = assignment.lane_repo_root.clone();
     let stderr_log_path = assignment.stderr_log_path.clone();
+    let worker_pid_path = assignment.worker_pid_path.clone();
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
     let lane_config = lane_config.clone();
@@ -1216,6 +1233,7 @@ fn spawn_parallel_lane_attempt(
                 &stderr_log_path,
                 &context_label,
                 &lane_config.extra_env,
+                Some(&worker_pid_path),
             )
             .await?
         } else {
@@ -1228,6 +1246,7 @@ fn spawn_parallel_lane_attempt(
                 &stderr_log_path,
                 &context_label,
                 &lane_config.extra_env,
+                Some(&worker_pid_path),
             )
             .await?
         };
@@ -1236,6 +1255,91 @@ fn spawn_parallel_lane_attempt(
             exit_status,
         })
     });
+    Ok(())
+}
+
+fn nudge_lingering_committed_lanes(
+    active_lanes: &mut BTreeMap<usize, ActiveLaneAssignment>,
+) -> Result<()> {
+    for assignment in active_lanes.values_mut() {
+        match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
+            LaneRepoProgress::NewCommits => {
+                let Some(pid) = read_worker_pid(&assignment.worker_pid_path)? else {
+                    assignment.clean_commit_since = None;
+                    assignment.terminate_requested_at = None;
+                    continue;
+                };
+                if !worker_pid_is_alive(pid)? {
+                    assignment.clean_commit_since = None;
+                    assignment.terminate_requested_at = None;
+                    continue;
+                }
+
+                let commit_since = assignment.clean_commit_since.get_or_insert_with(Instant::now);
+                if let Some(requested_at) = assignment.terminate_requested_at {
+                    if requested_at.elapsed() >= CLEAN_COMMIT_KILL_GRACE {
+                        signal_worker(pid, "KILL")?;
+                        println!(
+                            "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                            assignment.lane_index, assignment.task.id, pid
+                        );
+                        assignment.terminate_requested_at = None;
+                    }
+                    continue;
+                }
+
+                if commit_since.elapsed() >= CLEAN_COMMIT_GRACE {
+                    signal_worker(pid, "TERM")?;
+                    println!(
+                        "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
+                        assignment.lane_index, assignment.task.id, pid
+                    );
+                    assignment.terminate_requested_at = Some(Instant::now());
+                }
+            }
+            LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {
+                assignment.clean_commit_since = None;
+                assignment.terminate_requested_at = None;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let pid = trimmed
+        .parse::<u32>()
+        .with_context(|| format!("invalid pid in {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn worker_pid_is_alive(pid: u32) -> Result<bool> {
+    let status = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .context("failed to run kill -0")?;
+    Ok(status.success())
+}
+
+fn signal_worker(pid: u32, signal: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to send SIG{signal} to pid {pid}"))?;
+    if !status.success() {
+        bail!("kill -{signal} {pid} failed");
+    }
     Ok(())
 }
 

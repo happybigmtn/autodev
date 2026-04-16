@@ -33,6 +33,7 @@ pub(crate) async fn run_claude_exec(
         stderr_log_path,
         context_label,
         &[],
+        None,
     )
     .await
 }
@@ -46,6 +47,7 @@ pub(crate) async fn run_claude_exec_with_env(
     stderr_log_path: &Path,
     context_label: &str,
     extra_env: &[(String, String)],
+    worker_pid_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
     let resolved_model = resolve_claude_model(model);
     let resolved_effort = resolve_claude_effort(effort);
@@ -72,6 +74,7 @@ pub(crate) async fn run_claude_exec_with_env(
                     max_turns,
                     &context_label,
                     &extra_env,
+                    worker_pid_path,
                 )
                 .await
             }
@@ -87,6 +90,7 @@ pub(crate) async fn run_claude_exec_with_env(
             max_turns,
             context_label,
             extra_env,
+            worker_pid_path,
         )
         .await?
     };
@@ -104,6 +108,7 @@ async fn spawn_claude(
     max_turns: Option<usize>,
     context_label: &str,
     extra_env: &[(String, String)],
+    worker_pid_path: Option<&Path>,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new("claude");
     command
@@ -131,6 +136,7 @@ async fn spawn_claude(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch Claude from {}", repo_root.display()))?;
+    write_worker_pid(worker_pid_path, child.id())?;
 
     let mut stdin = child
         .stdin
@@ -176,6 +182,7 @@ async fn spawn_claude(
             std::process::ExitStatus::from_raw(FUTILITY_EXIT_MARKER << 8)
         }
     };
+    clear_worker_pid(worker_pid_path)?;
 
     stdout_task
         .await
@@ -185,6 +192,27 @@ async fn spawn_claude(
         .context("Claude stderr capture task panicked")??;
 
     Ok((status, stderr_text))
+}
+
+fn write_worker_pid(worker_pid_path: Option<&Path>, pid: Option<u32>) -> Result<()> {
+    let Some(path) = worker_pid_path else {
+        return Ok(());
+    };
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    atomic_write(path, pid.to_string().as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn clear_worker_pid(worker_pid_path: Option<&Path>) -> Result<()> {
+    let Some(path) = worker_pid_path else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
 pub(crate) fn resolve_claude_model(model: &str) -> String {

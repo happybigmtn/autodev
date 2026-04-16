@@ -44,6 +44,7 @@ pub(crate) async fn run_codex_exec(
         stderr_log_path,
         context_label,
         &[],
+        None,
     )
     .await
 }
@@ -58,6 +59,7 @@ pub(crate) async fn run_codex_exec_with_env(
     stderr_log_path: &Path,
     context_label: &str,
     extra_env: &[(String, String)],
+    worker_pid_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
     let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Codex) {
         let repo_root = repo_root.to_owned();
@@ -84,6 +86,7 @@ pub(crate) async fn run_codex_exec_with_env(
                     &codex_bin,
                     &context_label,
                     &extra_env,
+                    worker_pid_path,
                 )
                 .await
             }
@@ -99,6 +102,7 @@ pub(crate) async fn run_codex_exec_with_env(
             codex_bin,
             context_label,
             extra_env,
+            worker_pid_path,
         )
         .await?
     };
@@ -198,6 +202,7 @@ async fn spawn_codex(
     codex_bin: &Path,
     context_label: &str,
     extra_env: &[(String, String)],
+    worker_pid_path: Option<&Path>,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new(codex_bin);
     command
@@ -226,6 +231,7 @@ async fn spawn_codex(
             repo_root.display()
         )
     })?;
+    write_worker_pid(worker_pid_path, child.id())?;
 
     let mut stdin = child
         .stdin
@@ -253,6 +259,7 @@ async fn spawn_codex(
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for Codex")?;
+    clear_worker_pid(worker_pid_path)?;
     stdout_task
         .await
         .context("Codex stdout streaming task panicked")??;
@@ -261,6 +268,27 @@ async fn spawn_codex(
         .context("Codex stderr capture task panicked")??;
 
     Ok((status, stderr_text))
+}
+
+fn write_worker_pid(worker_pid_path: Option<&Path>, pid: Option<u32>) -> Result<()> {
+    let Some(path) = worker_pid_path else {
+        return Ok(());
+    };
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    atomic_write(path, pid.to_string().as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn clear_worker_pid(worker_pid_path: Option<&Path>) -> Result<()> {
+    let Some(path) = worker_pid_path else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
