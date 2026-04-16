@@ -524,9 +524,23 @@ fn parse_task_header(line: &str) -> Option<(LoopTaskStatus, String, String)> {
 }
 
 fn parse_task_dependencies(markdown: &str) -> Vec<String> {
-    task_field_body(markdown, "Dependencies:", "Estimated scope:")
-        .map(|body| collect_task_refs(&body))
-        .unwrap_or_default()
+    let Some(body) = task_field_body(markdown, "Dependencies:", "Estimated scope:") else {
+        return Vec::new();
+    };
+
+    let first_meaningful = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('-').trim().to_ascii_lowercase());
+    if first_meaningful
+        .as_deref()
+        .is_some_and(|line| line.starts_with("none"))
+    {
+        return Vec::new();
+    }
+
+    collect_task_refs(&body)
 }
 
 fn task_field_line_value(markdown: &str, field: &str) -> Option<String> {
@@ -2967,6 +2981,30 @@ mod tests {
         assert!(queue.blocked_ids.is_empty());
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[1].status, LoopTaskStatus::Done);
+    }
+
+    #[test]
+    fn parse_loop_plan_treats_none_dependencies_as_empty() {
+        let plan = r#"
+- [ ] `WEB-HOUSE-AUDIT` Audit
+  Dependencies: none (parallel with `WEB-CODEGEN-A`)
+  Estimated scope: S
+- [ ] `WEB-CODEGEN-A` Real tranche head
+  Dependencies: `WEB-HOUSE-AUDIT`
+  Estimated scope: L
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        assert!(snapshot.tasks[0].dependencies.is_empty());
+        assert_eq!(snapshot.tasks[1].dependencies, vec!["WEB-HOUSE-AUDIT"]);
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["WEB-HOUSE-AUDIT"]
+        );
     }
 
     #[test]
