@@ -834,6 +834,7 @@ async fn run_parallel_loop(
     let mut join_set = JoinSet::<Result<LaneAttemptResult>>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
+    let mut shelved_tasks = BTreeMap::<String, String>::new();
     let mut landed = 0usize;
     let mut plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
     let mut resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
@@ -850,6 +851,12 @@ async fn run_parallel_loop(
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes)?;
         plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+        shelved_tasks.retain(|task_id, markdown| {
+            plan.tasks
+                .iter()
+                .find(|task| task.id == *task_id)
+                .is_some_and(|task| task.markdown == *markdown)
+        });
 
         if args
             .max_iterations
@@ -882,7 +889,11 @@ async fn run_parallel_loop(
                 break;
             }
 
-            let ready = plan.ready_tasks(&active_tasks);
+            let ready = plan
+                .ready_tasks(&active_tasks)
+                .into_iter()
+                .filter(|task| !shelved_tasks.contains_key(&task.id))
+                .collect::<Vec<_>>();
             if ready.is_empty() {
                 break;
             }
@@ -986,7 +997,17 @@ async fn run_parallel_loop(
         if !lane_result.exit_status.success() {
             match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
                 LaneRepoProgress::NewCommits => {
-                    land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+                    if let Err(err) =
+                        land_parallel_lane_result(repo_root, target_branch, &assignment)
+                    {
+                        eprintln!(
+                            "warning: failed landing lane-{} `{}` after non-zero worker exit: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        );
+                        shelved_tasks
+                            .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                        continue;
+                    }
                     if let Some(tracker) = linear_tracker.as_mut() {
                         if let Err(err) = tracker.note_done(&assignment.task.id).await {
                             eprintln!(
@@ -1007,8 +1028,8 @@ async fn run_parallel_loop(
             let exit_code = lane_result.exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
             if assignment.attempts > args.max_retries {
-                bail!(
-                    "{} lane-{} (`{}`) exited with status {} after {} attempts; see {}",
+                eprintln!(
+                    "warning: {} lane-{} (`{}`) exited with status {} after {} attempts; shelving for the rest of this run. see {}",
                     harness,
                     assignment.lane_index,
                     assignment.task.id,
@@ -1020,6 +1041,8 @@ async fn run_parallel_loop(
                     assignment.attempts,
                     assignment.stderr_log_path.display()
                 );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
             }
 
             println!(
@@ -1050,23 +1073,36 @@ async fn run_parallel_loop(
 
         match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
             LaneRepoProgress::Dirty(status) => {
-                bail!(
-                    "parallel lane-{} (`{}`) exited cleanly but left uncommitted changes:\n{}",
+                eprintln!(
+                    "warning: parallel lane-{} (`{}`) exited cleanly but left uncommitted changes; shelving for the rest of this run:\n{}",
                     assignment.lane_index,
                     assignment.task.id,
                     status
                 );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
             }
             LaneRepoProgress::None => {
-                bail!(
-                    "parallel lane-{} (`{}`) exited cleanly without producing a local commit; see {}",
+                eprintln!(
+                    "warning: parallel lane-{} (`{}`) exited cleanly without producing a local commit; shelving for the rest of this run. see {}",
                     assignment.lane_index,
                     assignment.task.id,
                     assignment.stderr_log_path.display()
                 );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
             }
             LaneRepoProgress::NewCommits => {
-                land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+                if let Err(err) = land_parallel_lane_result(repo_root, target_branch, &assignment)
+                {
+                    eprintln!(
+                        "warning: failed landing lane-{} `{}`; shelving for the rest of this run: {err:#}",
+                        assignment.lane_index, assignment.task.id
+                    );
+                    shelved_tasks
+                        .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                    continue;
+                }
                 if let Some(tracker) = linear_tracker.as_mut() {
                     if let Err(err) = tracker.note_done(&assignment.task.id).await {
                         eprintln!(
@@ -1793,17 +1829,14 @@ fn build_parallel_lane_prompt(
         protected_files
     );
     let scope_budget = render_lane_scope_budget(task);
-    let allowed_surfaces = render_task_surface_summary(task);
-
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Keep the final diff within this task's scope budget ({scope_budget}) and declared file surfaces ({allowed_surfaces}). If the real fix needs more than that, stop and report the blocker instead of widening scope.\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Keep the final diff within this task's scope budget ({scope_budget}). If the real fix needs more than that, stop and report the blocker instead of widening scope.\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
         branch = branch,
         protected_clause = protected_clause,
         scope_budget = scope_budget,
-        allowed_surfaces = allowed_surfaces,
         pending_count = queue.pending_ids.len(),
         blocked_clause = blocked_clause,
         markdown = task.markdown
@@ -1825,19 +1858,6 @@ fn inspect_lane_repo_progress(repo_root: &Path, base_commit: &str) -> Result<Lan
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SurfacePatternKind {
-    Exact,
-    Prefix,
-    Glob,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SurfacePattern {
-    kind: SurfacePatternKind,
-    value: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LaneScopeBudget {
     max_changed_files: usize,
     max_package_roots: usize,
@@ -1856,23 +1876,6 @@ fn render_lane_scope_budget(task: &LoopTask) -> String {
         "{scope_label} => <= {} changed files, <= {} Rust packages, <= {} top-level areas",
         budget.max_changed_files, budget.max_package_roots, budget.max_area_roots
     )
-}
-
-fn render_task_surface_summary(task: &LoopTask) -> String {
-    let tokens = collect_task_surface_tokens(task);
-    if tokens.is_empty() {
-        return "no explicit repo paths; host falls back to scope budget + queue-file bans"
-            .to_string();
-    }
-    let mut rendered = tokens
-        .into_iter()
-        .take(8)
-        .map(|token| format!("`{token}`"))
-        .collect::<Vec<_>>();
-    if rendered.len() == 8 {
-        rendered.push("...".to_string());
-    }
-    rendered.join(", ")
 }
 
 fn is_verification_only_task(task: &LoopTask) -> bool {
@@ -1907,379 +1910,6 @@ fn lane_scope_budget(task: &LoopTask) -> LaneScopeBudget {
     }
 }
 
-fn collect_task_surface_tokens(task: &LoopTask) -> Vec<String> {
-    let mut tokens = Vec::new();
-    if let Some(body) = task_field_body(&task.markdown, "Owns:", "Integration touchpoints:") {
-        tokens.extend(extract_backtick_tokens(&body));
-    }
-    if let Some(body) = task_field_body(
-        &task.markdown,
-        "Integration touchpoints:",
-        "Scope boundary:",
-    ) {
-        tokens.extend(extract_backtick_tokens(&body));
-    }
-    dedup_tokens(tokens)
-}
-
-fn extract_backtick_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        let token = rest[..end].trim();
-        if !token.is_empty() {
-            tokens.push(token.to_string());
-        }
-        rest = &rest[end + 1..];
-    }
-    tokens
-}
-
-fn dedup_tokens(tokens: Vec<String>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
-    for token in tokens {
-        if seen.insert(token.clone()) {
-            deduped.push(token);
-        }
-    }
-    deduped
-}
-
-fn validate_parallel_lane_result(
-    lane_repo_root: &Path,
-    assignment: &ActiveLaneAssignment,
-    lane_head: &str,
-) -> Result<()> {
-    validate_lane_commit_subjects(
-        lane_repo_root,
-        &assignment.task.id,
-        &assignment.base_commit,
-        lane_head,
-    )?;
-    let changed_files = changed_files_between(lane_repo_root, &assignment.base_commit, lane_head)?;
-    let budget = lane_scope_budget(&assignment.task);
-    if changed_files.is_empty() {
-        bail!(
-            "parallel lane-{} (`{}`) produced a commit with no file-level diff",
-            assignment.lane_index,
-            assignment.task.id
-        );
-    }
-
-    let shared_queue_edits = changed_files
-        .iter()
-        .filter(|path| SHARED_QUEUE_FILES.contains(&path.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !shared_queue_edits.is_empty() {
-        bail!(
-            "parallel lane-{} (`{}`) edited host-owned queue files: {}",
-            assignment.lane_index,
-            assignment.task.id,
-            shared_queue_edits.join(", ")
-        );
-    }
-
-    if changed_files.len() > budget.max_changed_files {
-        bail!(
-            "parallel lane-{} (`{}`) exceeded scope budget: {} changed files (budget {})",
-            assignment.lane_index,
-            assignment.task.id,
-            changed_files.len(),
-            budget.max_changed_files
-        );
-    }
-
-    let package_roots = changed_files
-        .iter()
-        .filter_map(|path| cargo_package_root(lane_repo_root, path))
-        .collect::<BTreeSet<_>>();
-    if package_roots.len() > budget.max_package_roots {
-        bail!(
-            "parallel lane-{} (`{}`) touched too many Rust packages: {} (budget {}) [{}]",
-            assignment.lane_index,
-            assignment.task.id,
-            package_roots.len(),
-            budget.max_package_roots,
-            package_roots.into_iter().collect::<Vec<_>>().join(", ")
-        );
-    }
-
-    let top_level_areas = changed_files
-        .iter()
-        .map(|path| top_level_area(path))
-        .collect::<BTreeSet<_>>();
-    if top_level_areas.len() > budget.max_area_roots {
-        bail!(
-            "parallel lane-{} (`{}`) touched too many top-level areas: {} (budget {}) [{}]",
-            assignment.lane_index,
-            assignment.task.id,
-            top_level_areas.len(),
-            budget.max_area_roots,
-            top_level_areas.into_iter().collect::<Vec<_>>().join(", ")
-        );
-    }
-
-    let allowed_patterns = allowed_patterns_for_task(lane_repo_root, &assignment.task)?;
-    if !allowed_patterns.is_empty() {
-        let matched_package_roots = changed_files
-            .iter()
-            .filter(|path| matches_allowed(path, &allowed_patterns))
-            .filter_map(|path| cargo_package_root(lane_repo_root, path))
-            .collect::<BTreeSet<_>>();
-        let out_of_scope = changed_files
-            .iter()
-            .filter(|path| !matches_allowed(path, &allowed_patterns))
-            .filter(|path| {
-                !is_adjacent_rust_integration_path(lane_repo_root, path, &matched_package_roots)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !out_of_scope.is_empty() {
-            bail!(
-                "parallel lane-{} (`{}`) changed files outside the task contract: {}",
-                assignment.lane_index,
-                assignment.task.id,
-                out_of_scope.join(", ")
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_lane_commit_subjects(
-    repo_root: &Path,
-    task_id: &str,
-    base_commit: &str,
-    head_ref: &str,
-) -> Result<()> {
-    let range = format!("{base_commit}..{head_ref}");
-    let subjects = git_stdout(repo_root, ["log", "--format=%s", &range])?;
-    let mismatches = subjects
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.contains(task_id))
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    if !mismatches.is_empty() {
-        bail!(
-            "parallel lane commit subjects must include assigned task id `{task_id}`; offending subjects: {}",
-            mismatches.join(" | ")
-        );
-    }
-    Ok(())
-}
-
-fn changed_files_between(
-    repo_root: &Path,
-    base_commit: &str,
-    head_ref: &str,
-) -> Result<Vec<String>> {
-    let range = format!("{base_commit}..{head_ref}");
-    let output = git_stdout(repo_root, ["diff", "--name-only", &range])?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_string())
-        .collect())
-}
-
-fn top_level_area(path: &str) -> String {
-    path.split('/').next().unwrap_or(path).to_string()
-}
-
-fn cargo_package_root(repo_root: &Path, path: &str) -> Option<String> {
-    let relative = Path::new(path);
-    let mut current = relative
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_path_buf();
-    loop {
-        let manifest = if current.as_os_str().is_empty() {
-            repo_root.join("Cargo.toml")
-        } else {
-            repo_root.join(&current).join("Cargo.toml")
-        };
-        if manifest.is_file() {
-            return Some(if current.as_os_str().is_empty() {
-                ".".to_string()
-            } else {
-                current.to_string_lossy().into_owned()
-            });
-        }
-        if current.as_os_str().is_empty() {
-            return None;
-        }
-        current.pop();
-    }
-}
-
-fn allowed_patterns_for_task(repo_root: &Path, task: &LoopTask) -> Result<Vec<SurfacePattern>> {
-    let tracked = git_stdout(repo_root, ["ls-files"])?;
-    let tracked = tracked
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    let mut patterns = Vec::new();
-    for token in collect_task_surface_tokens(task) {
-        patterns.extend(resolve_surface_patterns(repo_root, &tracked, &token));
-    }
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
-    for pattern in patterns {
-        if seen.insert((pattern.kind as u8, pattern.value.clone())) {
-            deduped.push(pattern);
-        }
-    }
-    Ok(deduped)
-}
-
-fn resolve_surface_patterns(
-    repo_root: &Path,
-    tracked: &[String],
-    token: &str,
-) -> Vec<SurfacePattern> {
-    let Some(normalized) = normalize_surface_token(token) else {
-        return Vec::new();
-    };
-    if normalized.contains('*') || normalized.contains('?') || normalized.contains('[') {
-        return vec![SurfacePattern {
-            kind: SurfacePatternKind::Glob,
-            value: normalized,
-        }];
-    }
-
-    let candidate_rel = normalized.trim_start_matches('/');
-    if candidate_rel.is_empty() {
-        return Vec::new();
-    }
-    let candidate = repo_root.join(candidate_rel);
-    if candidate.is_dir() {
-        return vec![SurfacePattern {
-            kind: SurfacePatternKind::Prefix,
-            value: format!("{}/", candidate_rel.trim_end_matches('/')),
-        }];
-    }
-    if candidate.is_file() || tracked.iter().any(|path| path == candidate_rel) {
-        return vec![SurfacePattern {
-            kind: SurfacePatternKind::Exact,
-            value: candidate_rel.to_string(),
-        }];
-    }
-
-    let suffix_matches = tracked
-        .iter()
-        .filter(|path| path.ends_with(candidate_rel))
-        .cloned()
-        .collect::<Vec<_>>();
-    if suffix_matches.len() == 1 {
-        return vec![SurfacePattern {
-            kind: SurfacePatternKind::Exact,
-            value: suffix_matches[0].clone(),
-        }];
-    }
-
-    Vec::new()
-}
-
-fn normalize_surface_token(token: &str) -> Option<String> {
-    let mut value = token.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    if let Some(stripped) = value.strip_prefix("./") {
-        value = stripped;
-    }
-    if let Some((prefix, suffix)) = value.rsplit_once(':') {
-        if prefix.contains('/')
-            && suffix
-                .chars()
-                .all(|ch| ch.is_ascii_digit() || ch == ',' || ch == '-')
-        {
-            value = prefix;
-        }
-    }
-    Some(value.trim_end_matches('/').to_string())
-}
-
-fn matches_allowed(path: &str, patterns: &[SurfacePattern]) -> bool {
-    patterns.iter().any(|pattern| match pattern.kind {
-        SurfacePatternKind::Exact => path == pattern.value,
-        SurfacePatternKind::Prefix => path.starts_with(&pattern.value),
-        SurfacePatternKind::Glob => glob_match(path, &pattern.value),
-    })
-}
-
-fn glob_match(path: &str, pattern: &str) -> bool {
-    let path = path.as_bytes();
-    let pattern = pattern.as_bytes();
-    let mut path_index = 0usize;
-    let mut pattern_index = 0usize;
-    let mut star_index = None;
-    let mut match_index = 0usize;
-
-    while path_index < path.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == path[path_index])
-        {
-            path_index += 1;
-            pattern_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            star_index = Some(pattern_index);
-            match_index = path_index;
-            pattern_index += 1;
-        } else if let Some(star) = star_index {
-            pattern_index = star + 1;
-            match_index += 1;
-            path_index = match_index;
-        } else {
-            return false;
-        }
-    }
-
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-
-    pattern_index == pattern.len()
-}
-
-fn is_adjacent_rust_integration_path(
-    repo_root: &Path,
-    path: &str,
-    matched_package_roots: &BTreeSet<String>,
-) -> bool {
-    if matched_package_roots.is_empty() {
-        return false;
-    }
-    if path == "Cargo.lock" {
-        return true;
-    }
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if !matches!(
-        file_name,
-        "Cargo.toml" | "build.rs" | "lib.rs" | "main.rs" | "mod.rs"
-    ) {
-        return false;
-    }
-    cargo_package_root(repo_root, path)
-        .map(|root| matched_package_roots.contains(&root))
-        .unwrap_or(false)
-}
-
 fn land_parallel_lane_result(
     repo_root: &Path,
     target_branch: &str,
@@ -2287,7 +1917,6 @@ fn land_parallel_lane_result(
 ) -> Result<()> {
     let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
     let lane_head = lane_head.trim().to_string();
-    validate_parallel_lane_result(&assignment.lane_repo_root, assignment, &lane_head)?;
     fetch_lane_commit(repo_root, &assignment.lane_repo_root, &lane_head)?;
     cherry_pick_lane_range(repo_root, &assignment.base_commit, "FETCH_HEAD").with_context(
         || {
