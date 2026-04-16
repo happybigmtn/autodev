@@ -621,7 +621,8 @@ struct LaneResumeCandidate {
 #[derive(Debug)]
 struct LaneAttemptResult {
     lane_index: usize,
-    exit_status: ExitStatus,
+    exit_status: Option<ExitStatus>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -831,7 +832,7 @@ async fn run_parallel_loop(
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
     let lane_config = LaneRunConfig::new(args, worker_env);
-    let mut join_set = JoinSet::<Result<LaneAttemptResult>>::new();
+    let mut join_set = JoinSet::<LaneAttemptResult>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
@@ -845,12 +846,12 @@ async fn run_parallel_loop(
         linear_tracker,
     )
     .await?;
-    plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+    plan = refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
     resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
 
     loop {
-        nudge_lingering_committed_lanes(&mut active_lanes)?;
-        plan = refresh_parallel_plan(repo_root, linear_tracker).await?;
+        nudge_lingering_committed_lanes(&mut active_lanes);
+        plan = refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
                 .iter()
@@ -923,22 +924,40 @@ async fn run_parallel_loop(
                     None,
                 )
             };
-            let mut assignment = prepare_parallel_lane_assignment(
+            let mut assignment = match prepare_parallel_lane_assignment_with_fallback(
                 repo_root,
                 run_root,
                 target_branch,
                 lane_index,
-                task,
+                task.clone(),
                 resume_candidate,
-            )?;
-            spawn_parallel_lane_attempt(
+            ) {
+                Ok(assignment) => assignment,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed preparing lane-{} for `{}`; shelving for the rest of this run: {err:#}",
+                        lane_index,
+                        task.id
+                    );
+                    shelved_tasks.insert(task.id.clone(), task.markdown.clone());
+                    continue;
+                }
+            };
+            if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
                 prompt_template,
                 &plan,
                 &mut assignment,
                 target_branch,
-            )?;
+            ) {
+                eprintln!(
+                    "warning: failed starting lane-{} for `{}`; shelving for the rest of this run: {err:#}",
+                    assignment.lane_index, assignment.task.id
+                );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
+            }
             if let Some(tracker) = linear_tracker.as_mut() {
                 if let Err(err) = tracker.note_dispatch(&assignment.task.id).await {
                     eprintln!(
@@ -988,13 +1007,26 @@ async fn run_parallel_loop(
             Ok(result) => result.context("parallel lane join set unexpectedly empty")?,
             Err(_) => continue,
         };
-        let lane_result = joined.context("parallel lane task panicked")??;
+        let lane_result = joined.context("parallel lane task panicked")?;
         let mut assignment = active_lanes
             .remove(&lane_result.lane_index)
             .with_context(|| format!("missing active state for lane-{}", lane_result.lane_index))?;
         active_tasks.remove(&assignment.task.id);
 
-        if !lane_result.exit_status.success() {
+        if let Some(error) = lane_result.error {
+            eprintln!(
+                "warning: lane-{} `{}` failed before producing an exit status; shelving for the rest of this run: {}",
+                assignment.lane_index, assignment.task.id, error
+            );
+            shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+            continue;
+        }
+
+        let exit_status = lane_result
+            .exit_status
+            .context("lane attempt completed without an exit status or error")?;
+
+        if !exit_status.success() {
             match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
                 LaneRepoProgress::NewCommits => {
                     if let Err(err) =
@@ -1025,7 +1057,7 @@ async fn run_parallel_loop(
                 }
                 LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {}
             }
-            let exit_code = lane_result.exit_status.code().unwrap_or(-1);
+            let exit_code = exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
             if assignment.attempts > args.max_retries {
                 eprintln!(
@@ -1057,15 +1089,23 @@ async fn run_parallel_loop(
                 assignment.attempts,
                 args.max_retries + 1
             );
-            let plan_for_prompt = refresh_parallel_plan(repo_root, linear_tracker).await?;
-            spawn_parallel_lane_attempt(
+            let plan_for_prompt =
+                refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan).await;
+            if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
                 prompt_template,
                 &plan_for_prompt,
                 &mut assignment,
                 target_branch,
-            )?;
+            ) {
+                eprintln!(
+                    "warning: failed restarting lane-{} `{}`; shelving for the rest of this run: {err:#}",
+                    assignment.lane_index, assignment.task.id
+                );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
+            }
             active_tasks.insert(assignment.task.id.clone());
             active_lanes.insert(assignment.lane_index, assignment);
             continue;
@@ -1139,6 +1179,22 @@ async fn refresh_parallel_plan(
         }
     }
     Ok(parse_loop_plan(&plan_text))
+}
+
+async fn refresh_parallel_plan_or_last_good(
+    repo_root: &Path,
+    linear_tracker: &mut Option<LinearTracker>,
+    last_good_plan: &LoopPlanSnapshot,
+) -> LoopPlanSnapshot {
+    match refresh_parallel_plan(repo_root, linear_tracker).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to refresh IMPLEMENTATION_PLAN.md; continuing with the last good queue snapshot: {err:#}"
+            );
+            last_good_plan.clone()
+        }
+    }
 }
 
 fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> Result<()> {
@@ -1310,6 +1366,44 @@ fn prepare_parallel_lane_assignment(
     })
 }
 
+fn prepare_parallel_lane_assignment_with_fallback(
+    repo_root: &Path,
+    run_root: &Path,
+    target_branch: &str,
+    lane_index: usize,
+    task: LoopTask,
+    resume_candidate: Option<LaneResumeCandidate>,
+) -> Result<ActiveLaneAssignment> {
+    let resumable_snapshot = resume_candidate.clone();
+    match prepare_parallel_lane_assignment(
+        repo_root,
+        run_root,
+        target_branch,
+        lane_index,
+        task.clone(),
+        resume_candidate,
+    ) {
+        Ok(assignment) => Ok(assignment),
+        Err(err) => {
+            let Some(candidate) = resumable_snapshot else {
+                return Err(err);
+            };
+            eprintln!(
+                "warning: failed resuming lane-{} `{}`; retrying with a fresh clone: {err:#}",
+                candidate.lane_index, task.id
+            );
+            prepare_parallel_lane_assignment(
+                repo_root,
+                run_root,
+                target_branch,
+                lane_index,
+                task,
+                None,
+            )
+        }
+    }
+}
+
 fn discover_resume_candidates(
     run_root: &Path,
     target_branch: &str,
@@ -1358,26 +1452,71 @@ fn discover_resume_candidates(
 
         let stderr_log_path = lane_root.join("stderr.log");
         let worker_pid_path = lane_root.join("worker.pid");
-        clear_stale_worker_pid(&worker_pid_path)?;
-        if let Some(pid) = read_worker_pid(&worker_pid_path)? {
-            if worker_pid_is_alive(pid)? {
-                bail!(
-                    "lane-{} still has a live worker pid {} in {}; stop the previous auto parallel run before restarting",
-                    lane_index,
-                    pid,
-                    lane_root.display()
+        if let Err(err) = clear_stale_worker_pid(&worker_pid_path) {
+            eprintln!(
+                "warning: skipping resumable lane-{} because its worker pid file could not be cleaned up: {err:#}",
+                lane_index
+            );
+            continue;
+        }
+        match read_worker_pid(&worker_pid_path) {
+            Ok(Some(pid)) => match worker_pid_is_alive(pid) {
+                Ok(true) => {
+                    eprintln!(
+                        "warning: skipping resumable lane-{} because worker pid {} is still alive in {}",
+                        lane_index,
+                        pid,
+                        lane_root.display()
+                    );
+                    continue;
+                }
+                Ok(false) => {
+                    if let Err(err) = fs::remove_file(&worker_pid_path) {
+                        eprintln!(
+                            "warning: skipping resumable lane-{} because stale worker pid cleanup failed: {err:#}",
+                            lane_index
+                        );
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipping resumable lane-{} because worker pid liveness check failed: {err:#}",
+                        lane_index
+                    );
+                    continue;
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping resumable lane-{} because its worker pid file is unreadable: {err:#}",
+                    lane_index
                 );
+                continue;
             }
-            fs::remove_file(&worker_pid_path)
-                .with_context(|| format!("failed to remove {}", worker_pid_path.display()))?;
         }
 
-        let base_commit = infer_lane_base_commit(&lane_repo_root, target_branch)?;
-        if matches!(
-            inspect_lane_repo_progress(&lane_repo_root, &base_commit)?,
-            LaneRepoProgress::None
-        ) {
-            continue;
+        let base_commit = match infer_lane_base_commit(&lane_repo_root, target_branch) {
+            Ok(base_commit) => base_commit,
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping resumable lane-{} because its base commit could not be inferred: {err:#}",
+                    lane_index
+                );
+                continue;
+            }
+        };
+        match inspect_lane_repo_progress(&lane_repo_root, &base_commit) {
+            Ok(LaneRepoProgress::None) => continue,
+            Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::NewCommits) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
+                    lane_index
+                );
+                continue;
+            }
         }
 
         candidates.insert(
@@ -1406,21 +1545,29 @@ async fn harvest_resumable_lane_results(
     let mut landed = 0usize;
     let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
     for lane_index in lane_indexes {
-        let should_land = {
-            let candidate = resumable_lanes
-                .get(&lane_index)
-                .with_context(|| format!("missing resumable lane-{lane_index}"))?;
-            matches!(
-                inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)?,
-                LaneRepoProgress::NewCommits
-            )
+        let should_land = match resumable_lanes.get(&lane_index) {
+            Some(candidate) => match inspect_lane_repo_progress(
+                &candidate.lane_repo_root,
+                &candidate.base_commit,
+            ) {
+                Ok(LaneRepoProgress::NewCommits) => true,
+                Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::None) => false,
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
+                        lane_index
+                    );
+                    false
+                }
+            },
+            None => false,
         };
         if !should_land {
             continue;
         }
-        let candidate = resumable_lanes
-            .remove(&lane_index)
-            .with_context(|| format!("missing resumable lane-{lane_index}"))?;
+        let Some(candidate) = resumable_lanes.remove(&lane_index) else {
+            continue;
+        };
         let assignment = ActiveLaneAssignment {
             lane_index: candidate.lane_index,
             attempts: 0,
@@ -1529,7 +1676,7 @@ fn clone_loop_lane_repo(
 }
 
 fn spawn_parallel_lane_attempt(
-    join_set: &mut JoinSet<Result<LaneAttemptResult>>,
+    join_set: &mut JoinSet<LaneAttemptResult>,
     lane_config: &LaneRunConfig,
     prompt_template: &str,
     plan: &LoopPlanSnapshot,
@@ -1554,8 +1701,15 @@ fn spawn_parallel_lane_attempt(
     let lane_config = lane_config.clone();
 
     join_set.spawn(async move {
-        atomic_write(&prompt_path, full_prompt.as_bytes())
-            .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        if let Err(err) = atomic_write(&prompt_path, full_prompt.as_bytes())
+            .with_context(|| format!("failed to write {}", prompt_path.display()))
+        {
+            return LaneAttemptResult {
+                lane_index,
+                exit_status: None,
+                error: Some(format!("{err:#}")),
+            };
+        }
         let context_label = format!("auto parallel lane-{lane_index} {task_id}");
         let exit_status = if lane_config.claude {
             run_claude_exec_with_env(
@@ -1569,7 +1723,7 @@ fn spawn_parallel_lane_attempt(
                 &lane_config.extra_env,
                 Some(&worker_pid_path),
             )
-            .await?
+            .await
         } else {
             run_codex_exec_with_env(
                 &repo_root,
@@ -1582,12 +1736,20 @@ fn spawn_parallel_lane_attempt(
                 &lane_config.extra_env,
                 Some(&worker_pid_path),
             )
-            .await?
+            .await
         };
-        Ok(LaneAttemptResult {
-            lane_index,
-            exit_status,
-        })
+        match exit_status {
+            Ok(exit_status) => LaneAttemptResult {
+                lane_index,
+                exit_status: Some(exit_status),
+                error: None,
+            },
+            Err(err) => LaneAttemptResult {
+                lane_index,
+                exit_status: None,
+                error: Some(format!("{err:#}")),
+            },
+        }
     });
     Ok(())
 }
@@ -1606,18 +1768,53 @@ fn refresh_assignment_task_from_plan(
     }
 }
 
-fn nudge_lingering_committed_lanes(
-    active_lanes: &mut BTreeMap<usize, ActiveLaneAssignment>,
-) -> Result<()> {
+fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLaneAssignment>) {
     for assignment in active_lanes.values_mut() {
-        match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
+        let progress =
+            match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit) {
+                Ok(progress) => progress,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed inspecting lane-{} `{}` while checking for harvestable commits: {err:#}",
+                        assignment.lane_index, assignment.task.id
+                    );
+                    assignment.clean_commit_since = None;
+                    assignment.terminate_requested_at = None;
+                    continue;
+                }
+            };
+        match progress {
             LaneRepoProgress::NewCommits => {
-                let Some(pid) = read_worker_pid(&assignment.worker_pid_path)? else {
+                let pid = match read_worker_pid(&assignment.worker_pid_path) {
+                    Ok(pid) => pid,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed reading worker pid for lane-{} `{}`: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        );
+                        assignment.clean_commit_since = None;
+                        assignment.terminate_requested_at = None;
+                        continue;
+                    }
+                };
+                let Some(pid) = pid else {
                     assignment.clean_commit_since = None;
                     assignment.terminate_requested_at = None;
                     continue;
                 };
-                if !worker_pid_is_alive(pid)? {
+                let alive = match worker_pid_is_alive(pid) {
+                    Ok(alive) => alive,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed checking worker liveness for lane-{} `{}` pid {}: {err:#}",
+                            assignment.lane_index, assignment.task.id, pid
+                        );
+                        assignment.clean_commit_since = None;
+                        assignment.terminate_requested_at = None;
+                        continue;
+                    }
+                };
+                if !alive {
                     assignment.clean_commit_since = None;
                     assignment.terminate_requested_at = None;
                     continue;
@@ -1628,23 +1825,36 @@ fn nudge_lingering_committed_lanes(
                     .get_or_insert_with(Instant::now);
                 if let Some(requested_at) = assignment.terminate_requested_at {
                     if requested_at.elapsed() >= CLEAN_COMMIT_KILL_GRACE {
-                        signal_worker(pid, "KILL")?;
-                        println!(
-                            "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
-                            assignment.lane_index, assignment.task.id, pid
-                        );
+                        if let Err(err) = signal_worker(pid, "KILL") {
+                            eprintln!(
+                                "warning: failed sending SIGKILL to lingering worker pid {} for lane-{} `{}`: {err:#}",
+                                pid, assignment.lane_index, assignment.task.id
+                            );
+                        } else {
+                            println!(
+                                "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                                assignment.lane_index, assignment.task.id, pid
+                            );
+                        }
                         assignment.terminate_requested_at = None;
                     }
                     continue;
                 }
 
                 if commit_since.elapsed() >= CLEAN_COMMIT_GRACE {
-                    signal_worker(pid, "TERM")?;
-                    println!(
-                        "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
-                        assignment.lane_index, assignment.task.id, pid
-                    );
-                    assignment.terminate_requested_at = Some(Instant::now());
+                    if let Err(err) = signal_worker(pid, "TERM") {
+                        eprintln!(
+                            "warning: failed sending SIGTERM to lingering worker pid {} for lane-{} `{}`: {err:#}",
+                            pid, assignment.lane_index, assignment.task.id
+                        );
+                        assignment.terminate_requested_at = None;
+                    } else {
+                        println!(
+                            "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
+                            assignment.lane_index, assignment.task.id, pid
+                        );
+                        assignment.terminate_requested_at = Some(Instant::now());
+                    }
                 }
             }
             LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {
@@ -1653,7 +1863,6 @@ fn nudge_lingering_committed_lanes(
             }
         }
     }
-    Ok(())
 }
 
 fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
