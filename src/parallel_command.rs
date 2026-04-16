@@ -34,6 +34,7 @@ Repo-specific direct `REVIEW.md` handoff:
 - This repo normally records completion notes in `REVIEW.md`, but `auto parallel` treats queue and review files as host-owned state.
 - Do not edit `REVIEW.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, or `ARCHIVED.md` from a lane.
 - Preserve blocker or completion evidence in your committed code/tests and command output; the host will reconcile queue and review docs after landing."#;
+const LANE_TASK_ID_FILE: &str = "task-id";
 
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.max_concurrent_workers == 0 {
@@ -138,13 +139,11 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
             .unwrap_or_else(|| "built-in Ralph worker".to_string())
     );
 
-    if let Some(commit) =
-        auto_checkpoint_if_needed(
-            &repo_root,
-            target_branch.as_str(),
-            "auto parallel checkpoint",
-        )?
-    {
+    if let Some(commit) = auto_checkpoint_if_needed(
+        &repo_root,
+        target_branch.as_str(),
+        "auto parallel checkpoint",
+    )? {
         println!("checkpoint:  committed pre-existing changes at {commit}");
     } else if sync_branch_with_remote(&repo_root, target_branch.as_str())? {
         println!("remote sync: rebased onto origin/{}", target_branch);
@@ -581,6 +580,7 @@ struct ActiveLaneAssignment {
     lane_index: usize,
     attempts: usize,
     task: LoopTask,
+    resumed: bool,
     lane_root: PathBuf,
     lane_repo_root: PathBuf,
     base_commit: String,
@@ -588,6 +588,17 @@ struct ActiveLaneAssignment {
     worker_pid_path: PathBuf,
     clean_commit_since: Option<Instant>,
     terminate_requested_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct LaneResumeCandidate {
+    lane_index: usize,
+    task: LoopTask,
+    lane_root: PathBuf,
+    lane_repo_root: PathBuf,
+    base_commit: String,
+    stderr_log_path: PathBuf,
+    worker_pid_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -714,7 +725,10 @@ async fn run_serial_loop(
             if let Some(commit) = auto_checkpoint_if_needed(
                 repo_root,
                 target_branch,
-                &format!("auto parallel checkpoint (pre-retry {})", consecutive_failures),
+                &format!(
+                    "auto parallel checkpoint (pre-retry {})",
+                    consecutive_failures
+                ),
             )? {
                 println!("checkpoint:  committed partial changes at {commit}");
             }
@@ -760,11 +774,7 @@ async fn run_serial_loop(
             }
             RepoProgress::None => {
                 if let Some(commit) =
-                    auto_checkpoint_if_needed(
-                        repo_root,
-                        target_branch,
-                        "auto parallel checkpoint",
-                    )?
+                    auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
                 {
                     iteration += 1;
                     println!("checkpoint:  committed iteration changes at {commit}");
@@ -807,6 +817,11 @@ async fn run_parallel_loop(
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut landed = 0usize;
+    let mut resumable_lanes =
+        discover_resume_candidates(run_root, target_branch, &inspect_loop_plan(repo_root)?)?;
+    landed += harvest_resumable_lane_results(repo_root, target_branch, &mut resumable_lanes)?;
+    resumable_lanes =
+        discover_resume_candidates(run_root, target_branch, &inspect_loop_plan(repo_root)?)?;
 
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes)?;
@@ -861,15 +876,28 @@ async fn run_parallel_loop(
                 break;
             }
 
-            let task = executable_ready[0].clone();
-            let lane_index = next_free_lane_index(args.max_concurrent_workers, &active_lanes)
-                .context("failed to find a free loop lane")?;
+            let (task, lane_index, resume_candidate) = if let Some((lane_index, candidate)) =
+                take_matching_resume_candidate(
+                    &mut resumable_lanes,
+                    &executable_ready,
+                    &active_lanes,
+                ) {
+                (candidate.task.clone(), lane_index, Some(candidate))
+            } else {
+                (
+                    executable_ready[0].clone(),
+                    next_free_lane_index(args.max_concurrent_workers, &active_lanes)
+                        .context("failed to find a free loop lane")?,
+                    None,
+                )
+            };
             let mut assignment = prepare_parallel_lane_assignment(
                 repo_root,
                 run_root,
                 target_branch,
                 lane_index,
                 task,
+                resume_candidate,
             )?;
             let plan_for_prompt = inspect_loop_plan(repo_root)?;
             spawn_parallel_lane_attempt(
@@ -881,8 +909,11 @@ async fn run_parallel_loop(
                 target_branch,
             )?;
             println!(
-                "dispatch:    lane-{} -> {} {}",
-                lane_index, assignment.task.id, assignment.task.title
+                "dispatch:    lane-{} -> {} {}{}",
+                lane_index,
+                assignment.task.id,
+                assignment.task.title,
+                if assignment.resumed { " [resume]" } else { "" }
             );
             active_tasks.insert(assignment.task.id.clone());
             active_lanes.insert(lane_index, assignment);
@@ -1147,16 +1178,36 @@ fn prepare_parallel_lane_assignment(
     target_branch: &str,
     lane_index: usize,
     task: LoopTask,
+    resume_candidate: Option<LaneResumeCandidate>,
 ) -> Result<ActiveLaneAssignment> {
+    if let Some(candidate) = resume_candidate {
+        write_lane_task_id(&candidate.lane_root, &task.id)?;
+        return Ok(ActiveLaneAssignment {
+            lane_index: candidate.lane_index,
+            attempts: 0,
+            task,
+            resumed: true,
+            lane_root: candidate.lane_root,
+            lane_repo_root: candidate.lane_repo_root,
+            base_commit: candidate.base_commit,
+            stderr_log_path: candidate.stderr_log_path,
+            worker_pid_path: candidate.worker_pid_path,
+            clean_commit_since: None,
+            terminate_requested_at: None,
+        });
+    }
+
     let lane_root = run_root.join("lanes").join(format!("lane-{lane_index}"));
     clear_and_recreate_dir(&lane_root)?;
     let lane_repo_root = lane_root.join("repo");
     clone_loop_lane_repo(repo_root, target_branch, &lane_repo_root)?;
     let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?;
+    write_lane_task_id(&lane_root, &task.id)?;
     Ok(ActiveLaneAssignment {
         lane_index,
         attempts: 0,
         task,
+        resumed: false,
         lane_root: lane_root.clone(),
         lane_repo_root,
         base_commit: base_commit.trim().to_string(),
@@ -1165,6 +1216,160 @@ fn prepare_parallel_lane_assignment(
         clean_commit_since: None,
         terminate_requested_at: None,
     })
+}
+
+fn discover_resume_candidates(
+    run_root: &Path,
+    target_branch: &str,
+    plan: &LoopPlanSnapshot,
+) -> Result<BTreeMap<usize, LaneResumeCandidate>> {
+    let lanes_root = run_root.join("lanes");
+    if !lanes_root.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let pending_tasks = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .map(|task| (task.id.clone(), task.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut candidates = BTreeMap::new();
+
+    for entry in fs::read_dir(&lanes_root)
+        .with_context(|| format!("failed to read {}", lanes_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", lanes_root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let lane_root = entry.path();
+        let lane_name = entry.file_name();
+        let Some(lane_index) = parse_lane_index(&lane_name.to_string_lossy()) else {
+            continue;
+        };
+        let lane_repo_root = lane_root.join("repo");
+        if !lane_repo_root.join(".git").exists() {
+            continue;
+        }
+
+        let Some(task_id) = read_lane_task_id(&lane_root)? else {
+            continue;
+        };
+        let Some(task) = pending_tasks.get(&task_id).cloned() else {
+            continue;
+        };
+
+        let stderr_log_path = lane_root.join("stderr.log");
+        let worker_pid_path = lane_root.join("worker.pid");
+        clear_stale_worker_pid(&worker_pid_path)?;
+        if let Some(pid) = read_worker_pid(&worker_pid_path)? {
+            if worker_pid_is_alive(pid)? {
+                bail!(
+                    "lane-{} still has a live worker pid {} in {}; stop the previous auto parallel run before restarting",
+                    lane_index,
+                    pid,
+                    lane_root.display()
+                );
+            }
+            fs::remove_file(&worker_pid_path)
+                .with_context(|| format!("failed to remove {}", worker_pid_path.display()))?;
+        }
+
+        let base_commit = infer_lane_base_commit(&lane_repo_root, target_branch)?;
+        if matches!(
+            inspect_lane_repo_progress(&lane_repo_root, &base_commit)?,
+            LaneRepoProgress::None
+        ) {
+            continue;
+        }
+
+        candidates.insert(
+            lane_index,
+            LaneResumeCandidate {
+                lane_index,
+                task,
+                lane_root,
+                lane_repo_root,
+                base_commit,
+                stderr_log_path,
+                worker_pid_path,
+            },
+        );
+    }
+
+    Ok(candidates)
+}
+
+fn harvest_resumable_lane_results(
+    repo_root: &Path,
+    target_branch: &str,
+    resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
+) -> Result<usize> {
+    let mut landed = 0usize;
+    let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
+    for lane_index in lane_indexes {
+        let should_land = {
+            let candidate = resumable_lanes
+                .get(&lane_index)
+                .with_context(|| format!("missing resumable lane-{lane_index}"))?;
+            matches!(
+                inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)?,
+                LaneRepoProgress::NewCommits
+            )
+        };
+        if !should_land {
+            continue;
+        }
+        let candidate = resumable_lanes
+            .remove(&lane_index)
+            .with_context(|| format!("missing resumable lane-{lane_index}"))?;
+        let assignment = ActiveLaneAssignment {
+            lane_index: candidate.lane_index,
+            attempts: 0,
+            task: candidate.task,
+            resumed: true,
+            lane_root: candidate.lane_root,
+            lane_repo_root: candidate.lane_repo_root,
+            base_commit: candidate.base_commit,
+            stderr_log_path: candidate.stderr_log_path,
+            worker_pid_path: candidate.worker_pid_path,
+            clean_commit_since: None,
+            terminate_requested_at: None,
+        };
+        land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+        landed += 1;
+        println!(
+            "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
+            assignment.task.id, assignment.lane_index, landed
+        );
+    }
+    Ok(landed)
+}
+
+fn take_matching_resume_candidate(
+    resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
+    ready_tasks: &[LoopTask],
+    active_lanes: &BTreeMap<usize, ActiveLaneAssignment>,
+) -> Option<(usize, LaneResumeCandidate)> {
+    for task in ready_tasks {
+        let lane_index = resumable_lanes
+            .iter()
+            .find(|(lane_index, candidate)| {
+                !active_lanes.contains_key(lane_index) && candidate.task.id == task.id
+            })
+            .map(|(lane_index, _)| *lane_index);
+        let Some(lane_index) = lane_index else {
+            continue;
+        };
+        let candidate = resumable_lanes.remove(&lane_index)?;
+        return Some((lane_index, candidate));
+    }
+    None
 }
 
 fn clone_loop_lane_repo(
@@ -1287,7 +1492,9 @@ fn nudge_lingering_committed_lanes(
                     continue;
                 }
 
-                let commit_since = assignment.clean_commit_since.get_or_insert_with(Instant::now);
+                let commit_since = assignment
+                    .clean_commit_since
+                    .get_or_insert_with(Instant::now);
                 if let Some(requested_at) = assignment.terminate_requested_at {
                     if requested_at.elapsed() >= CLEAN_COMMIT_KILL_GRACE {
                         signal_worker(pid, "KILL")?;
@@ -1322,8 +1529,8 @@ fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -1332,6 +1539,112 @@ fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
         .parse::<u32>()
         .with_context(|| format!("invalid pid in {}", path.display()))?;
     Ok(Some(pid))
+}
+
+fn clear_stale_worker_pid(path: &Path) -> Result<()> {
+    let Some(pid) = read_worker_pid(path)? else {
+        return Ok(());
+    };
+    if worker_pid_is_alive(pid)? {
+        return Ok(());
+    }
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+fn parse_lane_index(name: &str) -> Option<usize> {
+    name.strip_prefix("lane-")?.parse::<usize>().ok()
+}
+
+fn write_lane_task_id(lane_root: &Path, task_id: &str) -> Result<()> {
+    atomic_write(&lane_root.join(LANE_TASK_ID_FILE), task_id.as_bytes()).with_context(|| {
+        format!(
+            "failed to write {}",
+            lane_root.join(LANE_TASK_ID_FILE).display()
+        )
+    })
+}
+
+fn read_lane_task_id(lane_root: &Path) -> Result<Option<String>> {
+    let task_id_path = lane_root.join(LANE_TASK_ID_FILE);
+    if task_id_path.exists() {
+        let task_id = fs::read_to_string(&task_id_path)
+            .with_context(|| format!("failed to read {}", task_id_path.display()))?;
+        let task_id = task_id.trim();
+        if !task_id.is_empty() {
+            return Ok(Some(task_id.to_string()));
+        }
+    }
+
+    let mut latest_prompt: Option<(std::time::SystemTime, String)> = None;
+    for entry in fs::read_dir(lane_root)
+        .with_context(|| format!("failed to read {}", lane_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", lane_root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Some(task_id) = task_id_from_prompt_filename(&file_name) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &latest_prompt {
+            Some((latest_modified, _)) if &modified <= latest_modified => {}
+            _ => latest_prompt = Some((modified, task_id)),
+        }
+    }
+
+    Ok(latest_prompt.map(|(_, task_id)| task_id))
+}
+
+fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix("-prompt.md")?;
+    let (task_id, attempt) = stem.rsplit_once("-attempt-")?;
+    if attempt.parse::<usize>().is_err() || task_id.is_empty() {
+        return None;
+    }
+    Some(task_id.to_string())
+}
+
+fn infer_lane_base_commit(lane_repo_root: &Path, target_branch: &str) -> Result<String> {
+    let remote_name = lane_remote_name(lane_repo_root)?;
+    run_git(
+        lane_repo_root,
+        ["fetch", "--quiet", &remote_name, target_branch],
+    )?;
+    let base_commit = git_stdout(lane_repo_root, ["merge-base", "HEAD", "FETCH_HEAD"])?;
+    let base_commit = base_commit.trim();
+    if base_commit.is_empty() {
+        bail!(
+            "failed to infer base commit for resumable lane repo {}",
+            lane_repo_root.display()
+        );
+    }
+    Ok(base_commit.to_string())
+}
+
+fn lane_remote_name(lane_repo_root: &Path) -> Result<String> {
+    let remotes = git_stdout(lane_repo_root, ["remote"])?;
+    for remote in remotes.lines().map(str::trim) {
+        if remote == "canonical" {
+            return Ok("canonical".to_string());
+        }
+    }
+    for remote in remotes.lines().map(str::trim) {
+        if remote == "origin" {
+            return Ok("origin".to_string());
+        }
+    }
+    bail!(
+        "lane repo {} has no `canonical` or `origin` remote",
+        lane_repo_root.display()
+    );
 }
 
 fn worker_pid_is_alive(pid: u32) -> Result<bool> {
@@ -2277,6 +2590,7 @@ fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -2287,9 +2601,11 @@ mod tests {
     use super::{
         build_iteration_prompt, default_cargo_build_jobs_for, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, is_verification_only_task, lane_scope_budget,
-        parse_loop_plan, remove_task_from_plan_text, render_default_parallel_prompt,
-        repo_forbids_legacy_review_trackers, resolve_loop_worker_env, resolve_reference_repos,
-        LoopQueueSnapshot, LoopTask, LoopTaskStatus,
+        parse_loop_plan, read_lane_task_id, remove_task_from_plan_text,
+        render_default_parallel_prompt, repo_forbids_legacy_review_trackers,
+        resolve_loop_worker_env, resolve_reference_repos, take_matching_resume_candidate,
+        task_id_from_prompt_filename, ActiveLaneAssignment, LaneResumeCandidate, LoopQueueSnapshot,
+        LoopTask, LoopTaskStatus,
     };
 
     #[test]
@@ -2436,6 +2752,121 @@ mod tests {
         };
 
         assert_eq!(effective_parallel_claude_max_turns(&args), None);
+    }
+
+    #[test]
+    fn prompt_filename_task_id_round_trips() {
+        assert_eq!(
+            task_id_from_prompt_filename("P-029C-attempt-03-prompt.md"),
+            Some("P-029C".to_string())
+        );
+        assert_eq!(
+            task_id_from_prompt_filename("WEB-CRAPS-D-attempt-1-prompt.md"),
+            Some("WEB-CRAPS-D".to_string())
+        );
+        assert_eq!(task_id_from_prompt_filename("stderr.log"), None);
+    }
+
+    #[test]
+    fn lane_task_id_prefers_metadata_and_falls_back_to_latest_prompt() {
+        let lane_root = unique_temp_dir("parallel-lane-task-id");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        fs::write(lane_root.join("P-018B-attempt-01-prompt.md"), "")
+            .expect("failed to write prompt");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(lane_root.join("P-021-attempt-02-prompt.md"), "")
+            .expect("failed to write prompt");
+
+        assert_eq!(
+            read_lane_task_id(&lane_root).expect("lane task id should read"),
+            Some("P-021".to_string())
+        );
+
+        fs::write(lane_root.join(super::LANE_TASK_ID_FILE), "P-029C\n")
+            .expect("failed to write metadata");
+        assert_eq!(
+            read_lane_task_id(&lane_root).expect("lane task id should read"),
+            Some("P-029C".to_string())
+        );
+
+        fs::remove_dir_all(&lane_root).expect("failed to remove lane root");
+    }
+
+    #[test]
+    fn matching_resume_candidate_uses_ready_task_order() {
+        let ready_tasks = vec![
+            LoopTask {
+                id: "P-019D".to_string(),
+                title: "first".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                markdown: String::new(),
+            },
+            LoopTask {
+                id: "P-021".to_string(),
+                title: "second".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                markdown: String::new(),
+            },
+        ];
+        let mut resumable = BTreeMap::new();
+        resumable.insert(
+            2,
+            LaneResumeCandidate {
+                lane_index: 2,
+                task: ready_tasks[1].clone(),
+                lane_root: PathBuf::from("/tmp/lane-2"),
+                lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
+                base_commit: "abc123".to_string(),
+                stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
+                worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
+            },
+        );
+        resumable.insert(
+            5,
+            LaneResumeCandidate {
+                lane_index: 5,
+                task: ready_tasks[0].clone(),
+                lane_root: PathBuf::from("/tmp/lane-5"),
+                lane_repo_root: PathBuf::from("/tmp/lane-5/repo"),
+                base_commit: "def456".to_string(),
+                stderr_log_path: PathBuf::from("/tmp/lane-5/stderr.log"),
+                worker_pid_path: PathBuf::from("/tmp/lane-5/worker.pid"),
+            },
+        );
+
+        let matched = take_matching_resume_candidate(
+            &mut resumable,
+            &ready_tasks,
+            &BTreeMap::<usize, ActiveLaneAssignment>::new(),
+        )
+        .expect("expected a matching resumable lane");
+        assert_eq!(matched.0, 5);
+        assert_eq!(matched.1.task.id, "P-019D");
+        assert!(resumable.contains_key(&2));
+        assert!(!resumable.contains_key(&5));
+
+        let mut active = BTreeMap::new();
+        active.insert(
+            2,
+            ActiveLaneAssignment {
+                lane_index: 2,
+                attempts: 1,
+                task: ready_tasks[1].clone(),
+                resumed: true,
+                lane_root: PathBuf::from("/tmp/lane-2"),
+                lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
+                base_commit: "abc123".to_string(),
+                stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
+                worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
+                clean_commit_since: None,
+                terminate_requested_at: None,
+            },
+        );
+        assert!(take_matching_resume_candidate(&mut resumable, &ready_tasks, &active).is_none());
     }
 
     #[test]

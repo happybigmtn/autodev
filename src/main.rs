@@ -583,7 +583,11 @@ pub(crate) struct ParallelArgs {
     max_iterations: Option<usize>,
 
     /// Maximum concurrent worker lanes.
-    #[arg(long = "threads", visible_alias = "max-concurrent-workers", default_value_t = 5)]
+    #[arg(
+        long = "threads",
+        visible_alias = "max-concurrent-workers",
+        default_value_t = 5
+    )]
     max_concurrent_workers: usize,
 
     /// Override CARGO_BUILD_JOBS for parallel workers. Defaults to a conservative automatic cap.
