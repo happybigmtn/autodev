@@ -626,7 +626,7 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     claude: bool,
 
-    /// Maximum Claude turns (only used with --claude). Omit for the parallel default cap.
+    /// Maximum Claude turns (only used with --claude). Omit for unlimited.
     #[arg(long)]
     max_turns: Option<usize>,
 
