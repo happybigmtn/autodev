@@ -464,8 +464,13 @@ fn parse_loop_plan(plan: &str) -> LoopPlanSnapshot {
 
 fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
     let header = header?;
-    let (status, id, title) = parse_task_header(&header)?;
+    let (mut status, id, title) = parse_task_header(&header)?;
     let markdown = lines.join("\n");
+    if matches!(status, LoopTaskStatus::Pending | LoopTaskStatus::Blocked)
+        && task_is_non_actionable_placeholder(&title, &markdown)
+    {
+        status = LoopTaskStatus::Done;
+    }
     Some(LoopTask {
         id,
         title,
@@ -473,6 +478,24 @@ fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
         dependencies: parse_task_dependencies(&markdown),
         estimated_scope: task_field_line_value(&markdown, "Estimated scope:"),
         markdown,
+    })
+}
+
+fn task_is_non_actionable_placeholder(title: &str, markdown: &str) -> bool {
+    if title
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("merged into ")
+    {
+        return true;
+    }
+
+    markdown.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix("Status:") else {
+            return false;
+        };
+        let rest = rest.to_ascii_lowercase();
+        rest.contains("placeholder") || rest.contains("merged into")
     })
 }
 
@@ -2924,6 +2947,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["TASK-001"]
         );
+    }
+
+    #[test]
+    fn parse_loop_plan_skips_merged_placeholder_tasks() {
+        let plan = r#"
+- [ ] `WEB-CODEGEN-A` Real tranche head
+  Dependencies:
+  - None
+- [ ] `WEB-PAYOUT-TRUTH` Merged into WEB-CODEGEN-A
+  Status: This standalone item is kept as a checkbox placeholder for traceability but its work is now folded into WEB-CODEGEN-A above.
+  Dependencies:
+  - `WEB-CODEGEN-A`
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["WEB-CODEGEN-A"]);
+        assert!(queue.blocked_ids.is_empty());
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert_eq!(snapshot.tasks[1].status, LoopTaskStatus::Done);
     }
 
     #[test]
