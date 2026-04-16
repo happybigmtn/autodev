@@ -1902,9 +1902,6 @@ fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> String {
         "ln -s ../.cargo-target .cargo-target".to_string(),
         format!("git fetch origin {}", spec.base_branch),
         format!("git checkout {}", spec.base_branch),
-        "if [ -d .githooks ]; then".to_string(),
-        "  git config core.hooksPath .githooks".to_string(),
-        "fi".to_string(),
         format!("ahead_commits=$(git rev-list --count origin/{}..HEAD)", spec.base_branch),
         "should_rebase=1".to_string(),
         "if [ \"$ahead_commits\" -gt 0 ]; then".to_string(),
@@ -2003,7 +2000,6 @@ Operating rules:\n\n\
 - If repo docs mention a fresh isolated Cargo target dir for local development, that guidance is overridden in Symphony sessions. Never prefix Cargo with a different `CARGO_TARGET_DIR`, never invent `/.cargo-target*` variants such as `/.cargo-target-rso29/`, and if `/.cargo-target` is present in the repo clone it must remain the shared `../.cargo-target` symlink.\n\
 - If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n\
 - Never hand-edit verification receipt files. They are execution evidence, not notes.\n\
-- If the repo provides verification receipt checks, landing is blocked until every `Verification:` command for the completed task has a passing receipt.\n\
 - If the repo contains `scripts/check-task-scope.py`, run `python3 scripts/check-task-scope.py --staged` before landing. If adjacent integration edits outside the owned or touchpoint surfaces are genuinely required, keep them minimal and record them under `Scope exceptions:` in the task's `REVIEW.md` handoff with a one-line reason per path.\n\
 - When the task is complete, mark the matching task in `IMPLEMENTATION_PLAN.md` as `- [x]` instead of deleting it so downstream dependency truth remains visible.\n\
 - Append a `REVIEW.md` handoff entry before landing. Preserve the existing file style when present; if `REVIEW.md` is missing, create it with a simple awaiting-review section. Include the task id, changed files or surfaces, `Scope exceptions: none` or the explicit exception list, the exact validation commands you actually ran, and any remaining blockers or `none`.\n\
@@ -2688,7 +2684,6 @@ Awaiting auto review:
         assert!(markdown.contains("removing repo-local cargo target path $stale_cargo_target"));
         assert!(markdown.contains("ln -s ../.cargo-target .cargo-target"));
         assert!(markdown.contains("git fetch origin trunk"));
-        assert!(markdown.contains("git config core.hooksPath .githooks"));
         assert!(markdown.contains("git rev-list --count origin/trunk..HEAD"));
         assert!(markdown.contains("should_rebase=1"));
         assert!(markdown.contains("git reset --mixed \"$merge_base\""));
@@ -2723,7 +2718,6 @@ Awaiting auto review:
         assert!(markdown.contains("never invent `/.cargo-target*` variants"));
         assert!(markdown.contains("If the repo contains `scripts/run-task-verification.sh`"));
         assert!(markdown.contains("Never hand-edit verification receipt files"));
-        assert!(markdown.contains("landing is blocked until every `Verification:` command"));
         assert!(markdown.contains("If the repo contains `scripts/check-task-scope.py`"));
         assert!(markdown.contains("Scope exceptions: none"));
         assert!(markdown.contains("Append a `REVIEW.md` handoff entry before landing."));
