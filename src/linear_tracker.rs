@@ -7,6 +7,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
 
+use crate::symphony_command::{parse_tasks, render_issue_title, TaskStatus};
+
 const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const TASK_SENTINEL_PREFIX: &str = "<!-- auto-symphony:";
 const DEFAULT_IN_PROGRESS_STATE: &str = "In Progress";
@@ -110,7 +112,24 @@ struct LinearIssue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TrackedIssue {
     id: String,
+    title: String,
+    description: String,
     state: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LinearCoverageDrift {
+    pub(crate) missing_task_ids: Vec<String>,
+    pub(crate) stale_task_ids: Vec<String>,
+    pub(crate) terminal_task_ids: Vec<String>,
+}
+
+impl LinearCoverageDrift {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.missing_task_ids.is_empty()
+            && self.stale_task_ids.is_empty()
+            && self.terminal_task_ids.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -129,6 +148,7 @@ pub(crate) struct LinearTracker {
     terminal_state_names: HashSet<String>,
     issues_by_task_id: HashMap<String, TrackedIssue>,
     last_plan_fingerprint: Option<u64>,
+    last_auto_sync_attempt_fingerprint: Option<u64>,
 }
 
 impl LinearTracker {
@@ -174,6 +194,7 @@ impl LinearTracker {
             done_state_name,
             issues_by_task_id: HashMap::new(),
             last_plan_fingerprint: None,
+            last_auto_sync_attempt_fingerprint: None,
         };
         tracker.refresh_issues().await?;
         Ok(Some(tracker))
@@ -194,6 +215,54 @@ impl LinearTracker {
         self.refresh_issues().await?;
         self.last_plan_fingerprint = Some(fingerprint);
         Ok(())
+    }
+
+    pub(crate) async fn refresh_after_sync(&mut self, plan_text: &str) -> Result<()> {
+        self.refresh_issues().await?;
+        let fingerprint = plan_fingerprint(plan_text);
+        self.last_plan_fingerprint = Some(fingerprint);
+        self.last_auto_sync_attempt_fingerprint = Some(fingerprint);
+        Ok(())
+    }
+
+    pub(crate) fn coverage_drift(
+        &self,
+        plan_text: &str,
+    ) -> LinearCoverageDrift {
+        let mut drift = LinearCoverageDrift::default();
+        for task in parse_tasks(plan_text)
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::Pending)
+        {
+            let Some(issue) = self.issues_by_task_id.get(&task.id) else {
+                drift.missing_task_ids.push(task.id);
+                continue;
+            };
+            if issue
+                .state
+                .as_deref()
+                .is_some_and(|state| self.terminal_state_names.contains(state))
+            {
+                drift.terminal_task_ids.push(task.id);
+                continue;
+            }
+            let expected_title = render_issue_title(&task);
+            let expected_markdown_block = format!("\n---\n\n{}\n", task.markdown);
+            if issue.title != expected_title
+                || !issue.description.contains(&expected_markdown_block)
+            {
+                drift.stale_task_ids.push(task.id);
+            }
+        }
+        drift
+    }
+
+    pub(crate) fn should_attempt_auto_sync(&self, plan_text: &str) -> bool {
+        self.last_auto_sync_attempt_fingerprint != Some(plan_fingerprint(plan_text))
+    }
+
+    pub(crate) fn mark_auto_sync_attempt(&mut self, plan_text: &str) {
+        self.last_auto_sync_attempt_fingerprint = Some(plan_fingerprint(plan_text));
     }
 
     pub(crate) async fn note_dispatch(&mut self, task_id: &str) -> Result<()> {
@@ -242,6 +311,8 @@ impl LinearTracker {
                         task_id,
                         TrackedIssue {
                             id: issue.id,
+                            title: issue.title,
+                            description: issue.description,
                             state: issue.state,
                         },
                     )

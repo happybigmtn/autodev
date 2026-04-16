@@ -11,12 +11,13 @@ use tokio::task::JoinSet;
 use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec_with_env;
 use crate::linear_tracker::LinearTracker;
+use crate::symphony_command::run_sync;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, clear_and_recreate_dir, ensure_repo_layout,
     git_repo_root, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
     sync_branch_with_remote, timestamp_slug,
 };
-use crate::ParallelArgs;
+use crate::{ParallelArgs, SymphonySyncArgs};
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 const SHARED_QUEUE_FILES: [&str; 5] = [
@@ -1172,10 +1173,51 @@ async fn refresh_parallel_plan(
     repo_root: &Path,
     linear_tracker: &mut Option<LinearTracker>,
 ) -> Result<LoopPlanSnapshot> {
-    let plan_text = read_loop_plan(repo_root)?;
+    let mut plan_text = read_loop_plan(repo_root)?;
     if let Some(tracker) = linear_tracker.as_mut() {
         if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
             eprintln!("warning: failed to refresh Linear task cache from updated plan: {err:#}");
+        } else if tracker.should_attempt_auto_sync(&plan_text) {
+            let drift = tracker.coverage_drift(&plan_text);
+            if !drift.is_empty() {
+                let mut reasons = Vec::new();
+                if !drift.missing_task_ids.is_empty() {
+                    reasons.push(format!("missing {}", drift.missing_task_ids.join(", ")));
+                }
+                if !drift.stale_task_ids.is_empty() {
+                    reasons.push(format!("stale {}", drift.stale_task_ids.join(", ")));
+                }
+                if !drift.terminal_task_ids.is_empty() {
+                    reasons.push(format!("terminal {}", drift.terminal_task_ids.join(", ")));
+                }
+                println!(
+                    "linear drift: {}. running `auto symphony sync --no-ai-planner` before dispatch",
+                    reasons.join(" | ")
+                );
+                tracker.mark_auto_sync_attempt(&plan_text);
+                if let Err(err) = run_sync(SymphonySyncArgs {
+                    repo_root: Some(repo_root.to_path_buf()),
+                    project_slug: None,
+                    todo_state: "Todo".to_string(),
+                    planner_model: "gpt-5.4".to_string(),
+                    planner_reasoning_effort: "high".to_string(),
+                    codex_bin: PathBuf::from("codex"),
+                    no_ai_planner: true,
+                })
+                .await
+                {
+                    eprintln!(
+                        "warning: automatic `auto symphony sync --no-ai-planner` failed; continuing without refreshed Linear coverage: {err:#}"
+                    );
+                } else {
+                    plan_text = read_loop_plan(repo_root)?;
+                    if let Err(err) = tracker.refresh_after_sync(&plan_text).await {
+                        eprintln!(
+                            "warning: failed refreshing Linear cache after automatic sync: {err:#}"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(parse_loop_plan(&plan_text))

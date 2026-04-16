@@ -250,19 +250,19 @@ mutation AutoSymphonyCreateRelation(
 
 const TASK_SENTINEL_PREFIX: &str = "<!-- auto-symphony:";
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum TaskStatus {
+pub(crate) enum TaskStatus {
     Pending,
     Blocked,
     Done,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SymphonyTask {
-    id: String,
-    title: String,
-    status: TaskStatus,
-    dependencies: Vec<String>,
-    markdown: String,
+pub(crate) struct SymphonyTask {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) status: TaskStatus,
+    pub(crate) dependencies: Vec<String>,
+    pub(crate) markdown: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,7 +373,7 @@ pub(crate) async fn run_symphony(args: SymphonyArgs) -> Result<()> {
     }
 }
 
-async fn run_sync(args: SymphonySyncArgs) -> Result<()> {
+pub(crate) async fn run_sync(args: SymphonySyncArgs) -> Result<()> {
     let repo_root = resolve_repo_root(args.repo_root)?;
     let project_slug = resolve_project_slug(&repo_root, args.project_slug.as_deref())?;
     let client = LinearGraphqlClient::from_env()?;
@@ -1632,7 +1632,7 @@ fn resolve_base_branch(repo_root: &Path, override_branch: Option<String>) -> Res
     Ok("main".to_string())
 }
 
-fn parse_tasks(plan: &str) -> Vec<SymphonyTask> {
+pub(crate) fn parse_tasks(plan: &str) -> Vec<SymphonyTask> {
     let mut tasks = Vec::new();
     let mut current_header = None::<String>;
     let mut current_lines = Vec::<String>::new();
@@ -1745,11 +1745,11 @@ fn collect_task_refs(text: &str) -> Vec<String> {
     dedup_task_refs(refs)
 }
 
-fn render_issue_title(task: &SymphonyTask) -> String {
+pub(crate) fn render_issue_title(task: &SymphonyTask) -> String {
     format!("[{}] {}", task.id, task.title)
 }
 
-fn render_issue_description(repo_root: &Path, task: &SymphonyTask) -> String {
+pub(crate) fn render_issue_description(repo_root: &Path, task: &SymphonyTask) -> String {
     let base_branch = resolve_base_branch(repo_root, None).unwrap_or_else(|_| "main".to_string());
     let task_brief = render_issue_task_brief(task);
     format!(
