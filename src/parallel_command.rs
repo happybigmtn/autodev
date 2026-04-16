@@ -1341,12 +1341,33 @@ fn harvest_resumable_lane_results(
             clean_commit_since: None,
             terminate_requested_at: None,
         };
-        land_parallel_lane_result(repo_root, target_branch, &assignment)?;
-        landed += 1;
-        println!(
-            "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
-            assignment.task.id, assignment.lane_index, landed
-        );
+        match land_parallel_lane_result(repo_root, target_branch, &assignment) {
+            Ok(()) => {
+                landed += 1;
+                println!(
+                    "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
+                    assignment.task.id, assignment.lane_index, landed
+                );
+            }
+            Err(error) => {
+                println!(
+                    "warning: resume harvest for lane-{} `{}` failed; keeping lane resumable instead: {error:#}",
+                    assignment.lane_index, assignment.task.id
+                );
+                resumable_lanes.insert(
+                    lane_index,
+                    LaneResumeCandidate {
+                        lane_index: assignment.lane_index,
+                        task: assignment.task,
+                        lane_root: assignment.lane_root,
+                        lane_repo_root: assignment.lane_repo_root,
+                        base_commit: assignment.base_commit,
+                        stderr_log_path: assignment.stderr_log_path,
+                        worker_pid_path: assignment.worker_pid_path,
+                    },
+                );
+            }
+        }
     }
     Ok(landed)
 }
