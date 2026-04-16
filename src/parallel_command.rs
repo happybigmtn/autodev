@@ -926,6 +926,18 @@ async fn run_parallel_loop(
         active_tasks.remove(&assignment.task.id);
 
         if !lane_result.exit_status.success() {
+            match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
+                LaneRepoProgress::NewCommits => {
+                    land_parallel_lane_result(repo_root, target_branch, &assignment)?;
+                    landed += 1;
+                    println!(
+                        "landed:      {} via lane-{} after non-zero worker exit (total landed: {})",
+                        assignment.task.id, assignment.lane_index, landed
+                    );
+                    continue;
+                }
+                LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {}
+            }
             let exit_code = lane_result.exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
             if assignment.attempts > args.max_retries {
@@ -1338,7 +1350,10 @@ fn signal_worker(pid: u32, signal: &str) -> Result<()> {
         .status()
         .with_context(|| format!("failed to send SIG{signal} to pid {pid}"))?;
     if !status.success() {
-        bail!("kill -{signal} {pid} failed");
+        if worker_pid_is_alive(pid)? {
+            bail!("kill -{signal} {pid} failed");
+        }
+        return Ok(());
     }
     Ok(())
 }
@@ -1373,7 +1388,7 @@ fn build_parallel_lane_prompt(
     let allowed_surfaces = render_task_surface_summary(task);
 
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Keep the final diff within this task's scope budget ({scope_budget}) and declared file surfaces ({allowed_surfaces}). If the real fix needs more than that, stop and report the blocker instead of widening scope.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Keep the final diff within this task's scope budget ({scope_budget}) and declared file surfaces ({allowed_surfaces}). If the real fix needs more than that, stop and report the blocker instead of widening scope.\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- If the lane repo contains `.githooks/`, pre-commit enforcement is active in this clone via `core.hooksPath=.githooks`; do not bypass it.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
