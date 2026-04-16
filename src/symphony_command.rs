@@ -1109,8 +1109,18 @@ fn single_line_excerpt(value: Option<String>, max_chars: usize) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if normalized.len() > max_chars {
-        normalized.truncate(max_chars.saturating_sub(3));
+    let normalized_chars = normalized.chars().count();
+    if normalized_chars > max_chars {
+        let keep_chars = max_chars.saturating_sub(3);
+        if keep_chars == 0 {
+            return "...".chars().take(max_chars).collect();
+        }
+        let truncate_at = normalized
+            .char_indices()
+            .nth(keep_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(normalized.len());
+        normalized.truncate(truncate_at);
         normalized.push_str("...");
     }
     normalized
@@ -2354,7 +2364,7 @@ mod tests {
         extract_agent_message_from_codex_stream, fallback_task_priorities,
         issue_task_id_from_description, mark_tasks_done_in_plan, markdown_front_matter,
         parse_tasks, render_issue_description, render_workflow_markdown, review_contains_task,
-        shell_quote, SymphonyTask, TaskStatus, WorkflowRenderSpec,
+        shell_quote, single_line_excerpt, SymphonyTask, TaskStatus, WorkflowRenderSpec,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -2608,5 +2618,20 @@ body
     #[test]
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn single_line_excerpt_truncates_on_utf8_boundaries() {
+        assert_eq!(
+            single_line_excerpt(Some("hello élan world".to_string()), 10),
+            "hello é..."
+        );
+    }
+
+    #[test]
+    fn single_line_excerpt_handles_tiny_limits() {
+        assert_eq!(single_line_excerpt(Some("abcdef".to_string()), 0), "");
+        assert_eq!(single_line_excerpt(Some("abcdef".to_string()), 2), "..");
+        assert_eq!(single_line_excerpt(Some("abcdef".to_string()), 3), "...");
     }
 }
