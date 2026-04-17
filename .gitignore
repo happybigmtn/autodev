@@ -1,5 +1,7 @@
 /target
+/.codex
 /.auto/
 /bug/
 /nemesis/
 /gen-*/
+/salvage/
