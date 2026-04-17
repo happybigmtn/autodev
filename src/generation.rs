@@ -1837,7 +1837,7 @@ Output requirements:
 - `Spec:` values must point to `specs/*.md`
 - Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames
 - Keep the plan concrete, file-grounded, and executable
-- `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there
+- `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there. Tasks whose only output is a git ref (annotated tag, branch) MUST write the ref path directly, e.g. `Owns: refs/tags/v0.2.0` or `Owns: refs/heads/release/0.3` — prose like `git tags only` is rejected
 - `Integration touchpoints:` should name concrete adjacent modules, route prefixes, commands, or config files; if none exist, write `none`
 - Do not include lane prose, staffing prose, or meta commentary
 - Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
@@ -2387,8 +2387,11 @@ fn verify_generated_plan_task_has_concrete_ownership(block: &PlanTaskBlock) -> R
     }
     if !body_contains_path_like_owner(normalized) {
         bail!(
-            "generated implementation plan task `{}` must give concrete path-like ownership in `Owns:`",
-            block.task_id
+            "generated implementation plan task `{}` must give concrete path-like ownership in `Owns:` \
+             (e.g. `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or for git-ref-only tasks `refs/tags/<tag>`); \
+             got `{}`",
+            block.task_id,
+            normalized
         );
     }
     Ok(())
@@ -4235,6 +4238,32 @@ No external dependencies.
             verify_generated_implementation_plan(&root).expect_err("expected ownership failure");
 
         assert!(error.to_string().contains("vague `Owns:`"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_tag_only_owns_prose_with_helpful_message() {
+        let root = temp_dir("tag-prose-ownership");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task()
+            .replace("Owns: docs", "Owns: git tags only (no files change).");
+        write_generated_plan(&root, &task);
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected ownership failure");
+
+        let msg = error.to_string();
+        assert!(msg.contains("must give concrete path-like ownership"));
+        assert!(msg.contains("refs/tags/<tag>"));
+    }
+
+    #[test]
+    fn generated_plan_accepts_git_ref_path_owns() {
+        let root = temp_dir("git-ref-ownership");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace("Owns: docs", "Owns: refs/tags/v0.2.0");
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root).expect("git ref ownership should be accepted");
     }
 
     #[test]
