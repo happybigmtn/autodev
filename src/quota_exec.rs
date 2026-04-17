@@ -446,23 +446,18 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
         accounts[choice - 1].name.clone()
     };
 
-    config.set_selected_account(provider, &selected_name)?;
-    config.save()?;
-
-    let mut state = QuotaState::load()?;
-    state.refresh_cooldowns(Utc::now());
-
-    let selected = quota_selector::select_account(&config, &state, provider).await?;
-    let account_name = selected.entry.name.clone();
-    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
+    let profile_dir = QuotaConfig::profile_dir(provider, &selected_name);
 
     if !profile_dir.exists() {
         anyhow::bail!(
-            "profile directory for account '{account_name}' not found at {}. \
-             Run `auto quota accounts capture {account_name}` to fix.",
+            "profile directory for account '{selected_name}' not found at {}. \
+             Run `auto quota accounts capture {selected_name}` to fix.",
             profile_dir.display()
         );
     }
+
+    config.set_selected_account(provider, &selected_name)?;
+    config.save()?;
 
     let mut lock = acquire_provider_lock(provider)?;
     let _lock_guard = lock.write().map_err(|e| {
@@ -470,11 +465,14 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
     })?;
     copy_profile_to_active_auth(provider, &profile_dir)?;
 
-    state.mark_used(&account_name, Utc::now());
+    let mut state = QuotaState::load()?;
+    state.refresh_cooldowns(Utc::now());
+    state.reset_account(&selected_name);
+    state.mark_used(&selected_name, Utc::now());
     state.save()?;
 
     eprintln!(
-        "[quota-router] primary {provider} account set to '{selected_name}'; active account is '{account_name}'"
+        "[quota-router] primary {provider} account set to '{selected_name}'; active account is '{selected_name}'"
     );
     Ok(())
 }

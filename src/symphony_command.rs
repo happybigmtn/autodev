@@ -1735,7 +1735,10 @@ fn parse_task_dependencies(markdown: &str) -> Vec<String> {
 
 fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
     let trimmed = line.trim();
-    if trimmed.to_ascii_lowercase().starts_with("external dependency:") {
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("external dependency:")
+    {
         return collect_task_refs(trimmed);
     }
     let without_parens = strip_parenthetical_groups(trimmed);

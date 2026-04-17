@@ -14,31 +14,10 @@ pub(crate) struct SelectedAccount<'a> {
     pub(crate) entry: &'a AccountEntry,
 }
 
-/// Select the best account for the given provider.
-///
-/// Strategy:
-/// 1. Prefer accounts with ≥25% session quota remaining.
-/// 2. Among those, prefer accounts with ≥10% weekly quota remaining,
-///    pick the one whose weekly quota resets soonest.
-/// 3. If all session-healthy accounts have <10% weekly remaining, pick the one with
-///    the highest weekly remaining percentage.
-/// 4. If every known account is below the session floor, pick the one with
-///    the highest session remaining percentage.
-/// 5. Accounts whose usage could not be fetched are used only as a
-///    last resort.
-pub(crate) async fn select_account<'a>(
-    config: &'a QuotaConfig,
-    state: &QuotaState,
+pub(crate) async fn score_accounts(
+    config: &QuotaConfig,
     provider: Provider,
-) -> Result<SelectedAccount<'a>> {
-    let scored = score_accounts(config, provider).await?;
-    select_account_from_scores(config, state, provider, &scored)
-}
-
-pub(crate) async fn score_accounts<'a>(
-    config: &'a QuotaConfig,
-    provider: Provider,
-) -> Result<Vec<(&'a AccountEntry, Option<AccountUsage>)>> {
+) -> Result<Vec<(&AccountEntry, Option<AccountUsage>)>> {
     let candidates = config.accounts_for_provider(provider);
     if candidates.is_empty() {
         bail!(
@@ -66,6 +45,16 @@ pub(crate) async fn score_accounts<'a>(
     Ok(scored)
 }
 
+/// Select the best account from pre-fetched quota scores.
+///
+/// Strategy:
+/// 1. Exclude known accounts with <10% weekly quota remaining.
+/// 2. Prefer accounts with ≥25% session quota remaining.
+/// 3. Among those, pick the one whose weekly quota resets soonest.
+/// 4. If every known account is below the session floor, pick the one with
+///    the highest session remaining percentage.
+/// 5. Accounts whose usage could not be fetched are used only as a
+///    last resort.
 pub(crate) fn select_account_from_scores<'a>(
     config: &'a QuotaConfig,
     state: &QuotaState,
@@ -89,7 +78,26 @@ pub(crate) fn select_account_from_scores<'a>(
         available
     };
 
-    let selected = pick_best(&available, state, config.selected_account_name(provider));
+    let below_weekly_floor = low_weekly_account_summaries(&available);
+    if !below_weekly_floor.is_empty() {
+        eprintln!(
+            "[quota-router] skipping accounts below {WEEKLY_FLOOR_PCT}% weekly quota: {}",
+            below_weekly_floor.join(", ")
+        );
+    }
+
+    let weekly_eligible = weekly_floor_candidates(&available);
+    if weekly_eligible.is_empty() {
+        bail!(
+            "no selectable {provider} account has at least {WEEKLY_FLOOR_PCT}% weekly quota remaining"
+        );
+    }
+
+    let selected = pick_best(
+        &weekly_eligible,
+        state,
+        config.selected_account_name(provider),
+    );
     log_selection(selected.entry, &available);
     Ok(selected)
 }
@@ -102,6 +110,32 @@ fn selectable_scored_candidates<'a>(
         .iter()
         .filter(|(entry, _)| !state.get(&entry.name).exhausted)
         .map(|(entry, usage)| (*entry, usage.clone()))
+        .collect()
+}
+
+fn weekly_floor_candidates<'a>(
+    scored: &[(&'a AccountEntry, Option<AccountUsage>)],
+) -> Vec<(&'a AccountEntry, Option<AccountUsage>)> {
+    scored
+        .iter()
+        .filter(|(_, usage)| {
+            usage
+                .as_ref()
+                .is_none_or(|usage| usage.weekly_remaining_pct >= WEEKLY_FLOOR_PCT)
+        })
+        .map(|(entry, usage)| (*entry, usage.clone()))
+        .collect()
+}
+
+fn low_weekly_account_summaries(scored: &[(&AccountEntry, Option<AccountUsage>)]) -> Vec<String> {
+    scored
+        .iter()
+        .filter_map(|(entry, usage)| {
+            usage.as_ref().and_then(|usage| {
+                (usage.weekly_remaining_pct < WEEKLY_FLOOR_PCT)
+                    .then(|| format!("{} ({}%)", entry.name, usage.weekly_remaining_pct))
+            })
+        })
         .collect()
 }
 
@@ -401,19 +435,70 @@ mod tests {
     }
 
     #[test]
-    fn highest_weekly_remaining_when_all_below_floor() {
-        let a = make_account("low-a", Provider::Claude);
-        let b = make_account("low-b", Provider::Claude);
+    fn below_weekly_floor_accounts_are_not_selected() {
+        let config = QuotaConfig {
+            accounts: vec![
+                make_account("healthy", Provider::Codex),
+                make_account("low-weekly", Provider::Codex),
+            ],
+            selected_codex_account: None,
+            selected_claude_account: None,
+        };
         let state = QuotaState::default();
 
-        // Both below 10% weekly; low-b has more remaining
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&a, Some(make_usage(50, 600, 92, 0))),
-            (&b, Some(make_usage(50, 3600, 88, 0))),
+            (&config.accounts[0], Some(make_usage(50, 600, 15, 3600))),
+            (&config.accounts[1], Some(make_usage(1, 3600, 96, 100))),
         ];
 
-        let selected = pick_best(&scored, &state, None);
-        assert_eq!(selected.entry.name, "low-b"); // 12% > 8%
+        let selected =
+            select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap();
+        assert_eq!(selected.entry.name, "healthy");
+    }
+
+    #[test]
+    fn below_weekly_floor_accounts_are_rejected_when_no_eligible_account_exists() {
+        let config = QuotaConfig {
+            accounts: vec![
+                make_account("low-a", Provider::Codex),
+                make_account("low-b", Provider::Codex),
+            ],
+            selected_codex_account: None,
+            selected_claude_account: None,
+        };
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&config.accounts[0], Some(make_usage(50, 600, 92, 0))),
+            (&config.accounts[1], Some(make_usage(50, 3600, 96, 0))),
+        ];
+
+        let error =
+            select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap_err();
+        assert!(error.to_string().contains("10% weekly quota"));
+    }
+
+    #[test]
+    fn weekly_floor_beats_active_lease_balancing() {
+        let config = QuotaConfig {
+            accounts: vec![
+                make_account("busy-healthy", Provider::Codex),
+                make_account("idle-low-weekly", Provider::Codex),
+            ],
+            selected_codex_account: None,
+            selected_claude_account: None,
+        };
+        let mut state = QuotaState::default();
+        state.mark_selected("busy-healthy", chrono::Utc::now());
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&config.accounts[0], Some(make_usage(5, 600, 15, 3600))),
+            (&config.accounts[1], Some(make_usage(1, 3600, 96, 100))),
+        ];
+
+        let selected =
+            select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap();
+        assert_eq!(selected.entry.name, "busy-healthy");
     }
 
     #[test]

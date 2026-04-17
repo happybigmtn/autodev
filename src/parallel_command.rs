@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -21,7 +21,7 @@ use crate::util::{
     git_repo_root, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
     sync_branch_with_remote, timestamp_slug,
 };
-use crate::{ParallelArgs, SymphonySyncArgs};
+use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 const SHARED_QUEUE_FILES: [&str; 5] = [
@@ -31,9 +31,17 @@ const SHARED_QUEUE_FILES: [&str; 5] = [
     "REVIEW.md",
     "AGENTS.md",
 ];
+const HOST_QUEUE_STATE_FILES: [&str; 5] = [
+    "IMPLEMENTATION_PLAN.md",
+    "COMPLETED.md",
+    "WORKLIST.md",
+    "REVIEW.md",
+    "ARCHIVED.md",
+];
 const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(15);
 const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
+const SALVAGE_DIR: &str = "salvage";
 const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
 Repo-specific direct `REVIEW.md` handoff:
@@ -43,6 +51,10 @@ Repo-specific direct `REVIEW.md` handoff:
 const LANE_TASK_ID_FILE: &str = "task-id";
 
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
+    if args.action == Some(ParallelAction::Status) {
+        return run_parallel_status(&args);
+    }
+
     if args.max_concurrent_workers == 0 {
         bail!("--max-concurrent-workers must be greater than 0");
     }
@@ -70,6 +82,27 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
             current_branch
         );
     }
+    if args.max_concurrent_workers > 1 {
+        let status = git_stdout(&repo_root, ["status", "--short"])?;
+        if !status.trim().is_empty() {
+            bail!(
+                "auto parallel requires a clean repo; commit, push, or revert pre-existing changes before launch"
+            );
+        }
+        if should_launch_parallel_tmux(&args) {
+            let session_name = parallel_tmux_session_name(&repo_root);
+            match launch_parallel_tmux_session(&session_name)? {
+                TmuxLaunchStatus::Launched => {
+                    println!("auto parallel launched tmux session `{session_name}`");
+                }
+                TmuxLaunchStatus::AlreadyRunning => {
+                    println!("auto parallel tmux session `{session_name}` is already running");
+                }
+            }
+            println!("attach: tmux attach -t {session_name}");
+            return Ok(());
+        }
+    }
 
     let mut prompt_template = match &args.prompt_file {
         Some(path) => {
@@ -90,15 +123,9 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         .with_context(|| format!("failed to create {}", run_root.display()))?;
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
-        let status = git_stdout(&repo_root, ["status", "--short"])?;
-        if !status.trim().is_empty() {
-            bail!(
-                "auto parallel requires a clean repo; commit, push, or revert pre-existing changes before launch"
-            );
-        }
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;
     }
-    let worker_env = build_loop_worker_env(&args, &run_root)?;
+    let worker_env = build_loop_worker_env(&args, &repo_root, &run_root)?;
     let mut linear_tracker = match LinearTracker::maybe_from_repo(&repo_root).await {
         Ok(Some(tracker)) => Some(tracker),
         Ok(None) => None,
@@ -202,6 +229,8 @@ struct LoopWorkerEnv {
     extra_env: Vec<(String, String)>,
     cargo_jobs_summary: String,
     cargo_target_summary: Option<String>,
+    lane_local_cargo_target: bool,
+    cargo_target_prompt_clause: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -227,7 +256,11 @@ fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> S
     )
 }
 
-fn build_loop_worker_env(args: &ParallelArgs, run_root: &Path) -> Result<LoopWorkerEnv> {
+fn build_loop_worker_env(
+    args: &ParallelArgs,
+    repo_root: &Path,
+    run_root: &Path,
+) -> Result<LoopWorkerEnv> {
     let inherited = std::env::var("CARGO_BUILD_JOBS").ok();
     let inherited_target = std::env::var("CARGO_TARGET_DIR").ok();
     let parallelism = std::thread::available_parallelism()
@@ -235,20 +268,25 @@ fn build_loop_worker_env(args: &ParallelArgs, run_root: &Path) -> Result<LoopWor
         .unwrap_or(4);
     resolve_loop_worker_env(
         args.cargo_build_jobs,
+        args.cargo_target,
         inherited.as_deref(),
         inherited_target.as_deref(),
         parallelism,
         args.max_concurrent_workers,
+        repo_uses_cargo(repo_root),
         run_root,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_loop_worker_env(
     cargo_build_jobs: Option<usize>,
+    cargo_target: ParallelCargoTarget,
     inherited_cargo_build_jobs: Option<&str>,
     inherited_cargo_target_dir: Option<&str>,
     available_parallelism: usize,
     max_concurrent_workers: usize,
+    repo_uses_cargo: bool,
     run_root: &Path,
 ) -> Result<LoopWorkerEnv> {
     if let Some(jobs) = cargo_build_jobs {
@@ -258,8 +296,10 @@ fn resolve_loop_worker_env(
         return Ok(cargo_build_jobs_env(
             jobs,
             format!("override CARGO_BUILD_JOBS={jobs}"),
+            cargo_target,
             inherited_cargo_target_dir,
             max_concurrent_workers,
+            repo_uses_cargo,
             run_root,
         ));
     }
@@ -269,8 +309,10 @@ fn resolve_loop_worker_env(
         if !value.is_empty() {
             return Ok(inherited_target_loop_worker_env(
                 format!("inherited CARGO_BUILD_JOBS={value}"),
+                cargo_target,
                 inherited_cargo_target_dir,
                 max_concurrent_workers,
+                repo_uses_cargo,
                 run_root,
             ));
         }
@@ -280,8 +322,10 @@ fn resolve_loop_worker_env(
     Ok(cargo_build_jobs_env(
         jobs,
         format!("auto CARGO_BUILD_JOBS={jobs}"),
+        cargo_target,
         inherited_cargo_target_dir,
         max_concurrent_workers,
+        repo_uses_cargo,
         run_root,
     ))
 }
@@ -289,14 +333,18 @@ fn resolve_loop_worker_env(
 fn cargo_build_jobs_env(
     jobs: usize,
     cargo_jobs_summary: String,
+    cargo_target: ParallelCargoTarget,
     inherited_cargo_target_dir: Option<&str>,
     max_concurrent_workers: usize,
+    repo_uses_cargo: bool,
     run_root: &Path,
 ) -> LoopWorkerEnv {
     let mut env = inherited_target_loop_worker_env(
         cargo_jobs_summary,
+        cargo_target,
         inherited_cargo_target_dir,
         max_concurrent_workers,
+        repo_uses_cargo,
         run_root,
     );
     env.extra_env
@@ -306,48 +354,105 @@ fn cargo_build_jobs_env(
 
 fn inherited_target_loop_worker_env(
     cargo_jobs_summary: String,
+    cargo_target: ParallelCargoTarget,
     inherited_cargo_target_dir: Option<&str>,
     max_concurrent_workers: usize,
+    repo_uses_cargo: bool,
     run_root: &Path,
 ) -> LoopWorkerEnv {
     let mut extra_env = Vec::new();
-    let cargo_target_summary = resolve_parallel_cargo_target_dir(
+    let cargo_target_layout = resolve_parallel_cargo_target_layout(
+        cargo_target,
         inherited_cargo_target_dir,
         max_concurrent_workers,
+        repo_uses_cargo,
         run_root,
-    )
-    .map(|target_dir| {
-        extra_env.push(("CARGO_TARGET_DIR".to_string(), target_dir.clone()));
-        target_dir
-    });
+    );
+    let mut lane_local_cargo_target = false;
+    let cargo_target_summary = match cargo_target_layout {
+        ParallelCargoTargetLayout::None => None,
+        ParallelCargoTargetLayout::Fixed(target_dir) => {
+            extra_env.push(("CARGO_TARGET_DIR".to_string(), target_dir.clone()));
+            Some(target_dir)
+        }
+        ParallelCargoTargetLayout::LaneLocal => {
+            lane_local_cargo_target = true;
+            Some(format!(
+                "lane-local under {}/lanes/lane-*/cargo-target",
+                run_root.display()
+            ))
+        }
+    };
+    let cargo_target_prompt_clause =
+        cargo_target_prompt_clause(lane_local_cargo_target, cargo_target_summary.as_deref());
     LoopWorkerEnv {
         extra_env,
         cargo_jobs_summary,
         cargo_target_summary,
+        lane_local_cargo_target,
+        cargo_target_prompt_clause,
     }
 }
 
-fn resolve_parallel_cargo_target_dir(
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParallelCargoTargetLayout {
+    None,
+    Fixed(String),
+    LaneLocal,
+}
+
+fn resolve_parallel_cargo_target_layout(
+    cargo_target: ParallelCargoTarget,
     inherited_cargo_target_dir: Option<&str>,
     max_concurrent_workers: usize,
+    repo_uses_cargo: bool,
     run_root: &Path,
-) -> Option<String> {
+) -> ParallelCargoTargetLayout {
     let inherited = inherited_cargo_target_dir
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
-    if inherited.is_some() {
-        return inherited;
+    match cargo_target {
+        ParallelCargoTarget::None => ParallelCargoTargetLayout::None,
+        ParallelCargoTarget::Shared => ParallelCargoTargetLayout::Fixed(
+            run_root
+                .join("shared-cargo-target")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ParallelCargoTarget::Lane => {
+            if max_concurrent_workers > 1 {
+                ParallelCargoTargetLayout::LaneLocal
+            } else {
+                ParallelCargoTargetLayout::Fixed(
+                    run_root.join("cargo-target").to_string_lossy().into_owned(),
+                )
+            }
+        }
+        ParallelCargoTarget::Auto => {
+            if let Some(target_dir) = inherited {
+                ParallelCargoTargetLayout::Fixed(target_dir)
+            } else if max_concurrent_workers > 1 && repo_uses_cargo {
+                ParallelCargoTargetLayout::LaneLocal
+            } else {
+                ParallelCargoTargetLayout::None
+            }
+        }
     }
-    if max_concurrent_workers <= 1 {
-        return None;
+}
+
+fn cargo_target_prompt_clause(lane_local: bool, summary: Option<&str>) -> String {
+    if lane_local {
+        return "Use the host-provided `CARGO_TARGET_DIR`; this run gives each lane its own target directory, so final proofs should go through `cargo test` or the repo's verification wrapper rather than direct binaries from another lane. Do not override it.".to_string();
     }
-    Some(
-        run_root
-            .join("shared-cargo-target")
-            .to_string_lossy()
-            .into_owned(),
-    )
+    if summary.is_some() {
+        return "Use the host-provided `CARGO_TARGET_DIR`. If Cargo is busy, wait or narrow the proof instead of switching target directories. Do not use direct target-dir test binaries as proof unless you just built that exact artifact from this lane's source tree.".to_string();
+    }
+    "Use the repo's normal Cargo target behavior. Do not create ad hoc target directories unless the task explicitly requires isolation, and prefer `cargo test` or the repo's verification wrapper for final proof.".to_string()
+}
+
+fn repo_uses_cargo(repo_root: &Path) -> bool {
+    repo_root.join("Cargo.toml").exists()
 }
 
 fn effective_parallel_claude_max_turns(args: &ParallelArgs) -> Option<usize> {
@@ -645,10 +750,17 @@ struct LaneRunConfig {
     reasoning_effort: String,
     codex_bin: PathBuf,
     extra_env: Vec<(String, String)>,
+    lane_local_cargo_target: bool,
+    cargo_target_prompt_clause: String,
+    preflight_prompt_clause: String,
 }
 
 impl LaneRunConfig {
-    fn new(args: &ParallelArgs, worker_env: &LoopWorkerEnv) -> Self {
+    fn new(
+        args: &ParallelArgs,
+        worker_env: &LoopWorkerEnv,
+        preflight_prompt_clause: String,
+    ) -> Self {
         Self {
             claude: args.claude,
             max_turns: effective_parallel_claude_max_turns(args),
@@ -656,7 +768,24 @@ impl LaneRunConfig {
             reasoning_effort: args.reasoning_effort.clone(),
             codex_bin: args.codex_bin.clone(),
             extra_env: worker_env.extra_env.clone(),
+            lane_local_cargo_target: worker_env.lane_local_cargo_target,
+            cargo_target_prompt_clause: worker_env.cargo_target_prompt_clause.clone(),
+            preflight_prompt_clause,
         }
+    }
+
+    fn env_for_lane(&self, lane_root: &Path) -> Vec<(String, String)> {
+        let mut extra_env = self.extra_env.clone();
+        if self.lane_local_cargo_target {
+            extra_env.push((
+                "CARGO_TARGET_DIR".to_string(),
+                lane_root
+                    .join("cargo-target")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+        extra_env
     }
 }
 
@@ -674,6 +803,7 @@ struct ActiveLaneAssignment {
     worker_pid_path: PathBuf,
     clean_commit_since: Option<Instant>,
     terminate_requested_at: Option<Instant>,
+    host_recovery_note: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +816,7 @@ struct LaneResumeCandidate {
     stdout_log_path: PathBuf,
     stderr_log_path: PathBuf,
     worker_pid_path: PathBuf,
+    host_recovery_note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -700,6 +831,7 @@ enum LaneRepoProgress {
     None,
     Dirty(String),
     NewCommits,
+    NewCommitsWithDirty(String),
 }
 
 #[derive(Clone, Debug)]
@@ -799,6 +931,471 @@ fn append_idle_status_to_free_lanes(
             &task_id,
             &format!("idle: {summary}"),
         );
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ParallelPreflightReport {
+    checks: Vec<ParallelPreflightCheck>,
+}
+
+impl ParallelPreflightReport {
+    fn add(&mut self, status: PreflightStatus, name: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(ParallelPreflightCheck {
+            status,
+            name: name.into(),
+            detail: detail.into(),
+        });
+    }
+
+    fn prompt_clause(&self) -> String {
+        self.checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "- {} {}: {}",
+                    check.status.label(),
+                    check.name,
+                    check.detail
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn summary(&self) -> String {
+        let warnings = self
+            .checks
+            .iter()
+            .filter(|check| check.status == PreflightStatus::Warn)
+            .count();
+        if warnings == 0 {
+            format!("{} checks ok", self.checks.len())
+        } else {
+            format!("{} checks, {} warning(s)", self.checks.len(), warnings)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParallelPreflightCheck {
+    status: PreflightStatus,
+    name: String,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightStatus {
+    Ok,
+    Warn,
+}
+
+impl PreflightStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+        }
+    }
+}
+
+fn run_parallel_preflight(
+    repo_root: &Path,
+    plan: &LoopPlanSnapshot,
+    run_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<ParallelPreflightReport> {
+    let mut report = ParallelPreflightReport::default();
+    let task_text = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .map(|task| format!("{} {}\n{}", task.id, task.title, task.markdown))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+
+    let needs_browser = contains_any(
+        &task_text,
+        &["agent-browser", "playwright", "browser", "e2e", "web"],
+    );
+    let needs_docker = contains_any(
+        &task_text,
+        &["docker", "compose", "regtest", "rbtc", "live"],
+    ) || repo_root.join("docker-compose.yml").exists();
+    let needs_regtest = contains_any(&task_text, &["regtest", "rbtc"]);
+
+    if repo_uses_cargo(repo_root) {
+        report.add(
+            PreflightStatus::Ok,
+            "cargo",
+            "Rust workspace detected; worker Cargo target policy is included in every lane prompt",
+        );
+    }
+
+    if needs_browser {
+        if command_exists("agent-browser") {
+            let socket = default_agent_browser_socket();
+            if socket.exists() {
+                report.add(
+                    PreflightStatus::Ok,
+                    "agent-browser",
+                    format!(
+                        "CLI present and daemon socket exists at {}",
+                        socket.display()
+                    ),
+                );
+            } else {
+                report.add(
+                    PreflightStatus::Warn,
+                    "agent-browser",
+                    format!(
+                        "CLI present but daemon socket is missing at {}; browser lanes should start/repair it or report AUTO_ENV_BLOCKER",
+                        socket.display()
+                    ),
+                );
+            }
+        } else {
+            report.add(
+                PreflightStatus::Warn,
+                "agent-browser",
+                "`agent-browser` is not on PATH; browser/e2e lanes may block",
+            );
+        }
+    }
+
+    if needs_docker {
+        if !command_exists("docker") {
+            report.add(
+                PreflightStatus::Warn,
+                "docker",
+                "`docker` is not on PATH; Docker-backed smoke tests may block",
+            );
+        } else if repo_root.join("docker-compose.yml").exists()
+            || repo_root.join("compose.yml").exists()
+            || repo_root.join("compose.yaml").exists()
+        {
+            match command_stdout(repo_root, ["docker", "compose", "config", "--quiet"]) {
+                Ok(_) => match command_stdout(
+                    repo_root,
+                    [
+                        "docker",
+                        "compose",
+                        "ps",
+                        "--services",
+                        "--status",
+                        "running",
+                    ],
+                ) {
+                    Ok(services) if !services.trim().is_empty() => report.add(
+                        PreflightStatus::Ok,
+                        "docker compose",
+                        format!(
+                            "running services: {}",
+                            services.lines().collect::<Vec<_>>().join(", ")
+                        ),
+                    ),
+                    Ok(_) => report.add(
+                        PreflightStatus::Warn,
+                        "docker compose",
+                        "compose config is valid but no services are currently running",
+                    ),
+                    Err(err) => report.add(
+                        PreflightStatus::Warn,
+                        "docker compose",
+                        format!("could not inspect running services: {err}"),
+                    ),
+                },
+                Err(err) => report.add(
+                    PreflightStatus::Warn,
+                    "docker compose",
+                    format!("compose config check failed: {err}"),
+                ),
+            }
+        } else {
+            report.add(
+                PreflightStatus::Warn,
+                "docker compose",
+                "tasks mention Docker/regtest/live infrastructure but no compose file was found",
+            );
+        }
+    }
+
+    if needs_regtest {
+        if command_exists("curl") {
+            match command_stdout(
+                repo_root,
+                [
+                    "curl",
+                    "-sf",
+                    "--max-time",
+                    "2",
+                    "http://127.0.0.1:18443/",
+                    "-u",
+                    "bitino:bitino",
+                    "-H",
+                    "content-type: application/json",
+                    "--data",
+                    "{\"jsonrpc\":\"1.0\",\"id\":\"auto-preflight\",\"method\":\"getblockchaininfo\",\"params\":[]}",
+                ],
+            ) {
+                Ok(_) => report.add(
+                    PreflightStatus::Ok,
+                    "regtest rpc",
+                    "127.0.0.1:18443 answered getblockchaininfo",
+                ),
+                Err(err) => report.add(
+                    PreflightStatus::Warn,
+                    "regtest rpc",
+                    format!("127.0.0.1:18443 did not answer getblockchaininfo: {err}"),
+                ),
+            }
+        } else {
+            report.add(
+                PreflightStatus::Warn,
+                "regtest rpc",
+                "`curl` is not on PATH; cannot probe local regtest RPC",
+            );
+        }
+    }
+
+    if report.checks.is_empty() {
+        report.add(
+            PreflightStatus::Ok,
+            "general",
+            "no browser, Docker, regtest, or Cargo preflight checks were triggered by pending tasks",
+        );
+    }
+
+    let rendered = report.prompt_clause();
+    atomic_write(&run_root.join("preflight.txt"), rendered.as_bytes()).with_context(|| {
+        format!(
+            "failed to write {}",
+            run_root.join("preflight.txt").display()
+        )
+    })?;
+    parallel_logger.info(format!("preflight:   {}", report.summary()));
+    for check in &report.checks {
+        if check.status == PreflightStatus::Warn {
+            parallel_logger.warn(format!(
+                "preflight:   warn {}: {}",
+                check.name, check.detail
+            ));
+        }
+    }
+    Ok(report)
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {}", shell_quote(command)))
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_stdout<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
+    let Some((program, rest)) = args.split_first() else {
+        bail!("empty command");
+    };
+    let output = Command::new(program)
+        .args(rest)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run `{}` in {}", args.join(" "), cwd.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    String::from_utf8(output.stdout).context("command stdout was not valid UTF-8")
+}
+
+fn default_agent_browser_socket() -> PathBuf {
+    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir)
+            .join("agent-browser")
+            .join("default.sock");
+    }
+    let uid = command_stdout(Path::new("."), ["id", "-u"]).unwrap_or_else(|_| "1000".to_string());
+    PathBuf::from("/run/user")
+        .join(uid.trim())
+        .join("agent-browser")
+        .join("default.sock")
+}
+
+fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
+    let repo_root = git_repo_root()?;
+    let run_root = args
+        .run_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join(".auto").join("parallel"));
+    let session_name = parallel_tmux_session_name(&repo_root);
+    let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    println!("auto parallel status");
+    println!("repo root:   {}", repo_root.display());
+    println!("branch:      {}", current_branch);
+    println!("run root:    {}", run_root.display());
+    match tmux_session_exists(&session_name) {
+        Ok(true) => {
+            println!("tmux:        {session_name} running");
+            match tmux_stdout([
+                "list-windows",
+                "-t",
+                &session_name,
+                "-F",
+                "#{window_index}:#{window_name}:dead=#{pane_dead}:cmd=#{pane_current_command}",
+            ]) {
+                Ok(windows) => {
+                    for line in windows.lines().filter(|line| !line.trim().is_empty()) {
+                        println!("  {line}");
+                    }
+                }
+                Err(err) => println!("  warning: failed to inspect tmux windows: {err:#}"),
+            }
+        }
+        Ok(false) => println!("tmux:        {session_name} not running"),
+        Err(err) => println!("tmux:        unknown ({err:#})"),
+    }
+
+    let host_processes = parallel_host_processes_for_repo(&repo_root);
+    if host_processes.is_empty() {
+        println!("host pids:   none detected");
+    } else {
+        println!("host pids:");
+        for line in host_processes {
+            println!("  {line}");
+        }
+    }
+
+    let lanes_root = run_root.join("lanes");
+    if !lanes_root.exists() {
+        println!("lanes:       none ({})", lanes_root.display());
+        return Ok(());
+    }
+
+    let mut lanes = fs::read_dir(&lanes_root)
+        .with_context(|| format!("failed to read {}", lanes_root.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            parse_lane_index(&name).map(|index| (index, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|(index, _)| *index);
+
+    println!("lanes:");
+    for (lane_index, lane_root) in lanes {
+        let task_id = read_lane_task_id(&lane_root)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "[unknown]".to_string());
+        let pid_state = match read_worker_pid(&lane_root.join("worker.pid")) {
+            Ok(Some(pid)) => match worker_pid_is_alive(pid) {
+                Ok(true) => format!("running pid {pid}"),
+                Ok(false) => format!("stale pid {pid}"),
+                Err(err) => format!("pid {pid} liveness unknown: {err:#}"),
+            },
+            Ok(None) => "no worker pid".to_string(),
+            Err(err) => format!("worker pid unreadable: {err:#}"),
+        };
+        let repo_status = lane_repo_status_summary(&lane_root.join("repo"));
+        let (log_age, log_line) = latest_lane_log_line(&lane_root);
+        println!(
+            "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
+        );
+        if let Some(line) = log_line {
+            println!("    {line}");
+        }
+    }
+    Ok(())
+}
+
+fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
+    command_stdout(Path::new("."), ["pgrep", "-af", "/auto parallel"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.contains(" parallel status"))
+        .filter(|line| process_line_cwd_matches_repo(line, repo_root))
+        .map(str::to_string)
+        .collect()
+}
+
+fn process_line_cwd_matches_repo(line: &str, repo_root: &Path) -> bool {
+    let Some(pid) = line
+        .split_whitespace()
+        .next()
+        .and_then(|raw| raw.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    fs::read_link(format!("/proc/{pid}/cwd")).map_or(true, |cwd| cwd == repo_root)
+}
+
+fn lane_repo_status_summary(repo_root: &Path) -> String {
+    if !repo_root.join(".git").exists() {
+        return "no repo".to_string();
+    }
+    let branch = git_stdout(repo_root, ["status", "--short", "--branch"]).unwrap_or_default();
+    let mut lines = branch.lines();
+    let head = lines.next().unwrap_or("## unknown").trim();
+    let dirty_count = lines.count();
+    if dirty_count == 0 {
+        format!("{head}; clean")
+    } else {
+        format!("{head}; {dirty_count} dirty path(s)")
+    }
+}
+
+fn latest_lane_log_line(lane_root: &Path) -> (String, Option<String>) {
+    let candidates = [lane_root.join("stdout.log"), lane_root.join("stderr.log")];
+    let latest = candidates
+        .iter()
+        .filter_map(|path| {
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            let line = read_last_nonempty_line(path).ok().flatten()?;
+            Some((modified, line))
+        })
+        .max_by_key(|(modified, _)| *modified);
+    let Some((modified, line)) = latest else {
+        return ("never".to_string(), None);
+    };
+    (format_system_time_age(modified), Some(line))
+}
+
+fn read_last_nonempty_line(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(content
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string))
+}
+
+fn format_system_time_age(time: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(time)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    if elapsed.as_secs() < 60 {
+        format!("{}s ago", elapsed.as_secs())
+    } else if elapsed.as_secs() < 3600 {
+        format!("{}m ago", elapsed.as_secs() / 60)
+    } else {
+        format!("{}h ago", elapsed.as_secs() / 3600)
     }
 }
 
@@ -993,6 +1590,7 @@ async fn run_serial_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_parallel_loop(
     repo_root: &Path,
     args: &ParallelArgs,
@@ -1004,13 +1602,15 @@ async fn run_parallel_loop(
     parallel_logger: &ParallelEventLogger,
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
-    let lane_config = LaneRunConfig::new(args, worker_env);
     let mut join_set = JoinSet::<LaneAttemptResult>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
     let mut landed = 0usize;
     let mut plan = refresh_parallel_plan(repo_root, linear_tracker, parallel_logger).await?;
+    let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
+    let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
+    checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger)?;
     let mut resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
     landed += harvest_resumable_lane_results(
         repo_root,
@@ -1022,7 +1622,10 @@ async fn run_parallel_loop(
     .await?;
     plan =
         refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger).await;
-    resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger)?;
+    let mut rediscovered_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    preserve_resume_recovery_notes(&mut rediscovered_lanes, &resumable_lanes);
+    resumable_lanes = rediscovered_lanes;
     let mut last_idle_summary = None::<String>;
 
     loop {
@@ -1030,6 +1633,7 @@ async fn run_parallel_loop(
         plan =
             refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger)
                 .await;
+        checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger)?;
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
                 .iter()
@@ -1249,10 +1853,46 @@ async fn run_parallel_loop(
                     if let Err(err) =
                         land_parallel_lane_result(repo_root, target_branch, &assignment)
                     {
-                        parallel_logger.warn(format!(
-                            "warning: failed landing lane-{} `{}` after non-zero worker exit: {err:#}",
-                            assignment.lane_index, assignment.task.id
-                        ));
+                        let recovery_note =
+                            landing_recovery_note(target_branch, &format!("{err:#}"));
+                        match try_spawn_lane_recovery_attempt(
+                            &mut join_set,
+                            &lane_config,
+                            prompt_template,
+                            &plan,
+                            &mut assignment,
+                            target_branch,
+                            args.max_retries,
+                            parallel_logger,
+                            "failed to land committed work after a non-zero worker exit",
+                            recovery_note,
+                        ) {
+                            Ok(true) => {
+                                active_tasks.insert(assignment.task.id.clone());
+                                active_lanes.insert(assignment.lane_index, assignment);
+                                continue;
+                            }
+                            Ok(false) => {
+                                parallel_logger.warn(format!(
+                                    "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain: {err:#}",
+                                    assignment.lane_index, assignment.task.id
+                                ));
+                                if let Err(salvage_err) =
+                                    write_parallel_salvage_record(&assignment, &format!("{err:#}"))
+                                {
+                                    parallel_logger.warn(format!(
+                                        "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                        assignment.lane_index, assignment.task.id
+                                    ));
+                                }
+                            }
+                            Err(retry_err) => {
+                                parallel_logger.warn(format!(
+                                    "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; original landing error: {err:#}",
+                                    assignment.lane_index, assignment.task.id
+                                ));
+                            }
+                        }
                         shelved_tasks
                             .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                         continue;
@@ -1280,7 +1920,53 @@ async fn run_parallel_loop(
                     last_idle_summary = None;
                     continue;
                 }
-                LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {}
+                LaneRepoProgress::Dirty(_)
+                | LaneRepoProgress::NewCommitsWithDirty(_)
+                | LaneRepoProgress::None => {}
+            }
+            if let Some(reason) = detect_lane_environment_blocker(&assignment) {
+                let recovery_note = environment_blocker_recovery_note(
+                    &reason,
+                    &lane_config.preflight_prompt_clause,
+                );
+                match try_spawn_lane_recovery_attempt(
+                    &mut join_set,
+                    &lane_config,
+                    prompt_template,
+                    &plan,
+                    &mut assignment,
+                    target_branch,
+                    args.max_retries,
+                    parallel_logger,
+                    "hit an external environment blocker",
+                    recovery_note,
+                ) {
+                    Ok(true) => {
+                        active_tasks.insert(assignment.task.id.clone());
+                        active_lanes.insert(assignment.lane_index, assignment);
+                        continue;
+                    }
+                    Ok(false) => {
+                        parallel_logger.warn(format!(
+                            "env-blocked: lane-{} `{}` exhausted retries after external blocker; shelving for the rest of this run: {}",
+                            assignment.lane_index, assignment.task.id, reason
+                        ));
+                    }
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed restarting lane-{} `{}` after environment blocker: {err:#}; shelving for the rest of this run: {}",
+                            assignment.lane_index, assignment.task.id, reason
+                        ));
+                    }
+                }
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    &format!("env-blocked: {reason}"),
+                );
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
             }
             let exit_code = exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
@@ -1371,13 +2057,40 @@ async fn run_parallel_loop(
         }
 
         match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit)? {
-            LaneRepoProgress::Dirty(status) => {
-                parallel_logger.warn(format!(
-                    "warning: parallel lane-{} (`{}`) exited cleanly but left uncommitted changes; shelving for the rest of this run:\n{}",
-                    assignment.lane_index,
-                    assignment.task.id,
-                    status
-                ));
+            LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status) => {
+                let recovery_note = dirty_worktree_recovery_note(&status);
+                match try_spawn_lane_recovery_attempt(
+                    &mut join_set,
+                    &lane_config,
+                    prompt_template,
+                    &plan,
+                    &mut assignment,
+                    target_branch,
+                    args.max_retries,
+                    parallel_logger,
+                    "exited cleanly but left a dirty worktree",
+                    recovery_note,
+                ) {
+                    Ok(true) => {
+                        active_tasks.insert(assignment.task.id.clone());
+                        active_lanes.insert(assignment.lane_index, assignment);
+                        continue;
+                    }
+                    Ok(false) => {
+                        parallel_logger.warn(format!(
+                            "warning: parallel lane-{} (`{}`) exited cleanly but left uncommitted changes and no recovery attempts remain; shelving for the rest of this run:\n{}",
+                            assignment.lane_index,
+                            assignment.task.id,
+                            status
+                        ));
+                    }
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed restarting lane-{} `{}` for dirty-worktree recovery: {err:#}; shelving for the rest of this run:\n{}",
+                            assignment.lane_index, assignment.task.id, status
+                        ));
+                    }
+                }
                 append_lane_host_event(
                     &assignment.stdout_log_path,
                     assignment.lane_index,
@@ -1405,10 +2118,45 @@ async fn run_parallel_loop(
             }
             LaneRepoProgress::NewCommits => {
                 if let Err(err) = land_parallel_lane_result(repo_root, target_branch, &assignment) {
-                    parallel_logger.warn(format!(
-                        "warning: failed landing lane-{} `{}`; shelving for the rest of this run: {err:#}",
-                        assignment.lane_index, assignment.task.id
-                    ));
+                    let recovery_note = landing_recovery_note(target_branch, &format!("{err:#}"));
+                    match try_spawn_lane_recovery_attempt(
+                        &mut join_set,
+                        &lane_config,
+                        prompt_template,
+                        &plan,
+                        &mut assignment,
+                        target_branch,
+                        args.max_retries,
+                        parallel_logger,
+                        "failed to land committed work",
+                        recovery_note,
+                    ) {
+                        Ok(true) => {
+                            active_tasks.insert(assignment.task.id.clone());
+                            active_lanes.insert(assignment.lane_index, assignment);
+                            continue;
+                        }
+                        Ok(false) => {
+                            parallel_logger.warn(format!(
+                                "warning: failed landing lane-{} `{}` and no recovery attempts remain; shelving for the rest of this run: {err:#}",
+                                assignment.lane_index, assignment.task.id
+                            ));
+                            if let Err(salvage_err) =
+                                write_parallel_salvage_record(&assignment, &format!("{err:#}"))
+                            {
+                                parallel_logger.warn(format!(
+                                    "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                    assignment.lane_index, assignment.task.id
+                                ));
+                            }
+                        }
+                        Err(retry_err) => {
+                            parallel_logger.warn(format!(
+                                "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; original landing error: {err:#}",
+                                assignment.lane_index, assignment.task.id
+                            ));
+                        }
+                    }
                     shelved_tasks
                         .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                     continue;
@@ -1441,6 +2189,277 @@ async fn run_parallel_loop(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_lane_recovery_attempt(
+    join_set: &mut JoinSet<LaneAttemptResult>,
+    lane_config: &LaneRunConfig,
+    prompt_template: &str,
+    plan: &LoopPlanSnapshot,
+    assignment: &mut ActiveLaneAssignment,
+    target_branch: &str,
+    max_retries: usize,
+    parallel_logger: &ParallelEventLogger,
+    reason: &str,
+    recovery_note: String,
+) -> Result<bool> {
+    if assignment.attempts > max_retries {
+        return Ok(false);
+    }
+
+    let next_attempt = assignment.attempts + 1;
+    let total_attempts = max_retries + 1;
+    parallel_logger.info(format!(
+        "repair:      lane-{} `{}` {}; retrying attempt {}/{}",
+        assignment.lane_index, assignment.task.id, reason, next_attempt, total_attempts
+    ));
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &format!("repair: {reason}; retrying attempt {next_attempt}/{total_attempts}"),
+    );
+    assignment.host_recovery_note = Some(recovery_note);
+    spawn_parallel_lane_attempt(
+        join_set,
+        lane_config,
+        prompt_template,
+        plan,
+        assignment,
+        target_branch,
+    )?;
+    Ok(true)
+}
+
+fn landing_recovery_note(branch: &str, error: &str) -> String {
+    format!(
+        r#"The host tried to land this lane's committed work onto `{branch}`, but Git reported a landing conflict.
+
+Required recovery:
+1. Keep the task's intent and previous committed work.
+2. Fetch the current target branch from the lane remote, then reconcile your lane onto the latest `{branch}` with judgment. Prefer `git fetch canonical {branch}` when the lane has a `canonical` remote; otherwise use `origin`.
+3. Resolve conflicts semantically against the latest code. Do not blindly choose one side.
+4. If a rebase continue step needs a commit message, use `GIT_EDITOR=true git rebase --continue` or `git -c core.editor=true rebase --continue` so the lane cannot block on an editor.
+5. End with local task commit(s) based on the latest `{branch}` and a clean `git status --short`.
+6. Do not push or edit shared queue files; the host still owns landing and queue reconciliation.
+
+Original host landing error:
+{error}"#
+    )
+}
+
+fn dirty_worktree_recovery_note(status: &str) -> String {
+    format!(
+        r#"The previous attempt exited successfully, but the lane worktree was still dirty.
+
+Required recovery:
+1. Run `git status --short` and inspect every listed path.
+2. If a dirty file is task-owned work, include it in a local task commit.
+3. If a dirty file is unrelated formatter spillover, accidental exploration, or stale scratch work, revert just that file.
+4. End only after `git status --short` is empty and the task has at least one local commit.
+5. Do not push or edit shared queue files; the host still owns landing and queue reconciliation.
+
+Dirty status seen by the host:
+{status}"#
+    )
+}
+
+fn environment_blocker_recovery_note(reason: &str, preflight_report: &str) -> String {
+    let preflight = if preflight_report.trim().is_empty() {
+        "No host preflight details were recorded.".to_string()
+    } else {
+        preflight_report.trim().to_string()
+    };
+    format!(
+        r#"The previous attempt appears blocked by external infrastructure, not by the task's code diff.
+
+Detected blocker:
+{reason}
+
+Host preflight:
+{preflight}
+
+Required recovery:
+1. Re-check the missing service/tool/browser/Docker dependency before changing code.
+2. If the infrastructure can be repaired from this lane without touching shared queue files, do that and rerun the exact verification.
+3. If the infrastructure is still unavailable, print `AUTO_ENV_BLOCKER: <short reason>` and exit non-zero without pretending code proof failed.
+4. If you did make task-owned code changes before finding the blocker, keep them only when they are independently correct, committed, and leave `git status --short` clean."#
+    )
+}
+
+fn write_parallel_salvage_record(
+    assignment: &ActiveLaneAssignment,
+    landing_error: &str,
+) -> Result<()> {
+    let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let lane_status = git_stdout(
+        &assignment.lane_repo_root,
+        ["status", "--short", "--branch"],
+    )
+    .unwrap_or_else(|_| "unknown".to_string());
+    let run_root = assignment
+        .lane_root
+        .parent()
+        .and_then(Path::parent)
+        .context("failed to infer parallel run root from lane path")?;
+    let salvage_root = run_root.join(SALVAGE_DIR);
+    fs::create_dir_all(&salvage_root)
+        .with_context(|| format!("failed to create {}", salvage_root.display()))?;
+    let filename = format!(
+        "lane-{}-{}.md",
+        assignment.lane_index,
+        sanitize_salvage_filename(&assignment.task.id)
+    );
+    let path = salvage_root.join(filename);
+    let content = format!(
+        "# auto parallel salvage\n\n\
+Task: `{}` {}\n\
+Lane: lane-{}\n\
+Attempts: {}\n\
+Lane repo: `{}`\n\
+Lane head: `{}`\n\n\
+## Lane Status\n\n```text\n{}\n```\n\n\
+## Landing Error\n\n```text\n{}\n```\n\n\
+## Recovery\n\n\
+The lane has clean committed work that the host could not land automatically. Reconcile it semantically onto the current target branch, verify it, then remove this salvage note when the task lands.\n",
+        assignment.task.id,
+        assignment.task.title,
+        assignment.lane_index,
+        assignment.attempts,
+        assignment.lane_repo_root.display(),
+        lane_head,
+        lane_status.trim(),
+        landing_error.trim()
+    );
+    atomic_write(&path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &format!("salvage: wrote {}", path.display()),
+    );
+    Ok(())
+}
+
+fn sanitize_salvage_filename(raw: &str) -> String {
+    let rendered = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let rendered = rendered.trim_matches('-');
+    if rendered.is_empty() {
+        "task".to_string()
+    } else {
+        rendered.to_string()
+    }
+}
+
+fn detect_lane_environment_blocker(assignment: &ActiveLaneAssignment) -> Option<String> {
+    let combined = [
+        read_recent_log_text(&assignment.stdout_log_path, 200).ok(),
+        read_recent_log_text(&assignment.stderr_log_path, 200).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    environment_blocker_reason(&combined)
+}
+
+fn environment_blocker_reason(log_text: &str) -> Option<String> {
+    for line in log_text.lines().rev() {
+        if let Some(reason) = line
+            .split_once("AUTO_ENV_BLOCKER:")
+            .map(|(_, reason)| reason)
+        {
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                return Some(reason.to_string());
+            }
+        }
+    }
+
+    let lower = log_text.to_ascii_lowercase();
+    let patterns = [
+        (
+            "agent-browser daemon failed to start",
+            "daemon failed to start",
+        ),
+        (
+            "agent-browser daemon socket missing",
+            "agent-browser/default.sock",
+        ),
+        (
+            "Docker daemon unavailable",
+            "cannot connect to the docker daemon",
+        ),
+        ("Docker compose stack is not running", "docker compose ps"),
+        ("local service refused a connection", "connection refused"),
+        ("local service refused a connection", "econnrefused"),
+        ("regtest stack is unavailable", "regtest stack"),
+        ("regtest RPC is unavailable", "127.0.0.1:18443"),
+        (
+            "Playwright browser dependencies are missing",
+            "playwright install",
+        ),
+        ("browser executable is missing", "executable doesn't exist"),
+    ];
+    patterns
+        .iter()
+        .find_map(|(reason, pattern)| lower.contains(pattern).then(|| (*reason).to_string()))
+}
+
+fn read_recent_log_text(path: &Path, max_lines: usize) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = content.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
+fn checkpoint_parallel_host_queue_changes(
+    repo_root: &Path,
+    target_branch: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<Option<String>> {
+    let mut status_args = vec!["status", "--short", "--"];
+    status_args.extend(HOST_QUEUE_STATE_FILES);
+    let status = git_stdout(repo_root, status_args)?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut add_args = vec!["add", "--all", "--"];
+    add_args.extend(HOST_QUEUE_STATE_FILES);
+    run_git(repo_root, add_args)?;
+    let message = format!("{}: parallel host queue sync", repo_name(repo_root));
+    run_git(repo_root, ["commit", "-m", &message])?;
+    let commit = git_stdout(repo_root, ["rev-parse", "--short", "HEAD"])?;
+    let commit = commit.trim().to_string();
+    if push_branch_with_remote_sync(repo_root, target_branch)? {
+        parallel_logger.info(format!(
+            "remote sync: rebased onto origin/{} after host queue sync",
+            target_branch
+        ));
+    }
+    parallel_logger.info(format!(
+        "host sync:  committed queue-state changes at {commit}"
+    ));
+    Ok(Some(commit))
 }
 
 fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
@@ -1578,6 +2597,88 @@ fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> 
     }
 
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TmuxLaunchStatus {
+    Launched,
+    AlreadyRunning,
+}
+
+fn should_launch_parallel_tmux(args: &ParallelArgs) -> bool {
+    args.max_concurrent_workers > 1
+        && env::var_os("AUTO_PARALLEL_TMUX_BOOTSTRAPPED").is_none()
+        && env::var_os("TMUX_PANE").is_none_or(|pane| pane.is_empty())
+}
+
+fn launch_parallel_tmux_session(session_name: &str) -> Result<TmuxLaunchStatus> {
+    if tmux_session_exists(session_name)? {
+        return Ok(TmuxLaunchStatus::AlreadyRunning);
+    }
+
+    let command = parallel_tmux_command()?;
+    let working_dir = env::current_dir()
+        .context("failed to resolve current directory")?
+        .display()
+        .to_string();
+    let output = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "-c",
+            &working_dir,
+            &command,
+        ])
+        .output()
+        .context("failed to launch tmux")?;
+    if !output.status.success() {
+        bail!(
+            "tmux command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(TmuxLaunchStatus::Launched)
+}
+
+fn tmux_session_exists(session_name: &str) -> Result<bool> {
+    let output = Command::new("tmux")
+        .args(["has-session", "-t", session_name])
+        .output()
+        .context("failed to launch tmux")?;
+    Ok(output.status.success())
+}
+
+fn parallel_tmux_session_name(repo_root: &Path) -> String {
+    let slug: String = repo_name(repo_root)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "repo" } else { slug };
+    format!("{slug}-parallel")
+}
+
+fn parallel_tmux_command() -> Result<String> {
+    let executable = env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .or_else(|| env::args().next())
+        .context("failed to resolve current executable")?;
+    let mut parts = vec![
+        "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
+        shell_quote(&executable),
+    ];
+    parts.extend(env::args().skip(1).map(|arg| shell_quote(&arg)));
+    Ok(parts.join(" "))
 }
 
 fn tmux_window_names(session_name: &str) -> Result<Vec<String>> {
@@ -1761,6 +2862,7 @@ fn prepare_parallel_lane_assignment(
             worker_pid_path: candidate.worker_pid_path,
             clean_commit_since: None,
             terminate_requested_at: None,
+            host_recovery_note: candidate.host_recovery_note,
         });
     }
 
@@ -1783,6 +2885,7 @@ fn prepare_parallel_lane_assignment(
         worker_pid_path: lane_root.join("worker.pid"),
         clean_commit_since: None,
         terminate_requested_at: None,
+        host_recovery_note: None,
     })
 }
 
@@ -1928,9 +3031,12 @@ fn discover_resume_candidates(
                 continue;
             }
         };
-        match inspect_lane_repo_progress(&lane_repo_root, &base_commit) {
+        let host_recovery_note = match inspect_lane_repo_progress(&lane_repo_root, &base_commit) {
             Ok(LaneRepoProgress::None) => continue,
-            Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::NewCommits) => {}
+            Ok(LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status)) => {
+                Some(dirty_worktree_recovery_note(&status))
+            }
+            Ok(LaneRepoProgress::NewCommits) => None,
             Err(err) => {
                 eprintln!(
                     "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
@@ -1938,7 +3044,7 @@ fn discover_resume_candidates(
                 );
                 continue;
             }
-        }
+        };
 
         candidates.insert(
             lane_index,
@@ -1951,6 +3057,7 @@ fn discover_resume_candidates(
                 stdout_log_path,
                 stderr_log_path,
                 worker_pid_path,
+                host_recovery_note,
             },
         );
     }
@@ -1973,12 +3080,16 @@ async fn harvest_resumable_lane_results(
                 match inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)
                 {
                     Ok(LaneRepoProgress::NewCommits) => true,
-                    Ok(LaneRepoProgress::Dirty(_) | LaneRepoProgress::None) => false,
+                    Ok(
+                        LaneRepoProgress::Dirty(_)
+                        | LaneRepoProgress::NewCommitsWithDirty(_)
+                        | LaneRepoProgress::None,
+                    ) => false,
                     Err(err) => {
                         eprintln!(
-                        "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
-                        lane_index
-                    );
+                            "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
+                            lane_index
+                        );
                         false
                     }
                 }
@@ -2004,6 +3115,7 @@ async fn harvest_resumable_lane_results(
             worker_pid_path: candidate.worker_pid_path,
             clean_commit_since: None,
             terminate_requested_at: None,
+            host_recovery_note: candidate.host_recovery_note,
         };
         match land_parallel_lane_result(repo_root, target_branch, &assignment) {
             Ok(()) => {
@@ -2037,6 +3149,10 @@ async fn harvest_resumable_lane_results(
                         stdout_log_path: assignment.stdout_log_path,
                         stderr_log_path: assignment.stderr_log_path,
                         worker_pid_path: assignment.worker_pid_path,
+                        host_recovery_note: Some(landing_recovery_note(
+                            target_branch,
+                            &format!("{error:#}"),
+                        )),
                     },
                 );
             }
@@ -2058,6 +3174,23 @@ fn take_resume_candidate_for_task(
         .map(|(lane_index, _)| *lane_index)?;
     let candidate = resumable_lanes.remove(&lane_index)?;
     Some((lane_index, candidate))
+}
+
+fn preserve_resume_recovery_notes(
+    rediscovered: &mut BTreeMap<usize, LaneResumeCandidate>,
+    previous: &BTreeMap<usize, LaneResumeCandidate>,
+) {
+    for (lane_index, candidate) in rediscovered {
+        if candidate.host_recovery_note.is_some() {
+            continue;
+        }
+        let Some(previous_candidate) = previous.get(lane_index) else {
+            continue;
+        };
+        if previous_candidate.task.id == candidate.task.id {
+            candidate.host_recovery_note = previous_candidate.host_recovery_note.clone();
+        }
+    }
 }
 
 fn clone_loop_lane_repo(
@@ -2109,8 +3242,15 @@ fn spawn_parallel_lane_attempt(
     assignment.clean_commit_since = None;
     assignment.terminate_requested_at = None;
     refresh_assignment_task_from_plan(plan, assignment);
-    let full_prompt =
-        build_parallel_lane_prompt(prompt_template, plan, &assignment.task, target_branch);
+    let full_prompt = build_parallel_lane_prompt(
+        prompt_template,
+        plan,
+        &assignment.task,
+        target_branch,
+        &lane_config.cargo_target_prompt_clause,
+        &lane_config.preflight_prompt_clause,
+        assignment.host_recovery_note.as_deref(),
+    );
     let prompt_path = assignment.lane_root.join(format!(
         "{}-attempt-{:02}-prompt.md",
         assignment.task.id, assignment.attempts
@@ -2119,6 +3259,7 @@ fn spawn_parallel_lane_attempt(
     let stderr_log_path = assignment.stderr_log_path.clone();
     let stdout_log_path = assignment.stdout_log_path.clone();
     let worker_pid_path = assignment.worker_pid_path.clone();
+    let extra_env = lane_config.env_for_lane(&assignment.lane_root);
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
     let lane_config = lane_config.clone();
@@ -2144,7 +3285,7 @@ fn spawn_parallel_lane_attempt(
                 &stderr_log_path,
                 Some(&stdout_log_path),
                 &context_label,
-                &lane_config.extra_env,
+                &extra_env,
                 Some(&worker_pid_path),
             )
             .await
@@ -2158,7 +3299,7 @@ fn spawn_parallel_lane_attempt(
                 &stderr_log_path,
                 Some(&stdout_log_path),
                 &context_label,
-                &lane_config.extra_env,
+                &extra_env,
                 Some(&worker_pid_path),
             )
             .await
@@ -2202,9 +3343,9 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
             Ok(progress) => progress,
             Err(err) => {
                 eprintln!(
-                        "warning: failed inspecting lane-{} `{}` while checking for harvestable commits: {err:#}",
-                        assignment.lane_index, assignment.task.id
-                    );
+                    "warning: failed inspecting lane-{} `{}` while checking for harvestable commits: {err:#}",
+                    assignment.lane_index, assignment.task.id
+                );
                 assignment.clean_commit_since = None;
                 assignment.terminate_requested_at = None;
                 continue;
@@ -2259,17 +3400,17 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
                             );
                         } else {
                             println!(
-                            "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
-                            assignment.lane_index, assignment.task.id, pid
-                        );
+                                "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                                assignment.lane_index, assignment.task.id, pid
+                            );
                             append_lane_host_event(
-                            &assignment.stdout_log_path,
-                            assignment.lane_index,
-                            &assignment.task.id,
-                            &format!(
-                                "harvest: sent SIGKILL to lingering worker pid {pid} after clean commit"
-                            ),
-                        );
+                                &assignment.stdout_log_path,
+                                assignment.lane_index,
+                                &assignment.task.id,
+                                &format!(
+                                    "harvest: sent SIGKILL to lingering worker pid {pid} after clean commit"
+                                ),
+                            );
                         }
                         assignment.terminate_requested_at = None;
                     }
@@ -2300,7 +3441,9 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
                     }
                 }
             }
-            LaneRepoProgress::Dirty(_) | LaneRepoProgress::None => {
+            LaneRepoProgress::Dirty(_)
+            | LaneRepoProgress::NewCommitsWithDirty(_)
+            | LaneRepoProgress::None => {
                 assignment.clean_commit_since = None;
                 assignment.terminate_requested_at = None;
             }
@@ -2459,6 +3602,9 @@ fn build_parallel_lane_prompt(
     plan: &LoopPlanSnapshot,
     task: &LoopTask,
     branch: &str,
+    cargo_target_clause: &str,
+    preflight_clause: &str,
+    host_recovery_note: Option<&str>,
 ) -> String {
     let queue = plan.queue_snapshot();
     let blocked_clause = if queue.blocked_ids.is_empty() {
@@ -2480,13 +3626,26 @@ fn build_parallel_lane_prompt(
         "Do not edit these shared queue files in this lane. The host owns queue reconciliation in parallel mode: {}.",
         protected_files
     );
+    let recovery_clause = host_recovery_note
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(|note| format!("\nHost recovery context:\n{note}\n"))
+        .unwrap_or_default();
+    let preflight_clause = preflight_clause
+        .trim()
+        .is_empty()
+        .then(String::new)
+        .unwrap_or_else(|| format!("\nHost preflight report:\n{}\n", preflight_clause.trim()));
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- {protected_clause}\n- Do not override the host-provided `CARGO_TARGET_DIR`. Shared build cache is part of the execution contract for this run; if Cargo is busy, wait or narrow the proof instead of switching to a lane-local target dir.\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
         branch = branch,
         protected_clause = protected_clause,
+        cargo_target_clause = cargo_target_clause,
+        preflight_clause = preflight_clause,
+        recovery_clause = recovery_clause,
         pending_count = queue.pending_ids.len(),
         blocked_clause = blocked_clause,
         markdown = task.markdown
@@ -2495,15 +3654,14 @@ fn build_parallel_lane_prompt(
 
 fn inspect_lane_repo_progress(repo_root: &Path, base_commit: &str) -> Result<LaneRepoProgress> {
     let status = git_stdout(repo_root, ["status", "--short"])?;
-    if !status.trim().is_empty() {
-        return Ok(LaneRepoProgress::Dirty(status.trim().to_string()));
-    }
-
     let head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
-    if head.trim() == base_commit {
-        Ok(LaneRepoProgress::None)
-    } else {
-        Ok(LaneRepoProgress::NewCommits)
+    let has_new_commits = head.trim() != base_commit;
+    let status = status.trim();
+    match (has_new_commits, status.is_empty()) {
+        (false, true) => Ok(LaneRepoProgress::None),
+        (false, false) => Ok(LaneRepoProgress::Dirty(status.to_string())),
+        (true, true) => Ok(LaneRepoProgress::NewCommits),
+        (true, false) => Ok(LaneRepoProgress::NewCommitsWithDirty(status.to_string())),
     }
 }
 
@@ -2571,16 +3729,23 @@ fn land_parallel_lane_result(
     let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
     let lane_head = lane_head.trim().to_string();
     fetch_lane_commit(repo_root, &assignment.lane_repo_root, &lane_head)?;
-    cherry_pick_lane_range(repo_root, &assignment.base_commit, "FETCH_HEAD").with_context(
-        || {
+    let landing_base = git_stdout(repo_root, ["merge-base", "HEAD", "FETCH_HEAD"])?;
+    let landing_base = landing_base.trim().to_string();
+    let range_base = if landing_base.is_empty() {
+        assignment.base_commit.as_str()
+    } else {
+        landing_base.as_str()
+    };
+    if !git_ref_is_ancestor(repo_root, "FETCH_HEAD", "HEAD")? {
+        cherry_pick_lane_range(repo_root, range_base, "FETCH_HEAD").with_context(|| {
             format!(
                 "failed landing lane-{} task `{}` from {}",
                 assignment.lane_index,
                 assignment.task.id,
                 assignment.lane_repo_root.display()
             )
-        },
-    )?;
+        })?;
+    }
     if remove_task_from_plan(repo_root, &assignment.task.id)? {
         let message = format!(
             "{}: {} queue sync",
@@ -2594,6 +3759,21 @@ fn land_parallel_lane_result(
         println!("remote sync: rebased onto origin/{}", target_branch);
     }
     Ok(())
+}
+
+fn git_ref_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed checking whether {ancestor} is an ancestor of {descendant} in {}",
+                repo_root.display()
+            )
+        })?;
+    Ok(output.status.success())
 }
 
 fn fetch_lane_commit(repo_root: &Path, lane_repo_root: &Path, lane_head: &str) -> Result<()> {
@@ -2973,16 +4153,19 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::ParallelArgs;
+    use crate::{ParallelArgs, ParallelCargoTarget};
 
     use super::{
-        build_iteration_prompt, default_cargo_build_jobs_for, discover_sibling_git_repos,
-        effective_parallel_claude_max_turns, is_verification_only_task, lane_scope_budget,
-        parse_loop_plan, read_lane_task_id, remove_task_from_plan_text,
+        build_iteration_prompt, build_parallel_lane_prompt, default_cargo_build_jobs_for,
+        dirty_worktree_recovery_note, discover_sibling_git_repos,
+        effective_parallel_claude_max_turns, environment_blocker_reason,
+        inspect_lane_repo_progress, is_verification_only_task, landing_recovery_note,
+        lane_scope_budget, parallel_tmux_session_name, parse_loop_plan,
+        preserve_resume_recovery_notes, read_lane_task_id, remove_task_from_plan_text,
         render_default_parallel_prompt, repo_forbids_legacy_review_trackers,
         resolve_loop_worker_env, resolve_reference_repos, take_resume_candidate_for_task,
-        task_id_from_prompt_filename, ActiveLaneAssignment, LaneResumeCandidate, LoopQueueSnapshot,
-        LoopTask, LoopTaskStatus,
+        task_id_from_prompt_filename, ActiveLaneAssignment, LaneRepoProgress, LaneResumeCandidate,
+        LoopQueueSnapshot, LoopTask, LoopTaskStatus,
     };
 
     #[test]
@@ -3008,6 +4191,80 @@ mod tests {
         assert!(prompt.contains("Additional repositories you may inspect or edit"));
         assert!(prompt.contains("/home/r/coding/robopokermulti"));
         assert!(prompt.contains("owned surfaces live in one of these repos"));
+    }
+
+    #[test]
+    fn parallel_tmux_session_name_uses_repo_slug() {
+        assert_eq!(
+            parallel_tmux_session_name(&PathBuf::from("/home/r/Coding/bitino")),
+            "bitino-parallel"
+        );
+        assert_eq!(
+            parallel_tmux_session_name(&PathBuf::from("/tmp/weird:repo name")),
+            "weird-repo-name-parallel"
+        );
+    }
+
+    #[test]
+    fn lane_prompt_requires_clean_committed_finish_and_can_include_recovery_context() {
+        let snapshot = parse_loop_plan(
+            r#"- [ ] `TASK-001` First task
+  Dependencies:
+  - None
+  Estimated scope: small
+"#,
+        );
+        let task = snapshot.tasks.first().expect("task should parse");
+        let prompt = build_parallel_lane_prompt(
+            "base prompt",
+            &snapshot,
+            task,
+            "trunk",
+            "Use the host-provided `CARGO_TARGET_DIR`; this run gives each lane its own target directory.",
+            "- warn agent-browser: daemon missing",
+            Some("Resolve the previous landing conflict."),
+        );
+
+        assert!(prompt.contains("run `git status --short`"));
+        assert!(prompt.contains("at least one local commit for this task and a clean worktree"));
+        assert!(prompt.contains("reports `0 tests`"));
+        assert!(prompt.contains("direct target-dir test binaries"));
+        assert!(prompt.contains("AUTO_ENV_BLOCKER"));
+        assert!(prompt.contains("Host preflight report:"));
+        assert!(prompt.contains("Host recovery context:"));
+        assert!(prompt.contains("Resolve the previous landing conflict."));
+    }
+
+    #[test]
+    fn recovery_notes_explain_semantic_merge_and_dirty_cleanup_contracts() {
+        let landing = landing_recovery_note("trunk", "conflict in src/lib.rs");
+        assert!(landing.contains("Resolve conflicts semantically"));
+        assert!(landing.contains("GIT_EDITOR=true git rebase --continue"));
+        assert!(landing.contains("based on the latest `trunk`"));
+        assert!(landing.contains("conflict in src/lib.rs"));
+
+        let dirty = dirty_worktree_recovery_note("M src/lib.rs");
+        assert!(dirty.contains("Run `git status --short`"));
+        assert!(dirty.contains("include it in a local task commit"));
+        assert!(dirty.contains("unrelated formatter spillover"));
+        assert!(dirty.contains("revert just that file"));
+        assert!(dirty.contains("M src/lib.rs"));
+    }
+
+    #[test]
+    fn environment_blocker_detection_prefers_explicit_marker() {
+        let log = "some output\nAUTO_ENV_BLOCKER: regtest RPC is down\nmore output";
+        assert_eq!(
+            environment_blocker_reason(log),
+            Some("regtest RPC is down".to_string())
+        );
+
+        assert_eq!(
+            environment_blocker_reason(
+                "Daemon failed to start (socket: /run/user/1000/agent-browser/default.sock)"
+            ),
+            Some("agent-browser daemon failed to start".to_string())
+        );
     }
 
     #[test]
@@ -3043,34 +4300,80 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let inherited = resolve_loop_worker_env(None, Some("8"), None, 22, 5, &run_root).unwrap();
-        assert_eq!(
-            inherited.extra_env,
-            vec![("CARGO_TARGET_DIR".to_string(), shared_target.clone())]
-        );
+        let inherited = resolve_loop_worker_env(
+            None,
+            ParallelCargoTarget::Auto,
+            Some("8"),
+            None,
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .unwrap();
+        assert!(inherited.extra_env.is_empty());
         assert_eq!(inherited.cargo_jobs_summary, "inherited CARGO_BUILD_JOBS=8");
-        assert_eq!(inherited.cargo_target_summary, Some(shared_target.clone()));
+        assert!(inherited.lane_local_cargo_target);
+        assert!(inherited
+            .cargo_target_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("lane-local")));
 
-        let overridden =
-            resolve_loop_worker_env(Some(3), Some("8"), None, 22, 5, &run_root).unwrap();
+        let overridden = resolve_loop_worker_env(
+            Some(3),
+            ParallelCargoTarget::Auto,
+            Some("8"),
+            None,
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .unwrap();
         assert_eq!(
             overridden.extra_env,
-            vec![
-                ("CARGO_TARGET_DIR".to_string(), shared_target.clone()),
-                ("CARGO_BUILD_JOBS".to_string(), "3".to_string())
-            ]
+            vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())]
         );
         assert_eq!(overridden.cargo_jobs_summary, "override CARGO_BUILD_JOBS=3");
+        assert!(overridden.lane_local_cargo_target);
 
-        let automatic = resolve_loop_worker_env(None, None, None, 22, 5, &run_root).unwrap();
+        let automatic = resolve_loop_worker_env(
+            None,
+            ParallelCargoTarget::Auto,
+            None,
+            None,
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .unwrap();
         assert_eq!(
             automatic.extra_env,
+            vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())]
+        );
+        assert_eq!(automatic.cargo_jobs_summary, "auto CARGO_BUILD_JOBS=3");
+        assert!(automatic.lane_local_cargo_target);
+
+        let shared = resolve_loop_worker_env(
+            None,
+            ParallelCargoTarget::Shared,
+            None,
+            None,
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .unwrap();
+        assert_eq!(
+            shared.extra_env,
             vec![
                 ("CARGO_TARGET_DIR".to_string(), shared_target),
                 ("CARGO_BUILD_JOBS".to_string(), "3".to_string())
             ]
         );
-        assert_eq!(automatic.cargo_jobs_summary, "auto CARGO_BUILD_JOBS=3");
+        assert!(!shared.lane_local_cargo_target);
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
@@ -3079,7 +4382,17 @@ mod tests {
     fn loop_worker_env_rejects_zero_cargo_jobs_override() {
         let run_root = unique_temp_dir("loop-worker-env-error");
         fs::create_dir_all(&run_root).expect("failed to create run root");
-        let err = resolve_loop_worker_env(Some(0), None, None, 22, 5, &run_root).unwrap_err();
+        let err = resolve_loop_worker_env(
+            Some(0),
+            ParallelCargoTarget::Auto,
+            None,
+            None,
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--cargo-build-jobs"));
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
@@ -3089,8 +4402,17 @@ mod tests {
         let run_root = unique_temp_dir("loop-worker-env-inherited-target");
         fs::create_dir_all(&run_root).expect("failed to create run root");
 
-        let env = resolve_loop_worker_env(None, None, Some("/tmp/shared-target"), 22, 5, &run_root)
-            .expect("worker env should resolve");
+        let env = resolve_loop_worker_env(
+            None,
+            ParallelCargoTarget::Auto,
+            None,
+            Some("/tmp/shared-target"),
+            22,
+            5,
+            true,
+            &run_root,
+        )
+        .expect("worker env should resolve");
         assert_eq!(
             env.extra_env,
             vec![
@@ -3105,6 +4427,7 @@ mod tests {
             env.cargo_target_summary,
             Some("/tmp/shared-target".to_string())
         );
+        assert!(!env.lane_local_cargo_target);
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
@@ -3112,9 +4435,11 @@ mod tests {
     #[test]
     fn parallel_claude_has_no_implicit_turn_budget() {
         let args = ParallelArgs {
+            action: None,
             max_iterations: None,
             max_concurrent_workers: 5,
             cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::Auto,
             prompt_file: None,
             model: "opus".to_string(),
             reasoning_effort: "xhigh".to_string(),
@@ -3170,8 +4495,39 @@ mod tests {
     }
 
     #[test]
+    fn lane_repo_progress_reports_commits_and_dirty_state_independently() {
+        let repo = unique_temp_dir("parallel-lane-progress");
+        init_git_repo(&repo);
+        fs::write(repo.join("file.txt"), "base\n").expect("failed to write base file");
+        git_ok(&repo, ["add", "file.txt"]);
+        git_ok(&repo, ["commit", "-m", "base"]);
+        let base = git_output(&repo, ["rev-parse", "HEAD"]);
+
+        fs::write(repo.join("file.txt"), "dirty\n").expect("failed to dirty file");
+        assert_eq!(
+            inspect_lane_repo_progress(&repo, &base).expect("progress should inspect"),
+            LaneRepoProgress::Dirty("M file.txt".to_string())
+        );
+
+        git_ok(&repo, ["add", "file.txt"]);
+        git_ok(&repo, ["commit", "-m", "task"]);
+        assert_eq!(
+            inspect_lane_repo_progress(&repo, &base).expect("progress should inspect"),
+            LaneRepoProgress::NewCommits
+        );
+
+        fs::write(repo.join("file.txt"), "dirty again\n").expect("failed to dirty file again");
+        assert_eq!(
+            inspect_lane_repo_progress(&repo, &base).expect("progress should inspect"),
+            LaneRepoProgress::NewCommitsWithDirty("M file.txt".to_string())
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
     fn resume_candidate_matches_requested_task() {
-        let ready_tasks = vec![
+        let ready_tasks = [
             LoopTask {
                 id: "P-019D".to_string(),
                 title: "first".to_string(),
@@ -3201,6 +4557,7 @@ mod tests {
                 stdout_log_path: PathBuf::from("/tmp/lane-2/stdout.log"),
                 stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
                 worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
+                host_recovery_note: None,
             },
         );
         resumable.insert(
@@ -3214,6 +4571,7 @@ mod tests {
                 stdout_log_path: PathBuf::from("/tmp/lane-5/stdout.log"),
                 stderr_log_path: PathBuf::from("/tmp/lane-5/stderr.log"),
                 worker_pid_path: PathBuf::from("/tmp/lane-5/worker.pid"),
+                host_recovery_note: Some("recover this lane".to_string()),
             },
         );
 
@@ -3225,8 +4583,39 @@ mod tests {
         .expect("expected a matching resumable lane");
         assert_eq!(matched.0, 5);
         assert_eq!(matched.1.task.id, "P-019D");
+        assert_eq!(
+            matched.1.host_recovery_note.as_deref(),
+            Some("recover this lane")
+        );
         assert!(resumable.contains_key(&2));
         assert!(!resumable.contains_key(&5));
+
+        let mut rediscovered = BTreeMap::new();
+        rediscovered.insert(
+            2,
+            LaneResumeCandidate {
+                lane_index: 2,
+                task: ready_tasks[1].clone(),
+                lane_root: PathBuf::from("/tmp/lane-2"),
+                lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
+                base_commit: "abc123".to_string(),
+                stdout_log_path: PathBuf::from("/tmp/lane-2/stdout.log"),
+                stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
+                worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
+                host_recovery_note: None,
+            },
+        );
+        resumable
+            .get_mut(&2)
+            .expect("lane-2 should remain resumable")
+            .host_recovery_note = Some("preserve this note".to_string());
+        preserve_resume_recovery_notes(&mut rediscovered, &resumable);
+        assert_eq!(
+            rediscovered
+                .get(&2)
+                .and_then(|candidate| candidate.host_recovery_note.as_deref()),
+            Some("preserve this note")
+        );
 
         let mut active = BTreeMap::new();
         active.insert(
@@ -3244,6 +4633,7 @@ mod tests {
                 worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
                 clean_commit_since: None,
                 terminate_requested_at: None,
+                host_recovery_note: None,
             },
         );
         assert!(
@@ -3520,6 +4910,37 @@ mod tests {
             .status()
             .expect("failed to run git init");
         assert!(status.success(), "git init should succeed");
+        git_ok(path, ["config", "user.email", "test@example.com"]);
+        git_ok(path, ["config", "user.name", "Autodev Test"]);
+    }
+
+    fn git_ok<const N: usize>(repo: &PathBuf, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output<const N: usize>(repo: &PathBuf, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

@@ -272,7 +272,7 @@ struct SymphonyRunArgs {
 enum QuotaSubcommand {
     /// Show quota status for all accounts
     Status,
-    /// Select the best account and activate its credentials for the provider
+    /// Select the primary account and activate its credentials for the provider
     Select(QuotaSelectArgs),
     /// Manage accounts
     Accounts(AccountsSubcommand),
@@ -579,6 +579,10 @@ pub(crate) struct LoopArgs {
 
 #[derive(Args, Clone)]
 pub(crate) struct ParallelArgs {
+    /// Optional action. `auto parallel status` prints the current tmux/lane health.
+    #[arg(value_enum)]
+    action: Option<ParallelAction>,
+
     /// Stop after this many successful parallel lands. Default is unlimited.
     #[arg(long)]
     max_iterations: Option<usize>,
@@ -594,6 +598,10 @@ pub(crate) struct ParallelArgs {
     /// Override CARGO_BUILD_JOBS for parallel workers. Defaults to a conservative automatic cap.
     #[arg(long)]
     cargo_build_jobs: Option<usize>,
+
+    /// Cargo target layout for workers. `auto` uses lane-local targets for multi-lane Rust repos.
+    #[arg(long = "cargo-target", value_enum, default_value = "auto")]
+    cargo_target: ParallelCargoTarget,
 
     /// Optional override for the worker prompt template
     #[arg(long)]
@@ -638,6 +646,24 @@ pub(crate) struct ParallelArgs {
     /// Maximum retries when Claude exits non-zero before bailing
     #[arg(long, default_value_t = 2)]
     max_retries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ParallelAction {
+    /// Print host, tmux, and lane health for the current repo's parallel run.
+    Status,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ParallelCargoTarget {
+    /// Inherit CARGO_TARGET_DIR when set; otherwise use lane-local targets for multi-lane Rust repos.
+    Auto,
+    /// Force a shared target directory under .auto/parallel.
+    Shared,
+    /// Force one target directory per lane.
+    Lane,
+    /// Do not set CARGO_TARGET_DIR for workers.
+    None,
 }
 
 #[derive(Args, Clone)]

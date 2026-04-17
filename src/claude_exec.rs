@@ -15,6 +15,7 @@ use crate::util::{atomic_write, timestamp_slug};
 
 const DEFAULT_CLAUDE_MODEL_ALIAS: &str = "opus";
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_claude_exec(
     repo_root: &Path,
     full_prompt: &str,
@@ -40,6 +41,7 @@ pub(crate) async fn run_claude_exec(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_claude_exec_with_env(
     repo_root: &Path,
     full_prompt: &str,
@@ -107,6 +109,7 @@ pub(crate) async fn run_claude_exec_with_env(
 
 pub(crate) const FUTILITY_EXIT_MARKER: i32 = 137;
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_claude(
     repo_root: &Path,
     full_prompt: &str,
@@ -262,6 +265,7 @@ fn looks_like_claude_model(model: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::fs;
 

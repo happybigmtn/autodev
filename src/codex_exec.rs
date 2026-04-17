@@ -26,6 +26,7 @@ pub(crate) struct TmuxCodexRunConfig {
     pub(crate) lane_label: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_exec(
     repo_root: &Path,
     full_prompt: &str,
@@ -201,6 +202,7 @@ pub(crate) fn ensure_tmux_lanes(session_name: &str, lanes: usize, cwd: &Path) ->
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_codex(
     repo_root: &Path,
     full_prompt: &str,

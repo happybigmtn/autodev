@@ -8,7 +8,7 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns twelve commands:
+`auto` owns thirteen commands:
 
 - `auto corpus`
 - `auto gen`
@@ -17,6 +17,7 @@ The local CLI command is `auto`.
 - `auto nemesis`
 - `auto quota`
 - `auto loop`
+- `auto parallel`
 - `auto qa`
 - `auto qa-only`
 - `auto health`
@@ -38,6 +39,10 @@ need to pass directories in the normal case.
 - `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `high`
   implementation pass by default
 - `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
+- `auto parallel` runs on the repo's primary branch by default with five workers; outside tmux it
+  launches a detached `<repo>-parallel` tmux session automatically
+- `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
+  state, worker PIDs, and latest lane log lines
 - `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and the
   `standard` tier
 - `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and
@@ -66,13 +71,14 @@ The commands form one opinionated lifecycle:
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
 
-The other five commands are side lanes:
+The other six commands are side lanes:
 
 - `auto reverse` documents current behavior from code reality.
 - `auto bug` runs a bug-finding and implementation pipeline.
 - `auto nemesis` runs a deeper audit, applies bounded hardening fixes, and appends unresolved
   findings back into specs and plan.
 - `auto quota` manages quota-aware account routing for Codex and Claude sessions.
+- `auto parallel` runs dependency-ready queue tasks across multiple tmux-backed worker lanes.
 - `auto qa-only` runs runtime QA without fixing anything.
 
 ## Detailed Command Guide
@@ -455,6 +461,7 @@ What it actually does:
   `auto quota select <provider>`
 - honors that primary account by default, but falls through to the next candidate when the
   selected account drops below 25% session or 5h remaining
+- never routes to an account with known weekly quota below 10%
 - rotates on quota-exhaustion signals during quota-routed Codex and Claude executions
 - exposes an `open` mode that launches the provider CLI with the currently selected account active
 
@@ -552,6 +559,43 @@ Queue markers:
 - `- [ ]` means pending and runnable when dependencies are satisfied
 - `- [!]` means blocked and skipped by `auto loop` until you explicitly unblock or rewrite it
 - `- [x]` means completed
+
+### `auto parallel`
+
+Purpose:
+
+- Run dependency-ready implementation-plan tasks across multiple isolated worker lanes
+
+What it actually does:
+
+- Defaults to five workers with `gpt-5.4` and `xhigh`
+- Requires a clean repo before launch
+- When run outside tmux, starts a detached `<repo>-parallel` tmux session running the same command
+  and prints the `tmux attach` command
+- Inside tmux, creates `parallel-lane-1` through `parallel-lane-N` windows that tail each lane's
+  live stdout/stderr logs
+- Uses the quota router for Codex workers, including the 10% weekly quota floor
+- Runs a host preflight once per parallel run and injects the report into lane prompts. The
+  preflight calls out common shared blockers such as missing `agent-browser`, inactive Docker
+  Compose services, and unavailable local regtest RPC.
+- Defaults `--cargo-target auto`, which uses lane-local Cargo target directories for multi-lane
+  Rust repos. This avoids cross-lane artifact contamination and Cargo-lock pileups during final
+  proof. Use `--cargo-target shared` only when shared build-cache speed is worth the risk.
+- Lane prompts reject `0 tests` as passing evidence and reject direct target-dir test binaries as
+  final proof unless the lane just built that exact artifact from its current sources.
+- Lanes can mark external infrastructure failures with `AUTO_ENV_BLOCKER: <reason>`; the host logs
+  those separately from code failures and retries with explicit recovery context while retries
+  remain.
+
+Useful flags:
+
+- `--threads <n>` to set worker lanes
+- `--max-iterations <n>` to stop after a fixed number of successful lands
+- `--cargo-build-jobs <n>` to cap each worker's nested Cargo build fanout
+- `--cargo-target auto|lane|shared|none` to control worker `CARGO_TARGET_DIR` layout
+- `--branch <name>` to lock the executor to a specific branch
+- `--run-root <dir>` to change where parallel logs are stored
+- `status` to print current host/tmux/lane health without starting new work
 
 ### `auto qa`
 
@@ -1022,5 +1066,5 @@ auto ship
 ## Design Goal
 
 This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`,
-`bug`, `nemesis`, `quota`, `loop`, `qa`, `qa-only`, `health`, `review`, or `ship`, it probably
-does not belong here.
+`bug`, `nemesis`, `quota`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, or `ship`, it
+probably does not belong here.
