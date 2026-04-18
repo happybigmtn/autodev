@@ -380,8 +380,12 @@ pub(crate) struct CorpusArgs {
     reference_repos: Vec<PathBuf>,
 
     /// Model used for corpus authoring
-    #[arg(long, default_value = "claude-opus-4-6")]
+    #[arg(long, default_value = "claude-opus-4-7")]
     model: String,
+
+    /// Reasoning effort used for corpus authoring
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
 
     /// Model used for the independent Codex review pass after corpus authoring
     #[arg(long, default_value = "gpt-5.4")]
@@ -423,8 +427,12 @@ pub(crate) struct GenerationArgs {
     output_dir: Option<PathBuf>,
 
     /// Model used for spec and plan authoring
-    #[arg(long, default_value = "claude-opus-4-6")]
+    #[arg(long, default_value = "claude-opus-4-7")]
     model: String,
+
+    /// Reasoning effort used for spec and plan authoring
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
 
     /// Model used for the independent Codex review pass after generation
     #[arg(long, default_value = "gpt-5.4")]

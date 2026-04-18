@@ -23,6 +23,8 @@ use crate::{
 const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const RELATION_BLOCKS: &str = "blocks";
 const SYNC_PLANNER_MAX_PRIORITY: i64 = 4;
+const DEFAULT_DONE_STATE: &str = "Done";
+const GENERIC_TERMINAL_STATES: &[&str] = &["closed", "cancelled", "canceled", "duplicate"];
 
 const FETCH_PROJECT_QUERY: &str = r#"
 query AutoSymphonyProject($slug: String!) {
@@ -219,6 +221,24 @@ mutation AutoSymphonyUpdateIssueAndState(
 }
 "#;
 
+const UPDATE_ISSUE_STATE_MUTATION: &str = r#"
+mutation AutoSymphonyUpdateIssueState($id: String!, $stateId: String!) {
+  issueUpdate(
+    id: $id
+    input: {
+      stateId: $stateId
+    }
+  ) {
+    success
+    issue {
+      state {
+        name
+      }
+    }
+  }
+}
+"#;
+
 const DELETE_RELATION_MUTATION: &str = r#"
 mutation AutoSymphonyDeleteRelation($id: String!) {
   issueRelationDelete(id: $id) {
@@ -360,6 +380,18 @@ struct CompletionArtifactSync {
     review_backfilled: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedPlanIssueUpdate {
+    issue_id: String,
+    task_id: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompletedPlanIssueSync {
+    done_state_name: Option<String>,
+    task_ids: Vec<String>,
+}
+
 pub(crate) async fn run_symphony(args: SymphonyArgs) -> Result<()> {
     match args.command {
         SymphonySubcommand::Sync(args) => run_sync(args).await,
@@ -387,9 +419,17 @@ pub(crate) async fn run_sync(args: SymphonySyncArgs) -> Result<()> {
         )
     })?;
     let terminal_state_names = project.terminal_state_names();
-    let existing_issues = client.fetch_project_issues(&project.slug).await?;
+    let mut existing_issues = client.fetch_project_issues(&project.slug).await?;
     let plan_text = load_plan_text(&repo_root)?;
     let all_tasks = parse_tasks(&plan_text);
+    let completed_plan_sync = reconcile_completed_plan_issues(
+        &client,
+        &project,
+        &all_tasks,
+        &mut existing_issues,
+        &terminal_state_names,
+    )
+    .await?;
     let completion_sync = reconcile_completion_artifacts(
         &repo_root,
         &plan_text,
@@ -557,6 +597,17 @@ pub(crate) async fn run_sync(args: SymphonySyncArgs) -> Result<()> {
     if !planning.strategy_summary.trim().is_empty() {
         println!("planner: {}", planning.strategy_summary.trim());
     }
+    if !completed_plan_sync.task_ids.is_empty() {
+        println!(
+            "plan reconciliation: moved {} completed plan issue(s) to `{}` in Linear ({})",
+            completed_plan_sync.task_ids.len(),
+            completed_plan_sync
+                .done_state_name
+                .as_deref()
+                .unwrap_or(DEFAULT_DONE_STATE),
+            completed_plan_sync.task_ids.join(", ")
+        );
+    }
     if !completion_sync.marked_done.is_empty() {
         println!(
             "plan reconciliation: marked {} completed task(s) done in IMPLEMENTATION_PLAN.md ({})",
@@ -652,6 +703,81 @@ async fn determine_sync_plan(
     let parsed: PlannerResponse = serde_json::from_str(&planner_json)
         .with_context(|| "failed to parse Codex planner JSON response")?;
     normalize_planner_response(tasks, parsed)
+}
+
+async fn reconcile_completed_plan_issues(
+    client: &LinearGraphqlClient,
+    project: &LinearProject,
+    tasks: &[SymphonyTask],
+    issues: &mut [LinearIssue],
+    terminal_state_names: &HashSet<String>,
+) -> Result<CompletedPlanIssueSync> {
+    let updates = completed_plan_issue_updates(tasks, issues, terminal_state_names);
+    if updates.is_empty() {
+        return Ok(CompletedPlanIssueSync::default());
+    }
+
+    let done_state = project.done_state_for_sync().ok_or_else(|| {
+        anyhow!(
+            "Linear project `{}` does not expose a completed state for checked-off plan tasks",
+            project.slug
+        )
+    })?;
+    let done_state_id = done_state.id.clone();
+    let done_state_name = done_state.name.clone();
+    let mut updated_task_ids = Vec::new();
+
+    for update in updates {
+        let updated_state = client
+            .update_issue_state(&update.issue_id, &done_state_id)
+            .await?;
+        let state_name = updated_state.unwrap_or_else(|| done_state_name.clone());
+        if let Some(issue) = issues.iter_mut().find(|issue| issue.id == update.issue_id) {
+            issue.state = Some(state_name);
+        }
+        updated_task_ids.push(update.task_id);
+    }
+
+    Ok(CompletedPlanIssueSync {
+        done_state_name: Some(done_state_name),
+        task_ids: updated_task_ids,
+    })
+}
+
+fn completed_plan_issue_updates(
+    tasks: &[SymphonyTask],
+    issues: &[LinearIssue],
+    terminal_state_names: &HashSet<String>,
+) -> Vec<CompletedPlanIssueUpdate> {
+    let completed_task_ids = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Done))
+        .map(|task| task.id.as_str())
+        .collect::<HashSet<_>>();
+    if completed_task_ids.is_empty() {
+        return Vec::new();
+    }
+
+    issues
+        .iter()
+        .filter_map(|issue| {
+            let task_id = issue_task_id(issue)?;
+            if !completed_task_ids.contains(task_id.as_str()) {
+                return None;
+            }
+            if issue
+                .state
+                .as_deref()
+                .is_some_and(|state| terminal_state_names.contains(state))
+            {
+                return None;
+            }
+            Some(CompletedPlanIssueUpdate {
+                issue_id: issue.id.clone(),
+                task_id,
+            })
+        })
+        .collect()
 }
 
 fn build_sync_planner_prompt(repo_root: &Path, plan_text: &str, tasks: &[SymphonyTask]) -> String {
@@ -1094,10 +1220,19 @@ fn render_sync_task_digest(task: &SymphonyTask) -> String {
     )
 }
 
+fn strip_list_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(bullet) {
+            return rest;
+        }
+    }
+    trimmed
+}
+
 fn task_field_line_value(markdown: &str, field: &str) -> Option<String> {
     markdown.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        trimmed
+        strip_list_bullet(line)
             .strip_prefix(field)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1764,15 +1899,15 @@ fn task_field_body(markdown: &str, field: &str, next_field: &str) -> Option<Stri
     let mut collecting = false;
     let mut body = Vec::new();
     for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(field) {
+        let unbulleted = strip_list_bullet(line);
+        if let Some(rest) = unbulleted.strip_prefix(field) {
             collecting = true;
             if !rest.trim().is_empty() {
                 body.push(rest.trim().to_string());
             }
             continue;
         }
-        if collecting && trimmed.starts_with(next_field) {
+        if collecting && unbulleted.starts_with(next_field) {
             break;
         }
         if collecting {
@@ -2085,6 +2220,26 @@ impl LinearProject {
             .map(|state| state.id.clone())
     }
 
+    fn done_state_for_sync(&self) -> Option<LinearState> {
+        self.team
+            .states
+            .iter()
+            .find(|state| normalize_name(&state.name) == normalize_name(DEFAULT_DONE_STATE))
+            .or_else(|| {
+                self.team.states.iter().find(|state| {
+                    is_completed_state(state)
+                        && !GENERIC_TERMINAL_STATES.contains(&normalize_name(&state.name).as_str())
+                })
+            })
+            .or_else(|| {
+                self.team
+                    .states
+                    .iter()
+                    .find(|state| is_completed_state(state))
+            })
+            .cloned()
+    }
+
     fn terminal_state_names(&self) -> HashSet<String> {
         self.team
             .states
@@ -2240,6 +2395,34 @@ impl LinearGraphqlClient {
             .and_then(|value| value.get("issue"))
             .ok_or_else(|| anyhow!("Linear issueUpdate response missing issue payload"))?;
         parse_issue(issue)
+    }
+
+    async fn update_issue_state(&self, issue_id: &str, state_id: &str) -> Result<Option<String>> {
+        let payload = self
+            .graphql(
+                UPDATE_ISSUE_STATE_MUTATION,
+                json!({
+                    "id": issue_id,
+                    "stateId": state_id,
+                }),
+            )
+            .await?;
+        let update = payload
+            .get("issueUpdate")
+            .ok_or_else(|| anyhow!("Linear issueUpdate response missing payload"))?;
+        if !update
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("Linear issueUpdate returned success=false");
+        }
+        Ok(update
+            .get("issue")
+            .and_then(|issue| issue.get("state"))
+            .and_then(|state| state.get("name"))
+            .and_then(Value::as_str)
+            .map(|state| state.to_string()))
     }
 
     async fn create_blocks_relation(
@@ -2414,14 +2597,22 @@ fn normalize_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn is_completed_state(state: &LinearState) -> bool {
+    state
+        .state_type
+        .as_deref()
+        .is_some_and(|kind| normalize_name(kind) == "completed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_agent_message_from_codex_stream, fallback_task_priorities,
-        issue_task_id_from_description, mark_tasks_done_in_plan, markdown_front_matter,
-        normalize_planner_response, parse_tasks, render_issue_description,
+        completed_plan_issue_updates, extract_agent_message_from_codex_stream,
+        fallback_task_priorities, issue_task_id_from_description, mark_tasks_done_in_plan,
+        markdown_front_matter, normalize_planner_response, parse_tasks, render_issue_description,
         render_workflow_markdown, review_contains_task, shell_quote, single_line_excerpt,
-        PlannerResponse, PlannerTask, SymphonyTask, TaskStatus, WorkflowRenderSpec,
+        LinearIssue, LinearProject, LinearState, LinearTeam, PlannerResponse, PlannerTask,
+        SymphonyTask, TaskStatus, WorkflowRenderSpec,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -2518,6 +2709,80 @@ mod tests {
         assert!(updated.contains("- [x] `P-018` Loan widget"));
         assert!(updated.contains("- [!] `P-019` Blocked follow-up"));
         assert_eq!(marked, vec!["P-018".to_string()]);
+    }
+
+    #[test]
+    fn completed_plan_issue_updates_selects_active_checked_tasks() {
+        let plan = r#"
+- [x] `P-018` Loan widget
+- [ ] `P-019` Pending widget
+- [x] `P-020` Already terminal
+"#;
+        let tasks = parse_tasks(plan);
+        let issues = vec![
+            LinearIssue {
+                id: "issue-active".to_string(),
+                identifier: Some("RSO-1".to_string()),
+                title: "[P-018] Loan widget".to_string(),
+                description: String::new(),
+                priority: None,
+                state: Some("In Progress".to_string()),
+                blocked_by: Vec::new(),
+            },
+            LinearIssue {
+                id: "issue-pending".to_string(),
+                identifier: Some("RSO-2".to_string()),
+                title: "[P-019] Pending widget".to_string(),
+                description: String::new(),
+                priority: None,
+                state: Some("Todo".to_string()),
+                blocked_by: Vec::new(),
+            },
+            LinearIssue {
+                id: "issue-done".to_string(),
+                identifier: Some("RSO-3".to_string()),
+                title: "[P-020] Already terminal".to_string(),
+                description: String::new(),
+                priority: None,
+                state: Some("Done".to_string()),
+                blocked_by: Vec::new(),
+            },
+        ];
+        let terminal_state_names = HashSet::from(["Done".to_string()]);
+        let updates = completed_plan_issue_updates(&tasks, &issues, &terminal_state_names);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].issue_id, "issue-active");
+        assert_eq!(updates[0].task_id, "P-018");
+    }
+
+    #[test]
+    fn done_state_for_sync_prefers_done_over_generic_terminal_states() {
+        let project = LinearProject {
+            id: "project".to_string(),
+            name: "Project".to_string(),
+            slug: "project-slug".to_string(),
+            team: LinearTeam {
+                id: "team".to_string(),
+                key: None,
+                name: None,
+                states: vec![
+                    LinearState {
+                        id: "closed".to_string(),
+                        name: "Closed".to_string(),
+                        state_type: Some("completed".to_string()),
+                    },
+                    LinearState {
+                        id: "done".to_string(),
+                        name: "Done".to_string(),
+                        state_type: Some("completed".to_string()),
+                    },
+                ],
+            },
+        };
+
+        let done_state = project.done_state_for_sync().expect("done state");
+        assert_eq!(done_state.id, "done");
     }
 
     #[test]

@@ -114,6 +114,7 @@ What it actually does:
 
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
+- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
 - Reviews the repo as the primary truth source
 - Determines the active planning surface from the repo's own instructions and
   control docs instead of assuming root-level primacy from filenames alone
@@ -171,6 +172,7 @@ Useful flags:
 - `--reference-repo <dir>` to require inspection of sibling or external repos as first-class
   reference inputs during corpus authoring and the mandatory Codex review pass
 - `--model <name>` to pick a different Claude model
+- `--reasoning-effort <level>` to change the Claude effort level
 - `--max-turns <n>` to raise or lower the planning budget
 - `--parallelism <n>` to encourage more or less parallel planning work
 - `--dry-run` to preview without invoking the model
@@ -196,6 +198,7 @@ What it writes:
 What it actually does:
 
 - Generates fresh specs from the planning corpus
+- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
 - Uses the planning corpus for intended future direction, but treats the live codebase as
   authoritative for current-state facts such as commands, counts, metric names, filenames, and
   behavior claims
@@ -245,7 +248,7 @@ Useful flags:
 - `--planning-root <dir>` to point at a non-default corpus
 - `--output-dir <dir>` to control the disposable generation output
 - `--plan-only` to reuse an existing `gen-*` output and only regenerate the plan
-- `--model`, `--max-turns`, and `--parallelism` to tune the generation pass
+- `--model`, `--reasoning-effort`, `--max-turns`, and `--parallelism` to tune the generation pass
 
 Binary provenance:
 
@@ -276,6 +279,7 @@ What it does not write:
 What it actually does:
 
 - Produces specs grounded in current behavior
+- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
 - Uses the same stronger spec format as `auto gen`
 - Surfaces assumptions and spec/code conflicts instead of silently reconciling them
 - Writes the results into the root `specs/` snapshot directory and replaces same-day same-topic
@@ -293,7 +297,7 @@ When to run it:
 
 Useful flags:
 
-- Same as `auto gen`: `--planning-root`, `--output-dir`, `--model`, `--max-turns`,
+- Same as `auto gen`: `--planning-root`, `--output-dir`, `--model`, `--reasoning-effort`, `--max-turns`,
   `--parallelism`, `--plan-only`
 
 ### `auto bug`

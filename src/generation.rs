@@ -192,6 +192,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         }
     }
     println!("model:       {}", args.model);
+    println!("effort:      {}", args.reasoning_effort);
     println!(
         "codex review:{}",
         if args.skip_codex_review {
@@ -243,6 +244,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         &repo_root,
         &prompt,
         &args.model,
+        &args.reasoning_effort,
         args.max_turns,
         "corpus generation",
         &prompt_path,
@@ -371,6 +373,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     );
     println!("output dir:  {}", output_dir.display());
     println!("model:       {}", args.model);
+    println!("effort:      {}", args.reasoning_effort);
     println!(
         "codex review:{}",
         if args.skip_codex_review {
@@ -432,6 +435,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             mode.spec_phase_slug(),
             &prompt,
             &args.model,
+            &args.reasoning_effort,
             args.max_turns,
         )?;
         let specs = verify_generated_specs(&output_dir)?;
@@ -456,6 +460,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             mode.plan_phase_slug(),
             &plan_prompt,
             &args.model,
+            &args.reasoning_effort,
             args.max_turns,
         )?;
         (
@@ -512,6 +517,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("planning:    {}", planning_root.display());
     println!("output dir:  {}", output_dir.display());
     println!("model:       {}", args.model);
+    println!("effort:      {}", args.reasoning_effort);
     println!(
         "codex review:{}",
         if args.skip_codex_review {
@@ -798,6 +804,7 @@ fn run_logged_claude_phase(
     phase_slug: &str,
     prompt: &str,
     model: &str,
+    reasoning_effort: &str,
     max_turns: usize,
 ) -> Result<PhaseRunSummary> {
     let prompt_path = repo_root
@@ -812,6 +819,7 @@ fn run_logged_claude_phase(
         repo_root,
         prompt,
         model,
+        reasoning_effort,
         max_turns,
         phase_slug,
         &prompt_path,
@@ -840,6 +848,7 @@ fn run_claude_prompt(
     repo_root: &Path,
     prompt: &str,
     model: &str,
+    reasoning_effort: &str,
     max_turns: usize,
     phase_label: &str,
     prompt_path: &Path,
@@ -851,6 +860,8 @@ fn run_claude_prompt(
         .arg("--dangerously-skip-permissions")
         .arg("--model")
         .arg(model)
+        .arg("--effort")
+        .arg(reasoning_effort)
         .arg("--max-turns")
         .arg(max_turns.to_string())
         .stdin(Stdio::piped())
@@ -861,6 +872,7 @@ fn run_claude_prompt(
         .with_context(|| format!("failed to launch Claude for {phase_label}"))?;
     let pid = child.id();
     println!("model:       {model}");
+    println!("effort:      {reasoning_effort}");
     println!("max turns:   {max_turns}");
     println!("phase start: {phase_label}");
     println!("claude pid:  {pid}");
@@ -1495,7 +1507,7 @@ fn build_corpus_codex_review_prompt(
 
 You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `auto corpus`.
 
-Claude Opus 4.6 has already produced the initial planning corpus under `{planning_root}` for the repository at `{repo_root}`. Your job is to conduct an independent review and validation pass, then amend the generated corpus in place when the documents fall short.
+Claude Opus 4.7 xhigh has already produced the initial planning corpus under `{planning_root}` for the repository at `{repo_root}`. Your job is to conduct an independent review and validation pass, then amend the generated corpus in place when the documents fall short.
 
 Edit boundary:
 - You may read the repository at `{repo_root}` and the generated corpus at `{planning_root}`.
@@ -1579,7 +1591,7 @@ fn build_generation_codex_review_prompt(
 
 You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `{command_label}`.
 
-Claude Opus 4.6 has already produced initial generated specs and an implementation plan in `{output_dir}` for the repository at `{repo_root}`.
+Claude Opus 4.7 xhigh has already produced initial generated specs and an implementation plan in `{output_dir}` for the repository at `{repo_root}`.
 
 {mode_clause}
 
@@ -1820,6 +1832,14 @@ Output requirements:
   - `## Completed / Already Satisfied`
 - Every unfinished task in `## Priority Work` and `## Follow-On Work` must use this exact header format:
   - `- [ ] `TASK-ID` Short title`
+- Each task field below must appear on its own line, indented under the task header, with the field name flush against the start (no `- ` bullet prefix on field lines). Example shape:
+  ```
+  - [ ] `TASK-001` Short title
+
+    Spec: `specs/...md`
+    Why now: ...
+    Estimated scope: S
+  ```
 - Every unfinished task in `## Priority Work` and `## Follow-On Work` must include these exact fields, even when it is deferred, gated, research-shaped, or lower priority:
   - `Spec:`
   - `Why now:`
@@ -2272,10 +2292,19 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
     Ok(())
 }
 
+fn strip_list_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(bullet) {
+            return rest;
+        }
+    }
+    trimmed
+}
+
 fn plan_task_field_line_value<'a>(block: &'a PlanTaskBlock, field: &str) -> Option<&'a str> {
     block.markdown.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        trimmed
+        strip_list_bullet(line)
             .strip_prefix(field)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2286,15 +2315,15 @@ fn plan_task_field_body(block: &PlanTaskBlock, field: &str, next_field: &str) ->
     let mut collecting = false;
     let mut body = Vec::new();
     for line in block.markdown.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(field) {
+        let unbulleted = strip_list_bullet(line);
+        if let Some(rest) = unbulleted.strip_prefix(field) {
             collecting = true;
             if !rest.trim().is_empty() {
                 body.push(rest.trim().to_string());
             }
             continue;
         }
-        if collecting && trimmed.starts_with(next_field) {
+        if collecting && unbulleted.starts_with(next_field) {
             break;
         }
         if collecting {

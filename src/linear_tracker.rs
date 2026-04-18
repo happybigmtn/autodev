@@ -122,6 +122,7 @@ pub(crate) struct LinearCoverageDrift {
     pub(crate) missing_task_ids: Vec<String>,
     pub(crate) stale_task_ids: Vec<String>,
     pub(crate) terminal_task_ids: Vec<String>,
+    pub(crate) completed_active_task_ids: Vec<String>,
 }
 
 impl LinearCoverageDrift {
@@ -129,6 +130,7 @@ impl LinearCoverageDrift {
         self.missing_task_ids.is_empty()
             && self.stale_task_ids.is_empty()
             && self.terminal_task_ids.is_empty()
+            && self.completed_active_task_ids.is_empty()
     }
 }
 
@@ -227,25 +229,40 @@ impl LinearTracker {
 
     pub(crate) fn coverage_drift(&self, plan_text: &str) -> LinearCoverageDrift {
         let mut drift = LinearCoverageDrift::default();
-        for task in parse_tasks(plan_text)
-            .into_iter()
-            .filter(|task| task.status == TaskStatus::Pending)
-        {
-            let Some(issue) = self.issues_by_task_id.get(&task.id) else {
-                drift.missing_task_ids.push(task.id);
-                continue;
-            };
-            if issue
-                .state
-                .as_deref()
-                .is_some_and(|state| self.terminal_state_names.contains(state))
-            {
-                drift.terminal_task_ids.push(task.id);
-                continue;
-            }
-            let expected_fingerprint = task_contract_fingerprint(&task);
-            if issue_contract_fingerprint(&issue.description) != Some(expected_fingerprint) {
-                drift.stale_task_ids.push(task.id);
+        for task in parse_tasks(plan_text) {
+            match task.status {
+                TaskStatus::Pending => {
+                    let Some(issue) = self.issues_by_task_id.get(&task.id) else {
+                        drift.missing_task_ids.push(task.id);
+                        continue;
+                    };
+                    if issue
+                        .state
+                        .as_deref()
+                        .is_some_and(|state| self.terminal_state_names.contains(state))
+                    {
+                        drift.terminal_task_ids.push(task.id);
+                        continue;
+                    }
+                    let expected_fingerprint = task_contract_fingerprint(&task);
+                    if issue_contract_fingerprint(&issue.description) != Some(expected_fingerprint)
+                    {
+                        drift.stale_task_ids.push(task.id);
+                    }
+                }
+                TaskStatus::Done => {
+                    let Some(issue) = self.issues_by_task_id.get(&task.id) else {
+                        continue;
+                    };
+                    if !issue
+                        .state
+                        .as_deref()
+                        .is_some_and(|state| self.terminal_state_names.contains(state))
+                    {
+                        drift.completed_active_task_ids.push(task.id);
+                    }
+                }
+                TaskStatus::Blocked => {}
             }
         }
         drift
@@ -784,5 +801,49 @@ mod tests {
         assert!(drift.missing_task_ids.is_empty());
         assert!(drift.terminal_task_ids.is_empty());
         assert!(drift.stale_task_ids.is_empty());
+    }
+
+    #[test]
+    fn coverage_drift_detects_checked_plan_tasks_still_active_in_linear() {
+        let plan = r#"- [x] `WEB-CRAPS-D` Snapshot-driven browser state and JS engine deletion
+"#;
+        let mut issues_by_task_id = HashMap::new();
+        issues_by_task_id.insert(
+            "WEB-CRAPS-D".to_string(),
+            TrackedIssue {
+                id: "issue-1".to_string(),
+                title: "[WEB-CRAPS-D] Snapshot".to_string(),
+                description: String::new(),
+                state: Some("In Progress".to_string()),
+            },
+        );
+        let tracker = LinearTracker {
+            client: LinearGraphqlClient {
+                http: Client::new(),
+                api_key: "test".to_string(),
+            },
+            project: LinearProject {
+                slug: "proj".to_string(),
+                team: LinearTeam {
+                    id: "team".to_string(),
+                    states: Vec::new(),
+                },
+            },
+            in_progress_state_id: "s1".to_string(),
+            in_progress_state_name: "In Progress".to_string(),
+            done_state_id: "s2".to_string(),
+            done_state_name: "Done".to_string(),
+            terminal_state_names: HashSet::from(["Done".to_string()]),
+            issues_by_task_id,
+            last_plan_fingerprint: None,
+            last_auto_sync_attempt_fingerprint: None,
+        };
+
+        let drift = tracker.coverage_drift(plan);
+        assert_eq!(
+            drift.completed_active_task_ids,
+            vec!["WEB-CRAPS-D".to_string()]
+        );
+        assert!(!drift.is_empty());
     }
 }

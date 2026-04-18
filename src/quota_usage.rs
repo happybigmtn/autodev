@@ -1,5 +1,8 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -10,11 +13,12 @@ use crate::quota_config::Provider;
 // OAuth token endpoints and client IDs
 const CLAUDE_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CODEX_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrannk";
 
 // Refresh 5 minutes before actual expiry
 const REFRESH_BUFFER_SECS: i64 = 300;
+const CODEX_REFRESH_PROMPT: &str = "Reply with OK only.";
+const CODEX_REFRESH_REASONING_EFFORT: &str = "low";
+const CODEX_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ── Codex (ChatGPT) usage ──────────────────────────────────────────────
 
@@ -151,16 +155,11 @@ async fn refresh_claude_if_needed(profile_dir: &Path) -> Result<()> {
 }
 
 async fn refresh_codex_if_needed(profile_dir: &Path) -> Result<()> {
-    let auth_path = profile_dir.join("auth.json");
-    let auth_text = fs::read_to_string(&auth_path)
-        .with_context(|| format!("failed to read {}", auth_path.display()))?;
-    let auth: serde_json::Value = serde_json::from_str(&auth_text)
-        .with_context(|| format!("failed to parse {}", auth_path.display()))?;
-
+    let auth = load_codex_auth(profile_dir)?;
     let Some(access_token) = auth["tokens"]["access_token"].as_str() else {
         return Ok(());
     };
-    let Some(refresh_token) = auth["tokens"]["refresh_token"].as_str() else {
+    let Some(_) = auth["tokens"]["refresh_token"].as_str() else {
         return Ok(());
     };
 
@@ -168,52 +167,8 @@ async fn refresh_codex_if_needed(profile_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("[quota-router] refreshing Codex OAuth token...");
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(CODEX_TOKEN_ENDPOINT)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", CODEX_CLIENT_ID),
-        ])
-        .send()
-        .await
-        .context("Codex token refresh request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Codex token refresh returned {status}: {body}");
-    }
-
-    let token_resp: serde_json::Value = resp
-        .json()
-        .await
-        .context("failed to parse Codex token response")?;
-
-    let mut auth: serde_json::Value = serde_json::from_str(&auth_text)?;
-    let tokens = auth["tokens"]
-        .as_object_mut()
-        .context("tokens is not an object")?;
-
-    if let Some(at) = token_resp["access_token"].as_str() {
-        tokens.insert("access_token".into(), serde_json::json!(at));
-    }
-    if let Some(rt) = token_resp["refresh_token"].as_str() {
-        tokens.insert("refresh_token".into(), serde_json::json!(rt));
-    }
-    if let Some(id) = token_resp["id_token"].as_str() {
-        tokens.insert("id_token".into(), serde_json::json!(id));
-    }
-    auth["last_refresh"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
-
-    fs::write(&auth_path, serde_json::to_string(&auth)?.as_bytes())
-        .with_context(|| format!("failed to write {}", auth_path.display()))?;
-
-    eprintln!("[quota-router] Codex OAuth token refreshed");
-    Ok(())
+    eprintln!("[quota-router] refreshing Codex OAuth token via codex CLI...");
+    refresh_codex_with_cli(profile_dir, &codex_cli_bin())
 }
 
 /// Check if a JWT access token is expired (or will expire within the buffer).
@@ -237,15 +192,11 @@ fn jwt_expired(token: &str) -> bool {
 // ── Fetch functions ────────────────────────────────────────────────────
 
 pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage> {
-    if let Err(e) = refresh_codex_if_needed(profile_dir).await {
-        eprintln!("[quota-router] codex token refresh failed: {e:#}");
-    }
+    refresh_codex_if_needed(profile_dir)
+        .await
+        .context("codex auth refresh failed")?;
 
-    let auth_path = profile_dir.join("auth.json");
-    let auth_text = fs::read_to_string(&auth_path)
-        .with_context(|| format!("failed to read {}", auth_path.display()))?;
-    let auth: serde_json::Value = serde_json::from_str(&auth_text)
-        .with_context(|| format!("failed to parse {}", auth_path.display()))?;
+    let auth = load_codex_auth(profile_dir)?;
 
     let access_token = auth["tokens"]["access_token"]
         .as_str()
@@ -365,4 +316,261 @@ fn parse_reset_secs(resets_at: &str) -> u64 {
             diff.num_seconds().max(0) as u64
         })
         .unwrap_or(0)
+}
+
+fn codex_cli_bin() -> PathBuf {
+    std::env::var_os("AUTO_QUOTA_CODEX_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+fn load_codex_auth(profile_dir: &Path) -> Result<serde_json::Value> {
+    let auth_path = profile_dir.join("auth.json");
+    let auth_text = fs::read_to_string(&auth_path)
+        .with_context(|| format!("failed to read {}", auth_path.display()))?;
+    serde_json::from_str(&auth_text)
+        .with_context(|| format!("failed to parse {}", auth_path.display()))
+}
+
+fn make_codex_refresh_workspace() -> Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "auto-quota-codex-refresh-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn refresh_codex_with_cli(profile_dir: &Path, codex_bin: &Path) -> Result<()> {
+    let scratch_dir = make_codex_refresh_workspace()?;
+    let spawn_result = Command::new(codex_bin)
+        .arg("exec")
+        .arg("--json")
+        .arg("--ephemeral")
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("--color")
+        .arg("never")
+        .arg("--cd")
+        .arg(&scratch_dir)
+        .arg("-c")
+        .arg(format!(
+            "model_reasoning_effort=\"{CODEX_REFRESH_REASONING_EFFORT}\""
+        ))
+        .arg(CODEX_REFRESH_PROMPT)
+        .env("CODEX_HOME", profile_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(&scratch_dir)
+        .spawn()
+        .with_context(|| format!("failed to launch Codex at {}", codex_bin.display()));
+
+    let output = match spawn_result {
+        Ok(mut child) => {
+            let started = Instant::now();
+            loop {
+                if child
+                    .try_wait()
+                    .context("failed to poll codex CLI refresh child")?
+                    .is_some()
+                {
+                    break child
+                        .wait_with_output()
+                        .context("failed to collect codex CLI refresh output")?;
+                }
+                if started.elapsed() >= CODEX_REFRESH_TIMEOUT {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .context("failed to collect timed-out codex CLI refresh output")?;
+                    let combined = combined_codex_refresh_output(&output);
+                    let _ = fs::remove_dir_all(&scratch_dir);
+                    if let Some(message) = summarize_codex_refresh_failure(&combined) {
+                        anyhow::bail!("{message}");
+                    }
+                    anyhow::bail!(
+                        "timed out waiting for codex CLI to refresh auth after {}s",
+                        CODEX_REFRESH_TIMEOUT.as_secs()
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(err) => {
+            let _ = fs::remove_dir_all(&scratch_dir);
+            return Err(err);
+        }
+    };
+    let _ = fs::remove_dir_all(&scratch_dir);
+
+    let refreshed_auth = load_codex_auth(profile_dir)?;
+    let refreshed_access_token = refreshed_auth["tokens"]["access_token"]
+        .as_str()
+        .context("missing tokens.access_token in refreshed codex auth")?;
+
+    if !jwt_expired(refreshed_access_token) {
+        eprintln!("[quota-router] Codex OAuth token refreshed");
+        return Ok(());
+    }
+
+    let combined_output = combined_codex_refresh_output(&output);
+    if let Some(message) = summarize_codex_refresh_failure(&combined_output) {
+        anyhow::bail!("{message}");
+    }
+    if !output.status.success() {
+        let combined_output = combined_output.trim();
+        if combined_output.is_empty() {
+            anyhow::bail!("codex CLI refresh failed with status {}", output.status);
+        }
+        anyhow::bail!(
+            "codex CLI refresh failed with status {}: {combined_output}",
+            output.status
+        );
+    }
+
+    anyhow::bail!("codex CLI exited successfully but left an expired access token");
+}
+
+fn combined_codex_refresh_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.trim().is_empty() {
+        stderr.into_owned()
+    } else if stderr.trim().is_empty() {
+        stdout.into_owned()
+    } else {
+        format!("{stdout}\n{stderr}")
+    }
+}
+
+fn summarize_codex_refresh_failure(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some((_, message)) = line.rsplit_once("Failed to refresh token: ") {
+            return Some(message.trim().to_string());
+        }
+        if let Some((_, message)) = line.rsplit_once(r#""message":"#) {
+            return Some(
+                message
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '}' || c == ',')
+                    .replace("\\\"", "\""),
+            );
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "auto-quota-usage-test-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_jwt(exp: i64) -> String {
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload =
+            general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    fn write_codex_auth(profile_dir: &Path, access_token: &str) {
+        let auth = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "last_refresh": "2026-04-07T17:04:23.095712068Z",
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "id_token": "id-token",
+                "account_id": "account-id",
+            }
+        });
+        fs::write(
+            profile_dir.join("auth.json"),
+            serde_json::to_vec_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_executable_script(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn codex_cli_refresh_accepts_updated_auth_even_when_cli_exits_non_zero() {
+        let profile_dir = test_dir("refresh-success");
+        let bin_dir = test_dir("bin-success");
+        let codex_bin = bin_dir.join("codex");
+        let future_token = fake_jwt(chrono::Utc::now().timestamp() + 3600);
+
+        write_codex_auth(
+            &profile_dir,
+            &fake_jwt(chrono::Utc::now().timestamp() - 3600),
+        );
+        write_executable_script(
+            &codex_bin,
+            &format!(
+                "#!/usr/bin/env bash\ncat > \"$CODEX_HOME/auth.json\" <<'JSON'\n{}\nJSON\nexit 1\n",
+                serde_json::to_string(&serde_json::json!({
+                    "auth_mode": "chatgpt",
+                    "last_refresh": chrono::Utc::now().to_rfc3339(),
+                    "tokens": {
+                        "access_token": future_token,
+                        "refresh_token": "new-refresh-token",
+                        "id_token": "new-id-token",
+                        "account_id": "account-id",
+                    }
+                }))
+                .unwrap()
+            ),
+        );
+
+        refresh_codex_with_cli(&profile_dir, &codex_bin).unwrap();
+
+        let auth = load_codex_auth(&profile_dir).unwrap();
+        assert_eq!(
+            auth["tokens"]["refresh_token"].as_str(),
+            Some("new-refresh-token")
+        );
+    }
+
+    #[test]
+    fn codex_cli_refresh_surfaces_human_refresh_error() {
+        let profile_dir = test_dir("refresh-error");
+        let bin_dir = test_dir("bin-error");
+        let codex_bin = bin_dir.join("codex");
+
+        write_codex_auth(
+            &profile_dir,
+            &fake_jwt(chrono::Utc::now().timestamp() - 3600),
+        );
+        write_executable_script(
+            &codex_bin,
+            "#!/usr/bin/env bash\necho '2026-04-17T21:03:08Z ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.' >&2\nexit 1\n",
+        );
+
+        let error = refresh_codex_with_cli(&profile_dir, &codex_bin).unwrap_err();
+        assert!(error.to_string().contains("refresh token was already used"));
+    }
 }
