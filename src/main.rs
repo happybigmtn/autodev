@@ -70,11 +70,12 @@ enum Command {
     Health(HealthArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
-    /// Stewardship pass for a mid-flight repo: reconcile plan claims against
-    /// live code, surface hinge items, and apply approved IMPLEMENTATION_PLAN.md
-    /// and WORKLIST.md updates in one Kimi and Codex pipeline. Replaces
-    /// `auto corpus` and `auto gen` for repos that already have an active
-    /// planning surface.
+    /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.4)
+    /// pipeline: reconciles plan claims against the live code, surfaces
+    /// hinge items, and applies approved IMPLEMENTATION_PLAN.md /
+    /// WORKLIST.md / LEARNINGS.md updates in-place. Replaces `auto corpus`
+    /// and `auto gen` for repos that already have an active planning
+    /// surface; greenfield repos should keep using those.
     Steward(StewardArgs),
     /// Prepare the current branch to ship, push it, and open or refresh a PR when appropriate
     Ship(ShipArgs),
@@ -788,17 +789,17 @@ pub(crate) struct StewardArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Steward model — reads the repo, writes drift + hinge + retire + hazard
-    /// artifacts, and proposes IMPLEMENTATION_PLAN.md edits.
-    #[arg(long, default_value = "k2.6")]
+    /// Codex model for the first steward pass — writes drift + hinge + retire +
+    /// hazard artifacts and proposes IMPLEMENTATION_PLAN.md edits.
+    #[arg(long, default_value = "gpt-5.4")]
     model: String,
 
-    /// Steward reasoning effort / thinking variant.
+    /// Codex reasoning effort for the first steward pass.
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
-    /// Codex finalizer model — reviews the Kimi steward output and applies
-    /// approved IMPLEMENTATION_PLAN.md / WORKLIST.md edits in-place.
+    /// Codex model for the finalizer pass — reviews the first pass's proposed
+    /// edits against the live tree and applies the ones that hold.
     #[arg(long, default_value = "gpt-5.4")]
     finalizer_model: String,
 
@@ -806,25 +807,14 @@ pub(crate) struct StewardArgs {
     #[arg(long, default_value = "high")]
     finalizer_effort: String,
 
-    /// Codex executable used by the finalizer pass.
+    /// Codex executable used by both steward passes.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Legacy PI executable, used when `--no-use-kimi-cli` is set.
-    #[arg(long = "pi-bin", default_value = "pi")]
-    pi_bin: PathBuf,
-
-    /// kimi-cli executable.
-    #[arg(long, default_value = "kimi-cli")]
-    kimi_bin: PathBuf,
-
-    /// Route the Kimi steward pass through kimi-cli. On by default.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    use_kimi_cli: bool,
-
-    /// Skip the Codex finalizer pass and stop after Kimi writes steward artifacts.
+    /// Skip the finalizer pass and stop after the first Codex pass writes its
+    /// deliverables. Useful when you want a quick audit without the review-and-apply step.
     #[arg(long)]
-    skip_codex_finalizer: bool,
+    skip_finalizer: bool,
 }
 
 #[derive(Args, Clone)]

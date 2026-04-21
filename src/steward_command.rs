@@ -1,28 +1,23 @@
 //! `auto steward` — stewardship replacement for corpus+gen on mid-flight repos.
+//!
+//! Both passes run through Codex (gpt-5.4 by default). The first pass reads
+//! the repo + planning surface and writes audit artifacts; the second pass is
+//! an independent Codex review that verifies the first pass's GHOST / ORPHAN
+//! rows against the live tree and applies the approved IMPLEMENTATION_PLAN.md
+//! / WORKLIST.md / LEARNINGS.md edits.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncRead;
-use tokio::process::Command as TokioCommand;
-use tokio::time;
 
 use crate::codex_exec::run_codex_exec;
-use crate::codex_stream::capture_pi_output;
-use crate::kimi_backend::{
-    extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
-    preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
-};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
 use crate::StewardArgs;
 
-const STEWARD_PHASE_TIMEOUT_SECS: u64 = 60 * 60;
 const STEWARD_DELIVERABLES: [&str; 5] = [
     "DRIFT.md",
     "HINGES.md",
@@ -66,7 +61,7 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         println!("branch:      {}", current_branch);
     }
     println!("steward:     {} ({})", args.model, args.reasoning_effort);
-    if args.skip_codex_finalizer {
+    if args.skip_finalizer {
         println!("finalizer:   (skipped)");
     } else {
         println!(
@@ -99,12 +94,6 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         }
     }
 
-    if args.use_kimi_cli && !args.dry_run {
-        let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
-        preflight_kimi_cli(&kimi_bin, &args.model)
-            .with_context(|| "kimi-cli preflight failed; aborting steward".to_string())?;
-    }
-
     let steward_prompt = build_steward_prompt(
         &repo_root,
         &output_dir,
@@ -129,10 +118,28 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
 
     println!();
     println!("phase:       steward");
-    let kimi_response = run_kimi_steward(&repo_root, &steward_prompt, &args).await?;
-    let response_path = output_dir.join("steward-response.log");
-    atomic_write(&response_path, kimi_response.as_bytes())
-        .with_context(|| format!("failed to write {}", response_path.display()))?;
+    let steward_stderr = output_dir.join("steward.stderr.log");
+    let steward_status = run_codex_exec(
+        &repo_root,
+        &steward_prompt,
+        &args.model,
+        &args.reasoning_effort,
+        &args.codex_bin,
+        &steward_stderr,
+        None,
+        "auto steward",
+    )
+    .await?;
+    if !steward_status.success() {
+        bail!(
+            "codex steward pass exited with status {}; see {}",
+            steward_status
+                .code()
+                .map(|c: i32| c.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            steward_stderr.display()
+        );
+    }
     verify_steward_deliverables(&output_dir)?;
     println!(
         "steward:     {} deliverables under {}",
@@ -140,24 +147,26 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         output_dir.display()
     );
 
+    // Post-steward checkpoint so the audit artifacts + any append-only plan
+    // edits land even if the finalizer pass fails or is skipped.
     if !args.report_only && !current_branch.is_empty() {
         if let Some(commit) = auto_checkpoint_if_needed(
             &repo_root,
             current_branch.as_str(),
-            "steward: kimi deliverables",
+            "steward: audit deliverables",
         )? {
             println!("checkpoint:  committed steward deliverables at {commit}");
         }
     }
 
-    if args.skip_codex_finalizer {
+    if args.skip_finalizer {
         println!();
         println!("done (finalizer skipped).");
         return Ok(());
     }
 
     println!();
-    println!("phase:       finalizer (codex)");
+    println!("phase:       finalizer");
     let finalizer_prompt =
         build_finalizer_prompt(&repo_root, &output_dir, &current_branch, args.report_only);
     let finalizer_prompt_path = repo_root
@@ -193,7 +202,7 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         if let Some(commit) = auto_checkpoint_if_needed(
             &repo_root,
             current_branch.as_str(),
-            "steward: codex finalizer applied",
+            "steward: finalizer applied",
         )? {
             println!("checkpoint:  committed finalizer edits at {commit}");
         }
@@ -337,8 +346,8 @@ fn build_steward_prompt(
            issues that need reviewer attention but not a full plan entry.\n\
          - `LEARNINGS.md`: append durable lessons observed from drift patterns.\n\n\
          Do NOT edit `REVIEW.md`, `ARCHIVED.md`, or code. Do NOT delete or \
-         rewrite existing items — append only. The Codex finalizer reviews \
-         your edits and trims or flags them."
+         rewrite existing items — append only. The finalizer pass reviews your \
+         edits and trims or flags them."
     };
     format!(
         r#"You are the **steward** of this repository at `{repo_root}`, branch `{branch}`.
@@ -412,7 +421,7 @@ Executive summary, 2-3 pages max:
 ## How to work
 
 - Verify before claiming. Every row must cite a file or git command.
-- Batch reads with parallel subagents.
+- Batch reads with parallel subagents when useful.
 - Do not invent items. If the queue is messy, say so; do not paper over it.
 - Stay scoped. This is reconciliation, not a re-plan.
 
@@ -443,31 +452,31 @@ fn build_finalizer_prompt(
         .display()
         .to_string();
     let apply_clause = if report_only {
-        "Kimi ran in report-only mode; you are also in report-only mode. Review \
-         the deliverables for plausibility, write your verdict, and stop. Do NOT \
-         edit any planning surface."
+        "The first pass ran in report-only mode; you are also in report-only \
+         mode. Review the deliverables for plausibility, write your verdict, \
+         and stop. Do NOT edit any planning surface."
     } else {
-        "Kimi's steward pass has either (a) written its proposed edits directly \
-         into `IMPLEMENTATION_PLAN.md` / `WORKLIST.md` / `LEARNINGS.md`, or (b) \
-         staged them inside the `## Proposed plan edits` section of \
-         `STEWARDSHIP-REPORT.md`. Verify and reconcile:\n\n\
+        "The first Codex pass has either (a) written its proposed edits \
+         directly into `IMPLEMENTATION_PLAN.md` / `WORKLIST.md` / `LEARNINGS.md`, \
+         or (b) staged them inside the `## Proposed plan edits` section of \
+         `STEWARDSHIP-REPORT.md`. Your job: verify and reconcile:\n\n\
          - Read the cited files in the repo to confirm each claim holds.\n\
-         - If Kimi wrote directly into a planning surface and the claim holds, \
-           leave it. If the entry shape does not match the surrounding file's \
-           convention, fix it or remove it.\n\
-         - If Kimi staged edits in `STEWARDSHIP-REPORT.md` and they hold, apply \
-           them in-place to the planning surface.\n\
+         - If the first pass wrote directly into a planning surface and the \
+           claim holds, leave it. If the entry shape does not match the \
+           surrounding file's convention, fix it or remove it.\n\
+         - If the first pass staged edits in `STEWARDSHIP-REPORT.md` and they \
+           hold, apply them in-place to the planning surface.\n\
          - Never delete or rewrite existing plan items during this pass; only \
            append or trim.\n\n\
          Write your verdict to `steward/final-review.md` with sections \
          `## Accepted`, `## Rejected`, `## Deferred`, `## Plan-surface diff \
          summary`. End with a `PASS | CONCERNS | FAIL` verdict.\n\n\
-         Commit any edits with message `steward: codex finalizer applied`."
+         Commit any edits with message `steward: finalizer applied`."
     };
     format!(
-        r#"You are the Codex finalizer for an `auto steward` pass.
+        r#"You are the finalizer for an `auto steward` pass. Both passes run under Codex gpt-5.4 by default; you are the second, independent look.
 
-Kimi 2.6 has just produced the steward artifacts. Verify they hold in the live tree and apply the approved IMPLEMENTATION_PLAN.md / WORKLIST.md / LEARNINGS.md edits.
+The first pass produced five artifacts. Verify they hold in the live tree and apply the approved IMPLEMENTATION_PLAN.md / WORKLIST.md / LEARNINGS.md edits.
 
 ## Inputs
 
@@ -492,115 +501,14 @@ Kimi 2.6 has just produced the steward artifacts. Verify they hold in the live t
 
 ## Hard rules
 
-- Do NOT rewrite Kimi's deliverable files. Your verdict goes in `steward/final-review.md`.
-- Do NOT invent new items. If you think Kimi missed something, record it under `## Finalizer addenda` in `final-review.md` as a follow-up.
+- Do NOT rewrite the first pass's deliverable files. Your verdict goes in `steward/final-review.md`.
+- Do NOT invent new items. If you think the first pass missed something, record it under `## Finalizer addenda` in `final-review.md` as a follow-up.
 - Stay on branch `{branch}`.
 "#,
         steward_dir = steward_dir,
         branch = if branch.is_empty() { "(detached)" } else { branch },
         apply_clause = apply_clause,
     )
-}
-
-async fn run_kimi_steward(
-    repo_root: &Path,
-    prompt: &str,
-    args: &StewardArgs,
-) -> Result<String> {
-    if !args.use_kimi_cli {
-        bail!("auto steward requires --use-kimi-cli (on by default).");
-    }
-    let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
-    let resolved_model = resolve_kimi_cli_model(&args.model);
-    let exec_args = kimi_exec_args(&resolved_model, &args.reasoning_effort, prompt);
-    let mut command = TokioCommand::new(&kimi_bin);
-    command
-        .args(&exec_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .current_dir(repo_root);
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to launch kimi-cli at {} from {}",
-            kimi_bin.display(),
-            repo_root.display()
-        )
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("kimi-cli stdout should be piped for auto steward")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("kimi-cli stderr should be piped for auto steward")?;
-    let stdout_task =
-        tokio::spawn(async move { capture_pi_output(stdout, "auto steward kimi-cli", 30).await });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
-
-    let wait_result =
-        time::timeout(Duration::from_secs(STEWARD_PHASE_TIMEOUT_SECS), child.wait()).await;
-    let timed_out = wait_result.is_err();
-    if timed_out {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-    let stdout = stdout_task
-        .await
-        .context("kimi-cli stdout capture task panicked")??;
-    let stderr_text = stderr_task
-        .await
-        .context("kimi-cli stderr capture task panicked")??;
-    if timed_out {
-        bail!(
-            "auto steward kimi-cli pass timed out after {}s",
-            STEWARD_PHASE_TIMEOUT_SECS
-        );
-    }
-    let status = wait_result
-        .expect("timeout already handled")
-        .context("failed waiting for kimi-cli")?;
-    if !status.success() {
-        let detail = parse_kimi_error(&stdout);
-        bail!(
-            "kimi-cli steward pass failed: {}",
-            if !stderr_text.trim().is_empty() {
-                stderr_text.trim().to_string()
-            } else {
-                detail.unwrap_or_else(|| stdout.trim().to_string())
-            }
-        );
-    }
-    if let Some(detail) = parse_kimi_error(&stdout) {
-        bail!("kimi-cli steward pass failed: {detail}");
-    }
-    let mut final_text = String::new();
-    for line in stdout.lines() {
-        if let Some(chunk) = kimi_extract_final_text(line) {
-            if !final_text.is_empty() {
-                final_text.push('\n');
-            }
-            final_text.push_str(&chunk);
-        }
-    }
-    if final_text.trim().is_empty() {
-        Ok(stdout)
-    } else {
-        Ok(final_text)
-    }
-}
-
-async fn read_stream<R>(stream: R) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = tokio::io::BufReader::new(stream);
-    let mut text = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut text)
-        .await
-        .context("failed to read child stream")?;
-    Ok(text)
 }
 
 #[cfg(test)]
