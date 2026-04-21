@@ -5,6 +5,7 @@ mod codex_stream;
 mod completion_artifacts;
 mod corpus;
 mod generation;
+mod audit_command;
 mod health_command;
 mod kimi_backend;
 mod linear_tracker;
@@ -77,6 +78,13 @@ enum Command {
     /// and `auto gen` for repos that already have an active planning
     /// surface; greenfield repos should keep using those.
     Steward(StewardArgs),
+    /// File-by-file audit of a mature codebase against an operator-authored
+    /// doctrine. Produces per-file verdicts (CLEAN / DRIFT / SLOP / RETIRE /
+    /// REFACTOR), applies safe fixes atomically, batches large work into
+    /// WORKLIST.md, and resumes cleanly from partial runs via a manifest.
+    /// Doctrine is whatever the operator writes in `audit/DOCTRINE.md` — the
+    /// command stays agnostic.
+    Audit(AuditArgs),
     /// Prepare the current branch to ship, push it, and open or refresh a PR when appropriate
     Ship(ShipArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
@@ -818,6 +826,105 @@ pub(crate) struct StewardArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct AuditArgs {
+    /// Operator-authored doctrine markdown. This is the judgment framework
+    /// the auditor applies. The command stays agnostic — whatever you put
+    /// here is what "clean" means for this repo. Required; will NOT be
+    /// auto-generated (auto-gen defeats operator ownership).
+    #[arg(long, default_value = "audit/DOCTRINE.md")]
+    doctrine_prompt: PathBuf,
+
+    /// Override the bundled verdicts / output rubric. Rare — changing this
+    /// will break the Rust-side parser unless you also maintain the shape.
+    #[arg(long)]
+    rubric_prompt: Option<PathBuf>,
+
+    /// Glob patterns to include. Repeatable. Defaults to sensible code +
+    /// spec globs; override to scope a run (e.g. `--paths 'node/src/bridge_*'`).
+    #[arg(long = "paths")]
+    include_paths: Vec<String>,
+
+    /// Glob patterns to exclude. Repeatable. Applied after `--paths`.
+    #[arg(long = "exclude")]
+    exclude_paths: Vec<String>,
+
+    /// Cap the number of files audited this run. 0 means unlimited.
+    /// Use to control cost on large codebases.
+    #[arg(long, default_value_t = 0)]
+    max_files: usize,
+
+    /// Directory for audit artifacts. Defaults to <repo>/audit
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Resume mode. `resume` (default) picks up at first pending file;
+    /// `fresh` archives the old manifest and starts over; `only-drifted`
+    /// re-audits files whose content or doctrine hash changed.
+    #[arg(long, value_enum, default_value_t = AuditResumeMode::Resume)]
+    resume_mode: AuditResumeMode,
+
+    /// Read-only. Write verdicts + manifest but never apply patches, append
+    /// to WORKLIST.md, or commit.
+    #[arg(long)]
+    report_only: bool,
+
+    /// Print the per-file prompt for the first pending file and exit.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Optional branch to require.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Auditor model. Kimi by default (high-volume read-heavy pass; Codex
+    /// handles escalations).
+    #[arg(long, default_value = "k2.6")]
+    model: String,
+
+    /// Auditor reasoning effort / thinking.
+    #[arg(long, default_value = "high")]
+    reasoning_effort: String,
+
+    /// Escalation model for DRIFT-LARGE / REFACTOR verdicts that write
+    /// worklist entries. Codex gives a second-opinion on high-impact calls.
+    #[arg(long, default_value = "gpt-5.4")]
+    escalation_model: String,
+
+    /// Escalation reasoning effort.
+    #[arg(long, default_value = "high")]
+    escalation_effort: String,
+
+    /// Codex executable (used for escalations + fallback).
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// kimi-cli executable (used for the primary auditor pass).
+    #[arg(long, default_value = "kimi-cli")]
+    kimi_bin: PathBuf,
+
+    /// Legacy PI binary, only used when `--no-use-kimi-cli` is set.
+    #[arg(long = "pi-bin", default_value = "pi")]
+    pi_bin: PathBuf,
+
+    /// Route the auditor through `kimi-cli --yolo`. Default on.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_kimi_cli: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum AuditResumeMode {
+    /// Resume from the existing manifest (default). Skips files already
+    /// audited if content + doctrine hashes still match; re-audits if
+    /// either has drifted.
+    Resume,
+    /// Archive the current manifest and start a fresh full pass.
+    Fresh,
+    /// Only re-audit files whose content or doctrine hash has drifted
+    /// since their last audit. Skips all files never audited.
+    OnlyDrifted,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct QaArgs {
     /// Stop after this many successful QA iterations. Default is 1.
     #[arg(long, default_value_t = 1)]
@@ -1045,6 +1152,7 @@ async fn main() -> Result<()> {
         Command::Health(args) => health_command::run_health(args).await,
         Command::Review(args) => review_command::run_review(args).await,
         Command::Steward(args) => steward_command::run_steward(args).await,
+        Command::Audit(args) => audit_command::run_audit(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
         Command::Quota(args) => match args.command {
