@@ -9,8 +9,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::time::{self, Duration};
 
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
+use crate::kimi_backend::{
+    extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
+    resolve_kimi_bin, KIMI_CLI_DEFAULT_MODEL,
+};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
@@ -23,6 +28,9 @@ const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
+const BUG_CHUNK_PHASE_TIMEOUT_SECS: u64 = 30 * 60;
+const BUG_IMPLEMENTATION_PHASE_TIMEOUT_SECS: u64 = 90 * 60;
+const BUG_FINAL_REVIEW_PHASE_TIMEOUT_SECS: u64 = 90 * 60;
 
 #[derive(Clone, Debug)]
 struct RepoChunk {
@@ -91,6 +99,16 @@ struct ReviewResult {
     follow_up: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FinalReviewResult {
+    bug_id: String,
+    status: String,
+    summary: String,
+    validation_commands: Vec<String>,
+    touched_files: Vec<String>,
+    residual_risks: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ChunkOutcome {
     chunk: RepoChunk,
@@ -120,6 +138,11 @@ enum LlmBackend {
         thinking: String,
         pi_bin: PathBuf,
     },
+    KimiCli {
+        model: String,
+        thinking: String,
+        kimi_bin: PathBuf,
+    },
 }
 
 impl LlmBackend {
@@ -127,6 +150,7 @@ impl LlmBackend {
         match self {
             Self::Codex { .. } => "codex",
             Self::Pi { provider_label, .. } => provider_label,
+            Self::KimiCli { .. } => "kimi-cli",
         }
     }
 
@@ -134,6 +158,7 @@ impl LlmBackend {
         match self {
             Self::Codex { model, .. } => model,
             Self::Pi { model, .. } => model,
+            Self::KimiCli { model, .. } => model,
         }
     }
 
@@ -143,7 +168,13 @@ impl LlmBackend {
                 reasoning_effort, ..
             } => reasoning_effort,
             Self::Pi { thinking, .. } => thinking,
+            Self::KimiCli { thinking, .. } => thinking,
         }
+    }
+
+    fn is_kimi_family(&self) -> bool {
+        matches!(self, Self::KimiCli { .. })
+            || matches!(self, Self::Pi { provider_label, .. } if *provider_label == "pi-kimi")
     }
 }
 
@@ -191,7 +222,28 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         model: args.reviewer_model.clone(),
         effort: args.reviewer_effort.clone(),
     };
-    ensure_code_writer_config("auto bug implementation pass", &fixer)?;
+    let finalizer = PhaseConfig {
+        model: args.finalizer_model.clone(),
+        effort: args.finalizer_effort.clone(),
+    };
+    ensure_code_writer_config("auto bug final review pass", &finalizer)?;
+    // Every pre-finalizer phase must route through Kimi. The finalizer stays
+    // Codex; everything else must be the Kimi remediation path (either via
+    // `kimi-cli` or the legacy PI Kimi route when `--no-use-kimi-cli` is set).
+    for (label, config) in [
+        ("finder", &finder),
+        ("skeptic", &skeptic),
+        ("reviewer", &reviewer),
+        ("fixer", &fixer),
+    ] {
+        if !is_kimi_model(&config.model) {
+            bail!(
+                "auto bug {label} phase must use a Kimi model (e.g. `k2.6`); got `{}`. \
+                 Run with `--{label}-model k2.6` or pass an explicit Kimi alias.",
+                config.model
+            );
+        }
+    }
 
     println!("auto bug");
     println!("repo root:   {}", repo_root.display());
@@ -212,7 +264,16 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         display_phase_model(&reviewer),
         reviewer.effort
     );
-    println!("implementer: {} ({})", fixer.model, fixer.effort);
+    println!(
+        "implementer: {} ({})",
+        display_phase_model(&fixer),
+        fixer.effort
+    );
+    println!(
+        "finalizer:   {} ({})",
+        display_phase_model(&finalizer),
+        finalizer.effort
+    );
     if !current_branch.is_empty() {
         println!("branch:      {}", current_branch);
     }
@@ -265,6 +326,7 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     }
 
     let mut outcomes = Vec::new();
+    let mut per_chunk_fixes: Vec<FixResult> = Vec::new();
     for chunk in chunks {
         let chunk_dir = output_dir.join("chunks").join(&chunk.id);
         fs::create_dir_all(&chunk_dir)
@@ -327,6 +389,40 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
             println!("review:      {} item(s)", reviews.len());
         }
 
+        // Fix-on-verify: as soon as this chunk's findings survive the skeptic
+        // and reviewer, run the Kimi implementer against them and commit the
+        // diff. Keeps remediation atomic per chunk so resume can skip over
+        // landed work without re-prompting the fixer.
+        let chunk_fixes = if args.report_only || verified.is_empty() {
+            Vec::new()
+        } else {
+            let results = load_or_run_fix_phase_for_chunk(
+                &repo_root,
+                &chunk,
+                &chunk_dir,
+                &verified,
+                &fixer,
+                current_branch.as_str(),
+                &args,
+                &stderr_log_path,
+            )
+            .await?;
+            if !current_branch.is_empty() && !args.allow_dirty {
+                if let Some(commit) = auto_checkpoint_if_needed(
+                    &repo_root,
+                    current_branch.as_str(),
+                    &format!("auto bug fix {}", chunk.id),
+                )? {
+                    println!(
+                        "checkpoint:  committed chunk {} fixes at {}",
+                        chunk.id, commit
+                    );
+                }
+            }
+            results
+        };
+        per_chunk_fixes.extend(chunk_fixes.clone());
+
         outcomes.push(ChunkOutcome {
             chunk,
             findings,
@@ -346,33 +442,48 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         serde_json::to_string_pretty(&all_verified)?.as_bytes(),
     )?;
 
-    let resumed_fix_results = if args.report_only || all_verified.is_empty() {
+    // Aggregate per-chunk fix results as the canonical
+    // `implementation-results.json`. The old `run_fix_phase` aggregate call is
+    // gone now that fixes land per-chunk; the aggregate file just mirrors the
+    // union so the downstream finalizer phase + existing resume tooling still
+    // have the shape they expect.
+    let aggregate_fixes_path = output_dir.join("implementation-results.json");
+    if !args.report_only && !per_chunk_fixes.is_empty() {
+        atomic_write(
+            &aggregate_fixes_path,
+            serde_json::to_string_pretty(&per_chunk_fixes)?.as_bytes(),
+        )?;
+    }
+    let resumed_final_review_results = if args.report_only || all_verified.is_empty() {
         None
     } else {
-        try_resume_fix_results(&output_dir, &all_verified, args.resume)?
+        try_resume_final_review_results(&output_dir, &all_verified, args.resume)?
     };
-    let fix_commit_before =
-        if args.report_only || all_verified.is_empty() || resumed_fix_results.is_some() {
-            None
-        } else {
-            Some(git_stdout(&repo_root, ["rev-parse", "HEAD"])?)
-        };
-    let fixes = if args.report_only || all_verified.is_empty() {
+    let code_phase_commit_before = if args.report_only
+        || all_verified.is_empty()
+        || resumed_final_review_results.is_some()
+    {
+        None
+    } else {
+        Some(git_stdout(&repo_root, ["rev-parse", "HEAD"])?)
+    };
+    let fixes = per_chunk_fixes;
+    let final_reviews = if args.report_only || all_verified.is_empty() {
         Vec::new()
-    } else if let Some(results) = resumed_fix_results {
+    } else if let Some(results) = resumed_final_review_results {
         results
     } else {
-        run_fix_phase(
+        run_final_review_phase(
             &repo_root,
             &output_dir,
-            &fixer,
+            &finalizer,
             &current_branch,
             &args,
             &stderr_log_path,
         )
         .await?
     };
-    if let Some(commit_before) = fix_commit_before {
+    if let Some(commit_before) = code_phase_commit_before {
         let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         if commit_before.trim() != commit_after.trim() {
             if push_branch_with_remote_sync(&repo_root, current_branch.as_str())? {
@@ -402,8 +513,17 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         println!();
         println!("implementation: {} item(s)", fixes.len());
     }
+    if !final_reviews.is_empty() {
+        println!("final review:  {} item(s)", final_reviews.len());
+    }
 
-    write_bug_summary(&output_dir, &outcomes, &fixes, args.report_only)?;
+    write_bug_summary(
+        &output_dir,
+        &outcomes,
+        &fixes,
+        &final_reviews,
+        args.report_only,
+    )?;
     let should_prune_bug_output = !args.report_only && !all_verified.is_empty();
     if should_prune_bug_output {
         fs::remove_dir_all(&output_dir)
@@ -428,6 +548,12 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
                 output_dir.join("implementation-results.json").display()
             );
         }
+        if !final_reviews.is_empty() {
+            println!(
+                "finalized:   {}",
+                output_dir.join("final-review-results.json").display()
+            );
+        }
         println!("stderr log:  {}", stderr_log_path.display());
     }
 
@@ -449,7 +575,14 @@ async fn run_finder_phase(
     let prompt = build_finder_prompt(chunk, &findings_json_path, &findings_md_path);
     atomic_write(&prompt_path, prompt.as_bytes())?;
 
-    let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
+    let backend = select_backend(
+        &config.model,
+        &config.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
     print_phase_header("finder", chunk, &backend);
     let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
@@ -458,6 +591,7 @@ async fn run_finder_phase(
         &args.codex_bin,
         stderr_log_path,
         &format!("finder {} {}", chunk.id, backend.label()),
+        Duration::from_secs(BUG_CHUNK_PHASE_TIMEOUT_SECS),
     )
     .await?;
     prune_bug_phase_pi_state(repo_root, &backend);
@@ -517,7 +651,14 @@ async fn run_skeptic_phase(
     );
     atomic_write(&prompt_path, prompt.as_bytes())?;
 
-    let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
+    let backend = select_backend(
+        &config.model,
+        &config.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
     print_phase_header("skeptic", chunk, &backend);
     let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
@@ -526,6 +667,7 @@ async fn run_skeptic_phase(
         &args.codex_bin,
         stderr_log_path,
         &format!("skeptic {} {}", chunk.id, backend.label()),
+        Duration::from_secs(BUG_CHUNK_PHASE_TIMEOUT_SECS),
     )
     .await?;
     prune_bug_phase_pi_state(repo_root, &backend);
@@ -577,36 +719,82 @@ async fn load_or_run_skeptic_phase(
     .await
 }
 
-async fn run_fix_phase(
+/// Per-chunk fix-on-verify. Writes the chunk's verified findings to a local
+/// JSON file, runs the Kimi implementer against them, and records the results
+/// inside the chunk directory so `--resume` can skip already-landed chunks.
+#[allow(clippy::too_many_arguments)]
+async fn run_fix_phase_for_chunk(
     repo_root: &Path,
-    output_dir: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    verified: &[AcceptedFinding],
     config: &PhaseConfig,
     branch: &str,
     args: &BugArgs,
     stderr_log_path: &Path,
 ) -> Result<Vec<FixResult>> {
-    let prompt_path = output_dir.join("implementation-prompt.md");
-    let response_path = output_dir.join("implementation-response.jsonl");
-    let results_json_path = output_dir.join("implementation-results.json");
-    let results_md_path = output_dir.join("implementation-results.md");
-    let verified_json_path = output_dir.join("verified-findings.json");
-    let prompt = build_fix_prompt(
+    let verified_json_path = chunk_dir.join("verified-findings.json");
+    atomic_write(
         &verified_json_path,
+        serde_json::to_string_pretty(&verified)?.as_bytes(),
+    )?;
+    let label = format!("implementer[{}]", chunk.id);
+    run_fix_phase_at(
+        repo_root,
+        chunk_dir,
+        &verified_json_path,
+        config,
+        branch,
+        args,
+        stderr_log_path,
+        &label,
+    )
+    .await
+}
+
+/// Core fixer pass, parameterised by the output directory (top-level or
+/// chunk-local) and the path the implementer should read verified findings
+/// from. Both `run_fix_phase` and `run_fix_phase_for_chunk` delegate here.
+#[allow(clippy::too_many_arguments)]
+async fn run_fix_phase_at(
+    repo_root: &Path,
+    scope_dir: &Path,
+    verified_json_path: &Path,
+    config: &PhaseConfig,
+    branch: &str,
+    args: &BugArgs,
+    stderr_log_path: &Path,
+    phase_label: &str,
+) -> Result<Vec<FixResult>> {
+    let prompt_path = scope_dir.join("implementation-prompt.md");
+    let response_path = scope_dir.join("implementation-response.jsonl");
+    let results_json_path = scope_dir.join("implementation-results.json");
+    let results_md_path = scope_dir.join("implementation-results.md");
+    let prompt = build_fix_prompt(
+        verified_json_path,
         &results_json_path,
         &results_md_path,
         branch,
     );
     atomic_write(&prompt_path, prompt.as_bytes())?;
 
-    let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
-    print_global_phase_header("implementer", &backend);
+    let backend = select_backend(
+        &config.model,
+        &config.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
+    print_global_phase_header(phase_label, &backend);
     let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
         &prompt,
         &backend,
         &args.codex_bin,
         stderr_log_path,
-        &format!("implementer {}", backend.label()),
+        &format!("{} {}", phase_label, backend.label()),
+        Duration::from_secs(BUG_IMPLEMENTATION_PHASE_TIMEOUT_SECS),
     )
     .await?;
     prune_bug_phase_pi_state(repo_root, &backend);
@@ -622,35 +810,148 @@ async fn run_fix_phase(
         &response_path,
     )
     .await?;
-    let verified: Vec<AcceptedFinding> = load_json_file(&verified_json_path)?;
+    let verified: Vec<AcceptedFinding> = load_json_file(verified_json_path)?;
     validate_fix_results(&verified, &results)?;
     Ok(results)
 }
 
-fn try_resume_fix_results(
+/// Resumable wrapper around `run_fix_phase_for_chunk`. When the chunk already
+/// has a valid `implementation-results.json` that covers every verified
+/// finding, reuse it; otherwise invoke the fixer fresh.
+#[allow(clippy::too_many_arguments)]
+async fn load_or_run_fix_phase_for_chunk(
+    repo_root: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    verified: &[AcceptedFinding],
+    config: &PhaseConfig,
+    branch: &str,
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<Vec<FixResult>> {
+    if args.resume {
+        let results_json_path = chunk_dir.join("implementation-results.json");
+        if let Some(results) = try_load_existing_json::<Vec<FixResult>>(
+            &results_json_path,
+            "implementation results",
+        )? {
+            match validate_fix_results(verified, &results) {
+                Ok(()) => {
+                    println!(
+                        "resume:      {} implementation results ({} item(s))",
+                        chunk.id,
+                        results.len()
+                    );
+                    return Ok(results);
+                }
+                Err(err) => {
+                    println!(
+                        "warning: ignoring invalid implementation results in {}: {err}",
+                        results_json_path.display()
+                    );
+                }
+            }
+        }
+    }
+    run_fix_phase_for_chunk(
+        repo_root,
+        chunk,
+        chunk_dir,
+        verified,
+        config,
+        branch,
+        args,
+        stderr_log_path,
+    )
+    .await
+}
+
+async fn run_final_review_phase(
+    repo_root: &Path,
+    output_dir: &Path,
+    config: &PhaseConfig,
+    branch: &str,
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<Vec<FinalReviewResult>> {
+    let prompt_path = output_dir.join("final-review-prompt.md");
+    let response_path = output_dir.join("final-review-response.jsonl");
+    let results_json_path = output_dir.join("final-review-results.json");
+    let results_md_path = output_dir.join("final-review-results.md");
+    let verified_json_path = output_dir.join("verified-findings.json");
+    let implementation_json_path = output_dir.join("implementation-results.json");
+    let prompt = build_final_review_prompt(
+        &verified_json_path,
+        &implementation_json_path,
+        &results_json_path,
+        &results_md_path,
+        branch,
+    );
+    atomic_write(&prompt_path, prompt.as_bytes())?;
+
+    let backend = select_backend(
+        &config.model,
+        &config.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
+    print_global_phase_header("finalizer", &backend);
+    let (raw_response, backend) = run_backend_prompt_with_fallback(
+        repo_root,
+        &prompt,
+        &backend,
+        &args.codex_bin,
+        stderr_log_path,
+        &format!("finalizer {}", backend.label()),
+        Duration::from_secs(BUG_FINAL_REVIEW_PHASE_TIMEOUT_SECS),
+    )
+    .await?;
+    prune_bug_phase_pi_state(repo_root, &backend);
+    atomic_write(&response_path, raw_response.as_bytes())?;
+
+    let results: Vec<FinalReviewResult> = load_json_file_with_backend_repair(
+        repo_root,
+        &results_json_path,
+        &backend,
+        stderr_log_path,
+        "final review results",
+        final_review_result_json_schema(),
+        &response_path,
+    )
+    .await?;
+    let verified: Vec<AcceptedFinding> = load_json_file(&verified_json_path)?;
+    validate_final_review_results(&verified, &results)?;
+    Ok(results)
+}
+
+fn try_resume_final_review_results(
     output_dir: &Path,
     verified: &[AcceptedFinding],
     resume: bool,
-) -> Result<Option<Vec<FixResult>>> {
+) -> Result<Option<Vec<FinalReviewResult>>> {
     if !resume {
         return Ok(None);
     }
 
-    let results_json_path = output_dir.join("implementation-results.json");
-    let Some(results) =
-        try_load_existing_json::<Vec<FixResult>>(&results_json_path, "implementation results")?
+    let results_json_path = output_dir.join("final-review-results.json");
+    let Some(results) = try_load_existing_json::<Vec<FinalReviewResult>>(
+        &results_json_path,
+        "final review results",
+    )?
     else {
         return Ok(None);
     };
 
-    match validate_fix_results(verified, &results) {
+    match validate_final_review_results(verified, &results) {
         Ok(()) => {
-            println!("resume:      reusing implementation results");
+            println!("resume:      reusing final review results");
             Ok(Some(results))
         }
         Err(err) => {
             println!(
-                "warning: ignoring invalid implementation results in {}: {err}",
+                "warning: ignoring invalid final review results in {}: {err}",
                 results_json_path.display()
             );
             Ok(None)
@@ -680,7 +981,14 @@ async fn run_review_phase(
     );
     atomic_write(&prompt_path, prompt.as_bytes())?;
 
-    let backend = select_backend(&config.model, &config.effort, &args.codex_bin, &args.pi_bin);
+    let backend = select_backend(
+        &config.model,
+        &config.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
     print_phase_header("reviewer", chunk, &backend);
     let (raw_response, backend) = run_backend_prompt_with_fallback(
         repo_root,
@@ -689,6 +997,7 @@ async fn run_review_phase(
         &args.codex_bin,
         stderr_log_path,
         &format!("reviewer {} {}", chunk.id, backend.label()),
+        Duration::from_secs(BUG_CHUNK_PHASE_TIMEOUT_SECS),
     )
     .await?;
     prune_bug_phase_pi_state(repo_root, &backend);
@@ -834,7 +1143,32 @@ where
     }
 }
 
-fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) -> LlmBackend {
+fn select_backend(
+    model: &str,
+    effort: &str,
+    codex_bin: &Path,
+    pi_bin: &Path,
+    kimi_bin: &Path,
+    use_kimi_cli: bool,
+) -> LlmBackend {
+    if is_kimi_model(model) {
+        if use_kimi_cli {
+            return LlmBackend::KimiCli {
+                model: resolve_kimi_cli_model_name(model),
+                thinking: effort.to_string(),
+                kimi_bin: resolve_kimi_bin(kimi_bin),
+            };
+        }
+        if let Some(provider) = PiProvider::detect(model) {
+            return LlmBackend::Pi {
+                provider_label: provider.provider_label(),
+                model: provider.resolve_model(model, DEFAULT_CODEX_MODEL),
+                thinking: effort.to_string(),
+                pi_bin: resolve_pi_bin(pi_bin),
+            };
+        }
+    }
+
     if let Some(provider) = PiProvider::detect(model) {
         return LlmBackend::Pi {
             provider_label: provider.provider_label(),
@@ -849,6 +1183,30 @@ fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) ->
         reasoning_effort: effort.to_string(),
         codex_bin: codex_bin.to_path_buf(),
     }
+}
+
+/// Does this model string refer to a Kimi coding model in any of its recognised
+/// spellings? Covers `k2.6`, `kimi`, `kimi-coding/k2p6`, `k2.5`, etc.
+fn is_kimi_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
+}
+
+/// Normalise the user's spelling to the short id `kimi-cli` expects (`k2.6`).
+fn resolve_kimi_cli_model_name(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return KIMI_CLI_DEFAULT_MODEL.to_string();
+    }
+    if let Some(short) = lower.rsplit('/').next() {
+        match short {
+            "k2p6" | "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
+            | "kimi-2.6-code-preview" => return "k2.6".to_string(),
+            "k2p5" | "k2.5" | "kimi-2.5" | "kimi-k2.5" => return "k2.5".to_string(),
+            _ => {}
+        }
+    }
+    model.trim().to_string()
 }
 
 fn display_phase_model(config: &PhaseConfig) -> String {
@@ -900,6 +1258,7 @@ async fn run_backend_prompt(
     backend: &LlmBackend,
     stderr_log_path: &Path,
     stream_label: &str,
+    timeout: Duration,
 ) -> Result<String> {
     match backend {
         LlmBackend::Codex {
@@ -954,7 +1313,12 @@ async fn run_backend_prompt(
             let stdout_task = tokio::spawn(async move { capture_codex_output(stdout).await });
             let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
-            let status = child.wait().await.context("failed waiting for Codex")?;
+            let wait_result = time::timeout(timeout, child.wait()).await;
+            let timed_out = wait_result.is_err();
+            if timed_out {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
             let stdout = stdout_task
                 .await
                 .context("Codex stdout capture task panicked")??;
@@ -962,6 +1326,15 @@ async fn run_backend_prompt(
                 .await
                 .context("Codex stderr capture task panicked")??;
             append_stderr_log(stderr_log_path, &stderr_text)?;
+            if timed_out {
+                bail!(
+                    "Codex bug phase timed out after {}s while running {stream_label}",
+                    timeout.as_secs()
+                );
+            }
+            let status = wait_result
+                .expect("timeout already handled")
+                .context("failed waiting for Codex")?;
 
             if !status.success() {
                 bail!(
@@ -1014,11 +1387,17 @@ async fn run_backend_prompt(
                 .context("PI stderr should be piped for auto bug")?;
 
             let stream_label = stream_label.to_string();
+            let heartbeat_label = stream_label.clone();
             let stdout_task =
-                tokio::spawn(async move { capture_pi_output(stdout, &stream_label, 15).await });
+                tokio::spawn(async move { capture_pi_output(stdout, &heartbeat_label, 15).await });
             let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
-            let status = child.wait().await.context("failed waiting for PI")?;
+            let wait_result = time::timeout(timeout, child.wait()).await;
+            let timed_out = wait_result.is_err();
+            if timed_out {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
             let stdout = stdout_task
                 .await
                 .context("PI stdout capture task panicked")??;
@@ -1026,6 +1405,15 @@ async fn run_backend_prompt(
                 .await
                 .context("PI stderr capture task panicked")??;
             append_stderr_log(stderr_log_path, &stderr_text)?;
+            if timed_out {
+                bail!(
+                    "PI bug phase timed out after {}s while running {stream_label}",
+                    timeout.as_secs()
+                );
+            }
+            let status = wait_result
+                .expect("timeout already handled")
+                .context("failed waiting for PI")?;
 
             if !status.success() {
                 bail!(
@@ -1040,6 +1428,101 @@ async fn run_backend_prompt(
             }
             Ok(stdout)
         }
+        LlmBackend::KimiCli {
+            model,
+            thinking,
+            kimi_bin,
+        } => {
+            let args = kimi_exec_args(model, thinking, prompt);
+            let mut command = TokioCommand::new(kimi_bin);
+            command
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .current_dir(repo_root);
+
+            let mut child = command.spawn().with_context(|| {
+                format!(
+                    "failed to launch kimi-cli at {} from {}",
+                    kimi_bin.display(),
+                    repo_root.display()
+                )
+            })?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .context("kimi-cli stdout should be piped for auto bug")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("kimi-cli stderr should be piped for auto bug")?;
+
+            let stream_label_owned = stream_label.to_string();
+            let heartbeat_label = stream_label_owned.clone();
+            // Reuse the PI output helper: kimi-cli stream-json frames are
+            // JSON lines, same shape family; capture_pi_output preserves raw
+            // output + drives the heartbeat.
+            let stdout_task = tokio::spawn(async move {
+                capture_pi_output(stdout, &heartbeat_label, 15).await
+            });
+            let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+
+            let wait_result = time::timeout(timeout, child.wait()).await;
+            let timed_out = wait_result.is_err();
+            if timed_out {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            let stdout = stdout_task
+                .await
+                .context("kimi-cli stdout capture task panicked")??;
+            let stderr_text = stderr_task
+                .await
+                .context("kimi-cli stderr capture task panicked")??;
+            append_stderr_log(stderr_log_path, &stderr_text)?;
+            if timed_out {
+                bail!(
+                    "kimi-cli bug phase timed out after {}s while running {stream_label_owned}",
+                    timeout.as_secs()
+                );
+            }
+            let status = wait_result
+                .expect("timeout already handled")
+                .context("failed waiting for kimi-cli")?;
+            if !status.success() {
+                bail!(
+                    "kimi-cli bug phase failed: {}",
+                    stderr_text
+                        .trim()
+                        .if_empty_then(parse_kimi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
+                );
+            }
+            if let Some(detail) = parse_kimi_error(&stdout) {
+                bail!("kimi-cli bug phase failed: {detail}");
+            }
+            // kimi-cli's stream-json puts the final text inside one
+            // `{"role":"assistant","content":[{"type":"text",...}]}` frame.
+            // Stitch those frames together so downstream JSON extractors see
+            // the model's actual answer rather than the trace.
+            let mut final_text = String::new();
+            for line in stdout.lines() {
+                if let Some(chunk) = kimi_extract_final_text(line) {
+                    if !final_text.is_empty() {
+                        final_text.push('\n');
+                    }
+                    final_text.push_str(&chunk);
+                }
+            }
+            if final_text.trim().is_empty() {
+                // Fall back to the raw stream so callers still have something
+                // to parse; kimi-cli must be reporting text in a non-standard
+                // frame shape.
+                return Ok(stdout);
+            }
+            Ok(final_text)
+        }
     }
 }
 
@@ -1051,11 +1534,21 @@ async fn run_backend_prompt_with_fallback(
     codex_bin: &Path,
     stderr_log_path: &Path,
     stream_label: &str,
+    timeout: Duration,
 ) -> Result<(String, LlmBackend)> {
-    match run_backend_prompt(repo_root, prompt, backend, stderr_log_path, stream_label).await {
+    match run_backend_prompt(
+        repo_root,
+        prompt,
+        backend,
+        stderr_log_path,
+        stream_label,
+        timeout,
+    )
+    .await
+    {
         Ok(r) => Ok((r, backend.clone())),
-        Err(e) if matches!(backend, LlmBackend::Pi { .. }) => {
-            eprintln!("[auto-bug] PI backend failed: {e:#}");
+        Err(e) if backend.is_kimi_family() => {
+            eprintln!("[auto-bug] Kimi backend failed: {e:#}");
             eprintln!("[auto-bug] falling back to Codex");
             let fallback = LlmBackend::Codex {
                 model: DEFAULT_CODEX_MODEL.to_string(),
@@ -1069,6 +1562,7 @@ async fn run_backend_prompt_with_fallback(
                 &fallback,
                 stderr_log_path,
                 &format!("{stream_label} (codex-fallback)"),
+                timeout,
             )
             .await?;
             Ok((r, fallback))
@@ -1343,7 +1837,7 @@ fn build_fix_prompt(
     branch: &str,
 ) -> String {
     format!(
-        r#"You are the final implementation pass in a multi-pass bug pipeline.
+        r#"You are the implementation pass in a multi-pass bug pipeline.
 
 Implement every verified bug in the repository-wide findings set.
 
@@ -1391,6 +1885,64 @@ Requirements:
     )
 }
 
+fn build_final_review_prompt(
+    verified_json: &Path,
+    implementation_json: &Path,
+    results_json: &Path,
+    results_md: &Path,
+    branch: &str,
+) -> String {
+    format!(
+        r#"You are the final Codex review pass in a multi-pass bug pipeline.
+
+Review the repository-wide verified findings and the implementation pass results.
+
+Input files:
+- `{verified_json}`
+- `{implementation_json}`
+
+Rules:
+- Treat the live repo state as truth.
+- Re-check every verified bug against the implementation results before you trust them.
+- Make any final code, test, or validation changes needed to close real remaining gaps.
+- Keep scope tight: finish or truthfully defer verified bugs; do not widen into unrelated cleanup.
+- Stay on the currently checked-out branch `{branch}`.
+- Commit only truthful review refinements with a message like `repo-name: bug review fixes`.
+- Push to `origin/{branch}` after each successful commit.
+- Do not create or switch branches.
+- Do not stage or commit unrelated pre-existing changes already present in the worktree.
+- Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`.
+- Only write these files:
+  - `{results_json}`
+  - `{results_md}`
+- `{results_json}` must be a JSON array with one entry per verified bug. If there are no verified bugs, write `[]`.
+
+Each JSON item must use exactly this schema:
+{{
+  "bug_id": "BUG-001-01",
+  "status": "confirmed|amended|deferred",
+  "summary": "What the final review concluded and what changed",
+  "validation_commands": ["Command actually run"],
+  "touched_files": ["path/to/file"],
+  "residual_risks": ["Anything still not fully closed"]
+}}
+
+Requirements:
+- `confirmed` means the implementation pass already fixed the bug and your review required no further code changes.
+- `amended` means you made additional code, test, or validation changes to finish the fix.
+- `deferred` means the bug remains real but you could not close it safely in this run.
+- `{results_md}` should summarize what the implementation pass got right, what you had to tighten, and any truthful remaining gaps.
+- JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
+"#,
+        verified_json = verified_json.display(),
+        implementation_json = implementation_json.display(),
+        results_json = results_json.display(),
+        results_md = results_md.display(),
+        branch = branch,
+    )
+}
+
 fn build_review_prompt(
     chunk: &RepoChunk,
     accepted_json: &Path,
@@ -1424,7 +1976,7 @@ Each JSON item must use exactly this schema:
 }}
 
 Requirements:
-- `verified` means the finding should be implemented in the final GPT-5.4 implementation pass.
+- `verified` means the finding should survive into the repository-wide implementation pass.
 - `discarded` means the finding is too weak, duplicated, or insufficiently supported to implement.
 - Prefer `verified` only when the bug is concrete enough to justify a reproduce-first/root-cause fix workflow.
 - Call out missing regression coverage, missing runtime proof, or suspiciously broad scope in `follow_up`.
@@ -1597,6 +2149,33 @@ fn validate_fix_results(verified: &[AcceptedFinding], results: &[FixResult]) -> 
         }
         if result.summary.trim().is_empty() {
             bail!("fix result for {} is missing a summary", result.bug_id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_final_review_results(
+    verified: &[AcceptedFinding],
+    results: &[FinalReviewResult],
+) -> Result<()> {
+    validate_bug_id_coverage(
+        verified.iter().map(|finding| finding.bug_id.as_str()),
+        results.iter().map(|result| result.bug_id.as_str()),
+        "final review results",
+    )?;
+    for result in results {
+        match result.status.trim().to_ascii_lowercase().as_str() {
+            "confirmed" | "amended" | "deferred" => {}
+            other => bail!(
+                "invalid final review status `{other}` for {}",
+                result.bug_id
+            ),
+        }
+        if result.summary.trim().is_empty() {
+            bail!(
+                "final review result for {} is missing a summary",
+                result.bug_id
+            );
         }
     }
     Ok(())
@@ -2157,7 +2736,7 @@ fn fix_result_json_schema() -> &'static str {
     r#"[
   {
     "bug_id": "BUG-001-01",
-    "status": "fixed|deferred|blocked",
+    "status": "fixed|deferred|not_reproduced",
     "summary": "What changed and why",
     "validation_commands": ["Command actually run"],
     "touched_files": ["path/to/file"],
@@ -2174,6 +2753,19 @@ fn review_result_json_schema() -> &'static str {
     "confidence": "high|medium|low",
     "notes": "Why this should or should not be implemented",
     "follow_up": ["Missing proof, scope risk, or test gaps"]
+  }
+]"#
+}
+
+fn final_review_result_json_schema() -> &'static str {
+    r#"[
+  {
+    "bug_id": "BUG-001-01",
+    "status": "confirmed|amended|deferred",
+    "summary": "What the final review concluded and what changed",
+    "validation_commands": ["Command actually run"],
+    "touched_files": ["path/to/file"],
+    "residual_risks": ["Anything still not fully closed"]
   }
 ]"#
 }
@@ -2229,6 +2821,7 @@ async fn attempt_llm_json_file_repair(
         backend,
         stderr_log_path,
         &format!("repair {artifact_label}"),
+        Duration::from_secs(BUG_CHUNK_PHASE_TIMEOUT_SECS),
     )
     .await?;
     if !repair_response.trim().is_empty() {
@@ -2266,6 +2859,7 @@ fn write_bug_summary(
     output_dir: &Path,
     outcomes: &[ChunkOutcome],
     fixes: &[FixResult],
+    final_reviews: &[FinalReviewResult],
     report_only: bool,
 ) -> Result<()> {
     let all_accepted = outcomes
@@ -2305,6 +2899,10 @@ fn write_bug_summary(
             .sum::<usize>()
     ));
     markdown.push_str(&format!("- Implementation results: `{}`\n", fixes.len()));
+    markdown.push_str(&format!(
+        "- Final review results: `{}`\n",
+        final_reviews.len()
+    ));
     markdown.push_str(&format!("- Review verdicts: `{}`\n", all_reviews.len()));
     markdown.push_str(&format!(
         "- Mode: `{}`\n\n",
@@ -2370,6 +2968,15 @@ fn write_bug_summary(
         } else {
             for fix in fixes {
                 markdown.push_str(&format!("- `{}`: `{}`\n", fix.bug_id, fix.status));
+            }
+        }
+
+        markdown.push_str("\n## Final Codex Review\n\n");
+        if final_reviews.is_empty() {
+            markdown.push_str("No final Codex review output captured.\n");
+        } else {
+            for result in final_reviews {
+                markdown.push_str(&format!("- `{}`: `{}`\n", result.bug_id, result.status));
             }
         }
     }
@@ -2478,11 +3085,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_fix_prompt, collect_repo_chunks, escape_unescaped_quotes_in_json_strings,
-        load_json_file, repair_llm_json, run_backend_prompt, should_audit_path, slugify,
+        build_final_review_prompt, build_fix_prompt, collect_repo_chunks,
+        escape_unescaped_quotes_in_json_strings, load_json_file, repair_llm_json,
+        run_backend_prompt, run_backend_prompt_with_fallback, should_audit_path, slugify,
         validate_accepted_findings, AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
@@ -2495,8 +3103,7 @@ mod tests {
         std::env::temp_dir().join(format!("autodev-bug-{name}-{}-{nonce}", std::process::id()))
     }
 
-    fn write_fake_pi_script(path: &Path) {
-        let script = "#!/bin/sh\nprintf '[]\\n'\n";
+    fn write_fake_script(path: &Path, script: &str) {
         fs::write(path, script).expect("failed to write fake pi script");
         #[cfg(unix)]
         {
@@ -2506,6 +3113,10 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("failed to chmod fake pi script");
         }
+    }
+
+    fn write_fake_pi_script(path: &Path) {
+        write_fake_script(path, "#!/bin/sh\nprintf '[]\\n'\n");
     }
 
     #[test]
@@ -2556,6 +3167,23 @@ mod tests {
         assert!(prompt.contains(
             "Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`."
         ));
+    }
+
+    #[test]
+    fn final_review_prompt_requires_review_of_fix_results() {
+        let prompt = build_final_review_prompt(
+            Path::new("bug/verified-findings.json"),
+            Path::new("bug/implementation-results.json"),
+            Path::new("bug/final-review-results.json"),
+            Path::new("bug/final-review-results.md"),
+            "main",
+        );
+
+        assert!(prompt.contains(
+            "Review the repository-wide verified findings and the implementation pass results."
+        ));
+        assert!(prompt.contains("`confirmed` means the implementation pass already fixed the bug"));
+        assert!(prompt.contains("Push to `origin/main` after each successful commit."));
     }
 
     #[test]
@@ -2736,6 +3364,7 @@ mod tests {
             &backend,
             &stderr_log_path,
             "test pi cleanup",
+            Duration::from_secs(5),
         )
         .await;
 
@@ -2760,5 +3389,40 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("automatic repair skipped"));
         assert!(message.contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn pi_timeout_falls_back_to_codex() {
+        let repo_root = temp_path("pi-timeout-fallback");
+        fs::create_dir_all(&repo_root).expect("failed to create repo root");
+
+        let fake_pi = repo_root.join("fake-pi-sleep.sh");
+        write_fake_script(&fake_pi, "#!/bin/sh\nsleep 2\nprintf '[]\\n'\n");
+
+        let fake_codex = repo_root.join("fake-codex.sh");
+        write_fake_script(&fake_codex, "#!/bin/sh\ncat >/dev/null\nprintf '[]\\n'\n");
+
+        let backend = LlmBackend::Pi {
+            provider_label: "pi-kimi",
+            model: "kimi-coding/k2p6".to_string(),
+            thinking: "high".to_string(),
+            pi_bin: fake_pi,
+        };
+        let stderr_log_path = repo_root.join("bug.stderr.log");
+
+        let (stdout, used_backend) = run_backend_prompt_with_fallback(
+            &repo_root,
+            "prompt",
+            &backend,
+            &fake_codex,
+            &stderr_log_path,
+            "timeout fallback",
+            Duration::from_millis(250),
+        )
+        .await
+        .expect("timeout should fall back to codex");
+
+        assert_eq!(stdout, "[]\n");
+        assert!(matches!(used_backend, LlmBackend::Codex { .. }));
     }
 }

@@ -8,8 +8,11 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
-use crate::codex_exec::run_codex_exec;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
+use crate::kimi_backend::{
+    extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
+    resolve_kimi_bin, KIMI_CLI_DEFAULT_MODEL,
+};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
@@ -138,6 +141,7 @@ Rules:
 Requirements:
 - Cover every unchecked `NEM-` task in the plan with one result entry unless the final plan already marks it satisfied.
 - `fixed` means the root cause was addressed and re-verified.
+- If the live repo already satisfies a `fixed` task without edits, keep `touched_files` as `[]` and say plainly in `summary` that no file changes were needed because the requirement was already satisfied.
 - `deferred` means the task remains valid but was intentionally left open with a truthful reason.
 - `blocked` means an external dependency, ambiguity, or repo limitation prevented a truthful close.
 - `{results_md}` should summarize proof-before-fix, root cause, changes made, validation, and any deferred or blocked tasks.
@@ -146,7 +150,8 @@ Requirements:
 "#;
 
 const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
-const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "minimax/MiniMax-M2.7-highspeed";
+#[allow(dead_code)]
+const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "k2.6";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
@@ -230,6 +235,11 @@ enum NemesisBackend {
         thinking: String,
         pi_bin: PathBuf,
     },
+    KimiCli {
+        model: String,
+        thinking: String,
+        kimi_bin: PathBuf,
+    },
 }
 
 impl NemesisBackend {
@@ -237,6 +247,7 @@ impl NemesisBackend {
         match self {
             Self::Codex { .. } => "codex",
             Self::Pi { provider_label, .. } => provider_label,
+            Self::KimiCli { .. } => "kimi-cli",
         }
     }
 
@@ -244,6 +255,7 @@ impl NemesisBackend {
         match self {
             Self::Codex { model, .. } => model,
             Self::Pi { model, .. } => model,
+            Self::KimiCli { model, .. } => model,
         }
     }
 
@@ -253,7 +265,14 @@ impl NemesisBackend {
                 reasoning_effort, ..
             } => reasoning_effort,
             Self::Pi { thinking, .. } => thinking,
+            Self::KimiCli { thinking, .. } => thinking,
         }
+    }
+
+    #[allow(dead_code)]
+    fn is_kimi_family(&self) -> bool {
+        matches!(self, Self::KimiCli { .. })
+            || matches!(self, Self::Pi { provider_label, .. } if *provider_label == "pi-kimi")
     }
 }
 
@@ -293,22 +312,38 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         model: args.fixer_model.clone(),
         effort: args.fixer_effort.clone(),
     };
-    ensure_pi_phase_config("auto nemesis audit pass", &auditor)?;
-    ensure_pi_phase_config("auto nemesis synthesis pass", &reviewer)?;
+    let finalizer = PhaseConfig {
+        model: args.finalizer_model.clone(),
+        effort: args.finalizer_effort.clone(),
+    };
+    ensure_kimi_phase_config("auto nemesis audit pass", &auditor)?;
+    ensure_kimi_phase_config("auto nemesis synthesis pass", &reviewer)?;
     ensure_nemesis_fixer_config(&fixer)?;
+    ensure_nemesis_finalizer_config(&finalizer)?;
     let audit_backend = select_backend(
         &auditor.model,
         &auditor.effort,
         &args.codex_bin,
         &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
     );
     let review_backend = select_backend(
         &reviewer.model,
         &reviewer.effort,
         &args.codex_bin,
         &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
     );
-    let fix_backend = select_backend(&fixer.model, &fixer.effort, &args.codex_bin, &args.pi_bin);
+    let fix_backend = select_backend(
+        &fixer.model,
+        &fixer.effort,
+        &args.codex_bin,
+        &args.pi_bin,
+        &args.kimi_bin,
+        args.use_kimi_cli,
+    );
     validate_nemesis_backend_binaries(&audit_backend, &review_backend, args.report_only, &args)?;
     let previous_snapshot = maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run)?;
 
@@ -459,35 +494,32 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         let commit_before = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
         println!();
         println!("phase:       implementer");
-        println!("backend:     codex");
-        println!("model:       {}", fixer.model);
-        println!("variant:     {}", fixer.effort);
+        println!("backend:     {}", fix_backend.label());
+        println!("model:       {}", fix_backend.model());
+        println!("variant:     {}", fix_backend.variant());
         if pending_tasks.is_empty() {
-            println!("status:      no unchecked Nemesis tasks; skipping Codex");
+            println!("status:      no unchecked Nemesis tasks; skipping implementer");
             implementation_summary =
                 format!("skipped (no unchecked tasks in {})", plan_path.display());
         } else {
-            let exit_status = run_codex_exec(
+            // Route the implementer through the selected backend (Kimi-cli by
+            // default). Codex stays as the finalizer that reviews the landed
+            // diff after this phase.
+            let stderr_log = output_dir.join("implementer.stderr.log");
+            let response = run_nemesis_backend(
                 &repo_root,
                 &implementation_prompt,
-                &fixer.model,
-                &fixer.effort,
+                &fix_backend,
                 &args.codex_bin,
-                &output_dir.join("codex.stderr.log"),
-                None,
-                "auto nemesis implementation",
             )
             .await?;
-            if !exit_status.success() {
-                bail!(
-                    "Codex Nemesis implementation failed with status {}; see {}",
-                    exit_status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "signal".to_string()),
-                    output_dir.join("codex.stderr.log").display()
-                );
+            let response_path = output_dir.join("implementation-response.log");
+            if !response.trim().is_empty() {
+                atomic_write(&response_path, response.as_bytes()).with_context(|| {
+                    format!("failed to write {}", response_path.display())
+                })?;
             }
+            let _ = stderr_log; // stderr capture already handled by backend helpers
 
             let implementation_path = verify_nemesis_implementation_results(
                 &repo_root,
@@ -501,6 +533,48 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             .await?;
             implementation_summary = implementation_path.display().to_string();
             implementation_results = Some(implementation_path);
+
+            // Codex finalizer: independent review of the diff Kimi just
+            // produced. Fails loudly if it finds regressions; audit record
+            // is written to `nemesis/final-review.md`.
+            let finalizer_backend = NemesisBackend::Codex {
+                model: finalizer.model.clone(),
+                reasoning_effort: finalizer.effort.clone(),
+                codex_bin: args.codex_bin.clone(),
+            };
+            let finalizer_prompt = build_finalizer_prompt(
+                &spec_path,
+                &plan_path,
+                &implementation_results_json_path,
+                &implementation_results_md_path,
+                args.branch.as_deref().unwrap_or(&current_branch),
+            );
+            let finalizer_prompt_path = repo_root
+                .join(".auto")
+                .join("logs")
+                .join(format!("nemesis-{}-finalizer-prompt.md", timestamp_slug()));
+            atomic_write(&finalizer_prompt_path, finalizer_prompt.as_bytes())
+                .with_context(|| {
+                    format!("failed to write {}", finalizer_prompt_path.display())
+                })?;
+            print_phase_header("finalizer", &finalizer_backend);
+            let finalizer_response = run_nemesis_backend(
+                &repo_root,
+                &finalizer_prompt,
+                &finalizer_backend,
+                &args.codex_bin,
+            )
+            .await?;
+            let finalizer_response_path = output_dir.join("final-review.md");
+            atomic_write(&finalizer_response_path, finalizer_response.as_bytes())
+                .with_context(|| {
+                    format!("failed to write {}", finalizer_response_path.display())
+                })?;
+            println!(
+                "finalizer:   wrote review to {}",
+                finalizer_response_path.display()
+            );
+
             let commit_after = git_stdout(&repo_root, ["rev-parse", "HEAD"])?;
             if commit_before.trim() != commit_after.trim()
                 && push_branch_with_remote_sync(&repo_root, current_branch.as_str())?
@@ -552,9 +626,24 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     Ok(())
 }
 
-fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) -> NemesisBackend {
-    let pi_provider = PiProvider::detect(model);
-    if let Some(provider) = pi_provider {
+fn select_backend(
+    model: &str,
+    effort: &str,
+    codex_bin: &Path,
+    pi_bin: &Path,
+    kimi_bin: &Path,
+    use_kimi_cli: bool,
+) -> NemesisBackend {
+    let is_kimi = is_kimi_model(model);
+    if is_kimi && use_kimi_cli {
+        return NemesisBackend::KimiCli {
+            model: resolve_kimi_cli_model_name(model),
+            thinking: effort.to_string(),
+            kimi_bin: resolve_kimi_bin(kimi_bin),
+        };
+    }
+
+    if let Some(provider) = PiProvider::detect(model) {
         return NemesisBackend::Pi {
             provider_label: provider.provider_label(),
             model: provider.resolve_model(model, DEFAULT_CODEX_NEMESIS_MODEL),
@@ -570,20 +659,54 @@ fn select_backend(model: &str, effort: &str, codex_bin: &Path, pi_bin: &Path) ->
     }
 }
 
-fn ensure_pi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
-    if PiProvider::detect(&config.model).is_none() {
+fn is_kimi_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
+}
+
+fn resolve_kimi_cli_model_name(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return KIMI_CLI_DEFAULT_MODEL.to_string();
+    }
+    if let Some(short) = lower.rsplit('/').next() {
+        match short {
+            "k2p6" | "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
+            | "kimi-2.6-code-preview" => return "k2.6".to_string(),
+            "k2p5" | "k2.5" | "kimi-2.5" | "kimi-k2.5" => return "k2.5".to_string(),
+            _ => {}
+        }
+    }
+    model.trim().to_string()
+}
+
+fn ensure_kimi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
+    if !is_kimi_model(&config.model) && PiProvider::detect(&config.model).is_none() {
         bail!(
-            "{label} must use a MiniMax or Kimi PI model; got `{}`",
+            "{label} must use a Kimi model (e.g. `k2.6`); got `{}`",
             config.model
         );
     }
     Ok(())
 }
 
+/// The fixer phase used to be hard-pinned to Codex because the Kimi wrapper
+/// ran through legacy PI. Now Kimi drives remediation (via `kimi-cli --yolo`)
+/// and Codex becomes the finalizer/reviewer. Accept either family here; the
+/// finalizer phase has its own Codex-only gate.
 fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
-    if PiProvider::detect(&config.model).is_some() {
+    if config.model.trim().is_empty() {
+        bail!("auto nemesis fixer model is required");
+    }
+    Ok(())
+}
+
+/// Finalizer MUST be Codex — we want an independent reviewer after Kimi's
+/// remediation lands.
+fn ensure_nemesis_finalizer_config(config: &PhaseConfig) -> Result<()> {
+    if is_kimi_model(&config.model) || PiProvider::detect(&config.model).is_some() {
         bail!(
-            "auto nemesis implementation pass must use a Codex model; got `{}`",
+            "auto nemesis finalizer must use a Codex model (e.g. `gpt-5.4`); got `{}`",
             config.model
         );
     }
@@ -591,14 +714,14 @@ fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
 }
 
 fn resolve_auditor_model(args: &NemesisArgs) -> String {
-    if args.model != DEFAULT_NEMESIS_AUDIT_MODEL {
-        return args.model.clone();
-    }
-    if args.kimi {
-        return "kimi".to_string();
-    }
+    // Explicit legacy opt-in still honoured so operators who want a MiniMax
+    // second-opinion run can force it with `--minimax`.
     if args.minimax {
         return "minimax".to_string();
+    }
+    // `--kimi` is now the default; setting it is a no-op beyond log clarity.
+    if args.kimi {
+        return "k2.6".to_string();
     }
     args.model.clone()
 }
@@ -621,6 +744,7 @@ fn validate_backend_binary(label: &str, backend: &NemesisBackend) -> Result<()> 
     match backend {
         NemesisBackend::Codex { codex_bin, .. } => ensure_executable_available(label, codex_bin),
         NemesisBackend::Pi { pi_bin, .. } => ensure_executable_available(label, pi_bin),
+        NemesisBackend::KimiCli { kimi_bin, .. } => ensure_executable_available(label, kimi_bin),
     }
 }
 
@@ -722,6 +846,81 @@ fn build_implementation_prompt(
         .replace("{branch}", branch)
 }
 
+/// Codex finalizer prompt. Reads the Kimi-produced spec + plan + implementation
+/// results and produces an independent review of the landed diff. Fails the
+/// audit if the reviewer finds regressions, missing test coverage, or a fix
+/// that claims `status: fixed` without touching the cited files.
+fn build_finalizer_prompt(
+    audit_path: &Path,
+    plan_path: &Path,
+    results_json: &Path,
+    results_md: &Path,
+    branch: &str,
+) -> String {
+    format!(
+        r#"You are the Codex finalizer for an `auto nemesis` run.
+
+Kimi 2.6 has just produced the audit, synthesis, and implementation passes. Your
+job is to give the landed diff an independent code review and decide whether the
+run is safe to ship as-is.
+
+## Inputs
+
+- Audit: `{audit}`
+- Plan: `{plan}`
+- Implementation results: `{results_json}`
+- Implementation summary: `{results_md}`
+- Branch: `{branch}`
+
+## What to verify
+
+1. For every task marked `status: fixed` in `{results_json}`:
+   - Re-read each cited path in `touched_files` and confirm the code change
+     actually addresses the root cause the audit + plan describe.
+   - Run the listed `validation_commands` and record pass/fail.
+   - Surface any regression, missing test coverage, or silent scope creep.
+2. For every task marked `deferred` or `blocked`, verify the stated reason is
+   truthful against the code.
+3. Flag any fix that claims `touched_files: []` but the codebase still contains
+   the documented failure mode.
+4. Look for the usual Kimi failure modes: over-wide refactors, speculative
+   cleanup, silent suppression of warnings, hard-coded test fixtures.
+
+## Deliverables
+
+Write your review to a markdown file at `nemesis/final-review.md`. Structure:
+
+```
+# Final Review — auto nemesis
+
+## Verdict
+PASS | CONCERNS | FAIL
+
+## Per-task verdicts
+- TASK_ID: PASS | CONCERNS | FAIL — rationale in 2-3 lines
+
+## Regressions observed
+(if any)
+
+## Validation commands rerun
+(which ones you executed; outcomes)
+```
+
+If you find `FAIL`-severity issues, fix them in place with a minimal diff and
+record them under `## Regressions observed`. Do not rewrite passing Kimi work.
+Do not touch `nemesis/` artifacts other than `nemesis/final-review.md`.
+
+Stay on branch `{branch}`. Commit any remediation with the message
+`codex-finalizer: address Kimi regressions`.
+"#,
+        audit = audit_path.display(),
+        plan = plan_path.display(),
+        results_json = results_json.display(),
+        results_md = results_md.display(),
+        branch = branch,
+    )
+}
+
 fn render_prompt_outputs(prompt_template: &str, audit_path: &Path, plan_path: &Path) -> String {
     prompt_template
         .replace(
@@ -808,7 +1007,32 @@ async fn run_nemesis_backend(
         } => match run_pi(repo_root, prompt, model, thinking, pi_bin).await {
             Ok(output) => Ok(output),
             Err(e) => {
-                eprintln!("[auto-nemesis] PI backend failed: {e:#}");
+                eprintln!("[auto-nemesis] Kimi (pi) backend failed: {e:#}");
+                eprintln!("[auto-nemesis] falling back to Codex");
+                let fallback = NemesisBackend::Codex {
+                    model: DEFAULT_CODEX_NEMESIS_MODEL.to_string(),
+                    reasoning_effort: "high".to_string(),
+                    codex_bin: codex_bin.to_path_buf(),
+                };
+                print_phase_header("fallback", &fallback);
+                run_codex(
+                    repo_root,
+                    prompt,
+                    DEFAULT_CODEX_NEMESIS_MODEL,
+                    "high",
+                    codex_bin,
+                )
+                .await
+            }
+        },
+        NemesisBackend::KimiCli {
+            model,
+            thinking,
+            kimi_bin,
+        } => match run_kimi_cli(repo_root, prompt, model, thinking, kimi_bin).await {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                eprintln!("[auto-nemesis] kimi-cli backend failed: {e:#}");
                 eprintln!("[auto-nemesis] falling back to Codex");
                 let fallback = NemesisBackend::Codex {
                     model: DEFAULT_CODEX_NEMESIS_MODEL.to_string(),
@@ -827,6 +1051,78 @@ async fn run_nemesis_backend(
             }
         },
     }
+}
+
+async fn run_kimi_cli(
+    repo_root: &Path,
+    prompt: &str,
+    model: &str,
+    thinking: &str,
+    kimi_bin: &Path,
+) -> Result<String> {
+    let args = kimi_exec_args(model, thinking, prompt);
+    let mut command = TokioCommand::new(kimi_bin);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(repo_root);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch kimi-cli at {} from {}",
+            kimi_bin.display(),
+            repo_root.display()
+        )
+    })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("kimi-cli stdout should be piped for nemesis")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("kimi-cli stderr should be piped for nemesis")?;
+
+    let stdout_task =
+        tokio::spawn(async move { capture_pi_output(stdout, "auto nemesis kimi-cli", 15).await });
+    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+
+    let status = child
+        .wait()
+        .await
+        .context("failed waiting for kimi-cli nemesis run")?;
+    let stdout = stdout_task
+        .await
+        .context("kimi-cli stdout capture task panicked")??;
+    let stderr = stderr_task
+        .await
+        .context("kimi-cli stderr capture task panicked")??;
+    if !status.success() {
+        bail!(
+            "kimi-cli nemesis run failed: {}",
+            stderr
+                .trim()
+                .if_empty_then(parse_kimi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
+        );
+    }
+    if let Some(detail) = parse_kimi_error(&stdout) {
+        bail!("kimi-cli nemesis run failed: {detail}");
+    }
+    let mut final_text = String::new();
+    for line in stdout.lines() {
+        if let Some(chunk) = kimi_extract_final_text(line) {
+            if !final_text.is_empty() {
+                final_text.push('\n');
+            }
+            final_text.push_str(&chunk);
+        }
+    }
+    if final_text.trim().is_empty() {
+        return Ok(stdout);
+    }
+    Ok(final_text)
 }
 
 async fn run_codex(
@@ -1202,9 +1498,9 @@ fn validate_nemesis_fix_results(results: &[NemesisFixResult]) -> Result<()> {
                     result.task_id
                 );
             }
-            if result.touched_files.is_empty() {
+            if result.touched_files.is_empty() && !fixed_nemesis_result_is_truthful_noop(result) {
                 bail!(
-                    "Nemesis implementation result for `{}` must include touched files",
+                    "Nemesis implementation result for `{}` must include touched files unless the summary explicitly states that no file changes were needed",
                     result.task_id
                 );
             }
@@ -1221,6 +1517,17 @@ fn validate_nemesis_fix_results(results: &[NemesisFixResult]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn fixed_nemesis_result_is_truthful_noop(result: &NemesisFixResult) -> bool {
+    if !result.status.eq_ignore_ascii_case("fixed") || !result.touched_files.is_empty() {
+        return false;
+    }
+
+    let summary = result.summary.to_ascii_lowercase();
+    summary.contains("no file changes were needed")
+        || summary.contains("no code changes were needed")
+        || summary.contains("no changes were needed")
 }
 
 fn repair_nemesis_json(content: &str) -> Option<String> {
@@ -1305,6 +1612,7 @@ Rules:
     "residual_risks": ["Anything still not fully closed"]
   }}
 ]
+- If a `fixed` task was already satisfied before this pass and required no edits, keep `touched_files` as `[]` and state explicitly in `summary` that no file changes were needed because the live repo already satisfied the requirement.
 - JSON strings must stay valid JSON. Escape embedded quotes when needed.
 - Double-escape literal backslashes in regexes, paths, and code snippets.
 "#,
@@ -1943,10 +2251,10 @@ mod tests {
     use super::{
         annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
         build_nemesis_results_repair_prompt, commit_nemesis_outputs_if_needed,
-        ensure_nemesis_fixer_config, ensure_pi_phase_config, load_nemesis_fix_results,
-        maybe_prepare_output_dir, next_nemesis_spec_destination, prepare_output_dir,
-        resolve_auditor_model, select_backend, unchecked_nemesis_task_ids, verify_nemesis_outputs,
-        PhaseConfig,
+        ensure_kimi_phase_config, ensure_nemesis_finalizer_config, ensure_nemesis_fixer_config,
+        load_nemesis_fix_results, maybe_prepare_output_dir, next_nemesis_spec_destination,
+        prepare_output_dir, resolve_auditor_model, select_backend, unchecked_nemesis_task_ids,
+        verify_nemesis_outputs, PhaseConfig, DEFAULT_NEMESIS_AUDIT_MODEL,
     };
     use crate::NemesisArgs;
 
@@ -2125,8 +2433,13 @@ Spec: specs/020426-nemesis-audit.md
             dry_run: true,
             fixer_model: "gpt-5.4".to_string(),
             fixer_effort: "high".to_string(),
+            finalizer_model: "gpt-5.4".to_string(),
+            finalizer_effort: "high".to_string(),
+            audit_passes: 1,
             codex_bin: PathBuf::from("codex"),
             pi_bin: PathBuf::from("pi"),
+            kimi_bin: PathBuf::from("kimi-cli"),
+            use_kimi_cli: false,
         }
     }
 
@@ -2138,6 +2451,8 @@ Spec: specs/020426-nemesis-audit.md
             &args.reasoning_effort,
             Path::new("codex"),
             Path::new("pi"),
+            Path::new("kimi-cli"),
+            false,
         );
         assert_eq!(backend.label(), "pi-minimax");
         assert_eq!(backend.model(), "minimax/MiniMax-M2.7-highspeed");
@@ -2145,13 +2460,31 @@ Spec: specs/020426-nemesis-audit.md
     }
 
     #[test]
-    fn select_backend_treats_kimi_model_alias_as_pi() {
+    fn select_backend_routes_kimi_through_kimi_cli_when_flag_is_on() {
+        let args = sample_args("k2.6");
+        let backend = select_backend(
+            &args.model,
+            &args.reasoning_effort,
+            Path::new("codex"),
+            Path::new("pi"),
+            Path::new("kimi-cli"),
+            true,
+        );
+        assert_eq!(backend.label(), "kimi-cli");
+        assert_eq!(backend.model(), "k2.6");
+        assert_eq!(backend.variant(), "high");
+    }
+
+    #[test]
+    fn select_backend_treats_kimi_model_alias_as_pi_when_kimi_cli_off() {
         let args = sample_args("kimi");
         let backend = select_backend(
             &args.model,
             &args.reasoning_effort,
             Path::new("codex"),
             Path::new("pi"),
+            Path::new("kimi-cli"),
+            false,
         );
         assert_eq!(backend.label(), "pi-kimi");
         assert_eq!(backend.model(), "kimi-coding/k2p6");
@@ -2166,31 +2499,33 @@ Spec: specs/020426-nemesis-audit.md
             &args.reasoning_effort,
             Path::new("codex"),
             Path::new("pi"),
+            Path::new("kimi-cli"),
+            false,
         );
         assert_eq!(backend.label(), "pi-minimax");
         assert_eq!(backend.model(), "minimax/MiniMax-M2.7-highspeed");
     }
 
     #[test]
-    fn explicit_model_override_wins_over_kimi_flag() {
+    fn minimax_flag_forces_minimax_even_if_model_is_custom_kimi() {
+        // The --minimax opt-in is an explicit "give me the legacy audit run"
+        // request; it overrides the model argument.
         let mut args = sample_args("kimi-coding/k2p5");
-        args.kimi = true;
-        assert_eq!(resolve_auditor_model(&args), "kimi-coding/k2p5");
-    }
-
-    #[test]
-    fn explicit_model_override_wins_over_minimax_flag() {
-        let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
-        args.model = "minimax/MiniMax-M2.7".to_string();
         args.minimax = true;
-        assert_eq!(resolve_auditor_model(&args), "minimax/MiniMax-M2.7");
+        assert_eq!(resolve_auditor_model(&args), "minimax");
     }
 
     #[test]
-    fn shorthand_flags_only_apply_when_model_is_default() {
+    fn kimi_flag_forces_k2p6_default_even_if_model_is_legacy_minimax() {
         let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
         args.kimi = true;
-        assert_eq!(resolve_auditor_model(&args), "kimi");
+        assert_eq!(resolve_auditor_model(&args), "k2.6");
+    }
+
+    #[test]
+    fn no_flags_and_default_model_resolves_to_new_default() {
+        let args = sample_args(DEFAULT_NEMESIS_AUDIT_MODEL);
+        assert_eq!(resolve_auditor_model(&args), DEFAULT_NEMESIS_AUDIT_MODEL);
     }
 
     #[test]
@@ -2199,7 +2534,7 @@ Spec: specs/020426-nemesis-audit.md
             model: "gpt-5.4".to_string(),
             effort: "high".to_string(),
         };
-        assert!(ensure_pi_phase_config("nemesis", &config).is_err());
+        assert!(ensure_kimi_phase_config("nemesis", &config).is_err());
     }
 
     #[test]
@@ -2286,12 +2621,85 @@ Spec: specs/020426-nemesis-audit.md
     }
 
     #[test]
-    fn nemesis_fixer_must_not_use_pi_model() {
+    fn load_nemesis_fix_results_allows_truthful_noop_fixed_results() {
+        let path = temp_repo_path("nemesis-fixed-noop").join("implementation-results.json");
+        fs::create_dir_all(path.parent().expect("temp file should have a parent"))
+            .expect("failed to create temp dir");
+        fs::write(
+            &path,
+            r#"[
+  {
+    "task_id": "NEM-010",
+    "status": "fixed",
+    "summary": "No file changes were needed because the live repo already satisfied the requirement.",
+    "validation_commands": ["rg -n 'alerts' docs/ops/alerts.md -S"],
+    "touched_files": [],
+    "residual_risks": []
+  }
+]"#,
+        )
+        .expect("failed to write noop json");
+
+        let results = load_nemesis_fix_results(&path).expect("noop fixed result should load");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].touched_files.is_empty());
+    }
+
+    #[test]
+    fn load_nemesis_fix_results_rejects_fixed_results_without_files_or_noop_summary() {
+        let path =
+            temp_repo_path("nemesis-fixed-missing-files").join("implementation-results.json");
+        fs::create_dir_all(path.parent().expect("temp file should have a parent"))
+            .expect("failed to create temp dir");
+        fs::write(
+            &path,
+            r#"[
+  {
+    "task_id": "NEM-011",
+    "status": "fixed",
+    "summary": "Updated the validation surface.",
+    "validation_commands": ["cargo test -p barely-human observatory"],
+    "touched_files": [],
+    "residual_risks": []
+  }
+]"#,
+        )
+        .expect("failed to write invalid noop json");
+
+        let error = load_nemesis_fix_results(&path).expect_err("result should be rejected");
+        assert!(error
+            .to_string()
+            .contains("must include touched files unless the summary explicitly states"));
+    }
+
+    #[test]
+    fn nemesis_fixer_accepts_kimi_model_now_that_it_drives_remediation() {
         let config = PhaseConfig {
-            model: "kimi".to_string(),
+            model: "k2.6".to_string(),
             effort: "high".to_string(),
         };
-        let error = ensure_nemesis_fixer_config(&config)
+        assert!(
+            ensure_nemesis_fixer_config(&config).is_ok(),
+            "Kimi is the default fixer since auto bug + nemesis moved to kimi-cli"
+        );
+    }
+
+    #[test]
+    fn nemesis_fixer_rejects_empty_model() {
+        let config = PhaseConfig {
+            model: "   ".to_string(),
+            effort: "high".to_string(),
+        };
+        assert!(ensure_nemesis_fixer_config(&config).is_err());
+    }
+
+    #[test]
+    fn nemesis_finalizer_rejects_kimi_model() {
+        let config = PhaseConfig {
+            model: "k2.6".to_string(),
+            effort: "high".to_string(),
+        };
+        let error = ensure_nemesis_finalizer_config(&config)
             .unwrap_err()
             .to_string();
         assert!(error.contains("must use a Codex model"));

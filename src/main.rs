@@ -6,6 +6,7 @@ mod completion_artifacts;
 mod corpus;
 mod generation;
 mod health_command;
+mod kimi_backend;
 mod linear_tracker;
 mod loop_command;
 mod nemesis;
@@ -494,8 +495,8 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Model for the initial finder pass
-    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
+    /// Model for the initial finder pass (Kimi k2.6 by default)
+    #[arg(long, default_value = "k2.6")]
     finder_model: String,
 
     /// Effort / variant for the initial finder pass
@@ -503,7 +504,7 @@ pub(crate) struct BugArgs {
     finder_effort: String,
 
     /// Model for the adversarial skeptic pass
-    #[arg(long, default_value = "kimi")]
+    #[arg(long, default_value = "k2.6")]
     skeptic_model: String,
 
     /// Effort / variant for the skeptic pass
@@ -511,7 +512,7 @@ pub(crate) struct BugArgs {
     skeptic_effort: String,
 
     /// Model for the implementation pass after review verification
-    #[arg(long, default_value = "kimi")]
+    #[arg(long, default_value = "k2.6")]
     fixer_model: String,
 
     /// Effort / variant for the implementation pass after review verification
@@ -519,7 +520,7 @@ pub(crate) struct BugArgs {
     fixer_effort: String,
 
     /// Model for the verification review pass
-    #[arg(long, default_value = "kimi")]
+    #[arg(long, default_value = "k2.6")]
     reviewer_model: String,
 
     /// Effort / variant for the verification review pass
@@ -534,13 +535,24 @@ pub(crate) struct BugArgs {
     #[arg(long, default_value = "high")]
     finalizer_effort: String,
 
-    /// Codex executable to invoke for non-PI models
+    /// Codex executable to invoke for the finalizer / fallback path
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// PI executable to invoke for MiniMax/Kimi models
+    /// Legacy PI executable. Retained only as a fallback — by default auto bug now
+    /// routes Kimi phases through `kimi-cli --yolo`. Set `--no-use-kimi-cli` to
+    /// go back through `pi`.
     #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
     pi_bin: PathBuf,
+
+    /// kimi-cli executable (used when `--use-kimi-cli` is on, which is the default)
+    #[arg(long, default_value = "kimi-cli")]
+    kimi_bin: PathBuf,
+
+    /// Route Kimi phases through `kimi-cli --yolo` instead of the legacy `pi` binary.
+    /// Enabled by default. Pass `--no-use-kimi-cli` to opt back into PI.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_kimi_cli: bool,
 }
 
 #[derive(Args, Clone)]
@@ -882,27 +894,28 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// Model to use for the initial Nemesis audit pass. Values like `minimax` or `kimi` automatically use PI.
-    #[arg(long, default_value = "minimax/MiniMax-M2.7-highspeed")]
+    /// Model for the initial Nemesis audit pass (Kimi k2.6 by default).
+    #[arg(long, default_value = "k2.6")]
     model: String,
 
     /// Reasoning effort / variant for the initial Nemesis audit pass
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
-    /// Model to use for the final Nemesis synthesis pass. Values like `minimax` or `kimi` automatically use PI.
-    #[arg(long, default_value = "kimi")]
+    /// Model for the Nemesis synthesis pass (Kimi k2.6 by default).
+    #[arg(long, default_value = "k2.6")]
     reviewer_model: String,
 
     /// Reasoning effort / variant for the final Nemesis synthesis pass
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
 
-    /// Use PI with the current Kimi coding model for the initial Nemesis audit pass
+    /// Legacy opt-in. Kimi is the default; pass `--kimi` only to make the default explicit in logs.
     #[arg(long, conflicts_with = "minimax")]
     kimi: bool,
 
-    /// Use PI with the MiniMax M2.7-highspeed model for the initial Nemesis audit pass
+    /// Opt back into the retired MiniMax audit model. Kept for operators who
+    /// deliberately want a second-opinion run against legacy output.
     #[arg(long, conflicts_with = "kimi")]
     minimax: bool,
 
@@ -918,21 +931,43 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Model to use for the Nemesis implementation pass
-    #[arg(long, default_value = "gpt-5.4")]
+    /// Model to use for the Nemesis implementation / fixer pass. Kimi by default.
+    #[arg(long, default_value = "k2.6")]
     fixer_model: String,
 
     /// Reasoning effort / variant for the Nemesis implementation pass
     #[arg(long, default_value = "high")]
     fixer_effort: String,
 
-    /// Codex executable to invoke for the default backend
+    /// Model used by the final Codex review-of-Kimi-diff pass. Stays on gpt-5.4.
+    #[arg(long, default_value = "gpt-5.4")]
+    finalizer_model: String,
+
+    /// Reasoning effort / variant for the Codex finalizer pass
+    #[arg(long, default_value = "high")]
+    finalizer_effort: String,
+
+    /// Number of Nemesis auditor passes to run. 2+ passes surface more findings
+    /// because each pass explores the codebase differently.
+    #[arg(long, default_value_t = 1)]
+    audit_passes: usize,
+
+    /// Codex executable used for the finalizer + fallback path
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// PI executable to invoke for the Kimi/MiniMax backends
+    /// Legacy PI executable. Retained only as a fallback; set `--no-use-kimi-cli`
+    /// to route Kimi phases through `pi` again.
     #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
     pi_bin: PathBuf,
+
+    /// kimi-cli executable (used when `--use-kimi-cli` is on, which is the default)
+    #[arg(long, default_value = "kimi-cli")]
+    kimi_bin: PathBuf,
+
+    /// Route Kimi phases through `kimi-cli --yolo`. Default on.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_kimi_cli: bool,
 }
 
 #[tokio::main]
