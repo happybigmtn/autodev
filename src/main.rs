@@ -10,6 +10,7 @@ mod kimi_backend;
 mod linear_tracker;
 mod loop_command;
 mod nemesis;
+mod steward_command;
 mod parallel_command;
 mod pi_backend;
 mod qa_command;
@@ -69,6 +70,12 @@ enum Command {
     Health(HealthArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
+    /// Stewardship pass for a mid-flight repo: reconcile plan claims against
+    /// live code, surface hinge items, and apply approved IMPLEMENTATION_PLAN.md
+    /// and WORKLIST.md updates in one Kimi and Codex pipeline. Replaces
+    /// `auto corpus` and `auto gen` for repos that already have an active
+    /// planning surface.
+    Steward(StewardArgs),
     /// Prepare the current branch to ship, push it, and open or refresh a PR when appropriate
     Ship(ShipArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
@@ -757,6 +764,70 @@ pub(crate) struct ReviewArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct StewardArgs {
+    /// Directory for steward artifacts. Defaults to <repo>/steward
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Additional repo roots the steward may inspect. Use for the other side
+    /// of a two-repo project (e.g. `--reference-repo ../bitino` when stewarding
+    /// autonomy) so cross-repo contracts get audited in the same pass.
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
+    /// Read-only mode. Produce the steward artifacts but never edit
+    /// IMPLEMENTATION_PLAN.md / WORKLIST.md / LEARNINGS.md.
+    #[arg(long)]
+    report_only: bool,
+
+    /// Preview the steward prompt without invoking the model.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Optional branch to require for the steward pass; defaults to the current branch.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Steward model — reads the repo, writes drift + hinge + retire + hazard
+    /// artifacts, and proposes IMPLEMENTATION_PLAN.md edits.
+    #[arg(long, default_value = "k2.6")]
+    model: String,
+
+    /// Steward reasoning effort / thinking variant.
+    #[arg(long, default_value = "high")]
+    reasoning_effort: String,
+
+    /// Codex finalizer model — reviews the Kimi steward output and applies
+    /// approved IMPLEMENTATION_PLAN.md / WORKLIST.md edits in-place.
+    #[arg(long, default_value = "gpt-5.4")]
+    finalizer_model: String,
+
+    /// Codex finalizer reasoning effort.
+    #[arg(long, default_value = "high")]
+    finalizer_effort: String,
+
+    /// Codex executable used by the finalizer pass.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Legacy PI executable, used when `--no-use-kimi-cli` is set.
+    #[arg(long = "pi-bin", default_value = "pi")]
+    pi_bin: PathBuf,
+
+    /// kimi-cli executable.
+    #[arg(long, default_value = "kimi-cli")]
+    kimi_bin: PathBuf,
+
+    /// Route the Kimi steward pass through kimi-cli. On by default.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_kimi_cli: bool,
+
+    /// Skip the Codex finalizer pass and stop after Kimi writes steward artifacts.
+    #[arg(long)]
+    skip_codex_finalizer: bool,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct QaArgs {
     /// Stop after this many successful QA iterations. Default is 1.
     #[arg(long, default_value_t = 1)]
@@ -983,6 +1054,7 @@ async fn main() -> Result<()> {
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
         Command::Health(args) => health_command::run_health(args).await,
         Command::Review(args) => review_command::run_review(args).await,
+        Command::Steward(args) => steward_command::run_steward(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
         Command::Quota(args) => match args.command {
