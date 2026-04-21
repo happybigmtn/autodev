@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,68 +13,44 @@ use crate::util::{
 };
 use crate::ReviewArgs;
 
-pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
-0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, and `LEARNINGS.md` if they exist.
-0c. You may use installed helper workflows like `/ce:review`, `/review`, `/ce:work`, or `/ce:compound` if they are available, but you must still satisfy the full review contract below even if those helpers are missing.
-0d. When additional repositories are listed below, inspect and edit them directly when a reviewed item's owned surfaces, changed files, acceptance criteria, or blocker evidence point there. Read each touched repo's own `AGENTS.md` and operational docs before editing it.
+pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"You are running one iteration of `auto review` against a BATCH of items pulled from `REVIEW.md`. The runner will give you another iteration if you make real progress.
 
-1. Your task is to review the items currently listed in `REVIEW.md`.
-   - Treat each review item as a claim that must be verified against the codebase, the specs, and the implementation plan.
-   - Re-read the owned surfaces, integration touchpoints, and validation evidence for those items before trusting the claim.
-   - If the reviewed item's implementation or fix lives in an additional listed repo, review and patch that repo directly while keeping this queue repo's review artifacts truthful.
-   - Run a broad engineering review, not a status recap: look for regressions, weak assumptions, missing edge cases, security issues, integration gaps, and test blind spots.
+## Setup (one-time reading, cheap)
+- `AGENTS.md` — build, validation, staging rules for this repo.
+- `specs/*`, `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, `LEARNINGS.md` — only read if the current batch references them.
+- Installed `/ce:review` / `/review` / `/ce:work` helpers may be used if present, but you must still satisfy the contract below without them.
+- Additional repos (if listed) are editable only when a reviewed item's owned surfaces live there; read that repo's `AGENTS.md` first.
 
-2. Use this review workflow for every item:
-   - Understand the intended behavior and expected change first.
-   - Review the tests and verification evidence before reviewing the implementation details.
-   - Reconstruct the changed-file set and blast radius for the reviewed item from commits, diffs, touched tests, and adjacent integration surfaces before you decide the item is safe.
-   - Review the implementation across these five axes:
-     - correctness
-     - readability and simplicity
-     - architecture and boundaries
-     - security and trust boundaries
-     - performance and scalability
-   - If a base branch is discoverable, compare the current branch diff against that base instead of reviewing files in isolation.
-   - Pay special attention to structural issues that tests often miss: SQL/query safety, trust-boundary violations, unintended conditional side effects, stale config or migration coupling, and changes whose blast radius is wider than the touched files imply.
-   - For browser-facing or runtime-sensitive items, use browser/runtime verification when available instead of static review alone.
-   - Verify the verification story itself: commands actually run, outputs believable, screenshots or runtime evidence consistent with the code.
-   - Run a bounded simplification pass on the touched code when it will clearly improve readability or reduce complexity without changing behavior. Keep that simplification inside the reviewed surfaces; no drive-by cleanup.
-   - If the reviewed item quietly bundles multiple logical changes, call that out and split the follow-up work truthfully instead of waving it through as one thing.
-   - Categorize any findings as `Critical`, required, `Optional`, or `FYI`.
+## Contract for each batch item
+1. **Treat the claim as suspect.** Queue prose is frozen at write time; the live tree is ground truth. Verify cited file paths, cited test names, and cited behaviors against the current code.
+2. **Blast-radius reconstruct.** Find the changed files from git history for the item, scan adjacent tests / integration surfaces, compare against the base branch if discoverable.
+3. **Review along five axes.** Correctness; readability + simplicity; architecture + boundaries; security + trust boundaries; performance + scalability. Pay special attention to SQL/query safety, trust-boundary violations, unintended conditional side effects, stale config or migration coupling, and blast-radius-wider-than-touched-files.
+4. **Verify the verification story.** Run the cited cargo / pnpm / bash commands. If a command fails or names a non-existent test, that's a finding.
+5. **Bounded simplification only** — inside the reviewed surface, no drive-by cleanup.
+6. **Severity-tag findings** as `Critical`, `Required`, `Optional`, or `FYI`.
 
-3. Respect the queue split:
-   - `REVIEW.md` is the in-flight review queue.
-   - `COMPLETED.md` is free to keep receiving new implementation completions while review is running.
-   - Do not move items back into `IMPLEMENTATION_PLAN.md`.
+## If you find problems
+- Fix the finding directly when the root cause is clear and bounded.
+- Append severity-tagged follow-ups to `WORKLIST.md` (create if missing).
+- Record durable engineering lessons in `LEARNINGS.md`.
+- Leave unfinished items in `REVIEW.md`.
 
-4. If you find problems:
-   - Append concrete, severity-tagged follow-up items to `WORKLIST.md`. Create it if missing.
-   - Fix review findings directly when the root cause is clear and the work is bounded.
-   - Record durable learnings in `LEARNINGS.md`.
-   - Leave any not-yet-cleared entries in `REVIEW.md` until the fixes are actually landed and supported by the codebase.
-   - Keep `AGENTS.md` operational only.
+## If a batch item passes review
+- Move the entry from `REVIEW.md` into `ARCHIVED.md` (append-only).
+- Do not archive a claim whose cited paths show `EXISTS=false` in the live-tree verification block below without first reconciling the surface.
 
-5. If a review item passes review:
-   - Move its entry from `REVIEW.md` into `ARCHIVED.md`.
-   - `ARCHIVED.md` should be append-only history.
-   - Only archive items that are genuinely complete after review and any follow-up fixes.
+## Commits and branches
+- Stay on the currently checked-out branch. Do not create or switch branches.
+- Stage only files relevant to the review: the reviewed sources + `REVIEW.md` / `ARCHIVED.md` / `WORKLIST.md` / `LEARNINGS.md` / `AGENTS.md` when changed.
+- One repo per commit if multiple repos are touched. Commit message: `repo-name: review <batch ids>`.
+- Push the queue repo's branch back to origin after each commit-producing pass.
 
-6. Commit and push only truthful review increments:
-   - Stay on the branch that is already checked out when `auto review` starts.
-   - Do not create or switch branches during the review pass.
-   - Stage only the files relevant to the review fixes plus `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, `LEARNINGS.md`, and `AGENTS.md` when they changed.
-   - If you touch multiple repositories, commit and push each repository separately. Never try to mix files from different git repos into one commit.
-   - Commit with a message like `repo-name: review completed items` using the actual repository name for each touched repo.
-   - Push back to that same branch in the queue repo after each successful commit-producing pass. For additional listed repos, push the currently checked-out branch unless that repo's own instructions require something else.
-
-7. If `REVIEW.md` is empty or has no reviewable items:
-   - Do not invent work.
-   - Say so briefly and stop without making changes.
-
-99999. Important: prefer fixing findings over explaining them.
-999999. Important: do not archive an item until the code and review evidence support it.
-9999999. Important: this is a bug-finding and hardening pass, not a feature pass.
-99999999. Important: if the tests do not prove the claim, the implementation does not get a free pass."#;
+## Hard rules
+- Prefer fixing over explaining.
+- Do not archive an item the code + tests do not support.
+- This is a bug-finding and hardening pass, not a feature pass.
+- If the tests do not prove the claim, the implementation does not get a free pass.
+- Do not invent work if the batch is empty — stop."#;
 
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";
 const REVIEW_HEADER: &str = "# REVIEW";
@@ -212,6 +189,8 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     }
 
     let mut iteration = 0usize;
+    let mut previous_batch_identity: Option<Vec<String>> = None;
+    let mut stale_batch_counts: HashMap<Vec<String>, usize> = HashMap::new();
     while args.max_iterations == 0 || iteration < args.max_iterations {
         if !has_reviewable_items(&review_path)? {
             println!();
@@ -225,8 +204,36 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             break;
         }
 
+        let batch_identity = batch_identity_set(&batch);
+        if previous_batch_identity.as_ref() == Some(&batch_identity) {
+            let counter = stale_batch_counts.entry(batch_identity.clone()).or_insert(0);
+            *counter += 1;
+            if *counter >= 1 {
+                eprintln!();
+                eprintln!(
+                    "stale batch: iteration {} would process the identical item set as \
+                     iteration {}. Reviewer did not archive or convert any of: {}.",
+                    iteration + 1,
+                    iteration,
+                    batch_identity.join(", ")
+                );
+                eprintln!(
+                    "stopping to avoid an infinite loop. Convert these items into \
+                     IMPLEMENTATION_PLAN.md follow-ups or remove them from REVIEW.md \
+                     manually, then re-run `auto review`."
+                );
+                break;
+            }
+        }
+
         let live_tree_annotation = build_live_tree_annotation(&repo_root, &batch);
-        let batch_block = format_batch_block(&batch, total);
+        let batch_block = format_batch_block(
+            &batch,
+            total,
+            iteration + 1,
+            args.max_iterations,
+            args.batch_size,
+        );
         let full_prompt = format!(
             "{prompt_template}{live_tree_annotation}{batch_block}\nExecute the instructions \
              above against the batch items listed. Remaining queue items stay in REVIEW.md \
@@ -245,7 +252,22 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             batch.len(),
             total
         );
+        println!("batch ids:   {}", batch_identity.join(", "));
 
+        if args.dry_run {
+            println!();
+            println!("--dry-run: not invoking {harness}. Prompt written above.");
+            println!("--- live-tree annotation ---");
+            print!("{}", live_tree_annotation);
+            println!("--- batch block ---");
+            print!("{}", batch_block);
+            break;
+        }
+
+        let iteration_before =
+            IterationSnapshot::capture(&repo_root, &review_path).with_context(|| {
+                format!("failed to snapshot review state in {}", repo_root.display())
+            })?;
         let state_before = collect_tracked_repo_states(&repo_root, &reference_repos)?;
         println!();
         println!("running {harness} review iteration {}", iteration + 1);
@@ -289,6 +311,21 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
 
         println!();
         println!("{harness} review iteration complete");
+
+        let iteration_after =
+            IterationSnapshot::capture(&repo_root, &review_path).with_context(|| {
+                format!("failed to snapshot review state in {}", repo_root.display())
+            })?;
+        print!(
+            "{}",
+            format_iteration_summary(
+                iteration + 1,
+                &iteration_before,
+                &iteration_after,
+                &repo_root,
+            )
+        );
+        previous_batch_identity = Some(batch_identity);
 
         let state_after = collect_tracked_repo_states(&repo_root, &reference_repos)?;
         match summarize_repo_progress(&state_before, &state_after) {
@@ -409,11 +446,189 @@ pub(crate) fn extract_cited_paths(item_body: &str) -> Vec<String> {
     paths
 }
 
+/// Compute a stable identity string for a REVIEW.md item from its first
+/// non-empty line, after stripping leading `## `/`- `/backtick decoration.
+/// Used to compare batches across iterations for stale-queue detection.
+pub(crate) fn item_identity(item: &str) -> String {
+    let first_line = item
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_start_matches("## ")
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim()
+        .to_string();
+    first_line
+}
+
+/// Sorted identity set for a batch. Two batches with the same identity set
+/// are considered "the same batch" even if the body prose drifted slightly.
+pub(crate) fn batch_identity_set(batch: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = batch.iter().map(|item| item_identity(item)).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Snapshot of observable review-pass state captured before and after each
+/// iteration so we can report a structured summary instead of a generic
+/// "iteration complete".
+#[derive(Clone, Debug)]
+pub(crate) struct IterationSnapshot {
+    pub review_count: usize,
+    pub worklist_bytes: u64,
+    pub archived_count: Option<usize>,
+    pub learnings_bytes: u64,
+    pub head_commit: String,
+}
+
+impl IterationSnapshot {
+    pub(crate) fn capture(repo_root: &Path, review_path: &Path) -> Result<Self> {
+        let review_count = if review_path.exists() {
+            let content = fs::read_to_string(review_path).with_context(|| {
+                format!("failed to read {}", review_path.display())
+            })?;
+            extract_review_items(&content).len()
+        } else {
+            0
+        };
+        let worklist_bytes = path_size(repo_root.join("WORKLIST.md"));
+        let learnings_bytes = path_size(repo_root.join("LEARNINGS.md"));
+        let archived_path = repo_root.join("ARCHIVED.md");
+        let archived_count = if archived_path.exists() {
+            let content = fs::read_to_string(&archived_path).ok();
+            content.map(|text| extract_review_items(&text).len())
+        } else {
+            None
+        };
+        let head_commit = git_stdout(repo_root, ["rev-parse", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok(Self {
+            review_count,
+            worklist_bytes,
+            archived_count,
+            learnings_bytes,
+            head_commit,
+        })
+    }
+}
+
+fn path_size(path: PathBuf) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// Render a human-readable summary of what changed between two iteration
+/// snapshots so the surrounding run log is self-describing.
+pub(crate) fn format_iteration_summary(
+    iteration: usize,
+    before: &IterationSnapshot,
+    after: &IterationSnapshot,
+    repo_root: &Path,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("iteration {} summary:\n", iteration));
+    out.push_str(&format!(
+        "  - REVIEW.md items:   {} -> {} ({})\n",
+        before.review_count,
+        after.review_count,
+        signed_delta(before.review_count as i64, after.review_count as i64),
+    ));
+    if let (Some(before_arc), Some(after_arc)) = (before.archived_count, after.archived_count) {
+        out.push_str(&format!(
+            "  - ARCHIVED.md items: {} -> {} ({})\n",
+            before_arc,
+            after_arc,
+            signed_delta(before_arc as i64, after_arc as i64),
+        ));
+    }
+    if before.worklist_bytes != after.worklist_bytes {
+        out.push_str(&format!(
+            "  - WORKLIST.md size:  {} -> {} bytes ({})\n",
+            before.worklist_bytes,
+            after.worklist_bytes,
+            signed_delta(before.worklist_bytes as i64, after.worklist_bytes as i64),
+        ));
+    }
+    if before.learnings_bytes != after.learnings_bytes {
+        out.push_str(&format!(
+            "  - LEARNINGS.md size: {} -> {} bytes ({})\n",
+            before.learnings_bytes,
+            after.learnings_bytes,
+            signed_delta(before.learnings_bytes as i64, after.learnings_bytes as i64),
+        ));
+    }
+    if before.head_commit != after.head_commit && !before.head_commit.is_empty() {
+        let range = format!("{}..{}", before.head_commit, after.head_commit);
+        let commit_log = git_stdout(repo_root, ["log", "--oneline", range.as_str()])
+            .unwrap_or_default();
+        let commit_lines: Vec<&str> = commit_log.lines().filter(|l| !l.is_empty()).collect();
+        out.push_str(&format!(
+            "  - new commits:       {} ({}..{})\n",
+            commit_lines.len(),
+            short_sha(&before.head_commit),
+            short_sha(&after.head_commit),
+        ));
+        for line in commit_lines.iter().take(5) {
+            out.push_str(&format!("      {}\n", line));
+        }
+    } else {
+        out.push_str("  - new commits:       0\n");
+    }
+    out
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+fn signed_delta(before: i64, after: i64) -> String {
+    let delta = after - before;
+    if delta > 0 {
+        format!("+{delta}")
+    } else {
+        delta.to_string()
+    }
+}
+
 /// Render the batch of review items into a markdown block the reviewer sees.
 /// This is appended to the prompt so the reviewer works against a bounded
-/// list rather than re-parsing the entire REVIEW.md file.
-pub(crate) fn format_batch_block(batch: &[String], total: usize) -> String {
-    let mut out = String::from("\n## Review batch for this iteration\n\n");
+/// list rather than re-parsing the entire REVIEW.md file. Also injects an
+/// iteration-budget note so the reviewer knows whether to be thorough or
+/// efficient (iteration 1 of ~35 calls for discipline).
+pub(crate) fn format_batch_block(
+    batch: &[String],
+    total: usize,
+    iteration: usize,
+    max_iterations: usize,
+    batch_size: usize,
+) -> String {
+    let mut out = String::from("\n## Iteration context\n\n");
+    let effective_batch = if batch_size == 0 {
+        total.max(1)
+    } else {
+        batch_size.max(1)
+    };
+    let estimated_batches = total.div_ceil(effective_batch);
+    out.push_str(&format!(
+        "- Current iteration: {iteration}\n\
+         - Estimated batches to drain queue at this size: {estimated_batches}\n\
+         - Iteration cap: {iteration_cap}\n\
+         - Posture: review only the batch below. Do NOT try to drain the whole \
+         queue in one pass; the surrounding runner will give you another \
+         iteration if progress is real.\n\n",
+        iteration = iteration,
+        estimated_batches = estimated_batches,
+        iteration_cap = if max_iterations == 0 {
+            "unlimited (runs until queue empties or progress stalls)".to_string()
+        } else {
+            max_iterations.to_string()
+        },
+    ));
+    out.push_str("## Review batch for this iteration\n\n");
     out.push_str(&format!(
         "Queue has {total} total item(s); this iteration reviews {batch_len}. \
          Complete only these items; leave the rest of REVIEW.md alone.\n\n",
@@ -444,11 +659,11 @@ pub(crate) fn build_live_tree_annotation(repo_root: &Path, batch: &[String]) -> 
          or (b) rewrite the queue entry truthfully.\n\n",
     );
     for (index, item) in batch.iter().enumerate() {
-        let first_line = item.lines().next().unwrap_or("").trim();
-        let label = if first_line.is_empty() {
+        let label_source = item_identity(item);
+        let label = if label_source.is_empty() {
             format!("item {}", index + 1)
         } else {
-            first_line.to_string()
+            label_source
         };
         out.push_str(&format!("- {label}\n"));
         let paths = extract_cited_paths(item);
@@ -830,11 +1045,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        append_reference_repo_clause, build_live_tree_annotation, collect_tracked_repo_states,
-        discover_sibling_git_repos, ensure_review_docs, extract_cited_paths, extract_review_items,
-        format_batch_block, repo_forbids_legacy_review_trackers, resolve_reference_repos,
-        select_review_batch, summarize_repo_progress, RepoProgress, TrackedRepoState,
-        ARCHIVED_HEADER, REVIEW_HEADER,
+        append_reference_repo_clause, batch_identity_set, build_live_tree_annotation,
+        collect_tracked_repo_states, discover_sibling_git_repos, ensure_review_docs,
+        extract_cited_paths, extract_review_items, format_batch_block, format_iteration_summary,
+        item_identity, repo_forbids_legacy_review_trackers, resolve_reference_repos,
+        select_review_batch, summarize_repo_progress, IterationSnapshot, RepoProgress,
+        TrackedRepoState, ARCHIVED_HEADER, REVIEW_HEADER,
     };
 
     #[test]
@@ -1034,7 +1250,10 @@ mod tests {
             "- `A` first item body".to_string(),
             "- `B` second item body".to_string(),
         ];
-        let rendered = format_batch_block(&batch, 5);
+        let rendered = format_batch_block(&batch, 5, 1, 0, 2);
+        assert!(rendered.contains("Iteration context"));
+        assert!(rendered.contains("Current iteration: 1"));
+        assert!(rendered.contains("Estimated batches to drain queue at this size: 3"));
         assert!(rendered.contains("Queue has 5 total"));
         assert!(rendered.contains("reviews 2"));
         assert!(rendered.contains("Batch item 1"));
@@ -1058,6 +1277,59 @@ mod tests {
         assert!(annotation.contains("`missing/elsewhere.rs` EXISTS=false"));
 
         fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[test]
+    fn item_identity_strips_leading_markers_and_dedups() {
+        assert_eq!(item_identity("- `A-1` thing"), "`A-1` thing");
+        assert_eq!(item_identity("## `A-1` thing"), "`A-1` thing");
+        assert_eq!(item_identity("   \n  - `A-1` thing"), "`A-1` thing");
+        let ids = batch_identity_set(&[
+            "- `A-1` one".to_string(),
+            "## `B-2` two".to_string(),
+            "- `A-1` one".to_string(),
+        ]);
+        assert_eq!(ids, vec!["`A-1` one".to_string(), "`B-2` two".to_string()]);
+    }
+
+    #[test]
+    fn format_batch_block_shows_iteration_context() {
+        let batch = vec!["- `A` one".to_string()];
+        let rendered = format_batch_block(&batch, 1, 4, 10, 5);
+        assert!(rendered.contains("Current iteration: 4"));
+        assert!(rendered.contains("Iteration cap: 10"));
+        let rendered_unlimited = format_batch_block(&batch, 1, 1, 0, 5);
+        assert!(rendered_unlimited.contains("unlimited"));
+    }
+
+    #[test]
+    fn format_iteration_summary_reports_review_and_archived_deltas() {
+        let temp = unique_temp_dir();
+        init_git_repo(&temp);
+        commit_empty_change(&temp);
+
+        let before = IterationSnapshot {
+            review_count: 5,
+            worklist_bytes: 100,
+            archived_count: Some(10),
+            learnings_bytes: 200,
+            head_commit: "aaaaaaaa".to_string(),
+        };
+        let after = IterationSnapshot {
+            review_count: 3,
+            worklist_bytes: 150,
+            archived_count: Some(12),
+            learnings_bytes: 200,
+            head_commit: "aaaaaaaa".to_string(),
+        };
+        let summary = format_iteration_summary(2, &before, &after, &temp);
+        assert!(summary.contains("iteration 2 summary"));
+        assert!(summary.contains("5 -> 3 (-2)"));
+        assert!(summary.contains("10 -> 12 (+2)"));
+        assert!(summary.contains("100 -> 150 bytes (+50)"));
+        assert!(summary.contains("new commits:       0"));
+
+        fs::remove_dir_all(temp).expect("cleanup");
     }
 
     #[test]

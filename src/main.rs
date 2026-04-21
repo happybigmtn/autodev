@@ -736,6 +736,12 @@ pub(crate) struct ReviewArgs {
     /// Maximum Claude turns (only used with --claude). Omit for unlimited.
     #[arg(long)]
     max_turns: Option<usize>,
+
+    /// Build the per-iteration prompt, write it to the logs, and print the
+    /// batch + live-tree block to stdout — but do not invoke the model.
+    /// Useful for inspecting what will be sent before burning tokens.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Clone)]
