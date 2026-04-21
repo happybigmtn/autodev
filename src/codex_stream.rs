@@ -14,6 +14,12 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 use crate::util::clip_line_for_display;
 
 pub(crate) const CLAUDE_FUTILITY_THRESHOLD: usize = 8;
+/// Futility threshold used for passes that are read-heavy by design (code
+/// review). The standard threshold is tuned for implementation loops where
+/// each tool call produces a file edit; review spends more calls inspecting
+/// source before emitting anything, so the 8-count trigger frequently
+/// false-fires on an otherwise-healthy review run.
+pub(crate) const CLAUDE_FUTILITY_THRESHOLD_REVIEW: usize = 16;
 const CLAUDE_SEARCH_MISS_HINT_THRESHOLD: usize = 3;
 
 #[derive(Default)]
@@ -43,7 +49,6 @@ struct PiRenderState {
     last_agent_message: Option<String>,
 }
 
-#[derive(Default)]
 struct ClaudeRenderState {
     tool_count: usize,
     current_tool_name: Option<String>,
@@ -51,6 +56,24 @@ struct ClaudeRenderState {
     consecutive_empty_results: usize,
     consecutive_search_misses: usize,
     futility_detected: bool,
+    /// Threshold after which consecutive empty tool results are treated as
+    /// futility. Defaults to `CLAUDE_FUTILITY_THRESHOLD`; review mode raises
+    /// this because reviewer runs are read-heavy by design.
+    futility_threshold: usize,
+}
+
+impl Default for ClaudeRenderState {
+    fn default() -> Self {
+        Self {
+            tool_count: 0,
+            current_tool_name: None,
+            last_agent_message: None,
+            consecutive_empty_results: 0,
+            consecutive_search_misses: 0,
+            futility_detected: false,
+            futility_threshold: CLAUDE_FUTILITY_THRESHOLD,
+        }
+    }
 }
 
 pub(crate) async fn capture_codex_output<R>(stream: R) -> Result<String>
@@ -170,17 +193,21 @@ where
     Ok(raw)
 }
 
-pub(crate) async fn stream_claude_output<R>(
+pub(crate) async fn stream_claude_output_with_threshold<R>(
     stream: R,
     futility_tx: Option<oneshot::Sender<()>>,
     prefix: Option<&str>,
     rendered_log_path: Option<&Path>,
+    futility_threshold: usize,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream).lines();
-    let mut state = ClaudeRenderState::default();
+    let mut state = ClaudeRenderState {
+        futility_threshold,
+        ..ClaudeRenderState::default()
+    };
     let mut futility_tx = futility_tx;
     let mut rendered_log = open_rendered_log(rendered_log_path)?;
     while let Some(line) = reader
@@ -1013,7 +1040,7 @@ fn track_claude_tool_futility(
             state.consecutive_empty_results = 0;
         }
     }
-    if state.consecutive_empty_results >= CLAUDE_FUTILITY_THRESHOLD {
+    if state.consecutive_empty_results >= state.futility_threshold {
         state.futility_detected = true;
     }
     if emit_search_hint {

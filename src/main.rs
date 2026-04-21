@@ -2,6 +2,7 @@ mod bug_command;
 mod claude_exec;
 mod codex_exec;
 mod codex_stream;
+mod completion_artifacts;
 mod corpus;
 mod generation;
 mod health_command;
@@ -485,7 +486,7 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     report_only: bool,
 
-    /// Allow the final implementation pass to run on a dirty worktree
+    /// Allow the implementation and final review passes to run on a dirty worktree
     #[arg(long)]
     allow_dirty: bool,
 
@@ -509,11 +510,11 @@ pub(crate) struct BugArgs {
     #[arg(long, default_value = "high")]
     skeptic_effort: String,
 
-    /// Model for the final implementation pass. This stays pinned to gpt-5.4.
-    #[arg(long, default_value = "gpt-5.4")]
+    /// Model for the implementation pass after review verification
+    #[arg(long, default_value = "kimi")]
     fixer_model: String,
 
-    /// Effort / variant for the final implementation pass. This stays pinned to high.
+    /// Effort / variant for the implementation pass after review verification
     #[arg(long, default_value = "high")]
     fixer_effort: String,
 
@@ -524,6 +525,14 @@ pub(crate) struct BugArgs {
     /// Effort / variant for the verification review pass
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
+
+    /// Model for the final Codex review pass. This stays pinned to gpt-5.4.
+    #[arg(long, default_value = "gpt-5.4")]
+    finalizer_model: String,
+
+    /// Effort / variant for the final Codex review pass. This stays pinned to high.
+    #[arg(long, default_value = "high")]
+    finalizer_effort: String,
 
     /// Codex executable to invoke for non-PI models
     #[arg(long, default_value = "codex")]
@@ -681,6 +690,11 @@ pub(crate) struct ReviewArgs {
     #[arg(long, default_value_t = 0)]
     max_iterations: usize,
 
+    /// Number of REVIEW.md items to feed the reviewer per iteration. 0 means
+    /// "all items in one call" (legacy behavior — brittle on large queues).
+    #[arg(long, default_value_t = 5)]
+    batch_size: usize,
+
     /// Optional override for the review prompt template
     #[arg(long)]
     prompt_file: Option<PathBuf>,
@@ -697,9 +711,15 @@ pub(crate) struct ReviewArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Additional repo roots to add beyond auto-discovered sibling git repos.
+    /// Additional repo roots the reviewer may inspect or edit beyond the queue repo.
     #[arg(long = "reference-repo")]
     reference_repos: Vec<PathBuf>,
+
+    /// Auto-discover sibling git repos in the parent directory as reference repos.
+    /// Off by default — prior behavior was to enroll every sibling, which is slow
+    /// and makes one dirty unrelated sibling abort the whole review pass.
+    #[arg(long)]
+    include_siblings: bool,
 
     /// Directory for review logs. Defaults to <repo>/.auto/review
     #[arg(long)]

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::claude_exec::{describe_claude_harness, run_claude_exec};
+use crate::claude_exec::{describe_claude_harness, run_claude_with_futility};
 use crate::codex_exec::run_codex_exec;
+use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
@@ -96,7 +97,8 @@ Repo-specific direct `REVIEW.md` mode:
 pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
-    let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
+    let reference_repos =
+        resolve_reference_repos(&repo_root, &args.reference_repos, args.include_siblings)?;
 
     let completed_path = repo_root.join("COMPLETED.md");
     let review_path = repo_root.join("REVIEW.md");
@@ -146,7 +148,6 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             append_reference_repo_clause(prompt, &reference_repos)
         }
     };
-    let full_prompt = format!("{prompt_template}\n\nExecute the instructions above.");
 
     let run_root = args
         .run_root
@@ -176,11 +177,21 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!("reasoning:   {}", args.reasoning_effort);
     }
     println!("review doc:  {}", review_path.display());
+    println!(
+        "batch size:  {}",
+        if args.batch_size == 0 {
+            "unlimited (legacy)".to_string()
+        } else {
+            args.batch_size.to_string()
+        }
+    );
     if !reference_repos.is_empty() {
         println!("references:  {}", reference_repos.len());
         for path in &reference_repos {
             println!("  - {}", path.display());
         }
+    } else if !args.include_siblings {
+        println!("references:  none (pass --include-siblings or --reference-repo to enroll)");
     }
     if moved_items > 0 {
         println!(
@@ -202,6 +213,26 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
 
     let mut iteration = 0usize;
     while args.max_iterations == 0 || iteration < args.max_iterations {
+        if !has_reviewable_items(&review_path)? {
+            println!();
+            println!("REVIEW.md is empty; stopping.");
+            break;
+        }
+        let (batch, total) = select_review_batch(&review_path, args.batch_size)?;
+        if batch.is_empty() {
+            println!();
+            println!("no reviewable items selected; stopping.");
+            break;
+        }
+
+        let live_tree_annotation = build_live_tree_annotation(&repo_root, &batch);
+        let batch_block = format_batch_block(&batch, total);
+        let full_prompt = format!(
+            "{prompt_template}{live_tree_annotation}{batch_block}\nExecute the instructions \
+             above against the batch items listed. Remaining queue items stay in REVIEW.md \
+             for the next iteration — do not try to drain the whole queue in one pass."
+        );
+
         let prompt_path = repo_root
             .join(".auto")
             .join("logs")
@@ -209,13 +240,18 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
         println!("prompt log:  {}", prompt_path.display());
+        println!(
+            "batch:       {} of {} queued item(s)",
+            batch.len(),
+            total
+        );
 
         let state_before = collect_tracked_repo_states(&repo_root, &reference_repos)?;
         println!();
         println!("running {harness} review iteration {}", iteration + 1);
 
         let exit_status = if args.claude {
-            run_claude_exec(
+            run_claude_with_futility(
                 &repo_root,
                 &full_prompt,
                 &args.model,
@@ -224,6 +260,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
                 &stderr_log_path,
                 None,
                 "auto review",
+                Some(CLAUDE_FUTILITY_THRESHOLD_REVIEW),
             )
             .await?
         } else {
@@ -301,6 +338,133 @@ pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {
     Ok(!extract_review_items(&content).is_empty())
 }
 
+/// Read REVIEW.md and return the first `batch_size` items. A `batch_size` of 0
+/// means "pick every item" (legacy behavior — brittle on large queues).
+pub(crate) fn select_review_batch(
+    review_path: &Path,
+    batch_size: usize,
+) -> Result<(Vec<String>, usize)> {
+    let content = fs::read_to_string(review_path)
+        .with_context(|| format!("failed to read {}", review_path.display()))?;
+    let items = extract_review_items(&content);
+    let total = items.len();
+    if batch_size == 0 || items.len() <= batch_size {
+        return Ok((items, total));
+    }
+    let batch = items.into_iter().take(batch_size).collect();
+    Ok((batch, total))
+}
+
+/// Extract `path/file.ext`-shaped tokens from a REVIEW.md item body. Only the
+/// characters between matching backticks count; this avoids treating prose
+/// phrases as paths. A path must contain at least one `/` and at least one
+/// `.` (to screen out constants / env vars named in bullets).
+pub(crate) fn extract_cited_paths(item_body: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut iter = item_body.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if ch != '`' {
+            continue;
+        }
+        let start = idx + 1;
+        let mut end = None;
+        for (j, c) in item_body[start..].char_indices() {
+            if c == '`' {
+                end = Some(start + j);
+                break;
+            }
+        }
+        let Some(end_idx) = end else { break };
+        let token = &item_body[start..end_idx];
+        while let Some((next_idx, _)) = iter.peek() {
+            if *next_idx <= end_idx {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        if token.is_empty() || token.len() > 200 {
+            continue;
+        }
+        if !token.contains('/') || !token.contains('.') {
+            continue;
+        }
+        if token.chars().any(|c| c.is_whitespace()) {
+            continue;
+        }
+        // Drop anchor / query / colon suffixes (e.g. `foo/bar.rs:123`).
+        let cleaned = token
+            .split([':', '#', '?'])
+            .next()
+            .unwrap_or(token)
+            .trim_start_matches("./")
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+        paths.push(cleaned);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Render the batch of review items into a markdown block the reviewer sees.
+/// This is appended to the prompt so the reviewer works against a bounded
+/// list rather than re-parsing the entire REVIEW.md file.
+pub(crate) fn format_batch_block(batch: &[String], total: usize) -> String {
+    let mut out = String::from("\n## Review batch for this iteration\n\n");
+    out.push_str(&format!(
+        "Queue has {total} total item(s); this iteration reviews {batch_len}. \
+         Complete only these items; leave the rest of REVIEW.md alone.\n\n",
+        total = total,
+        batch_len = batch.len(),
+    ));
+    for (index, item) in batch.iter().enumerate() {
+        out.push_str(&format!("### Batch item {}\n\n", index + 1));
+        out.push_str(item);
+        if !item.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Emit a `## Live-tree verification` prompt annotation enumerating each
+/// batch item's cited paths and whether they still exist. The reviewer sees
+/// `EXISTS=false` against deleted surfaces and refuses to archive a stale
+/// claim rather than trusting the prose in REVIEW.md.
+pub(crate) fn build_live_tree_annotation(repo_root: &Path, batch: &[String]) -> String {
+    let mut out = String::from("\n## Live-tree verification\n\n");
+    out.push_str(
+        "The queue entries below name one or more file paths. Before archiving any item, \
+         refuse items whose cited paths no longer exist in the current tree and either \
+         (a) convert them into fresh IMPLEMENTATION_PLAN.md tasks that re-land the surface, \
+         or (b) rewrite the queue entry truthfully.\n\n",
+    );
+    for (index, item) in batch.iter().enumerate() {
+        let first_line = item.lines().next().unwrap_or("").trim();
+        let label = if first_line.is_empty() {
+            format!("item {}", index + 1)
+        } else {
+            first_line.to_string()
+        };
+        out.push_str(&format!("- {label}\n"));
+        let paths = extract_cited_paths(item);
+        if paths.is_empty() {
+            out.push_str("  - no `/`-containing paths cited in the body\n");
+            continue;
+        }
+        for path in paths {
+            let exists = repo_root.join(&path).exists();
+            out.push_str(&format!("  - `{path}` EXISTS={exists}\n"));
+        }
+    }
+    out.push('\n');
+    out
+}
+
 fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> String {
     if reference_repos.is_empty() {
         return prompt;
@@ -328,8 +492,16 @@ fn repo_forbids_legacy_review_trackers(repo_root: &Path) -> bool {
     })
 }
 
-fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut resolved = discover_sibling_git_repos(repo_root)?;
+fn resolve_reference_repos(
+    repo_root: &Path,
+    paths: &[PathBuf],
+    include_siblings: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut resolved = if include_siblings {
+        discover_sibling_git_repos(repo_root)?
+    } else {
+        Vec::new()
+    };
     for path in paths {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -472,30 +644,56 @@ fn collect_tracked_repo_states(
     Ok(states)
 }
 
+/// Summarize repo progress. The first entry in `before`/`after` is the primary
+/// (queue) repo; the rest are reference repos. Uncommitted changes in the
+/// primary repo are a hard signal (`DirtyChanges`) so the reviewer is forced
+/// to resolve them; dirty reference repos only emit a warning — one dirty
+/// unrelated sibling must not abort an otherwise-healthy review pass.
 fn summarize_repo_progress(
     before: &[TrackedRepoState],
     after: &[TrackedRepoState],
 ) -> RepoProgress {
-    let mut dirty_repos = Vec::new();
-    for after_state in after {
+    let mut dirty_primary = Vec::new();
+    let mut dirty_references = Vec::new();
+    let mut any_new_commits = false;
+    for (index, after_state) in after.iter().enumerate() {
+        let is_primary = index == 0;
         let Some(before_state) = before.iter().find(|state| state.path == after_state.path) else {
-            return RepoProgress::NewCommits;
+            any_new_commits = true;
+            continue;
         };
         if before_state.head != after_state.head {
-            return RepoProgress::NewCommits;
+            any_new_commits = true;
+            continue;
         }
         if before_state.status != after_state.status {
-            dirty_repos.push(after_state.name.clone());
+            if is_primary {
+                dirty_primary.push(after_state.name.clone());
+            } else {
+                dirty_references.push(after_state.name.clone());
+            }
         }
     }
 
-    if dirty_repos.is_empty() {
-        RepoProgress::None
-    } else {
-        dirty_repos.sort();
-        dirty_repos.dedup();
-        RepoProgress::DirtyChanges(dirty_repos)
+    if !dirty_references.is_empty() {
+        dirty_references.sort();
+        dirty_references.dedup();
+        eprintln!(
+            "warning: reference repo(s) left uncommitted changes: {}; ignoring and continuing \
+             (use --reference-repo only for repos you actually want the reviewer to touch)",
+            dirty_references.join(", ")
+        );
     }
+
+    if any_new_commits {
+        return RepoProgress::NewCommits;
+    }
+    if !dirty_primary.is_empty() {
+        dirty_primary.sort();
+        dirty_primary.dedup();
+        return RepoProgress::DirtyChanges(dirty_primary);
+    }
+    RepoProgress::None
 }
 
 pub(crate) fn handoff_completed_items_to_review_queue(
@@ -632,9 +830,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        append_reference_repo_clause, collect_tracked_repo_states, discover_sibling_git_repos,
-        ensure_review_docs, extract_review_items, repo_forbids_legacy_review_trackers,
-        resolve_reference_repos, summarize_repo_progress, RepoProgress, TrackedRepoState,
+        append_reference_repo_clause, build_live_tree_annotation, collect_tracked_repo_states,
+        discover_sibling_git_repos, ensure_review_docs, extract_cited_paths, extract_review_items,
+        format_batch_block, repo_forbids_legacy_review_trackers, resolve_reference_repos,
+        select_review_batch, summarize_repo_progress, RepoProgress, TrackedRepoState,
         ARCHIVED_HEADER, REVIEW_HEADER,
     };
 
@@ -729,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reference_repos_merges_siblings_and_explicit_paths() {
+    fn resolve_reference_repos_merges_siblings_and_explicit_paths_when_opted_in() {
         let workspace = unique_temp_dir();
         let repo_root = workspace.join("bitpoker");
         let sibling_repo = workspace.join("robopokermulti");
@@ -742,6 +941,7 @@ mod tests {
         let resolved = resolve_reference_repos(
             &repo_root,
             &[PathBuf::from("../sharedlib"), sibling_repo.clone()],
+            true,
         )
         .expect("resolve repos");
 
@@ -754,6 +954,110 @@ mod tests {
         );
 
         fs::remove_dir_all(&workspace).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn resolve_reference_repos_skips_siblings_by_default() {
+        let workspace = unique_temp_dir();
+        let repo_root = workspace.join("bitpoker");
+        let sibling_repo = workspace.join("robopokermulti");
+        let explicit_repo = workspace.join("sharedlib");
+
+        init_git_repo(&repo_root);
+        init_git_repo(&sibling_repo);
+        init_git_repo(&explicit_repo);
+
+        let resolved = resolve_reference_repos(
+            &repo_root,
+            &[PathBuf::from("../sharedlib")],
+            false,
+        )
+        .expect("resolve repos");
+
+        assert_eq!(
+            resolved,
+            vec![explicit_repo.canonicalize().expect("canonical explicit")],
+            "sibling repo should not be enrolled without --include-siblings"
+        );
+
+        fs::remove_dir_all(&workspace).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn extract_cited_paths_finds_rs_and_md_paths_in_backticks() {
+        let body = "- `P-020B` fix at `observatory-tui/src/nl/parser.rs:42`\n  - note `scripts/check-autoloop-affected-rust.sh`\n  - verbatim `not/a/path.plain text` should not match";
+        let paths = extract_cited_paths(body);
+        assert!(paths.contains(&"observatory-tui/src/nl/parser.rs".to_string()));
+        assert!(paths.contains(&"scripts/check-autoloop-affected-rust.sh".to_string()));
+        for path in &paths {
+            assert!(!path.contains(' '), "paths must not contain whitespace");
+            assert!(!path.contains(':'), "paths must strip trailing :N anchors");
+        }
+    }
+
+    #[test]
+    fn extract_cited_paths_skips_non_path_tokens() {
+        let body = "- `W2-NS-39` references `BRIDGE_COSIGN_VALIDATOR_PUBKEYS` and `SomeType`";
+        let paths = extract_cited_paths(body);
+        assert!(
+            paths.is_empty(),
+            "bare identifiers without / or . should not be flagged as paths, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn select_review_batch_respects_batch_size() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let review_path = temp.join("REVIEW.md");
+        fs::write(
+            &review_path,
+            "# REVIEW\n\n- `A` one\n- `B` two\n- `C` three\n- `D` four\n",
+        )
+        .expect("write review");
+
+        let (batch, total) = select_review_batch(&review_path, 2).expect("select");
+        assert_eq!(total, 4);
+        assert_eq!(batch.len(), 2);
+        assert!(batch[0].starts_with("- `A`"));
+        assert!(batch[1].starts_with("- `B`"));
+
+        let (all_batch, _) = select_review_batch(&review_path, 0).expect("select all");
+        assert_eq!(all_batch.len(), 4, "batch_size 0 must fall back to all items");
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn format_batch_block_includes_each_item_and_total_count() {
+        let batch = vec![
+            "- `A` first item body".to_string(),
+            "- `B` second item body".to_string(),
+        ];
+        let rendered = format_batch_block(&batch, 5);
+        assert!(rendered.contains("Queue has 5 total"));
+        assert!(rendered.contains("reviews 2"));
+        assert!(rendered.contains("Batch item 1"));
+        assert!(rendered.contains("- `A` first item body"));
+        assert!(rendered.contains("Batch item 2"));
+        assert!(rendered.contains("- `B` second item body"));
+    }
+
+    #[test]
+    fn build_live_tree_annotation_flags_missing_paths() {
+        let workspace = unique_temp_dir();
+        fs::create_dir_all(workspace.join("src")).expect("create workspace");
+        fs::write(workspace.join("src/present.rs"), "").expect("write present.rs");
+
+        let batch = vec![format!(
+            "- `FAKE-001` exists via `src/present.rs` and absent via `missing/elsewhere.rs`"
+        )];
+        let annotation = build_live_tree_annotation(&workspace, &batch);
+        assert!(annotation.contains("Live-tree verification"));
+        assert!(annotation.contains("`src/present.rs` EXISTS=true"));
+        assert!(annotation.contains("`missing/elsewhere.rs` EXISTS=false"));
+
+        fs::remove_dir_all(workspace).expect("cleanup");
     }
 
     #[test]
@@ -772,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_progress_flags_dirty_reference_repo_without_commit() {
+    fn repo_progress_warns_on_dirty_reference_repo_without_bailing() {
         let before = vec![
             TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
             TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
@@ -790,7 +1094,32 @@ mod tests {
         let progress = summarize_repo_progress(&before, &after);
         assert_eq!(
             progress,
-            RepoProgress::DirtyChanges(vec!["robopokermulti".to_string()])
+            RepoProgress::None,
+            "dirty reference repo should warn (via stderr), not force the caller to bail"
+        );
+    }
+
+    #[test]
+    fn repo_progress_bails_only_on_dirty_primary_repo() {
+        let before = vec![
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", ""),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+        let after = vec![
+            TrackedRepoState::new(
+                "bitpoker",
+                "/tmp/bitpoker",
+                "aaa111",
+                " M src/main.rs",
+            ),
+            TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
+        ];
+
+        let progress = summarize_repo_progress(&before, &after);
+        assert_eq!(
+            progress,
+            RepoProgress::DirtyChanges(vec!["bitpoker".to_string()]),
+            "dirty primary repo must still bail out"
         );
     }
 

@@ -37,6 +37,35 @@ pub(crate) async fn run_claude_exec(
         context_label,
         &[],
         None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_claude_with_futility(
+    repo_root: &Path,
+    full_prompt: &str,
+    model: &str,
+    effort: &str,
+    max_turns: Option<usize>,
+    stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
+    context_label: &str,
+    futility_threshold: Option<usize>,
+) -> Result<std::process::ExitStatus> {
+    run_claude_exec_with_env(
+        repo_root,
+        full_prompt,
+        model,
+        effort,
+        max_turns,
+        stderr_log_path,
+        stdout_log_path,
+        context_label,
+        &[],
+        None,
+        futility_threshold,
     )
     .await
 }
@@ -53,6 +82,7 @@ pub(crate) async fn run_claude_exec_with_env(
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
+    futility_threshold: Option<usize>,
 ) -> Result<std::process::ExitStatus> {
     let resolved_model = resolve_claude_model(model);
     let resolved_effort = resolve_claude_effort(effort);
@@ -83,6 +113,7 @@ pub(crate) async fn run_claude_exec_with_env(
                     &context_label,
                     &extra_env,
                     worker_pid_path,
+                    futility_threshold,
                 )
                 .await
             }
@@ -100,6 +131,7 @@ pub(crate) async fn run_claude_exec_with_env(
             context_label,
             extra_env,
             worker_pid_path,
+            futility_threshold,
         )
         .await?
     };
@@ -120,6 +152,7 @@ async fn spawn_claude(
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
+    futility_threshold: Option<usize>,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new("claude");
     command
@@ -171,12 +204,15 @@ async fn spawn_claude(
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
     let stream_label = context_label.to_string();
     let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
+    let resolved_threshold =
+        futility_threshold.unwrap_or(codex_stream::CLAUDE_FUTILITY_THRESHOLD);
     let stdout_task = tokio::spawn(async move {
-        codex_stream::stream_claude_output(
+        codex_stream::stream_claude_output_with_threshold(
             stdout,
             Some(futility_tx),
             Some(stream_label.as_str()),
             stdout_log_path.as_deref(),
+            resolved_threshold,
         )
         .await
     });
