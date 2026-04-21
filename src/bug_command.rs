@@ -14,7 +14,7 @@ use tokio::time::{self, Duration};
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
-    resolve_kimi_bin, KIMI_CLI_DEFAULT_MODEL,
+    preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
@@ -227,6 +227,16 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         effort: args.finalizer_effort.clone(),
     };
     ensure_code_writer_config("auto bug final review pass", &finalizer)?;
+    if args.use_kimi_cli {
+        let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
+        preflight_kimi_cli(&kimi_bin, &finder.model).with_context(|| {
+            format!(
+                "kimi-cli preflight failed. Pipeline aborted before touching {} \
+                 chunks; no work was wasted.",
+                chunks.len()
+            )
+        })?;
+    }
     // Every pre-finalizer phase must route through Kimi. The finalizer stays
     // Codex; everything else must be the Kimi remediation path (either via
     // `kimi-cli` or the legacy PI Kimi route when `--no-use-kimi-cli` is set).
@@ -1154,7 +1164,7 @@ fn select_backend(
     if is_kimi_model(model) {
         if use_kimi_cli {
             return LlmBackend::KimiCli {
-                model: resolve_kimi_cli_model_name(model),
+                model: resolve_kimi_cli_model(model),
                 thinking: effort.to_string(),
                 kimi_bin: resolve_kimi_bin(kimi_bin),
             };
@@ -1192,22 +1202,6 @@ fn is_kimi_model(model: &str) -> bool {
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
 
-/// Normalise the user's spelling to the short id `kimi-cli` expects (`k2.6`).
-fn resolve_kimi_cli_model_name(model: &str) -> String {
-    let lower = model.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return KIMI_CLI_DEFAULT_MODEL.to_string();
-    }
-    if let Some(short) = lower.rsplit('/').next() {
-        match short {
-            "k2p6" | "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
-            | "kimi-2.6-code-preview" => return "k2.6".to_string(),
-            "k2p5" | "k2.5" | "kimi-2.5" | "kimi-k2.5" => return "k2.5".to_string(),
-            _ => {}
-        }
-    }
-    model.trim().to_string()
-}
 
 fn display_phase_model(config: &PhaseConfig) -> String {
     PiProvider::detect(&config.model)

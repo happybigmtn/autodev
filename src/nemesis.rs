@@ -11,7 +11,7 @@ use tokio::process::Command as TokioCommand;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
-    resolve_kimi_bin, KIMI_CLI_DEFAULT_MODEL,
+    preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::util::{
@@ -320,6 +320,10 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     ensure_kimi_phase_config("auto nemesis synthesis pass", &reviewer)?;
     ensure_nemesis_fixer_config(&fixer)?;
     ensure_nemesis_finalizer_config(&finalizer)?;
+    if args.use_kimi_cli {
+        let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
+        preflight_kimi_cli(&kimi_bin, &auditor.model)?;
+    }
     let audit_backend = select_backend(
         &auditor.model,
         &auditor.effort,
@@ -637,7 +641,7 @@ fn select_backend(
     let is_kimi = is_kimi_model(model);
     if is_kimi && use_kimi_cli {
         return NemesisBackend::KimiCli {
-            model: resolve_kimi_cli_model_name(model),
+            model: resolve_kimi_cli_model(model),
             thinking: effort.to_string(),
             kimi_bin: resolve_kimi_bin(kimi_bin),
         };
@@ -664,21 +668,6 @@ fn is_kimi_model(model: &str) -> bool {
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
 
-fn resolve_kimi_cli_model_name(model: &str) -> String {
-    let lower = model.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return KIMI_CLI_DEFAULT_MODEL.to_string();
-    }
-    if let Some(short) = lower.rsplit('/').next() {
-        match short {
-            "k2p6" | "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
-            | "kimi-2.6-code-preview" => return "k2.6".to_string(),
-            "k2p5" | "k2.5" | "kimi-2.5" | "kimi-k2.5" => return "k2.5".to_string(),
-            _ => {}
-        }
-    }
-    model.trim().to_string()
-}
 
 fn ensure_kimi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
     if !is_kimi_model(&config.model) && PiProvider::detect(&config.model).is_none() {
@@ -2471,7 +2460,9 @@ Spec: specs/020426-nemesis-audit.md
             true,
         );
         assert_eq!(backend.label(), "kimi-cli");
-        assert_eq!(backend.model(), "k2.6");
+        // `k2.6` is the short id; it must be resolved to the provider-qualified
+        // name kimi-cli actually reads from ~/.kimi/config.toml.
+        assert_eq!(backend.model(), "kimi-code/kimi-for-coding");
         assert_eq!(backend.variant(), "high");
     }
 

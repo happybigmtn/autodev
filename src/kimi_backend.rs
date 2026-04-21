@@ -13,13 +13,47 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-/// Default Kimi model id passed to `kimi-cli -m`. `kimi-cli` reads an
-/// overridable config at `~/.kimi/config.toml`; we pass a value that both
-/// cloud and self-hosted setups recognise.
-pub(crate) const KIMI_CLI_DEFAULT_MODEL: &str = "k2.6";
+/// Default Kimi model id passed to `kimi-cli -m`. `kimi-cli` 1.22 expects
+/// the full provider-qualified name from its `~/.kimi/config.toml` — the
+/// short ids like `k2.6` that we use in CLI flags and logs must be mapped
+/// back to this form or kimi-cli will bail with `LLM not set`.
+pub(crate) const KIMI_CLI_DEFAULT_MODEL: &str = "kimi-code/kimi-for-coding";
+
+/// Env override for the kimi-cli model id. Operators who pin a non-default
+/// `~/.kimi/config.toml` model can set `FABRO_KIMI_CLI_MODEL=<full id>` and
+/// both `auto bug` and `auto nemesis` pick it up.
+const KIMI_CLI_MODEL_ENV: &str = "FABRO_KIMI_CLI_MODEL";
+
+/// Map a user-facing short id (`k2.6`, `kimi`, `kimi-coding/k2p6`, …) onto
+/// the provider-qualified id kimi-cli expects. Falls back to the configured
+/// default when the input doesn't match a known alias.
+pub(crate) fn resolve_kimi_cli_model(short_id: &str) -> String {
+    if let Ok(explicit) = std::env::var(KIMI_CLI_MODEL_ENV) {
+        if !explicit.trim().is_empty() {
+            return explicit.trim().to_string();
+        }
+    }
+    let lower = short_id.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return KIMI_CLI_DEFAULT_MODEL.to_string();
+    }
+    // If the caller already passed a provider-qualified id (contains `/`),
+    // trust it — that's the shape kimi-cli reads from `~/.kimi/config.toml`.
+    if short_id.contains('/') {
+        return short_id.trim().to_string();
+    }
+    match lower.as_str() {
+        "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
+        | "kimi-2.6-code-preview" | "k2p6" | "kimi-for-coding" => {
+            KIMI_CLI_DEFAULT_MODEL.to_string()
+        }
+        "k2.5" | "kimi-2.5" | "kimi-k2.5" | "k2p5" => "kimi-code/kimi-for-coding-k2p5".to_string(),
+        _ => KIMI_CLI_DEFAULT_MODEL.to_string(),
+    }
+}
 
 /// Resolve the `kimi-cli` binary. If the caller passed an absolute path or a
 /// non-default `kimi-bin` override, honour it; otherwise discover via
@@ -56,13 +90,14 @@ pub(crate) fn resolve_kimi_bin(configured: &Path) -> PathBuf {
 /// for progress rendering + final-text extraction.
 #[must_use]
 pub(crate) fn kimi_exec_args(model: &str, thinking: &str, prompt: &str) -> Vec<String> {
+    let resolved_model = resolve_kimi_cli_model(model);
     let mut args = vec![
         "--yolo".to_string(),
         "--print".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "-m".to_string(),
-        model.to_string(),
+        resolved_model,
     ];
     // `thinking` maps onto kimi-cli's `--thinking` toggle. Kimi k2.6 currently
     // accepts "on" (default) or "off"; we map our effort strings conservatively.
@@ -99,7 +134,21 @@ pub(crate) fn extract_final_text(line: &str) -> Option<String> {
 /// Decode a kimi-cli-reported error from a stream-json payload. kimi-cli
 /// emits `{"type":"error", ...}` frames on auth / quota / context-window
 /// failures; map them to a terse operator message.
+///
+/// Also detects the plain-text "LLM not set" failure that kimi-cli 1.22
+/// emits as a bare string on stdout (exit 0!) when the requested model id
+/// isn't present in `~/.kimi/config.toml`. That failure mode is silent from
+/// the caller's perspective, so we surface it explicitly.
 pub(crate) fn parse_kimi_error(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed == "LLM not set" || trimmed.ends_with("\nLLM not set") {
+        return Some(
+            "kimi-cli reported `LLM not set` — the configured model id is not in \
+             ~/.kimi/config.toml. Run `kimi-cli login`, check `default_model`, or \
+             set FABRO_KIMI_CLI_MODEL=<full model id>."
+                .to_string(),
+        );
+    }
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -118,6 +167,58 @@ pub(crate) fn parse_kimi_error(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Preflight that the kimi-cli binary + model combination actually produces
+/// usable output. Run once at the top of `auto bug` / `auto nemesis` so we
+/// fail in under a second if the operator hasn't run `kimi-cli login` or
+/// has the wrong model id, instead of burning 119 chunks worth of fallback
+/// attempts.
+pub(crate) fn preflight_kimi_cli(kimi_bin: &std::path::Path, model: &str) -> Result<()> {
+    let resolved = resolve_kimi_cli_model(model);
+    let output = std::process::Command::new(kimi_bin)
+        .args([
+            "--yolo",
+            "--print",
+            "--output-format",
+            "text",
+            "--final-message-only",
+            "-m",
+            &resolved,
+            "--no-thinking",
+            "-p",
+            "reply with exactly one word: ok",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to invoke `{} --print -p` for kimi-cli preflight",
+                kimi_bin.display()
+            )
+        })?;
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|c: i32| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        bail!(
+            "kimi-cli preflight failed with status {}: {}",
+            code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(detail) = parse_kimi_error(&stdout) {
+        bail!("kimi-cli preflight failed: {detail}");
+    }
+    if stdout.trim().is_empty() {
+        bail!(
+            "kimi-cli preflight produced empty output; aborting before running the pipeline. \
+             Model resolved to `{resolved}`; check `kimi-cli info` and `~/.kimi/config.toml`."
+        );
+    }
+    Ok(())
 }
 
 /// Sanity-check a user-supplied model string. Rejects patterns that look like
@@ -147,8 +248,31 @@ mod tests {
         assert!(args.contains(&"--print".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"--thinking".to_string()));
-        assert!(args.windows(2).any(|w| w[0] == "-m" && w[1] == "k2.6"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-m" && w[1] == KIMI_CLI_DEFAULT_MODEL),
+            "short id `k2.6` must be resolved to the provider-qualified default model"
+        );
         assert!(args.last().map(String::as_str) == Some("audit this"));
+    }
+
+    #[test]
+    fn resolve_kimi_cli_model_maps_short_ids_to_full_provider_qualified_name() {
+        assert_eq!(resolve_kimi_cli_model("k2.6"), KIMI_CLI_DEFAULT_MODEL);
+        assert_eq!(resolve_kimi_cli_model("kimi"), KIMI_CLI_DEFAULT_MODEL);
+        assert_eq!(
+            resolve_kimi_cli_model("kimi-code/kimi-for-coding"),
+            "kimi-code/kimi-for-coding",
+            "caller-supplied provider-qualified names pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn parse_kimi_error_detects_llm_not_set() {
+        let stdout = "LLM not set\n";
+        let err = parse_kimi_error(stdout).expect("LLM not set must surface");
+        assert!(err.contains("LLM not set"));
+        assert!(err.contains("FABRO_KIMI_CLI_MODEL"));
     }
 
     #[test]
