@@ -5651,11 +5651,16 @@ fn cherry_pick_lane_range(
     head_ref: &str,
     failure_policy: CherryPickFailurePolicy,
 ) -> Result<()> {
+    if lane_changed_files(repo_root, base_commit, head_ref)?.is_empty() {
+        return Ok(());
+    }
+
     let range = format!("{base_commit}..{head_ref}");
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .arg("cherry-pick")
+        .arg("--empty=drop")
         .arg(&range)
         .output()
         .with_context(|| format!("failed to cherry-pick {range} in {}", repo_root.display()))?;
@@ -6069,8 +6074,9 @@ mod tests {
 
     use super::{
         audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
-        classify_parallel_preflight_needs, clear_partial_follow_up_tracking,
-        default_cargo_build_jobs_for, dirty_worktree_recovery_note, discover_sibling_git_repos,
+        cherry_pick_lane_range, classify_parallel_preflight_needs,
+        clear_partial_follow_up_tracking, default_cargo_build_jobs_for,
+        dirty_worktree_recovery_note, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, environment_blocker_reason,
         host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
         is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
@@ -6087,9 +6093,9 @@ mod tests {
         reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
         salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
         try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
-        ActiveLaneAssignment, LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate,
-        LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind,
-        ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
+        ActiveLaneAssignment, CherryPickFailurePolicy, LaneLandingRecoveryPrep, LaneRepoProgress,
+        LaneResumeCandidate, LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus,
+        ParallelBlockerKind, ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
         ParallelUnblockCandidateKind, PartialFollowUpDisposition,
     };
 
@@ -6705,6 +6711,54 @@ mod tests {
         assert!(!lane_repo_has_active_cherry_pick(&lane));
         let log = run_git_in(&lane, ["log", "--format=%s", "-2"]);
         assert_eq!(log, "lane change\nmain change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn cherry_pick_lane_range_treats_empty_tree_diff_as_already_applied() {
+        let (root, remote, _upstream, worker) =
+            init_remote_and_clones("parallel-empty-lane-commit", "main");
+        let lane = root.join("lane-empty");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane, ["config", "user.email", "autodev@example.com"]);
+
+        let base_commit = git_output(&lane, ["rev-parse", "HEAD"]);
+        run_git_in(
+            &lane,
+            ["commit", "--allow-empty", "-m", "verification-only marker"],
+        );
+        let lane_head = git_output(&lane, ["rev-parse", "HEAD"]);
+        run_git_in(
+            &worker,
+            [
+                "fetch",
+                lane.to_str().expect("lane path should be utf-8"),
+                lane_head.as_str(),
+            ],
+        );
+
+        cherry_pick_lane_range(
+            &worker,
+            &base_commit,
+            "FETCH_HEAD",
+            CherryPickFailurePolicy::Abort,
+        )
+        .expect("empty tree-diff lane commit should be treated as already applied");
+
+        assert_eq!(git_output(&worker, ["rev-parse", "HEAD"]), base_commit);
+        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        assert!(!lane_repo_has_active_cherry_pick(&worker));
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
