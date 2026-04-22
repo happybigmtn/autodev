@@ -57,3 +57,11 @@ Awaiting auto review:
 - Validation: repo does not require a verification receipt wrapper for this task
 - Completion artifacts: `.github/workflows/ci.yml`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `TASK-012`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/loop-receipt-gating.md`
+- Scope exceptions: none recorded by host.
+- Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib loop_command::tests::downgrades_marker_when_receipt_missing`
+- Completion artifacts: `docs/decisions/loop-receipt-gating.md`
+- Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib loop_command::tests::downgrades_marker_when_receipt_missing`
