@@ -49,3 +49,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib quota_usage::tests::claude_refresh_error_does_not_leak_body`, `cargo test --lib quota_status::tests::print_does_not_leak_token_chain`
 - Completion artifacts: `src/quota_usage.rs`, `src/quota_status.rs`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib quota_usage::tests::claude_refresh_error_does_not_leak_body`, `cargo test --lib quota_status::tests::print_does_not_leak_token_chain`
+
+## `TASK-008`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `.github/workflows/ci.yml`
+- Scope exceptions: none recorded by host.
+- Validation: repo does not require a verification receipt wrapper for this task
+- Completion artifacts: `.github/workflows/ci.yml`
+- Remaining blockers: missing REVIEW.md handoff

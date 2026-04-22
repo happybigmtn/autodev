@@ -121,7 +121,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: XS
     Completion signal: COMPLETED.md notes the post-cluster baseline (fmt clean, clippy clean, test count) so TASK-008 can wire CI confidently.
 
-- [ ] `TASK-008` Bootstrap minimal `.github/workflows/ci.yml` with fmt + clippy + test on push and PR
+- [x] `TASK-008` Bootstrap minimal `.github/workflows/ci.yml` with fmt + clippy + test on push and PR
 
     Spec: `specs/220426-build-provenance-and-ci-bootstrap.md`
     Why now: there is no CI today (`.github/` is absent); every regression has had to be caught by an operator running `cargo test` locally. The repo is already clippy-D-warnings-clean, fmt-clean, and 332 tests green, so wiring CI now is low-risk and locks the baseline.
