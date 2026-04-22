@@ -1060,11 +1060,11 @@ fn is_numbered_corpus_plan_file(path: &Path) -> bool {
 }
 
 fn sanitize_corpus_outputs(repo_root: &Path, planning_root: &Path) -> Result<()> {
-    sanitize_corpus_numbered_plan_front_matter(planning_root)?;
+    sanitize_corpus_numbered_plan_shapes(planning_root)?;
     sanitize_corpus_repo_root_paths(repo_root, planning_root)
 }
 
-fn sanitize_corpus_numbered_plan_front_matter(planning_root: &Path) -> Result<()> {
+fn sanitize_corpus_numbered_plan_shapes(planning_root: &Path) -> Result<()> {
     let plans_dir = planning_root.join("plans");
     if !plans_dir.is_dir() {
         return Ok(());
@@ -1075,11 +1075,13 @@ fn sanitize_corpus_numbered_plan_front_matter(planning_root: &Path) -> Result<()
     {
         let markdown = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let Some(sanitized) = strip_leading_yaml_front_matter_before_title(&markdown) else {
-            continue;
-        };
-        atomic_write(&path, sanitized.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        let without_front_matter = strip_leading_yaml_front_matter_before_title(&markdown)
+            .unwrap_or_else(|| markdown.clone());
+        let sanitized = normalize_corpus_execplan_headings(&without_front_matter);
+        if sanitized != markdown {
+            atomic_write(&path, sanitized.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -1105,6 +1107,44 @@ fn strip_leading_yaml_front_matter_before_title(markdown: &str) -> Option<String
         offset = line_end;
     }
     None
+}
+
+fn normalize_corpus_execplan_headings(markdown: &str) -> String {
+    let mut normalized = markdown
+        .lines()
+        .map(|line| {
+            normalize_corpus_execplan_heading_line(line).unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn normalize_corpus_execplan_heading_line(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("## ")?;
+    let unnumbered = strip_ordered_list_marker(rest).unwrap_or(rest).trim();
+    let canonical = match unnumbered.to_ascii_lowercase().as_str() {
+        "purpose and big picture" | "purpose / big picture" => "## Purpose / Big Picture",
+        "requirements trace" => "## Requirements Trace",
+        "scope boundaries" => "## Scope Boundaries",
+        "progress" => "## Progress",
+        "surprises and discoveries" | "surprises & discoveries" => "## Surprises & Discoveries",
+        "decision log" => "## Decision Log",
+        "outcomes and retrospective" | "outcomes & retrospective" => "## Outcomes & Retrospective",
+        "context and orientation" => "## Context and Orientation",
+        "plan of work" => "## Plan of Work",
+        "implementation units" => "## Implementation Units",
+        "concrete steps" => "## Concrete Steps",
+        "validation and acceptance" => "## Validation and Acceptance",
+        "idempotence and recovery" => "## Idempotence and Recovery",
+        "artifacts and notes" => "## Artifacts and Notes",
+        "interfaces and dependencies" => "## Interfaces and Dependencies",
+        _ => return None,
+    };
+    Some(canonical.to_string())
 }
 
 fn sanitize_corpus_repo_root_paths(repo_root: &Path, planning_root: &Path) -> Result<()> {
@@ -3323,7 +3363,7 @@ mod tests {
         generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
         normalize_generated_implementation_plan, normalize_generated_spec_markdown,
-        rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_front_matter,
+        rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_shapes,
         sanitize_corpus_repo_root_paths, sync_generated_specs_to_root_for_date,
         verify_corpus_execplan, verify_corpus_outputs, verify_generated_implementation_plan,
         ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
@@ -3897,45 +3937,45 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 
 This plan must be maintained in accordance with `PLANS.md` at the repository root.
 
-## Purpose / Big Picture
+## 1. Purpose and Big Picture
 
 Create one proof artifact.
 
-## Requirements Trace
+## 2. Requirements Trace
 
 R1: The artifact exists.
 
-## Scope Boundaries
+## 3. Scope Boundaries
 
 No runtime behavior changes.
 
-## Progress
+## 4. Progress
 
 - [ ] Start.
 
-## Surprises & Discoveries
+## 5. Surprises and Discoveries
 
 None yet.
 
-## Decision Log
+## 6. Decision Log
 
 - Decision: Keep it small.
   Rationale: Easier to verify.
   Date/Author: 2026-04-22 / test
 
-## Outcomes & Retrospective
+## 7. Outcomes and Retrospective
 
 None yet.
 
-## Context and Orientation
+## 8. Context and Orientation
 
 Read `docs/example.md`.
 
-## Plan of Work
+## 9. Plan of Work
 
 Update the example document.
 
-## Implementation Units
+## 10. Implementation Units
 
 Unit 1.
 Goal: Update the example.
@@ -3946,34 +3986,37 @@ Tests to add or modify: add one focused test.
 Approach: edit the file.
 Specific test scenarios: run the focused test.
 
-## Concrete Steps
+## 11. Concrete Steps
 
     cargo test -p example example_test
 
-## Validation and Acceptance
+## 12. Validation and Acceptance
 
 The focused test passes.
 
-## Idempotence and Recovery
+## 13. Idempotence and Recovery
 
 Rerun the same command safely.
 
-## Artifacts and Notes
+## 14. Artifacts and Notes
 
 No notes.
 
-## Interfaces and Dependencies
+## 15. Interfaces and Dependencies
 
 No new dependencies.
 "#,
         )
         .unwrap();
 
-        sanitize_corpus_numbered_plan_front_matter(&planning_root).unwrap();
+        sanitize_corpus_numbered_plan_shapes(&planning_root).unwrap();
 
         let sanitized = fs::read_to_string(&plan_path).unwrap();
         assert!(sanitized.starts_with("# Example Slice\n"));
         assert!(!sanitized.contains("id: GENESIS-001"));
+        assert!(sanitized.contains("## Purpose / Big Picture\n"));
+        assert!(sanitized.contains("## Surprises & Discoveries\n"));
+        assert!(sanitized.contains("## Outcomes & Retrospective\n"));
         verify_corpus_execplan(&plan_path).unwrap();
     }
 
