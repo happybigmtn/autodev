@@ -123,8 +123,7 @@ async fn refresh_claude_if_needed(profile_dir: &Path) -> Result<()> {
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Claude token refresh returned {status}: {body}");
+        anyhow::bail!("{}", claude_refresh_http_error_message(profile_dir, status));
     }
 
     let token_resp: serde_json::Value = resp
@@ -170,6 +169,9 @@ async fn refresh_codex_if_needed(profile_dir: &Path) -> Result<()> {
     }
 
     eprintln!("[quota-router] refreshing Codex OAuth token via codex CLI...");
+    // Codex CLI refresh failures are surfaced from the CLI itself; this path
+    // intentionally relies on the CLI's own redaction instead of reprinting
+    // raw stderr here.
     refresh_codex_with_cli(profile_dir, &codex_cli_bin())
 }
 
@@ -244,7 +246,7 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
 
 pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsage> {
     if let Err(e) = refresh_claude_if_needed(profile_dir).await {
-        eprintln!("[quota-router] claude token refresh failed: {e:#}");
+        eprintln!("[quota-router] {}", sanitize_quota_error_message(&e));
     }
 
     let creds_path = profile_dir.join(".credentials.json");
@@ -318,6 +320,56 @@ fn parse_reset_secs(resets_at: &str) -> u64 {
             diff.num_seconds().max(0) as u64
         })
         .unwrap_or(0)
+}
+
+fn claude_refresh_http_error_message(profile_dir: &Path, status: reqwest::StatusCode) -> String {
+    format!(
+        "Claude token refresh failed: provider=claude account={} http={status}",
+        quota_profile_account_name(profile_dir, Provider::Claude)
+    )
+}
+
+fn quota_profile_account_name(profile_dir: &Path, provider: Provider) -> String {
+    let prefix = format!("{}-", provider.label());
+    profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(crate) fn sanitize_quota_error_message(err: &anyhow::Error) -> String {
+    sanitize_quota_error_text(&err.to_string())
+}
+
+fn sanitize_quota_error_text(message: &str) -> String {
+    if quota_error_contains_secret_payload(message) {
+        "sensitive auth details redacted".to_string()
+    } else {
+        message
+            .replace("tokens.access_token", "tokens.token")
+            .replace("tokens.refresh_token", "tokens.token")
+            .replace("claudeAiOauth.accessToken", "claudeAiOauth.token")
+            .replace("claudeAiOauth.refreshToken", "claudeAiOauth.token")
+            .replace("access_token", "token")
+            .replace("refresh_token", "token")
+            .replace("accessToken", "token")
+            .replace("refreshToken", "token")
+    }
+}
+
+fn quota_error_contains_secret_payload(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("\"access_token\"")
+        || lower.contains("\"refresh_token\"")
+        || lower.contains("\"accesstoken\"")
+        || lower.contains("\"refreshtoken\"")
+        || lower.contains("access_token=")
+        || lower.contains("refresh_token=")
+        || lower.contains("accesstoken=")
+        || lower.contains("refreshtoken=")
+        || lower.contains("bearer ")
+        || lower.contains("eyj")
 }
 
 fn codex_cli_bin() -> PathBuf {
@@ -474,6 +526,15 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt;
 
+    fn assert_no_secret_markers(message: &str) {
+        for marker in ["access_token", "refresh_token", "Bearer ", "eyJ"] {
+            assert!(
+                !message.contains(marker),
+                "message leaked sensitive marker {marker:?}: {message}"
+            );
+        }
+    }
+
     fn test_dir(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -574,5 +635,34 @@ mod tests {
 
         let error = refresh_codex_with_cli(&profile_dir, &codex_bin).unwrap_err();
         assert!(error.to_string().contains("refresh token was already used"));
+    }
+
+    #[test]
+    fn claude_refresh_error_does_not_leak_body() {
+        let profile_dir = PathBuf::from("/tmp/quota-router/profiles/claude-primary");
+        let fake_body = r#"{"error":"invalid_grant","access_token":"access_token_value","refresh_token":"refresh_token_value","authorization":"Bearer eyJ.fake.jwt"}"#;
+
+        let sanitized = sanitize_quota_error_message(&anyhow::Error::msg(format!(
+            "Claude token refresh returned 401 Unauthorized: {fake_body}"
+        )));
+        assert!(sanitized.contains("redacted"));
+        assert_no_secret_markers(&sanitized);
+
+        let refresh_error =
+            claude_refresh_http_error_message(&profile_dir, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(refresh_error.contains("provider=claude"));
+        assert!(refresh_error.contains("account=primary"));
+        assert!(refresh_error.contains("http=401 Unauthorized"));
+        assert_no_secret_markers(&refresh_error);
+        assert!(!refresh_error.contains(fake_body));
+    }
+
+    #[test]
+    fn sanitize_quota_error_message_keeps_non_secret_context() {
+        let sanitized = sanitize_quota_error_message(&anyhow::Error::msg(
+            "missing tokens.access_token in codex auth",
+        ));
+        assert_eq!(sanitized, "missing tokens.token in codex auth");
+        assert_no_secret_markers(&sanitized);
     }
 }

@@ -72,7 +72,7 @@ pub(crate) async fn run_status() -> Result<()> {
                     "  {} ({}) {}",
                     bold.apply_to(&account.name),
                     account.provider.label(),
-                    red.apply_to(format!("error: {e:#}")),
+                    red.apply_to(format_usage_error(&e)),
                 );
             }
         }
@@ -126,5 +126,40 @@ fn format_secs(secs: u64) -> String {
         format!("resets in {hours}h{minutes:02}m")
     } else {
         format!("resets in {minutes}m")
+    }
+}
+
+fn format_usage_error(err: &anyhow::Error) -> String {
+    format!("error: {}", quota_usage::sanitize_quota_error_message(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_no_secret_markers(message: &str) {
+        for marker in ["access_token", "refresh_token", "Bearer ", "eyJ"] {
+            assert!(
+                !message.contains(marker),
+                "message leaked sensitive marker {marker:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn print_does_not_leak_token_chain() {
+        let fake_body = r#"{"access_token":"access_token_value","refresh_token":"refresh_token_value","authorization":"Bearer eyJ.fake.jwt"}"#;
+
+        let direct = format_usage_error(&anyhow::Error::msg(format!(
+            "Claude token refresh returned 401 Unauthorized: {fake_body}"
+        )));
+        assert!(direct.contains("redacted"));
+        assert_no_secret_markers(&direct);
+
+        let chained = anyhow::Error::msg(format!("provider body: {fake_body}"))
+            .context("quota fetch failed for claude-primary");
+        let rendered = format_usage_error(&chained);
+        assert_eq!(rendered, "error: quota fetch failed for claude-primary");
+        assert_no_secret_markers(&rendered);
     }
 }
