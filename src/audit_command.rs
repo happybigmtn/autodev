@@ -1164,6 +1164,28 @@ mod tests {
         ))
     }
 
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(name: &str) -> Self {
+            let path = temp_repo_path(name);
+            fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn run_git_in<'a>(repo: &Path, args: impl IntoIterator<Item = &'a str>) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -1179,16 +1201,15 @@ mod tests {
         String::from_utf8(output.stdout).expect("git stdout should be utf-8")
     }
 
-    fn init_repo(name: &str) -> PathBuf {
-        let repo = temp_repo_path(name);
-        fs::create_dir_all(&repo).expect("failed to create temp repo");
-        run_git_in(&repo, ["init"]);
-        run_git_in(&repo, ["config", "user.name", "autodev tests"]);
-        run_git_in(&repo, ["config", "user.email", "autodev@example.com"]);
-        fs::write(repo.join("README.md"), "# temp\n").expect("failed to write README");
-        run_git_in(&repo, ["add", "README.md"]);
-        run_git_in(&repo, ["commit", "-m", "init"]);
-        run_git_in(&repo, ["branch", "-M", "main"]);
+    fn init_repo(name: &str) -> TestTempDir {
+        let repo = TestTempDir::new(name);
+        run_git_in(repo.path(), ["init"]);
+        run_git_in(repo.path(), ["config", "user.name", "autodev tests"]);
+        run_git_in(repo.path(), ["config", "user.email", "autodev@example.com"]);
+        fs::write(repo.path().join("README.md"), "# temp\n").expect("failed to write README");
+        run_git_in(repo.path(), ["add", "README.md"]);
+        run_git_in(repo.path(), ["commit", "-m", "init"]);
+        run_git_in(repo.path(), ["branch", "-M", "main"]);
         repo
     }
 
@@ -1232,13 +1253,13 @@ mod tests {
     #[test]
     fn apply_verdict_clean_returns_audited() {
         let repo = init_repo("apply-verdict-clean");
-        let output_dir = repo.join("audit");
+        let output_dir = repo.path().join("audit");
         let file_dir = output_dir.join("files").join("clean");
         fs::create_dir_all(&file_dir).expect("failed to create file dir");
-        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+        let head_before = run_git_in(repo.path(), ["rev-parse", "HEAD"]);
 
         let (status, commit) = apply_verdict(
-            &repo,
+            repo.path(),
             &output_dir,
             "main",
             "README.md",
@@ -1250,23 +1271,21 @@ mod tests {
 
         assert_eq!(status, EntryStatus::Audited);
         assert_eq!(commit, None);
-        assert_eq!(run_git_in(&repo, ["rev-parse", "HEAD"]), head_before);
-        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
-        assert!(!repo.join("WORKLIST.md").exists());
-
-        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+        assert_eq!(run_git_in(repo.path(), ["rev-parse", "HEAD"]), head_before);
+        assert_eq!(run_git_in(repo.path(), ["status", "--short"]), "");
+        assert!(!repo.path().join("WORKLIST.md").exists());
     }
 
     #[test]
     fn apply_verdict_unknown_leaves_pending() {
         let repo = init_repo("apply-verdict-unknown");
-        let output_dir = repo.join("audit");
+        let output_dir = repo.path().join("audit");
         let file_dir = output_dir.join("files").join("unknown");
         fs::create_dir_all(&file_dir).expect("failed to create file dir");
-        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+        let head_before = run_git_in(repo.path(), ["rev-parse", "HEAD"]);
 
         let (status, commit) = apply_verdict(
-            &repo,
+            repo.path(),
             &output_dir,
             "main",
             "README.md",
@@ -1278,23 +1297,21 @@ mod tests {
 
         assert_eq!(status, EntryStatus::Pending);
         assert_eq!(commit, None);
-        assert_eq!(run_git_in(&repo, ["rev-parse", "HEAD"]), head_before);
-        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
-        assert!(!repo.join("WORKLIST.md").exists());
-
-        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+        assert_eq!(run_git_in(repo.path(), ["rev-parse", "HEAD"]), head_before);
+        assert_eq!(run_git_in(repo.path(), ["status", "--short"]), "");
+        assert!(!repo.path().join("WORKLIST.md").exists());
     }
 
     #[test]
     fn apply_verdict_drift_small_without_patch_promotes_to_worklist() {
         let repo = init_repo("apply-verdict-worklist");
-        let output_dir = repo.join("audit");
+        let output_dir = repo.path().join("audit");
         let file_dir = output_dir.join("files").join("drift-small");
         fs::create_dir_all(&file_dir).expect("failed to create file dir");
-        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+        let head_before = run_git_in(repo.path(), ["rev-parse", "HEAD"]);
 
         let (status, commit) = apply_verdict(
-            &repo,
+            repo.path(),
             &output_dir,
             "main",
             "README.md",
@@ -1304,9 +1321,9 @@ mod tests {
         )
         .expect("missing patch should downgrade to worklist");
 
-        let head_after = run_git_in(&repo, ["rev-parse", "HEAD"]);
+        let head_after = run_git_in(repo.path(), ["rev-parse", "HEAD"]);
         let worklist =
-            fs::read_to_string(repo.join("WORKLIST.md")).expect("failed to read WORKLIST");
+            fs::read_to_string(repo.path().join("WORKLIST.md")).expect("failed to read WORKLIST");
 
         assert_eq!(status, EntryStatus::Audited);
         assert_eq!(commit.as_deref(), Some(head_after.trim()));
@@ -1317,18 +1334,15 @@ mod tests {
             "auditor emitted DRIFT-SMALL / SLOP without a patch.diff; promoted to worklist"
         ));
         assert_eq!(
-            run_git_in(&repo, ["log", "--format=%s", "-1"]).trim(),
+            run_git_in(repo.path(), ["log", "--format=%s", "-1"]).trim(),
             "audit: DRIFT-LARGE README.md (worklist)"
         );
-        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
-
-        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+        assert_eq!(run_git_in(repo.path(), ["status", "--short"]), "");
     }
 
     #[tokio::test]
     async fn run_audit_requires_use_kimi_cli() {
-        let repo_root = temp_repo_path("run-audit-requires-kimi");
-        fs::create_dir_all(&repo_root).expect("failed to create temp dir");
+        let repo_root = TestTempDir::new("run-audit-requires-kimi");
         let args = AuditArgs {
             doctrine_prompt: PathBuf::from("audit/DOCTRINE.md"),
             rubric_prompt: None,
@@ -1350,7 +1364,7 @@ mod tests {
             use_kimi_cli: false,
         };
 
-        let err = run_auditor(&repo_root, "prompt", &args)
+        let err = run_auditor(repo_root.path(), "prompt", &args)
             .await
             .expect_err("run_auditor should reject --no-use-kimi-cli");
 
@@ -1358,7 +1372,5 @@ mod tests {
             err.to_string(),
             "auto audit currently requires --use-kimi-cli"
         );
-
-        fs::remove_dir_all(&repo_root).expect("failed to remove temp dir");
     }
 }
