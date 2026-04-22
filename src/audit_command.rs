@@ -1144,7 +1144,62 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{glob_match, sha256_hex};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::{AuditArgs, AuditResumeMode};
+
+    use super::{apply_verdict, glob_match, run_auditor, sha256_hex, EntryStatus, FileVerdict};
+
+    fn temp_repo_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "autodev-audit-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn run_git_in<'a>(repo: &Path, args: impl IntoIterator<Item = &'a str>) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to launch git");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git stdout should be utf-8")
+    }
+
+    fn init_repo(name: &str) -> PathBuf {
+        let repo = temp_repo_path(name);
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+        run_git_in(&repo, ["init"]);
+        run_git_in(&repo, ["config", "user.name", "autodev tests"]);
+        run_git_in(&repo, ["config", "user.email", "autodev@example.com"]);
+        fs::write(repo.join("README.md"), "# temp\n").expect("failed to write README");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        run_git_in(&repo, ["branch", "-M", "main"]);
+        repo
+    }
+
+    fn verdict(verdict: &str, rationale: &str) -> FileVerdict {
+        FileVerdict {
+            verdict: verdict.to_string(),
+            rationale: rationale.to_string(),
+            touched_paths: Vec::new(),
+            escalate: false,
+        }
+    }
 
     #[test]
     fn glob_match_handles_double_star_prefix() {
@@ -1172,5 +1227,138 @@ mod tests {
         let b = sha256_hex(b"hello");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn apply_verdict_clean_returns_audited() {
+        let repo = init_repo("apply-verdict-clean");
+        let output_dir = repo.join("audit");
+        let file_dir = output_dir.join("files").join("clean");
+        fs::create_dir_all(&file_dir).expect("failed to create file dir");
+        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+
+        let (status, commit) = apply_verdict(
+            &repo,
+            &output_dir,
+            "main",
+            "README.md",
+            &file_dir,
+            &verdict("CLEAN", "already matches doctrine"),
+            false,
+        )
+        .expect("clean verdict should succeed");
+
+        assert_eq!(status, EntryStatus::Audited);
+        assert_eq!(commit, None);
+        assert_eq!(run_git_in(&repo, ["rev-parse", "HEAD"]), head_before);
+        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
+        assert!(!repo.join("WORKLIST.md").exists());
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn apply_verdict_unknown_leaves_pending() {
+        let repo = init_repo("apply-verdict-unknown");
+        let output_dir = repo.join("audit");
+        let file_dir = output_dir.join("files").join("unknown");
+        fs::create_dir_all(&file_dir).expect("failed to create file dir");
+        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+
+        let (status, commit) = apply_verdict(
+            &repo,
+            &output_dir,
+            "main",
+            "README.md",
+            &file_dir,
+            &verdict("MYSTERY", "operator should review this verdict manually"),
+            false,
+        )
+        .expect("unknown verdict branch should return pending");
+
+        assert_eq!(status, EntryStatus::Pending);
+        assert_eq!(commit, None);
+        assert_eq!(run_git_in(&repo, ["rev-parse", "HEAD"]), head_before);
+        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
+        assert!(!repo.join("WORKLIST.md").exists());
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn apply_verdict_drift_small_without_patch_promotes_to_worklist() {
+        let repo = init_repo("apply-verdict-worklist");
+        let output_dir = repo.join("audit");
+        let file_dir = output_dir.join("files").join("drift-small");
+        fs::create_dir_all(&file_dir).expect("failed to create file dir");
+        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+
+        let (status, commit) = apply_verdict(
+            &repo,
+            &output_dir,
+            "main",
+            "README.md",
+            &file_dir,
+            &verdict("DRIFT-SMALL", "small patch should have been emitted"),
+            false,
+        )
+        .expect("missing patch should downgrade to worklist");
+
+        let head_after = run_git_in(&repo, ["rev-parse", "HEAD"]);
+        let worklist =
+            fs::read_to_string(repo.join("WORKLIST.md")).expect("failed to read WORKLIST");
+
+        assert_eq!(status, EntryStatus::Audited);
+        assert_eq!(commit.as_deref(), Some(head_after.trim()));
+        assert_ne!(head_before, head_after);
+        assert!(worklist.contains("README.md"));
+        assert!(worklist.contains("audit DRIFT-LARGE"));
+        assert!(worklist.contains(
+            "auditor emitted DRIFT-SMALL / SLOP without a patch.diff; promoted to worklist"
+        ));
+        assert_eq!(
+            run_git_in(&repo, ["log", "--format=%s", "-1"]).trim(),
+            "audit: DRIFT-LARGE README.md (worklist)"
+        );
+        assert_eq!(run_git_in(&repo, ["status", "--short"]), "");
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[tokio::test]
+    async fn run_audit_requires_use_kimi_cli() {
+        let repo_root = temp_repo_path("run-audit-requires-kimi");
+        fs::create_dir_all(&repo_root).expect("failed to create temp dir");
+        let args = AuditArgs {
+            doctrine_prompt: PathBuf::from("audit/DOCTRINE.md"),
+            rubric_prompt: None,
+            include_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            max_files: 0,
+            output_dir: None,
+            resume_mode: AuditResumeMode::Resume,
+            report_only: false,
+            dry_run: false,
+            branch: None,
+            model: "k2.6".to_string(),
+            reasoning_effort: "high".to_string(),
+            escalation_model: "gpt-5.4".to_string(),
+            escalation_effort: "high".to_string(),
+            codex_bin: PathBuf::from("codex"),
+            kimi_bin: PathBuf::from("kimi-cli"),
+            pi_bin: PathBuf::from("pi"),
+            use_kimi_cli: false,
+        };
+
+        let err = run_auditor(&repo_root, "prompt", &args)
+            .await
+            .expect_err("run_auditor should reject --no-use-kimi-cli");
+
+        assert_eq!(
+            err.to_string(),
+            "auto audit currently requires --use-kimi-cli"
+        );
+
+        fs::remove_dir_all(&repo_root).expect("failed to remove temp dir");
     }
 }
