@@ -25,3 +25,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib audit_command::tests::`
 - Completion artifacts: `src/audit_command.rs`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib audit_command::tests::`
+
+## `TASK-003`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/codex_exec.rs`
+- Scope exceptions: none recorded by host.
+- Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo clippy -p autodev --lib --bins -- -D warnings`, `cargo test --lib codex_exec`, `cargo build`
+- Completion artifacts: `src/codex_exec.rs`
+- Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo clippy -p autodev --lib --bins -- -D warnings`, `cargo test --lib codex_exec`, `cargo build`
