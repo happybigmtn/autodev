@@ -9,7 +9,7 @@ use crate::quota_config::{Provider, QuotaConfig};
 use crate::quota_patterns::{self, QuotaVerdict};
 use crate::quota_selector;
 use crate::quota_state::QuotaState;
-use crate::util::chmod_0o600_if_unix;
+use crate::util::write_0o600_if_unix;
 
 /// Guard that restores original auth files on drop.
 struct AuthRestoreGuard {
@@ -40,8 +40,7 @@ impl Drop for AuthRestoreGuard {
                 if backup.is_dir() {
                     let _ = remove_and_copy_dir(backup, target);
                 } else {
-                    let _ = fs::copy(backup, target);
-                    let _ = chmod_0o600_if_unix(target);
+                    let _ = copy_file_0o600(backup, target);
                 }
                 let _ = remove_path(backup);
             }
@@ -64,6 +63,11 @@ fn remove_and_copy_dir(src: &Path, dst: &Path) -> Result<()> {
     copy_dir_recursive(src, dst)
 }
 
+fn copy_file_0o600(src: &Path, dst: &Path) -> Result<()> {
+    let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    write_0o600_if_unix(dst, &bytes)
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
     for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
@@ -82,14 +86,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            fs::copy(&src_path, &dst_path).with_context(|| {
+            copy_file_0o600(&src_path, &dst_path).with_context(|| {
                 format!(
                     "failed to copy {} -> {}",
                     src_path.display(),
                     dst_path.display()
                 )
             })?;
-            chmod_0o600_if_unix(&dst_path)?;
         }
     }
     Ok(())
@@ -101,14 +104,13 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
     match provider {
         Provider::Codex => {
             let profile_auth = profile_dir.join("auth.json");
-            fs::copy(&profile_auth, &target).with_context(|| {
+            copy_file_0o600(&profile_auth, &target).with_context(|| {
                 format!(
                     "failed to swap credentials from {} to {}",
                     profile_auth.display(),
                     target.display()
                 )
             })?;
-            chmod_0o600_if_unix(&target)?;
         }
         Provider::Claude => {
             let home = dirs::home_dir().expect("cannot resolve home directory");
@@ -122,14 +124,13 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                 let src = entry.path();
 
                 if name == ".claude.json" {
-                    fs::copy(&src, &claude_json).with_context(|| {
+                    copy_file_0o600(&src, &claude_json).with_context(|| {
                         format!(
                             "failed to swap {} -> {}",
                             src.display(),
                             claude_json.display()
                         )
                     })?;
-                    chmod_0o600_if_unix(&claude_json)?;
                     continue;
                 }
 
@@ -137,10 +138,9 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                 if src.is_dir() {
                     remove_and_copy_dir(&src, &dst)?;
                 } else {
-                    fs::copy(&src, &dst).with_context(|| {
+                    copy_file_0o600(&src, &dst).with_context(|| {
                         format!("failed to copy {} -> {}", src.display(), dst.display())
                     })?;
-                    chmod_0o600_if_unix(&dst)?;
                 }
             }
         }
@@ -158,9 +158,8 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
         Provider::Codex => {
             let bp = backup_dir.join("codex-auth.json");
             if target.exists() {
-                fs::copy(&target, &bp)
+                copy_file_0o600(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
-                chmod_0o600_if_unix(&bp)?;
             }
             copy_profile_to_active_auth(provider, profile_dir)?;
             vec![(bp, target)]
@@ -179,9 +178,8 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
 
             // Backup ~/.claude.json separately (lives in home, not in ~/.claude)
             if claude_json.exists() {
-                fs::copy(&claude_json, &claude_json_bp)
+                copy_file_0o600(&claude_json, &claude_json_bp)
                     .with_context(|| format!("failed to backup {}", claude_json.display()))?;
-                chmod_0o600_if_unix(&claude_json_bp)?;
             }
 
             copy_profile_to_active_auth(provider, profile_dir)?;
@@ -371,8 +369,7 @@ fn restore_credentials(provider: Provider) -> Result<()> {
         Provider::Codex => {
             let bp = backup_dir.join("codex-auth.json");
             if bp.exists() {
-                fs::copy(&bp, &target)?;
-                chmod_0o600_if_unix(&target)?;
+                copy_file_0o600(&bp, &target)?;
                 fs::remove_file(&bp)?;
             }
         }
@@ -610,8 +607,21 @@ mod tests {
             .expect("failed to write profile auth");
         set_mode(&profile_auth, 0o644);
 
-        let _guard = swap_credentials(Provider::Codex, &profile_dir)
+        let guard = swap_credentials(Provider::Codex, &profile_dir)
             .expect("credential swap should succeed");
+
+        let backup_auth = home
+            .root
+            .join("config")
+            .join("quota-router")
+            .join("backup")
+            .join("codex-auth.json");
+        let backup_mode = fs::metadata(&backup_auth)
+            .expect("failed to stat credential backup")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(backup_mode, 0o600);
 
         let mode = fs::metadata(&active_auth)
             .expect("failed to stat swapped auth")
@@ -619,5 +629,16 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+
+        drop(guard);
+
+        let restored = fs::read(&active_auth).expect("failed to read restored auth");
+        assert_eq!(restored, br#"{"account":"active"}"#);
+        let restored_mode = fs::metadata(&active_auth)
+            .expect("failed to stat restored auth")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(restored_mode, 0o600);
     }
 }

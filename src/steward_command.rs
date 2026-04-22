@@ -62,8 +62,6 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         .output_dir
         .clone()
         .unwrap_or_else(|| repo_root.join("steward"));
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let reference_repos = resolve_reference_repos(&repo_root, &args.reference_repos)?;
     let planning_surface = detect_planning_surface(&repo_root);
 
@@ -100,6 +98,9 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
     if planning_surface.is_empty() && !args.dry_run && !args.report_only {
         bail!("{}", no_planning_surface_message(&repo_root));
     }
+
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     if !args.dry_run && !args.report_only {
         if let Some(commit) =
@@ -681,6 +682,24 @@ mod tests {
                 "message omitted {probe}: {message}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refusal_does_not_create_default_output_dir() {
+        let temp = unique_temp_dir();
+        init_git_repo(&temp);
+
+        let error = run_steward_from(&temp, steward_args(&temp, false))
+            .await
+            .expect_err("steward should refuse greenfield repos");
+
+        assert!(error.to_string().contains("no active planning surface"));
+        assert!(
+            !temp.join("steward").exists(),
+            "refusal should not create steward output dir"
+        );
+
+        fs::remove_dir_all(temp).expect("cleanup");
     }
 
     #[tokio::test(flavor = "current_thread")]

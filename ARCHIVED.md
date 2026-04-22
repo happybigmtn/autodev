@@ -79,3 +79,43 @@
 - Validation: `rg -n "GraphQL-only|linear_tracker.rs|symphony_command.rs|AUTODEV_SYMPHONY_ROOT" docs/decisions/symphony-graphql-surface.md specs/220426-symphony-linear-orchestration.md`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 - Completion artifacts: `docs/decisions/symphony-graphql-surface.md`, `specs/220426-symphony-linear-orchestration.md`
 - Remaining blockers: none.
+
+## `TASK-014`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/util.rs`
+- Review result: passed. The stale queue blocker claimed the verification receipt was missing, but `.auto/symphony/verification-receipts/TASK-014.json` exists and the three `atomic_write` regression tests pass against the live tree.
+- Validation: `cargo test util::tests::atomic_write_creates_missing_parent_dir`, `cargo test util::tests::atomic_write_handles_rapid_succession_collisions`, `cargo test util::tests::atomic_write_works_outside_git_repo`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `src/util.rs`
+- Remaining blockers: none.
+
+## `TASK-010`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/steward_command.rs`
+- Review result: passed after fixing a required conditional-side-effect issue: `auto steward` now refuses no-planning-surface repos before creating the default `steward/` output directory, and a regression test asserts the refusal leaves that directory absent.
+- Validation: `cargo test steward_command::tests::dry_run_succeeds_without_planning_surface`, `cargo test steward_command::tests::refuses_to_run_when_no_planning_surface_present`, `cargo test steward_command::tests::refusal_does_not_create_default_output_dir`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `src/steward_command.rs`
+- Remaining blockers: none.
+
+## `TASK-015`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_exec.rs`
+- Review result: passed after fixing a required credential-copy hardening issue: quota swap, backup, and restore paths now read source bytes and write through the owner-only writer instead of copying first and chmodding after.
+- Validation: `cargo test quota_exec::tests::swap_credentials_enforces_0o600`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `src/quota_exec.rs`
+- Remaining blockers: none.
+
+## `TASK-007`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `IMPLEMENTATION_PLAN.md`
+- Review result: passed. The live receipt `.auto/symphony/verification-receipts/TASK-007.json` supports the current-state baseline checkpoint.
+- Validation: `cargo build`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `IMPLEMENTATION_PLAN.md` current-state baseline note
+- Remaining blockers: none.
+
+## `TASK-011`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: none recorded by host
+- Review result: passed after reconciling the stale handoff claim with the live receipt `.auto/symphony/verification-receipts/TASK-011.json`. The task is a baseline checkpoint with receipt-backed proof and no owned code surface beyond the already-recorded plan state.
+- Validation: `actionlint .github/workflows/ci.yml`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `COMPLETED.md`
+- Remaining blockers: none.

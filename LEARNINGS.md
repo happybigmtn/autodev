@@ -5,3 +5,5 @@
 - `auto audit` resume logic must compare stored content hashes with current file hashes before skipping. Storing the hash without checking it makes the resumability contract look present while silently missing changed files.
 - Quota error redaction must consider the full anyhow chain, not only `err.to_string()`. Callers that render `{err:#}` can otherwise reintroduce token-bearing source errors after a sanitizer appears to pass direct-message tests.
 - Specs that record "verified facts" need the same review treatment as code: when a task removes an operator-specific default, adjacent specs and decision docs must be searched for the old literal path before archiving the task.
+- Refusal paths should happen before creating task output artifacts. For commands like `auto steward`, tests should assert both the error message and the absence of default output directories so a "refuse to run" path stays side-effect-light.
+- Sensitive credential copy paths need the same pre-tightened write discipline as direct writes. Reading the source and writing through the owner-only helper avoids the exposure window left by `fs::copy` followed by chmod.
