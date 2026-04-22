@@ -8,21 +8,24 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns thirteen commands:
+`auto` owns sixteen commands:
 
-- `auto corpus`
-- `auto gen`
-- `auto reverse`
-- `auto bug`
-- `auto nemesis`
-- `auto quota`
-- `auto loop`
-- `auto parallel`
-- `auto qa`
-- `auto qa-only`
-- `auto health`
-- `auto review`
-- `auto ship`
+- `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
+- `auto gen` generates specs and a new implementation plan from `genesis/`.
+- `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
+- `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
+- `auto loop` runs the implementation loop on the repo's primary branch.
+- `auto parallel` runs the experimental multi-lane implementation executor.
+- `auto qa` runs a runtime QA and ship-readiness pass on the current branch.
+- `auto qa-only` runs a report-only runtime QA pass on the current branch.
+- `auto health` runs a repo-wide quality and verification health report.
+- `auto review` reviews completed work on the current branch.
+- `auto steward` runs a stewardship pass for a mid-flight repo.
+- `auto audit` runs a file-by-file audit against an operator-authored doctrine.
+- `auto ship` prepares the current branch to ship, pushes it, and opens or refreshes a PR when appropriate.
+- `auto nemesis` runs a disposable Nemesis audit and appends its outputs into root specs and plan.
+- `auto quota` manages quota-aware account multiplexing for Claude and Codex.
+- `auto symphony` syncs implementation-plan items into Linear and runs the local Symphony runtime.
 
 It does not own the old parallel `malina run` workflow.
 
@@ -36,8 +39,8 @@ need to pass directories in the normal case.
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `high`
-  implementation pass by default
+- `auto bug` runs Kimi `k2.6` finder, skeptic, fixer, and reviewer with a final `gpt-5.4`
+  `high` Codex finalizer by default
 - `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
 - `auto parallel` runs on the repo's primary branch by default with five workers; outside tmux it
   launches a detached `<repo>-parallel` tmux session automatically
@@ -51,8 +54,8 @@ need to pass directories in the normal case.
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
 - `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `high`,
   targeting the repo's resolved base branch
-- `auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `high` implementation pass
-  unless `--report-only` is used
+- `auto nemesis` runs Kimi `k2.6` audit, synthesis, and fixer passes plus a Codex `gpt-5.4`
+  `high` finalizer unless `--report-only` is used
 - All mutating branch commands (`auto loop`, `auto qa`, `auto review`, `auto ship`, `auto bug`,
   and `auto nemesis`) now rebase onto `origin/<branch>` when that remote branch exists before
   starting work and again before pushing, so remote fast-forwards do not kill long runs at the end
@@ -71,15 +74,18 @@ The commands form one opinionated lifecycle:
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
 
-The other six commands are side lanes:
+The other nine commands are side lanes:
 
 - `auto reverse` documents current behavior from code reality.
 - `auto bug` runs a bug-finding and implementation pipeline.
+- `auto steward` reconciles an active planning surface against the live repo and updates it in place.
+- `auto audit` runs a doctrine-driven file-by-file audit and applies bounded fixes.
 - `auto nemesis` runs a deeper audit, applies bounded hardening fixes, and appends unresolved
   findings back into specs and plan.
 - `auto quota` manages quota-aware account routing for Codex and Claude sessions.
 - `auto parallel` runs dependency-ready queue tasks across multiple tmux-backed worker lanes.
 - `auto qa-only` runs runtime QA without fixing anything.
+- `auto symphony` syncs implementation-plan work into Linear and runs the local Symphony runtime.
 
 ## Detailed Command Guide
 
@@ -1078,5 +1084,5 @@ auto ship
 ## Design Goal
 
 This repo should stay small. If a feature does not directly improve `corpus`, `gen`, `reverse`,
-`bug`, `nemesis`, `quota`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, or `ship`, it
-probably does not belong here.
+`bug`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, `steward`, `audit`, `ship`,
+`nemesis`, `quota`, or `symphony`, it probably does not belong here.
