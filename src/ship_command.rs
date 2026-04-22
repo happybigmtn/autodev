@@ -333,12 +333,15 @@ mod tests {
             .output()
             .expect("git checkout main failed");
 
-        let current =
-            git_stdout(&repo, ["branch", "--show-current"]).expect("git branch --show-current failed");
+        let current = git_stdout(&repo, ["branch", "--show-current"])
+            .expect("git branch --show-current failed");
         assert_eq!(current.trim(), "main");
 
         let base = resolve_base_branch(&repo, None, "main").expect("resolve_base_branch failed");
-        assert_eq!(base, "main", "expected main when currently on main, got {base}");
+        assert_eq!(
+            base, "main",
+            "expected main when currently on main, got {base}"
+        );
     }
 
     #[test]
@@ -355,6 +358,9 @@ mod tests {
             .expect("git checkout feature failed");
 
         let base = resolve_base_branch(&repo, None, "feature").expect("resolve_base_branch failed");
-        assert_eq!(base, "master", "expected master when on feature branch, got {base}");
+        assert_eq!(
+            base, "master",
+            "expected master when on feature branch, got {base}"
+        );
     }
 }

@@ -31,6 +31,7 @@ const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 const BUG_CHUNK_PHASE_TIMEOUT_SECS: u64 = 30 * 60;
 const BUG_IMPLEMENTATION_PHASE_TIMEOUT_SECS: u64 = 90 * 60;
 const BUG_FINAL_REVIEW_PHASE_TIMEOUT_SECS: u64 = 90 * 60;
+const BUG_PHASE_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Debug)]
 struct RepoChunk {
@@ -652,6 +653,56 @@ async fn run_skeptic_phase(
     args: &BugArgs,
     stderr_log_path: &Path,
 ) -> Result<(usize, Vec<AcceptedFinding>)> {
+    let mut previous_errors = Vec::new();
+    for attempt in 1..=BUG_PHASE_MAX_ATTEMPTS {
+        if attempt > 1 {
+            clear_skeptic_phase_outputs(chunk_dir)?;
+        }
+
+        match run_skeptic_phase_once(
+            repo_root,
+            chunk,
+            chunk_dir,
+            config,
+            findings,
+            args,
+            stderr_log_path,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) if attempt < BUG_PHASE_MAX_ATTEMPTS => {
+                println!(
+                    "warning: skeptic {} attempt {attempt} produced unusable output: {err}; retrying",
+                    chunk.id
+                );
+                previous_errors.push(format!("attempt {attempt}: {err}"));
+            }
+            Err(err) => {
+                if previous_errors.is_empty() {
+                    return Err(err);
+                }
+                bail!(
+                    "skeptic {} failed after {BUG_PHASE_MAX_ATTEMPTS} attempts; final error: {err}; previous errors: {}",
+                    chunk.id,
+                    previous_errors.join("; ")
+                );
+            }
+        }
+    }
+
+    unreachable!("skeptic retry loop always returns")
+}
+
+async fn run_skeptic_phase_once(
+    repo_root: &Path,
+    chunk: &RepoChunk,
+    chunk_dir: &Path,
+    config: &PhaseConfig,
+    findings: &[BugFinding],
+    args: &BugArgs,
+    stderr_log_path: &Path,
+) -> Result<(usize, Vec<AcceptedFinding>)> {
     let prompt_path = chunk_dir.join("skeptic-prompt.md");
     let response_path = chunk_dir.join("skeptic-response.jsonl");
     let verdicts_json_path = chunk_dir.join("skeptic-verdicts.json");
@@ -703,6 +754,22 @@ async fn run_skeptic_phase(
         serde_json::to_string_pretty(&accepted)?.as_bytes(),
     )?;
     Ok((disproved_count, accepted))
+}
+
+fn clear_skeptic_phase_outputs(chunk_dir: &Path) -> Result<()> {
+    for file in [
+        "skeptic-response.jsonl",
+        "skeptic-verdicts.json",
+        "skeptic-verdicts.md",
+        "accepted-findings.json",
+    ] {
+        let path = chunk_dir.join(file);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove stale {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn load_or_run_skeptic_phase(
@@ -2114,6 +2181,8 @@ fn derive_accepted_findings(
     findings: &[BugFinding],
     verdicts: &[SkepticVerdict],
 ) -> Result<(usize, Vec<AcceptedFinding>)> {
+    validate_skeptic_verdicts(findings, verdicts)?;
+
     let mut verdicts_by_id = HashMap::<&str, &SkepticVerdict>::new();
     for verdict in verdicts {
         verdicts_by_id.insert(verdict.bug_id.as_str(), verdict);
@@ -2147,6 +2216,51 @@ fn derive_accepted_findings(
     }
 
     Ok((disproved, accepted))
+}
+
+fn validate_skeptic_verdicts(findings: &[BugFinding], verdicts: &[SkepticVerdict]) -> Result<()> {
+    let finding_ids = findings
+        .iter()
+        .map(|finding| finding.bug_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut verdict_ids = HashSet::new();
+
+    for verdict in verdicts {
+        if !finding_ids.contains(verdict.bug_id.as_str()) {
+            bail!(
+                "skeptic output contains unknown bug id `{}`",
+                verdict.bug_id
+            );
+        }
+        if !verdict_ids.insert(verdict.bug_id.as_str()) {
+            bail!(
+                "skeptic output contains duplicate verdict for `{}`",
+                verdict.bug_id
+            );
+        }
+        match verdict.decision.trim().to_ascii_lowercase().as_str() {
+            "accepted" | "disproved" => {}
+            other => bail!("invalid skeptic decision `{other}` for {}", verdict.bug_id),
+        }
+        if verdict.confidence_percent > 100 {
+            bail!(
+                "invalid skeptic confidence {} for {}",
+                verdict.confidence_percent,
+                verdict.bug_id
+            );
+        }
+    }
+
+    let missing = findings
+        .iter()
+        .filter(|finding| !verdict_ids.contains(finding.bug_id.as_str()))
+        .map(|finding| finding.bug_id.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!("skeptic output missing verdict(s): {}", missing.join(", "));
+    }
+
+    Ok(())
 }
 
 fn derive_verified_findings(
@@ -3125,7 +3239,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_final_review_prompt, build_fix_prompt, collect_repo_chunks,
+        build_final_review_prompt, build_fix_prompt, collect_repo_chunks, derive_accepted_findings,
         escape_unescaped_quotes_in_json_strings, load_json_file, normalize_finder_findings,
         repair_llm_json, run_backend_prompt, run_backend_prompt_with_fallback, should_audit_path,
         slugify, validate_accepted_findings, validate_findings, AcceptedFinding, BugFinding,
@@ -3335,6 +3449,26 @@ mod tests {
         }];
 
         assert!(validate_accepted_findings(&findings, &accepted).is_err());
+    }
+
+    #[test]
+    fn skeptic_verdicts_must_cover_every_finding() {
+        let chunk = test_chunk(7);
+        let findings = vec![test_finding("BUG-007-01"), test_finding("BUG-007-02")];
+        let verdicts = vec![SkepticVerdict {
+            bug_id: "BUG-007-02".to_string(),
+            decision: "disproved".to_string(),
+            confidence_percent: 95,
+            counter_argument: "The second finding does not survive challenge.".to_string(),
+            risk_calculation: "Low risk.".to_string(),
+            follow_up_checks: vec!["Review the source evidence.".to_string()],
+        }];
+
+        let err = derive_accepted_findings(&chunk, &findings, &verdicts)
+            .expect_err("missing skeptic verdict should invalidate the phase output");
+
+        let message = err.to_string();
+        assert!(message.contains("skeptic output missing verdict(s): BUG-007-01"));
     }
 
     #[test]

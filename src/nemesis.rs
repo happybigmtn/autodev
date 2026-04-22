@@ -2910,10 +2910,11 @@ Spec: nemesis/nemesis-audit.md
         run_git_in(&repo, ["config", "user.useConfigOnly", "true"]);
         run_git_in(&repo, ["config", "--unset", "user.name"]);
         run_git_in(&repo, ["config", "--unset", "user.email"]);
+        let branch = run_git_in(&repo, ["branch", "--show-current"]);
 
         let error = commit_nemesis_outputs_if_needed(
             &repo,
-            "main",
+            branch.trim(),
             &output_dir,
             &repo.join("specs").join("nemesis.md"),
             &repo.join("IMPLEMENTATION_PLAN.md"),

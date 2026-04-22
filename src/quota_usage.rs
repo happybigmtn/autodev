@@ -700,7 +700,10 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         // Should be roughly now + 3600s, within a few seconds tolerance
         let diff_ms = (new_expires_at - (now_ms + 3600 * 1000)).abs();
-        assert!(diff_ms < 5000, "expiresAt should default to ~3600s from now, diff={diff_ms}ms");
+        assert!(
+            diff_ms < 5000,
+            "expiresAt should default to ~3600s from now, diff={diff_ms}ms"
+        );
     }
 
     #[test]
@@ -722,6 +725,9 @@ mod tests {
         let new_expires_at = oauth["expiresAt"].as_i64().unwrap();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let diff_ms = (new_expires_at - (now_ms + 7200 * 1000)).abs();
-        assert!(diff_ms < 5000, "expiresAt should be ~7200s from now, diff={diff_ms}ms");
+        assert!(
+            diff_ms < 5000,
+            "expiresAt should be ~7200s from now, diff={diff_ms}ms"
+        );
     }
 }

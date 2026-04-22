@@ -137,6 +137,8 @@ pub(crate) fn auto_checkpoint_if_needed(
     branch: &str,
     message_suffix: &str,
 ) -> Result<Option<String>> {
+    ensure_checked_out_branch(repo_root, branch, "checkpoint")?;
+
     let status = checkpoint_status(repo_root)?;
     if status.trim().is_empty() {
         return Ok(None);
@@ -197,6 +199,8 @@ fn has_staged_changes(repo_root: &Path) -> Result<bool> {
 }
 
 pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<bool> {
+    ensure_checked_out_branch(repo_root, branch, "sync")?;
+
     if !remote_branch_exists(repo_root, branch)? {
         return Ok(false);
     }
@@ -239,9 +243,71 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
 }
 
 pub(crate) fn push_branch_with_remote_sync(repo_root: &Path, branch: &str) -> Result<bool> {
-    let synced = sync_branch_with_remote(repo_root, branch)?;
-    run_git(repo_root, ["push", "origin", branch])?;
+    ensure_checked_out_branch(repo_root, branch, "push")?;
+
+    let mut synced = sync_branch_with_remote(repo_root, branch)?;
+    let output = git_output(repo_root, ["push", "origin", branch])?;
+    if output.status.success() {
+        return Ok(synced);
+    }
+    if !is_non_fast_forward_push_failure(&output) {
+        bail!(
+            "git command failed in {}: {}",
+            repo_root.display(),
+            git_failure_message(&output)
+        );
+    }
+
+    eprintln!(
+        "warning: push of {branch} was rejected as non-fast-forward after sync; rebasing and retrying once"
+    );
+    synced |= sync_branch_with_remote(repo_root, branch)?;
+    let retry = git_output(repo_root, ["push", "origin", branch])?;
+    if !retry.status.success() {
+        bail!(
+            "git command failed in {}: {}",
+            repo_root.display(),
+            git_failure_message(&retry)
+        );
+    }
     Ok(synced)
+}
+
+fn git_output<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))
+}
+
+fn ensure_checked_out_branch(repo_root: &Path, branch: &str, operation: &str) -> Result<()> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        bail!("refusing to {operation} without a checked-out target branch");
+    }
+
+    let current = git_stdout(repo_root, ["branch", "--show-current"])?;
+    let current = current.trim();
+    if current.is_empty() {
+        bail!("refusing to {operation} branch `{branch}` from detached HEAD");
+    }
+    if current != branch {
+        bail!(
+            "refusing to {operation} branch `{branch}` while checked out on `{current}`; \
+             checkout `{branch}` or pass the current branch explicitly"
+        );
+    }
+    Ok(())
+}
+
+fn is_non_fast_forward_push_failure(output: &Output) -> bool {
+    let message = git_failure_message(output).to_ascii_lowercase();
+    message.contains("non-fast-forward")
+        || message.contains("fetch first")
+        || message.contains("updates were rejected")
+        || message.contains("incorrect old value provided")
 }
 
 fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
@@ -1028,6 +1094,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_checkpoint_if_needed_refuses_branch_mismatch_before_commit() {
+        let repo = init_repo("checkpoint-branch-mismatch");
+        let target_branch = run_git_in(&repo, ["branch", "--show-current"])
+            .trim()
+            .to_string();
+        run_git_in(&repo, ["checkout", "-b", "feature"]);
+        fs::write(repo.join("README.md"), "# dirty\n").expect("failed to dirty README");
+        let head_before = run_git_in(&repo, ["rev-parse", "HEAD"]);
+
+        let err = auto_checkpoint_if_needed(&repo, &target_branch, "auto bug checkpoint")
+            .expect_err("checkpoint should refuse branch mismatch before committing");
+
+        assert!(err.to_string().contains("refusing to checkpoint branch"));
+        assert_eq!(run_git_in(&repo, ["rev-parse", "HEAD"]), head_before);
+        assert!(run_git_in(&repo, ["status", "--short"]).contains(" M README.md"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
     fn auto_checkpoint_if_needed_aborts_conflicted_rebase_and_reports_checkpoint_commit() {
         let (root, _remote, upstream, worker) =
             init_remote_and_clones("checkpoint-conflict-sync", "trunk");
@@ -1075,6 +1161,50 @@ mod tests {
         run_git_in(&upstream, ["fetch", "origin", "trunk"]);
         let log = run_git_in(&upstream, ["log", "--format=%s", "-2", "origin/trunk"]);
         assert_eq!(log, "worker change\nupstream change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_branch_with_remote_sync_retries_non_fast_forward_push_race() {
+        let (root, _remote, upstream, worker) = init_remote_and_clones("push-race-retry", "trunk");
+
+        fs::write(worker.join("WORKER.md"), "worker\n").expect("failed to write worker");
+        run_git_in(&worker, ["add", "WORKER.md"]);
+        run_git_in(&worker, ["commit", "-m", "worker change"]);
+
+        let marker = root.join("push-race-fired");
+        let hook = worker.join(".git").join("hooks").join("pre-push");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+if [ ! -f "{marker}" ]; then
+  touch "{marker}"
+  printf 'race\n' > "{upstream}/RACE.md"
+  git -C "{upstream}" add RACE.md
+  git -C "{upstream}" commit -m "race change"
+  git -C "{upstream}" push origin trunk
+fi
+"#,
+            marker = marker.display(),
+            upstream = upstream.display()
+        );
+        fs::write(&hook, script).expect("failed to write pre-push hook");
+        let mut permissions = fs::metadata(&hook)
+            .expect("failed to stat pre-push hook")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).expect("failed to chmod pre-push hook");
+
+        let synced =
+            push_branch_with_remote_sync(&worker, "trunk").expect("push race should be retried");
+
+        assert!(synced);
+        assert!(marker.exists());
+        run_git_in(&upstream, ["fetch", "origin", "trunk"]);
+        let log = run_git_in(&upstream, ["log", "--format=%s", "-3", "origin/trunk"]);
+        assert_eq!(log, "worker change\nrace change\ninit\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
