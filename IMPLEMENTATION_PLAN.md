@@ -41,7 +41,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: three new subsections present and grep checks pass.
 
-- [~] `TASK-003` Remove dead tmux scaffolding from `src/codex_exec.rs`
+- [x] `TASK-003` Remove dead tmux scaffolding from `src/codex_exec.rs`
 
     Spec: `specs/220426-agent-backend-execution.md`
     Why now: file-wide `#![allow(dead_code)]` at `src/codex_exec.rs:1` is hiding ~430 lines of orphaned tmux helpers (`run_codex_exec_in_tmux_with_env`, `ensure_tmux_lanes`, `spawn_codex_in_tmux`, `render_tmux_codex_script`, `wait_for_tmux_completion`, `read_completed_success`, `codex_stdout_has_agent_progress`, `read_status`, `read_pid`, `tmux_worker_is_alive`, `process_alive`, `ensure_tmux_lane`, `tmux_session_exists`, `tmux_window_exists`, `run_tmux_owned`). Verified unused: `grep` for these symbols across `src/` returns matches only in `codex_exec.rs` itself; `parallel_command.rs` only imports `run_codex_exec_with_env`. Deleting them lets us drop the file-wide `#![allow(dead_code)]`, recovers signal from clippy, and shrinks the file from ~700 to ~300 lines.
