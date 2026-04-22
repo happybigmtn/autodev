@@ -635,6 +635,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread::sleep;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1050,6 +1051,124 @@ mod tests {
         assert_eq!(log, "worker change\nupstream change\n");
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn atomic_write_works_outside_git_repo() {
+        let dir = temp_repo_path("atomic-write-non-git");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("state.json");
+        let payload = br#"{"outside":"git"}"#;
+
+        assert!(
+            !dir.join(".git").exists(),
+            "fixture should stay outside a git repo"
+        );
+
+        atomic_write(&target, payload).expect("atomic write should succeed outside a git repo");
+
+        let written = fs::read(&target).expect("failed to read atomic write output");
+        assert_eq!(written, payload);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_dir() {
+        let dir = temp_repo_path("atomic-write-missing-parent");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("nested").join("missing").join("result.json");
+        let parent = target.parent().expect("target should have a parent");
+        let payload = br#"{"created":"parent"}"#;
+
+        assert!(!parent.exists(), "parent should start missing");
+
+        atomic_write(&target, payload).expect("atomic write should create missing parents");
+
+        assert!(
+            parent.is_dir(),
+            "atomic write should create the parent directory"
+        );
+        let written = fs::read(&target).expect("failed to read atomic write output");
+        assert_eq!(written, payload);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn atomic_write_handles_rapid_succession_collisions() {
+        let dir = temp_repo_path("atomic-write-collision");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("state.json");
+        let concurrent_writers = 3usize;
+        let start = Arc::new(Barrier::new(concurrent_writers + 1));
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut handles = Vec::new();
+
+        for writer in 0..concurrent_writers {
+            let start = Arc::clone(&start);
+            let done_tx = done_tx.clone();
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut payload = format!("writer-{writer}:").into_bytes();
+                payload.resize(128 * 1024, b'a' + writer as u8);
+
+                start.wait();
+                let result = atomic_write(&target, &payload);
+                done_tx
+                    .send(())
+                    .expect("failed to signal concurrent writer completion");
+                result
+            }));
+        }
+        drop(done_tx);
+
+        let final_payload = {
+            let mut payload = b"writer-final:".to_vec();
+            payload.resize(128 * 1024, b'z');
+            payload
+        };
+        let start_for_final = Arc::clone(&start);
+        let target_for_final = target.clone();
+        handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
+            start_for_final.wait();
+            for _ in 0..concurrent_writers {
+                done_rx
+                    .recv()
+                    .expect("failed to wait for concurrent writer completion");
+            }
+            atomic_write(&target_for_final, &final_payload)
+        }));
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("writer thread should not panic")
+                .expect("all atomic writes should succeed");
+        }
+
+        let written = fs::read(&target).expect("failed to read atomic write output");
+        let mut expected = b"writer-final:".to_vec();
+        expected.resize(128 * 1024, b'z');
+        assert_eq!(written, expected);
+
+        let temp_files = fs::read_dir(&dir)
+            .expect("failed to read temp dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read temp dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".state.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "unexpected temp files after concurrent writes: {temp_files:?}"
+        );
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 
     #[test]
