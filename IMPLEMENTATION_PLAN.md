@@ -203,7 +203,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: decision doc lands; either a new implementation task is queued or the current behavior is documented as accepted.
 
-- [ ] `TASK-013` Decide whether to dedupe Linear GraphQL surface between `linear_tracker.rs` and `symphony_command.rs`
+- [x] `TASK-013` Decide whether to dedupe Linear GraphQL surface between `linear_tracker.rs` and `symphony_command.rs`
 
     Spec: `specs/220426-symphony-linear-orchestration.md`
     Why now: spec says `linear_tracker.rs` GraphQL queries are the sole egress to Linear, but `src/symphony_command.rs:30-200+` carries a parallel set (`AutoSymphonyProject`, `AutoSymphonyProjectIssues`, `CREATE_ISSUE_MUTATION`, `UPDATE_ISSUE_MUTATION`, `UPDATE_ISSUE_AND_STATE_MUTATION`). Either the spec is too narrow or the code drifted. Need a research-shaped review before consolidation.

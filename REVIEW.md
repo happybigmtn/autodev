@@ -73,3 +73,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib symphony_command::tests::run_requires_symphony_root_when_unset`, `grep -n "/home/r/coding" src/`
 - Completion artifacts: `src/main.rs`, `src/symphony_command.rs`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib symphony_command::tests::run_requires_symphony_root_when_unset`, `grep -n "/home/r/coding" src/`
+
+## `TASK-013`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/symphony-graphql-surface.md`, `specs/220426-symphony-linear-orchestration.md`
+- Scope exceptions: none recorded by host.
+- Validation: repo does not require a verification receipt wrapper for this task
+- Completion artifacts: `docs/decisions/symphony-graphql-surface.md`
+- Remaining blockers: missing REVIEW.md handoff
