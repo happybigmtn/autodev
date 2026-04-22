@@ -169,7 +169,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: tests pass, hand-running `auto steward` in a greenfield clone exits non-zero with the actionable error.
 
-- [ ] `TASK-011` Checkpoint: re-confirm clean baseline before opening Follow-On work
+- [x] `TASK-011` Checkpoint: re-confirm clean baseline before opening Follow-On work
 
     Spec: `specs/220426-build-provenance-and-ci-bootstrap.md`
     Why now: closes the second priority cluster (TASK-008/009/010) before any Follow-On is picked up. Operators (or the CI workflow itself once TASK-008 lands) need a recorded checkpoint so anyone resuming the queue knows the baseline.
