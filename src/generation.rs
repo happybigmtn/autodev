@@ -2557,8 +2557,7 @@ fn body_contains_path_like_owner(body: &str) -> bool {
 fn token_looks_like_plan_owner(token: &str) -> bool {
     let token = token
         .trim()
-        .trim_matches(|ch: char| matches!(ch, '.' | ':' | '"' | '\'' | '`'))
-        .trim_end_matches('/');
+        .trim_matches(|ch: char| matches!(ch, '.' | ':' | '"' | '\'' | '`'));
     if token.is_empty() || token.contains('*') || token.starts_with('-') || token.starts_with('$') {
         return false;
     }
@@ -2574,6 +2573,7 @@ fn token_looks_like_plan_owner(token: &str) -> bool {
         "docs"
             | "specs"
             | "plans"
+            | "crates"
             | "scripts"
             | "fixtures"
             | "deploy"
@@ -4573,6 +4573,20 @@ No external dependencies.
         write_generated_plan(&root, &task);
 
         verify_generated_implementation_plan(&root).expect("git ref ownership should be accepted");
+    }
+
+    #[test]
+    fn generated_plan_accepts_backticked_directory_owner_with_trailing_slash() {
+        let root = temp_dir("backticked-directory-owner");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Owns: docs",
+            "Owns: `crates/` (whatever files need reformatting)",
+        );
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root)
+            .expect("backticked directory owners with trailing slash should be accepted");
     }
 
     #[test]
