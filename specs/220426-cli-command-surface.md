@@ -59,4 +59,4 @@ Lock the `auto` CLI's top-level command surface, clap argument layout, subcomman
 
 - Should `auto --help` group the sixteen commands by lifecycle cluster using `clap::Command::next_help_heading`? (Recommended by `corpus/DESIGN.md`; not implemented.)
 - Should the README explicitly document the existing `dirty: unknown` fallback for builds where `build.rs` cannot reach `git` (for example, release tarballs or stripped build environments)?
-- Should `auto symphony run --symphony-root <path>` be required, or should `AUTODEV_SYMPHONY_ROOT` provide the default? It is optional today at `src/main.rs:276-278` with a hardcoded `/home/r/coding/symphony/elixir` default that is operator-specific; TASK-009 covers this DX defect.
+- Should `auto symphony run` keep the current `--symphony-root <path>` / `AUTODEV_SYMPHONY_ROOT` resolution contract, or add more explicit preflight diagnostics for an unbuilt Symphony checkout? The operator-specific hardcoded default was removed by TASK-009.

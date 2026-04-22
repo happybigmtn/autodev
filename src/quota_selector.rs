@@ -34,8 +34,9 @@ pub(crate) async fn score_accounts(
             Ok(usage) => scored.push((entry, Some(usage))),
             Err(e) => {
                 eprintln!(
-                    "[quota-router] failed to fetch usage for '{}': {e:#}",
+                    "[quota-router] failed to fetch usage for '{}': {}",
                     entry.name,
+                    quota_usage::sanitize_quota_error_message(&e),
                 );
                 scored.push((entry, None));
             }

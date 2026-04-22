@@ -159,7 +159,7 @@ mod tests {
         let chained = anyhow::Error::msg(format!("provider body: {fake_body}"))
             .context("quota fetch failed for claude-primary");
         let rendered = format_usage_error(&chained);
-        assert_eq!(rendered, "error: quota fetch failed for claude-primary");
+        assert_eq!(rendered, "error: sensitive auth details redacted");
         assert_no_secret_markers(&rendered);
     }
 }

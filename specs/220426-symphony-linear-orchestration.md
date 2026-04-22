@@ -11,7 +11,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 - `src/main.rs:95` declares `Symphony`; `SymphonySubcommand` at `src/main.rs:111-118` covers `Sync`, `Workflow`, `Run`.
 - `SymphonySyncArgs` (`src/main.rs:121-149`): `--repo-root`, `--project-slug`, `--todo-state` (default `"Todo"`), `--planner-model` (default `"gpt-5.4"`), `--planner-reasoning-effort` (default `"high"`), `--codex-bin` (default `"codex"`), `--no-ai-planner`.
 - `SymphonyWorkflowArgs` (`src/main.rs:151-200+`): `--repo-root`, `--project-slug`, `--output`, `--workspace-root`, `--base-branch`, `--max-concurrent-agents` (default `1`), `--poll-interval-ms` (default `5_000`), `--model` (default `"gpt-5.4"`), `--reasoning-effort` (default `"high"`), `--in-progress-state` (default `"In Progress"`), `--done-state` (default `"Done"`), `--blocked-state` (optional).
-- `SymphonyRunArgs` (`src/main.rs:201-286`) includes `--symphony-root` with a hardcoded default `/home/r/coding/symphony/elixir` (`src/main.rs:274-278`) that is operator-specific and likely should be configurable or required.
+- `SymphonyRunArgs` (`src/main.rs:201-286`) includes `--symphony-root` with no hardcoded default; `auto symphony run` resolves an explicit path first, then `AUTODEV_SYMPHONY_ROOT`, and fails with an actionable error when both are unset (`src/symphony_command.rs:1672-1682`).
 - `symphony_command.rs` is ~3,062 LOC (corpus ASSESSMENT). Tests ~18 covering GraphQL query construction and state parsing.
 - Host-side `auto parallel` GraphQL tracker queries live in `src/linear_tracker.rs`:
   - `FETCH_PROJECT_QUERY` (`linear_tracker.rs:16`) for project/team/state lookup.
@@ -44,7 +44,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 ### Recommendations (corpus)
 
 - Add `auto symphony` to the README inventory and write a short purpose / flag summary (`corpus/plans/002-readme-command-inventory-sync.md`).
-- Remove the hardcoded `/home/r/coding/symphony/elixir` default on `SymphonyRunArgs.symphony_root` or scope it behind an env var / required flag. `WORKFLOW.md` is the rendered workflow output and is separate from the local Symphony Elixir root.
+- Keep the local Symphony Elixir root separate from rendered workflow output. `WORKFLOW.md` is repo runtime configuration; `--symphony-root` / `AUTODEV_SYMPHONY_ROOT` points at the local Symphony checkout.
 - `corpus/DESIGN.md` §"What we are explicitly not designing for" excludes multi-user concurrency; Linear integration stays single-operator-per-repo.
 
 ### Hypotheses / unresolved questions
@@ -69,7 +69,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 - Symphony runs do not retry requests silently; failures surface to the operator.
 - Missing `codex` binary under `sync` with `--no-ai-planner=false` yields a named-dependency non-zero exit.
 - `auto symphony` is added to the README inventory with at least a one-line purpose description.
-- The hardcoded `SymphonyRunArgs.symphony_root` default (`/home/r/coding/symphony/elixir`) is removed or made non-operator-specific (for example, required or resolved from `AUTODEV_SYMPHONY_ROOT`).
+- The operator-specific `SymphonyRunArgs.symphony_root` default remains absent; `auto symphony run` accepts `--symphony-root`, falls back to `AUTODEV_SYMPHONY_ROOT`, and errors when neither is set.
 
 ## Verification
 
@@ -82,7 +82,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 
 ## Open Questions
 
-- Should the hardcoded `--symphony-root` default be replaced with a required flag, or should it resolve from `AUTODEV_SYMPHONY_ROOT`? `<repo>/WORKFLOW.md` is the workflow file, not the Symphony runtime root.
+- Should `auto symphony run` validate that the resolved Symphony checkout has already been built before rendering/syncing the repo workflow, or is the current late binary check sufficient?
 - Is `LINEAR_API_KEY` the only auth mechanism, or does Symphony support OAuth flows? Should this be surfaced in the README?
 - Should `auto symphony sync --no-ai-planner` be the default and AI-planner be opt-in, given that the AI path adds a mandatory `codex` dependency?
 - When two `auto symphony sync` runs happen concurrently in the same repo, what is the intended contention behavior?

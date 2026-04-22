@@ -600,8 +600,7 @@ mod tests {
         let active_dir = home.home().join(".codex");
         fs::create_dir_all(&active_dir).expect("failed to create active auth dir");
         let active_auth = active_dir.join("auth.json");
-        fs::write(&active_auth, br#"{"account":"active"}"#)
-            .expect("failed to write active auth");
+        fs::write(&active_auth, br#"{"account":"active"}"#).expect("failed to write active auth");
         set_mode(&active_auth, 0o644);
 
         let profile_dir = home.profile_dir("work");

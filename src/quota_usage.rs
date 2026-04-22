@@ -337,6 +337,10 @@ fn quota_profile_account_name(profile_dir: &Path, provider: Provider) -> String 
 }
 
 pub(crate) fn sanitize_quota_error_message(err: &anyhow::Error) -> String {
+    let chain = format!("{err:#}");
+    if quota_error_contains_secret_payload(&chain) {
+        return "sensitive auth details redacted".to_string();
+    }
     sanitize_quota_error_text(&err.to_string())
 }
 
