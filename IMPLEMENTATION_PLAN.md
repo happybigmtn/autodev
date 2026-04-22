@@ -57,7 +57,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: file shrinks substantially, `#![allow(dead_code)]` is gone, and clippy stays clean on the unmodified surviving callers.
 
-- [~] `TASK-004` Lock `auto audit` verdict-application behavior with regression tests
+- [x] `TASK-004` Lock `auto audit` verdict-application behavior with regression tests
 
     Spec: `specs/220426-audit-doctrine-pass.md`
     Why now: `src/audit_command.rs` is 1145 lines with only 4 tests, all targeting `glob_match` and `sha256_hex` (`src/audit_command.rs:1145-1175`). The verdict-application branches at `:797-889` (CLEAN / DRIFT-SMALL+SLOP / DRIFT-LARGE+REFACTOR / RETIRE / unknown) have zero coverage, so the next refactor or doctrine change can silently break the dispatch contract. The bail at `:1050` (`auto audit currently requires --use-kimi-cli`) also has no test.
