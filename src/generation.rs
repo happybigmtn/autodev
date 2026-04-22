@@ -476,14 +476,16 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             &corpus,
             args.parallelism.clamp(1, 10),
         );
-        let phase = run_logged_claude_phase(
+        let phase = run_logged_author_phase(
             &repo_root,
             mode.spec_phase_slug(),
             &prompt,
             &args.model,
             &args.reasoning_effort,
             args.max_turns,
-        )?;
+            &args.codex_bin,
+        )
+        .await?;
         let specs = verify_generated_specs(&output_dir)?;
         println!("spec prompt: {}", phase.prompt_path.display());
         if let Some(response_path) = phase.response_path {
@@ -501,14 +503,16 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             &generated_specs,
             args.parallelism.clamp(1, 10),
         );
-        let plan_phase = run_logged_claude_phase(
+        let plan_phase = run_logged_author_phase(
             &repo_root,
             mode.plan_phase_slug(),
             &plan_prompt,
             &args.model,
             &args.reasoning_effort,
             args.max_turns,
-        )?;
+            &args.codex_bin,
+        )
+        .await?;
         (
             verify_generated_implementation_plan(&output_dir)?,
             Some(plan_phase),
@@ -843,6 +847,107 @@ fn verify_codex_review_report(report_path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn run_logged_author_phase(
+    repo_root: &Path,
+    phase_slug: &str,
+    prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    max_turns: usize,
+    codex_bin: &Path,
+) -> Result<PhaseRunSummary> {
+    if author_phase_uses_claude_model(model) {
+        return run_logged_claude_phase(
+            repo_root,
+            phase_slug,
+            prompt,
+            model,
+            reasoning_effort,
+            max_turns,
+        );
+    }
+    run_logged_codex_author_phase(
+        repo_root,
+        phase_slug,
+        prompt,
+        model,
+        reasoning_effort,
+        codex_bin,
+    )
+    .await
+}
+
+async fn run_logged_codex_author_phase(
+    repo_root: &Path,
+    phase_slug: &str,
+    prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+) -> Result<PhaseRunSummary> {
+    let prompt_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("{phase_slug}-{}-prompt.md", timestamp_slug()));
+    let stdout_log_path = prompt_path.with_file_name(
+        prompt_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("author-prompt.md")
+            .replace("-prompt.md", "-stdout.log"),
+    );
+    let stderr_log_path = prompt_path.with_file_name(
+        prompt_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("author-prompt.md")
+            .replace("-prompt.md", "-stderr.log"),
+    );
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!("phase:       {phase_slug}");
+    println!("model:       {model}");
+    println!("effort:      {reasoning_effort}");
+    println!("codex bin:   {}", codex_bin.display());
+    println!("prompt log:  {}", prompt_path.display());
+    println!("stdout log:  {}", stdout_log_path.display());
+    println!("stderr log:  {}", stderr_log_path.display());
+
+    let status = run_codex_exec(
+        repo_root,
+        prompt,
+        model,
+        reasoning_effort,
+        codex_bin,
+        &stderr_log_path,
+        Some(&stdout_log_path),
+        phase_slug,
+    )
+    .await?;
+    if !status.success() {
+        bail!(
+            "Codex authoring phase `{phase_slug}` failed with status {status}; see {}",
+            stderr_log_path.display()
+        );
+    }
+    Ok(PhaseRunSummary {
+        prompt_path,
+        response_path: Some(stdout_log_path),
+    })
+}
+
+fn author_phase_uses_claude_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized == "opus"
+        || normalized == "sonnet"
+        || normalized == "haiku"
+        || normalized.contains("claude")
+        || normalized.contains("opus")
+        || normalized.contains("sonnet")
+        || normalized.contains("haiku")
 }
 
 fn run_logged_claude_phase(
@@ -3358,7 +3463,7 @@ fn strip_fixed_numeric_prefix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_corpus_codex_review_prompt, build_corpus_prompt,
+        author_phase_uses_claude_model, build_corpus_codex_review_prompt, build_corpus_prompt,
         build_generation_codex_review_prompt, build_implementation_plan_prompt,
         generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
@@ -3825,6 +3930,14 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(corpus_prompt.contains("before calling cross-repo work ungrounded"));
         assert!(corpus_prompt.contains("must reconcile to these surfaces explicitly"));
         assert!(corpus_prompt.contains("second active master plan"));
+    }
+
+    #[test]
+    fn generation_author_backend_uses_codex_for_non_claude_models() {
+        assert!(author_phase_uses_claude_model("claude-opus-4-7"));
+        assert!(author_phase_uses_claude_model("sonnet"));
+        assert!(!author_phase_uses_claude_model("gpt-5.4"));
+        assert!(!author_phase_uses_claude_model("o3"));
     }
 
     #[test]
