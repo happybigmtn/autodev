@@ -3268,6 +3268,18 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_finder_alias_prefix_to_canonical_bug_id() {
+        let chunk = test_chunk(5);
+        let findings = vec![test_finding("FND-005-01")];
+
+        let (findings, rewrites) = normalize_finder_findings(&chunk, findings);
+
+        assert_eq!(findings[0].bug_id, "BUG-005-01");
+        assert_eq!(rewrites.len(), 1);
+        validate_findings(&chunk, &findings).expect("FND alias should normalize before validation");
+    }
+
+    #[test]
     fn leaves_canonical_finder_bug_ids_unchanged() {
         let chunk = test_chunk(3);
         let findings = vec![test_finding("BUG-003-01"), test_finding("BUG-003-02")];
