@@ -9,6 +9,7 @@ use crate::quota_config::{Provider, QuotaConfig};
 use crate::quota_patterns::{self, QuotaVerdict};
 use crate::quota_selector;
 use crate::quota_state::QuotaState;
+use crate::util::chmod_0o600_if_unix;
 
 /// Guard that restores original auth files on drop.
 struct AuthRestoreGuard {
@@ -40,6 +41,7 @@ impl Drop for AuthRestoreGuard {
                     let _ = remove_and_copy_dir(backup, target);
                 } else {
                     let _ = fs::copy(backup, target);
+                    let _ = chmod_0o600_if_unix(target);
                 }
                 let _ = remove_path(backup);
             }
@@ -87,6 +89,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                     dst_path.display()
                 )
             })?;
+            chmod_0o600_if_unix(&dst_path)?;
         }
     }
     Ok(())
@@ -105,6 +108,7 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                     target.display()
                 )
             })?;
+            chmod_0o600_if_unix(&target)?;
         }
         Provider::Claude => {
             let home = dirs::home_dir().expect("cannot resolve home directory");
@@ -125,6 +129,7 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                             claude_json.display()
                         )
                     })?;
+                    chmod_0o600_if_unix(&claude_json)?;
                     continue;
                 }
 
@@ -135,6 +140,7 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                     fs::copy(&src, &dst).with_context(|| {
                         format!("failed to copy {} -> {}", src.display(), dst.display())
                     })?;
+                    chmod_0o600_if_unix(&dst)?;
                 }
             }
         }
@@ -154,6 +160,7 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
             if target.exists() {
                 fs::copy(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
+                chmod_0o600_if_unix(&bp)?;
             }
             copy_profile_to_active_auth(provider, profile_dir)?;
             vec![(bp, target)]
@@ -174,6 +181,7 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
             if claude_json.exists() {
                 fs::copy(&claude_json, &claude_json_bp)
                     .with_context(|| format!("failed to backup {}", claude_json.display()))?;
+                chmod_0o600_if_unix(&claude_json_bp)?;
             }
 
             copy_profile_to_active_auth(provider, profile_dir)?;
@@ -364,6 +372,7 @@ fn restore_credentials(provider: Provider) -> Result<()> {
             let bp = backup_dir.join("codex-auth.json");
             if bp.exists() {
                 fs::copy(&bp, &target)?;
+                chmod_0o600_if_unix(&target)?;
                 fs::remove_file(&bp)?;
             }
         }
@@ -479,7 +488,96 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::quota_output_has_agent_progress;
+    use super::{quota_output_has_agent_progress, swap_credentials};
+    use crate::quota_config::Provider;
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    struct TempQuotaHome {
+        root: PathBuf,
+        home_previous: Option<OsString>,
+        config_previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempQuotaHome {
+        fn new(label: &str) -> Self {
+            let lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("autodev-{label}-{}-{stamp}", std::process::id()));
+            let home = root.join("home");
+            let config = root.join("config");
+            fs::create_dir_all(&home).expect("failed to create temp home");
+            fs::create_dir_all(&config).expect("failed to create temp config");
+            let home_previous = std::env::var_os("HOME");
+            let config_previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            Self {
+                root,
+                home_previous,
+                config_previous,
+                _lock: lock,
+            }
+        }
+
+        fn home(&self) -> PathBuf {
+            self.root.join("home")
+        }
+
+        fn profile_dir(&self, name: &str) -> PathBuf {
+            self.root
+                .join("config")
+                .join("quota-router")
+                .join("profiles")
+                .join(format!("codex-{name}"))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempQuotaHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.home_previous {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(previous) = &self.config_previous {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        let mut permissions = fs::metadata(path)
+            .expect("failed to stat file")
+            .permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).expect("failed to set file permissions");
+    }
 
     #[test]
     fn detects_progress_sentinel_before_quota_failure() {
@@ -493,5 +591,34 @@ mod tests {
         assert!(!quota_output_has_agent_progress(
             "Error: rate limit exceeded for this organization"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_credentials_enforces_0o600() {
+        let home = TempQuotaHome::new("quota-exec-swap");
+        let active_dir = home.home().join(".codex");
+        fs::create_dir_all(&active_dir).expect("failed to create active auth dir");
+        let active_auth = active_dir.join("auth.json");
+        fs::write(&active_auth, br#"{"account":"active"}"#)
+            .expect("failed to write active auth");
+        set_mode(&active_auth, 0o644);
+
+        let profile_dir = home.profile_dir("work");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        let profile_auth = profile_dir.join("auth.json");
+        fs::write(&profile_auth, br#"{"account":"profile"}"#)
+            .expect("failed to write profile auth");
+        set_mode(&profile_auth, 0o644);
+
+        let _guard = swap_credentials(Provider::Codex, &profile_dir)
+            .expect("credential swap should succeed");
+
+        let mode = fs::metadata(&active_auth)
+            .expect("failed to stat swapped auth")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
