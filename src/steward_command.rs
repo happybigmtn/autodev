@@ -27,6 +27,18 @@ const STEWARD_DELIVERABLES: [&str; 6] = [
     "PROMOTIONS.md",
 ];
 
+const PLANNING_SURFACE_PROBES: [&str; 9] = [
+    "IMPLEMENTATION_PLAN.md",
+    "REVIEW.md",
+    "SECURITY_PLAN.md",
+    "WORKLIST.md",
+    "LEARNINGS.md",
+    "ARCHIVED.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "PLANS.md",
+];
+
 pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
@@ -83,6 +95,10 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
     );
     if args.report_only {
         println!("mode:        report-only");
+    }
+
+    if planning_surface.is_empty() && !args.dry_run && !args.report_only {
+        bail!("{}", no_planning_surface_message(&repo_root));
     }
 
     if !args.dry_run && !args.report_only {
@@ -249,21 +265,24 @@ fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<Pa
 }
 
 fn detect_planning_surface(repo_root: &Path) -> Vec<PathBuf> {
-    [
-        "IMPLEMENTATION_PLAN.md",
-        "REVIEW.md",
-        "SECURITY_PLAN.md",
-        "WORKLIST.md",
-        "LEARNINGS.md",
-        "ARCHIVED.md",
-        "AGENTS.md",
-        "CLAUDE.md",
-        "PLANS.md",
-    ]
-    .iter()
-    .map(|name| repo_root.join(name))
-    .filter(|p| p.exists())
-    .collect()
+    PLANNING_SURFACE_PROBES
+        .iter()
+        .map(|name| repo_root.join(name))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+fn no_planning_surface_message(repo_root: &Path) -> String {
+    format!(
+        "auto steward found no active planning surface in {}. Probed paths: {}. \
+         Use `auto corpus` + `auto gen` for greenfield repos before running `auto steward`.",
+        repo_root.display(),
+        PLANNING_SURFACE_PROBES
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn verify_steward_deliverables(output_dir: &Path) -> Result<()> {
@@ -570,10 +589,17 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 
 #[cfg(test)]
 mod tests {
-    use super::{build_finalizer_prompt, build_steward_prompt, detect_planning_surface};
+    use super::PLANNING_SURFACE_PROBES;
+    use super::{
+        build_finalizer_prompt, build_steward_prompt, detect_planning_surface, run_steward,
+    };
+    use crate::StewardArgs;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Mutex;
 
     fn unique_temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -581,6 +607,92 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("auto-steward-test-{nanos}"))
+    }
+
+    fn init_git_repo(path: &PathBuf) {
+        fs::create_dir_all(path).expect("create repo");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(path)
+            .output()
+            .expect("run git init");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let branch = Command::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .expect("set git branch");
+        assert!(
+            branch.status.success(),
+            "git symbolic-ref failed: {}",
+            String::from_utf8_lossy(&branch.stderr)
+        );
+    }
+
+    fn steward_args(repo: &Path, dry_run: bool) -> StewardArgs {
+        StewardArgs {
+            output_dir: None,
+            reference_repos: Vec::new(),
+            report_only: false,
+            dry_run,
+            branch: None,
+            model: "gpt-5.4".to_string(),
+            reasoning_effort: "high".to_string(),
+            finalizer_model: "gpt-5.4".to_string(),
+            finalizer_effort: "high".to_string(),
+            codex_bin: repo.join("missing-codex"),
+            skip_finalizer: false,
+        }
+    }
+
+    async fn run_steward_from(repo: &Path, args: StewardArgs) -> anyhow::Result<()> {
+        static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        let _guard = CURRENT_DIR_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+        let previous = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(repo).expect("enter repo");
+        let result = run_steward(args).await;
+        std::env::set_current_dir(previous).expect("restore current dir");
+        result
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_to_run_when_no_planning_surface_present() {
+        let temp = unique_temp_dir();
+        init_git_repo(&temp);
+
+        let error = run_steward_from(&temp, steward_args(&temp, false))
+            .await
+            .expect_err("steward should refuse greenfield repos");
+        let message = error.to_string();
+
+        fs::remove_dir_all(temp).expect("cleanup");
+
+        assert!(message.contains("no active planning surface"));
+        assert!(message.contains("auto corpus"));
+        for probe in PLANNING_SURFACE_PROBES {
+            assert!(
+                message.contains(probe),
+                "message omitted {probe}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dry_run_succeeds_without_planning_surface() {
+        let temp = unique_temp_dir();
+        init_git_repo(&temp);
+
+        let result = run_steward_from(&temp, steward_args(&temp, true)).await;
+
+        fs::remove_dir_all(temp).expect("cleanup");
+
+        result.expect("dry run should only write prompt preview");
     }
 
     #[test]
