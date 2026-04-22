@@ -235,7 +235,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: three new tests pass; spec acceptance for the shared util layer test ask is closed.
 
-- [~] `TASK-015` Add 0o600 enforcement to credential SWAP path in `quota_exec.rs`
+- [x] `TASK-015` Add 0o600 enforcement to credential SWAP path in `quota_exec.rs`
 
     Spec: `specs/220426-quota-routing-and-credential-hardening.md`
     Why now: spec inventory of `fs::write` callsites is incomplete. `src/quota_exec.rs` performs `fs::copy` on credential files in `swap_credentials`/`copy_profile_to_active_auth` and creates lockfiles under `~/.config/quota-router/`; on filesystems where `fs::copy` doesn't preserve source mode strictly, the copied `auth.json` may end up world-readable. Worth gating behind TASK-005 to confirm the helper exists first.
