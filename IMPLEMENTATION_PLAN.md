@@ -219,7 +219,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: decision doc lands and either a follow-up implementation task is queued or the spec is updated to match reality.
 
-- [ ] `TASK-014` Add tmpdir / missing-parent / rapid-collision regression tests for `util::atomic_write`
+- [~] `TASK-014` Add tmpdir / missing-parent / rapid-collision regression tests for `util::atomic_write`
 
     Spec: `specs/220426-shared-util-layer.md`
     Why now: spec asks for three explicit test cases on `atomic_write` (tmpdir-not-a-git-repo behavior, missing parent dir auto-create, rapid-succession collision tiebreaker). Existing tests at `src/util.rs:1032-1091` cover only rename-failure cleanup and write-failure cleanup. The collision-tiebreaker test is the one most likely to catch a real bug — the temp filename uses `Utc::now().timestamp_nanos_opt().unwrap_or_default()` (`src/util.rs:413`), which can collide if two threads call into the same directory in the same nanosecond on systems where `timestamp_nanos_opt` returns `None`.

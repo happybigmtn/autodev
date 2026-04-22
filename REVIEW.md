@@ -81,3 +81,11 @@ Awaiting auto review:
 - Validation: repo does not require a verification receipt wrapper for this task
 - Completion artifacts: `docs/decisions/symphony-graphql-surface.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `TASK-014`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/util.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt still missing at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-014.json`
+- Completion artifacts: `src/util.rs`
+- Remaining blockers: missing REVIEW.md handoff; missing verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-014.json`
