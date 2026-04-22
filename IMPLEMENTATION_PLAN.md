@@ -187,7 +187,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
 
 ## Follow-On Work
 
-- [~] `TASK-012` Decide whether to enforce verification-receipt presence inside `auto loop`
+- [x] `TASK-012` Decide whether to enforce verification-receipt presence inside `auto loop`
 
     Spec: `specs/220426-execution-loop-and-parallel.md`
     Why now: spec asserts "loop never marks `[x]` unless evidence is present", but `src/loop_command.rs` does not import `completion_artifacts`; the gating exists only in the prompt and in `parallel_command.rs` / `review_command.rs`. This is a real spec/code drift but spec also flags loop-integration as one of the open questions. Need a decision (research-shaped) before code.
