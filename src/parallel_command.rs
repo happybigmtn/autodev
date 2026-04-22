@@ -6117,12 +6117,10 @@ mod tests {
 
     #[test]
     fn default_prompt_lists_reference_repos_when_declared() {
-        let prompt = render_default_parallel_prompt(
-            "main",
-            &[PathBuf::from("/home/r/coding/robopokermulti")],
-        );
+        let prompt =
+            render_default_parallel_prompt("main", &[PathBuf::from("/tmp/robopokermulti")]);
         assert!(prompt.contains("Additional repositories you may inspect as read-only context"));
-        assert!(prompt.contains("/home/r/coding/robopokermulti"));
+        assert!(prompt.contains("/tmp/robopokermulti"));
         assert!(prompt.contains("Do not edit, format, stage, commit, push"));
         assert!(prompt.contains("leave a precise follow-up plan item or blocker"));
     }

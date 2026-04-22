@@ -273,9 +273,9 @@ struct SymphonyRunArgs {
     #[arg(long)]
     blocked_state: Option<String>,
 
-    /// Local Symphony Elixir root directory
-    #[arg(long, default_value = "/home/r/coding/symphony/elixir")]
-    symphony_root: PathBuf,
+    /// Local Symphony Elixir root directory. Overrides AUTODEV_SYMPHONY_ROOT; required when the env var is unset.
+    #[arg(long, value_name = "PATH")]
+    symphony_root: Option<PathBuf>,
 
     /// Directory where Symphony should write its own log files
     #[arg(long)]
@@ -1218,5 +1218,16 @@ mod tests {
             panic!("expected symphony run");
         };
         assert!(args.sync_first);
+    }
+
+    #[test]
+    fn symphony_run_help_mentions_symphony_root_env() {
+        let help = match Cli::try_parse_from(["auto", "symphony", "run", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected help output"),
+        };
+
+        assert!(help.contains("--symphony-root <PATH>"));
+        assert!(help.contains("AUTODEV_SYMPHONY_ROOT"));
     }
 }

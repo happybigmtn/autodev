@@ -694,10 +694,9 @@ mod tests {
 
     #[test]
     fn default_prompt_lists_reference_repos_when_declared() {
-        let prompt =
-            render_default_loop_prompt("main", &[PathBuf::from("/home/r/coding/robopokermulti")]);
+        let prompt = render_default_loop_prompt("main", &[PathBuf::from("/tmp/robopokermulti")]);
         assert!(prompt.contains("Additional repositories you may inspect or edit"));
-        assert!(prompt.contains("/home/r/coding/robopokermulti"));
+        assert!(prompt.contains("/tmp/robopokermulti"));
         assert!(prompt.contains("owned surfaces live in one of these repos"));
     }
 

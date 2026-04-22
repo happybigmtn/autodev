@@ -26,6 +26,7 @@ use crate::{
 const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const RELATION_BLOCKS: &str = "blocks";
 const SYNC_PLANNER_MAX_PRIORITY: i64 = 4;
+const SYMPHONY_ROOT_ENV: &str = "AUTODEV_SYMPHONY_ROOT";
 
 const FETCH_PROJECT_QUERY: &str = r#"
 query AutoSymphonyProject($slug: String!) {
@@ -1587,6 +1588,8 @@ async fn render_workflow(args: SymphonyWorkflowArgs) -> Result<RenderedWorkflow>
 }
 
 async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
+    let symphony_root = resolve_symphony_root(args.symphony_root.clone())?;
+
     if args.sync_first {
         run_sync(SymphonySyncArgs {
             repo_root: args.repo_root.clone(),
@@ -1616,12 +1619,12 @@ async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
     })
     .await?;
 
-    let symphony_bin = args.symphony_root.join("bin").join("symphony");
+    let symphony_bin = symphony_root.join("bin").join("symphony");
     if !symphony_bin.is_file() {
         bail!(
             "Symphony binary not found at {}; build it first with `cd {} && mix build` or `mise exec -- mix build`",
             symphony_bin.display(),
-            args.symphony_root.display()
+            symphony_root.display()
         );
     }
 
@@ -1640,7 +1643,7 @@ async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
 
     let mut command = TokioCommand::new(&symphony_bin);
     command
-        .current_dir(&args.symphony_root)
+        .current_dir(&symphony_root)
         .arg("--i-understand-that-this-will-be-running-without-the-usual-guardrails")
         .arg("--logs-root")
         .arg(&logs_root)
@@ -1664,6 +1667,20 @@ async fn run_foreground(args: SymphonyRunArgs) -> Result<()> {
         bail!("Symphony exited with status {status}");
     }
     Ok(())
+}
+
+fn resolve_symphony_root(explicit_root: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(root) = explicit_root {
+        return Ok(root);
+    }
+
+    let Some(root) = std::env::var_os(SYMPHONY_ROOT_ENV).filter(|value| !value.is_empty()) else {
+        bail!(
+            "missing symphony root: pass --symphony-root <path> or set {SYMPHONY_ROOT_ENV}=<path>"
+        );
+    };
+
+    Ok(PathBuf::from(root))
 }
 
 fn resolve_repo_root(repo_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -2591,12 +2608,77 @@ mod tests {
         completed_plan_issue_updates, extract_agent_message_from_codex_stream,
         fallback_task_priorities, issue_requires_reactivation, issue_task_id_from_description,
         mark_tasks_done_in_plan, markdown_front_matter, normalize_planner_response, parse_tasks,
-        render_issue_description, render_workflow_markdown, review_contains_task, shell_quote,
-        single_line_excerpt, LinearIssue, PlannerResponse, PlannerTask, SymphonyTask, TaskStatus,
-        WorkflowRenderSpec,
+        render_issue_description, render_workflow_markdown, resolve_symphony_root,
+        review_contains_task, shell_quote, single_line_excerpt, LinearIssue, PlannerResponse,
+        PlannerTask, SymphonyTask, TaskStatus, WorkflowRenderSpec, SYMPHONY_ROOT_ENV,
     };
     use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvRestore {
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(SYMPHONY_ROOT_ENV, previous);
+            } else {
+                std::env::remove_var(SYMPHONY_ROOT_ENV);
+            }
+        }
+    }
+
+    fn symphony_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn replace_symphony_root_env(value: Option<&str>) -> EnvRestore {
+        let previous = std::env::var_os(SYMPHONY_ROOT_ENV);
+        if let Some(value) = value {
+            std::env::set_var(SYMPHONY_ROOT_ENV, value);
+        } else {
+            std::env::remove_var(SYMPHONY_ROOT_ENV);
+        }
+        EnvRestore { previous }
+    }
+
+    #[test]
+    fn run_requires_symphony_root_when_unset() {
+        let _guard = symphony_root_env_lock().lock().expect("env lock");
+        let _restore = replace_symphony_root_env(None);
+
+        let error = resolve_symphony_root(None).expect_err("missing root should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("missing symphony root"));
+        assert!(message.contains("--symphony-root <path>"));
+        assert!(message.contains("AUTODEV_SYMPHONY_ROOT=<path>"));
+    }
+
+    #[test]
+    fn run_uses_symphony_root_env_when_arg_missing() {
+        let _guard = symphony_root_env_lock().lock().expect("env lock");
+        let _restore = replace_symphony_root_env(Some("/tmp/autodev-symphony"));
+
+        let root = resolve_symphony_root(None).expect("env root should resolve");
+
+        assert_eq!(root, PathBuf::from("/tmp/autodev-symphony"));
+    }
+
+    #[test]
+    fn run_symphony_root_arg_overrides_env() {
+        let _guard = symphony_root_env_lock().lock().expect("env lock");
+        let _restore = replace_symphony_root_env(Some("/tmp/autodev-env-symphony"));
+
+        let root = resolve_symphony_root(Some(PathBuf::from("/tmp/autodev-cli-symphony")))
+            .expect("explicit root should resolve");
+
+        assert_eq!(root, PathBuf::from("/tmp/autodev-cli-symphony"));
+    }
 
     #[test]
     fn parse_tasks_extracts_pending_items_and_dependencies() {

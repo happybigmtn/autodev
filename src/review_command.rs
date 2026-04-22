@@ -1669,11 +1669,11 @@ mod tests {
     fn appends_reference_repo_clause_when_repos_present() {
         let prompt = append_reference_repo_clause(
             "review prompt".to_string(),
-            &[PathBuf::from("/home/r/coding/robopokermulti")],
+            &[PathBuf::from("/tmp/robopokermulti")],
         );
 
         assert!(prompt.contains("Additional repositories you may inspect or edit"));
-        assert!(prompt.contains("/home/r/coding/robopokermulti"));
+        assert!(prompt.contains("/tmp/robopokermulti"));
         assert!(prompt.contains("owned or changed surfaces live in one of these repos"));
     }
 
