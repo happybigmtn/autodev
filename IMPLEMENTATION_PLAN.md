@@ -105,7 +105,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: both tests pass and message-shape regression tests block re-introduction of `{body}` or `{e:#}` in those exact callsites.
 
-- [ ] `TASK-007` Checkpoint: re-confirm clean baseline after the high-risk hardening cluster
+- [x] `TASK-007` Checkpoint: re-confirm clean baseline after the high-risk hardening cluster
 
     Spec: `specs/220426-build-provenance-and-ci-bootstrap.md`
     Why now: spec part (b) (CI bootstrap) explicitly gates on `cargo clippy -D warnings` being clean. TASK-003 (dead-code deletion), TASK-005 (perm tightening), and TASK-006 (error scrubbing) all touch hot files; before adding CI we must reverify that fmt + clippy + tests are still green and document the verified baseline so the CI workflow won't fail on day one.
