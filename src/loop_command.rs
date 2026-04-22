@@ -366,6 +366,10 @@ fn parse_loop_queue(plan: &str) -> LoopQueueSnapshot {
             if let Some(task_id) = extract_task_id(task) {
                 queue.pending_ids.push(task_id);
             }
+        } else if let Some(task) = trimmed.strip_prefix("- [~] ") {
+            if let Some(task_id) = extract_task_id(task) {
+                queue.pending_ids.push(task_id);
+            }
         } else if let Some(task) = trimmed.strip_prefix("- [!] ") {
             if let Some(task_id) = extract_task_id(task) {
                 queue.blocked_ids.push(task_id);
@@ -794,6 +798,25 @@ mod tests {
             LoopQueueSnapshot {
                 pending_ids: vec!["META-001".to_string(), "GATE-P4".to_string()],
                 blocked_ids: vec!["DEC-001".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_loop_queue_treats_tilde_tasks_as_pending() {
+        let queue = parse_loop_queue(
+            r#"
+- [~] `PARTIAL-001` Partially completed task
+- [!] `BLOCKED-001` Blocked task
+- [x] `DONE-001` Finished already
+"#,
+        );
+
+        assert_eq!(
+            queue,
+            LoopQueueSnapshot {
+                pending_ids: vec!["PARTIAL-001".to_string()],
+                blocked_ids: vec!["BLOCKED-001".to_string()],
             }
         );
     }

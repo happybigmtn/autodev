@@ -532,7 +532,7 @@ What it actually does:
 - Prefers task-scoped and affected-surface validation over workspace-wide or package-wide sweeps
 - Does not default to broad workspace validation; it only runs broad suites when the current task
   explicitly requires them or when the repo offers no narrower truthful proof
-- Removes finished tasks from `IMPLEMENTATION_PLAN.md`
+- Preserves finished tasks in `IMPLEMENTATION_PLAN.md` and marks them `- [x]`
 - Appends a completion record to `REVIEW.md`
 - Commits and pushes truthful increments to the allowed branch
 - Treats a commit in the queue repo or any declared reference repo as real loop progress
