@@ -23,7 +23,9 @@ fn emit_git_rerun_markers() {
     emit_rerun_if_changed(git_dir.join("packed-refs"));
 
     if let Some(head_ref) = git_output(&["symbolic-ref", "HEAD"]) {
-        emit_rerun_if_changed(git_dir.join(head_ref));
+        if let Some(ref_path) = git_output(&["rev-parse", "--git-path", &head_ref]) {
+            emit_rerun_if_changed(PathBuf::from(ref_path));
+        }
     }
     if let Some(index_path) = git_output(&["rev-parse", "--git-path", "index"]) {
         emit_rerun_if_changed(PathBuf::from(index_path));
