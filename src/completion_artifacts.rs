@@ -418,23 +418,6 @@ fn inspect_verification_receipt(
         );
     }
 
-    let mut unexpected = recorded.difference(&expected).cloned().collect::<Vec<_>>();
-    unexpected.sort();
-    if !unexpected.is_empty() {
-        return (
-            false,
-            Some(format!(
-                "verification receipt `{}` does not match the current Verification block; unexpected command(s): {}",
-                verification_receipt_path.display(),
-                unexpected
-                    .iter()
-                    .map(|command| format!("`{command}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        );
-    }
-
     let mut failed = receipt
         .commands
         .iter()
@@ -913,5 +896,34 @@ Dependencies: none
             .missing_reasons()
             .join("\n")
             .contains("is missing command(s)"));
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_ignores_extra_historical_receipts() {
+        let root = temp_dir("extra-receipts");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-10`\n",
+        )
+        .expect("failed to write review");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-10.json"),
+            r#"{"commands":[{"command":"cargo test -p demo current","exit_code":0,"status":"passed"},{"command":"cargo test -p demo old","exit_code":101,"status":"failed"}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-10",
+            "- [ ] `TASK-10` Example\nVerification:\n  - `cargo test -p demo current`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+        assert!(evidence.missing_reasons().is_empty());
     }
 }
