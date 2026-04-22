@@ -65,3 +65,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib loop_command::tests::downgrades_marker_when_receipt_missing`
 - Completion artifacts: `docs/decisions/loop-receipt-gating.md`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib loop_command::tests::downgrades_marker_when_receipt_missing`
+
+## `TASK-009`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/loop_command.rs`, `src/main.rs`, `src/parallel_command.rs`, `src/review_command.rs`, `src/symphony_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib symphony_command::tests::run_requires_symphony_root_when_unset`, `grep -n "/home/r/coding" src/`
+- Completion artifacts: `src/main.rs`, `src/symphony_command.rs`
+- Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib symphony_command::tests::run_requires_symphony_root_when_unset`, `grep -n "/home/r/coding" src/`
