@@ -7,3 +7,5 @@
 - Specs that record "verified facts" need the same review treatment as code: when a task removes an operator-specific default, adjacent specs and decision docs must be searched for the old literal path before archiving the task.
 - Refusal paths should happen before creating task output artifacts. For commands like `auto steward`, tests should assert both the error message and the absence of default output directories so a "refuse to run" path stays side-effect-light.
 - Sensitive credential copy paths need the same pre-tightened write discipline as direct writes. Reading the source and writing through the owner-only helper avoids the exposure window left by `fs::copy` followed by chmod.
+- Model shorthand flags must not silently override an explicit `--model` value. Regression tests should cover "explicit model plus convenience flag" because default-model tests alone miss precedence bugs.
+- CLI default-behavior claims need parser-level tests, not only helper-function tests. A sibling-discovery helper can pass while the exposed command still defaults to not calling it.

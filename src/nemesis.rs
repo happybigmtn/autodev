@@ -698,6 +698,9 @@ fn ensure_nemesis_finalizer_config(config: &PhaseConfig) -> Result<()> {
 }
 
 fn resolve_auditor_model(args: &NemesisArgs) -> String {
+    if args.model != DEFAULT_NEMESIS_AUDIT_MODEL {
+        return args.model.clone();
+    }
     // Explicit legacy opt-in still honoured so operators who want a MiniMax
     // second-opinion run can force it with `--minimax`.
     if args.minimax {
@@ -2495,17 +2498,32 @@ Spec: specs/020426-nemesis-audit.md
     }
 
     #[test]
-    fn minimax_flag_forces_minimax_even_if_model_is_custom_kimi() {
-        // The --minimax opt-in is an explicit "give me the legacy audit run"
-        // request; it overrides the model argument.
+    fn explicit_model_takes_precedence_over_minimax_flag() {
         let mut args = sample_args("kimi-coding/k2p5");
+        args.minimax = true;
+        assert_eq!(resolve_auditor_model(&args), "kimi-coding/k2p5");
+    }
+
+    #[test]
+    fn explicit_model_takes_precedence_over_kimi_flag() {
+        let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
+        args.kimi = true;
+        assert_eq!(
+            resolve_auditor_model(&args),
+            "minimax/MiniMax-M2.7-highspeed"
+        );
+    }
+
+    #[test]
+    fn minimax_flag_selects_minimax_when_model_is_default() {
+        let mut args = sample_args(DEFAULT_NEMESIS_AUDIT_MODEL);
         args.minimax = true;
         assert_eq!(resolve_auditor_model(&args), "minimax");
     }
 
     #[test]
-    fn kimi_flag_forces_k2p6_default_even_if_model_is_legacy_minimax() {
-        let mut args = sample_args("minimax/MiniMax-M2.7-highspeed");
+    fn kimi_flag_selects_k2p6_when_model_is_default() {
+        let mut args = sample_args(DEFAULT_NEMESIS_AUDIT_MODEL);
         args.kimi = true;
         assert_eq!(resolve_auditor_model(&args), "k2.6");
     }

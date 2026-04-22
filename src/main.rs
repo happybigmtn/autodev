@@ -752,9 +752,9 @@ pub(crate) struct ReviewArgs {
     reference_repos: Vec<PathBuf>,
 
     /// Auto-discover sibling git repos in the parent directory as reference repos.
-    /// Off by default — prior behavior was to enroll every sibling, which is slow
-    /// and makes one dirty unrelated sibling abort the whole review pass.
-    #[arg(long)]
+    /// Enabled by default so `auto review` can reconcile queue items whose owned
+    /// surfaces landed in sibling repos.
+    #[arg(long, default_value_t = true)]
     include_siblings: bool,
 
     /// Directory for review logs. Defaults to <repo>/.auto/review
@@ -1218,6 +1218,15 @@ mod tests {
             panic!("expected symphony run");
         };
         assert!(args.sync_first);
+    }
+
+    #[test]
+    fn review_includes_siblings_by_default() {
+        let cli = Cli::try_parse_from(["auto", "review"]).expect("cli parse");
+        let Command::Review(args) = cli.command else {
+            panic!("expected review command");
+        };
+        assert!(args.include_siblings);
     }
 
     #[test]

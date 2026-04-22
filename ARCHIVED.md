@@ -119,3 +119,23 @@
 - Validation: `actionlint .github/workflows/ci.yml`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 - Completion artifacts: `COMPLETED.md`
 - Remaining blockers: none.
+
+## `TASK-016`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `Cargo.lock`, `Cargo.toml`
+- Review result: passed after reconciling stale queue prose. The live receipt `.auto/symphony/verification-receipts/TASK-016.json` now records the previously missing tag checks, and `refs/tags/v0.2.0` resolves to the release-baseline tag.
+- Validation: `git tag -l v0.2.0`, `git cat-file -p v0.2.0`, `cargo build`, `./target/debug/auto --version`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check`, and `cargo test`.
+- Completion artifacts: `COMPLETED.md`, `refs/tags/v0.2.0`
+- Remaining blockers: none.
+
+## Nemesis Audit Findings (spec: specs/050426-nemesis-audit.md)
+- Review result: passed after fixing a [Required] NEM-F2 regression found during review. `resolve_auditor_model` now preserves an explicit non-default `--model` before applying `--kimi` or `--minimax`, while shorthand flags still select their models when the default model is otherwise in use. The remaining NEM-F1 and NEM-F3 through NEM-F10 claims matched the live code and regression tests.
+- Validation: `cargo test` (365 passed), `cargo check`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `src/nemesis.rs`, `src/util.rs`, `src/bug_command.rs`, `specs/050426-nemesis-audit.md`
+- Remaining blockers: none.
+
+## Quota Router Primary Selection and Review Repo Discovery
+- Review result: passed after fixing a [Required] review discovery regression found during review. `auto review` now parses with sibling repo discovery enabled by default, and a parser-level regression test covers that exposed CLI behavior. The quota primary-account selection, status marker, and session-headroom fallback claims matched the live code and tests.
+- Validation: `cargo test` (365 passed), `cargo check`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo install --path . --root ~/.local`.
+- Completion artifacts: `src/main.rs`, `src/quota_exec.rs`, `src/quota_selector.rs`, `src/quota_status.rs`, `src/review_command.rs`
+- Remaining blockers: none.
