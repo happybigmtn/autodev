@@ -2340,28 +2340,41 @@ fn strip_list_bullet(line: &str) -> &str {
     trimmed
 }
 
+fn plan_field_line_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let unbulleted = strip_list_bullet(line);
+    if let Some(rest) = unbulleted.strip_prefix(field) {
+        return Some(rest.trim());
+    }
+
+    let field_name = field.trim_end_matches(':');
+    let bold_field = format!("**{field_name}:**");
+    if let Some(rest) = unbulleted.strip_prefix(&bold_field) {
+        return Some(rest.trim());
+    }
+
+    let bold_name_field = format!("**{field_name}**:");
+    unbulleted.strip_prefix(&bold_name_field).map(str::trim)
+}
+
 fn plan_task_field_line_value<'a>(block: &'a PlanTaskBlock, field: &str) -> Option<&'a str> {
-    block.markdown.lines().find_map(|line| {
-        strip_list_bullet(line)
-            .strip_prefix(field)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
+    block
+        .markdown
+        .lines()
+        .find_map(|line| plan_field_line_value(line, field).filter(|value| !value.is_empty()))
 }
 
 fn plan_task_field_body(block: &PlanTaskBlock, field: &str, next_field: &str) -> Option<String> {
     let mut collecting = false;
     let mut body = Vec::new();
     for line in block.markdown.lines() {
-        let unbulleted = strip_list_bullet(line);
-        if let Some(rest) = unbulleted.strip_prefix(field) {
+        if let Some(rest) = plan_field_line_value(line, field) {
             collecting = true;
-            if !rest.trim().is_empty() {
-                body.push(rest.trim().to_string());
+            if !rest.is_empty() {
+                body.push(rest.to_string());
             }
             continue;
         }
-        if collecting && unbulleted.starts_with(next_field) {
+        if collecting && plan_field_line_value(line, next_field).is_some() {
             break;
         }
         if collecting {
@@ -2389,20 +2402,18 @@ fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result
         }
     }
 
-    let bullet_count = normalized
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("- ") || trimmed.starts_with("* ")
-        })
-        .count();
-    if bullet_count > 5 {
+    if required_tests_body_is_none(normalized) {
+        return Ok(());
+    }
+
+    let explicit_test_count = count_required_test_entries(normalized);
+    if explicit_test_count > 5 {
         bail!(
-            "generated implementation plan task `{}` lists {bullet_count} required tests; split the task to keep at most five",
+            "generated implementation plan task `{}` lists {explicit_test_count} required tests; split the task to keep at most five",
             block.task_id
         );
     }
-    if bullet_count == 0 && normalized != "none" {
+    if explicit_test_count == 0 {
         bail!(
             "generated implementation plan task `{}` must list concrete required test names or `Required tests: none`",
             block.task_id
@@ -2410,6 +2421,40 @@ fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result
     }
 
     Ok(())
+}
+
+fn required_tests_body_is_none(body: &str) -> bool {
+    let normalized = body.trim();
+    let lowercase = normalized.to_ascii_lowercase();
+    lowercase == "none" || lowercase.starts_with("none ") || lowercase.starts_with("none(")
+}
+
+fn count_required_test_entries(body: &str) -> usize {
+    let bullet_count = body
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ") || trimmed.starts_with("* ")
+        })
+        .count();
+    if bullet_count > 0 {
+        return bullet_count;
+    }
+
+    let mut count = 0usize;
+    let mut rest = body;
+    while let Some(start) = rest.find('`') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        let token = after_start[..end].trim();
+        if !token.is_empty() {
+            count += 1;
+        }
+        rest = &after_start[end + 1..];
+    }
+    count
 }
 
 fn verify_completion_artifacts_are_concrete(block: &PlanTaskBlock, body: &str) -> Result<()> {
@@ -2905,10 +2950,10 @@ fn validate_plan_spec_refs(
     context_label: &str,
 ) -> Result<()> {
     for (line_index, line) in markdown.lines().enumerate() {
-        if !line.contains("Spec:") {
+        let Some(spec_value) = plan_field_line_value(line, "Spec:") else {
             continue;
-        }
-        let refs = extract_spec_refs_from_line(line);
+        };
+        let refs = extract_spec_refs_from_line(spec_value);
         if refs.is_empty() {
             bail!(
                 "{context_label} line {} contains `Spec:` but no `specs/*.md` path",
@@ -4371,6 +4416,46 @@ No external dependencies.
     }
 
     #[test]
+    fn generated_plan_accepts_inline_required_test_names() {
+        let root = temp_dir("inline-required-tests");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `exact_docs_test`",
+            "Required tests: `codex_exec::` (existing progress tests must still pass)",
+        );
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root)
+            .expect("inline concrete required tests should be accepted");
+    }
+
+    #[test]
+    fn generated_plan_accepts_bold_fields_and_required_tests_none_explanation() {
+        let root = temp_dir("bold-fields-required-tests-none");
+        write_real_spec(&root);
+        let task = [
+            "- **Spec:** `specs/050426-real.md`",
+            "- **Why now:** needed",
+            "- **Codebase evidence:** present",
+            "- **Owns:** docs/evidence.md",
+            "- **Integration touchpoints:** docs",
+            "- **Scope boundary:** docs only",
+            "- **Acceptance criteria:** evidence lands",
+            "- **Verification:** `grep -n evidence docs/evidence.md` returns one match.",
+            "- **Required tests:** None (evidence task; no code change).",
+            "- **Completion artifacts:** `docs/evidence.md`",
+            "- **Dependencies:** none",
+            "- **Estimated scope:** XS",
+            "- **Completion signal:** evidence recorded",
+        ]
+        .join("\n");
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root)
+            .expect("bold task fields and explanatory none should be accepted");
+    }
+
+    #[test]
     fn generated_plan_rejects_more_than_five_required_tests() {
         let root = temp_dir("too-many-required-tests");
         write_real_spec(&root);
@@ -4384,6 +4469,39 @@ No external dependencies.
             verify_generated_implementation_plan(&root).expect_err("expected test count failure");
 
         assert!(error.to_string().contains("at most five"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_more_than_five_inline_required_tests() {
+        let root = temp_dir("too-many-inline-required-tests");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `exact_docs_test`",
+            "Required tests: `t1`, `t2`, `t3`, `t4`, `t5`, `t6`",
+        );
+        write_generated_plan(&root, &task);
+
+        let error =
+            verify_generated_implementation_plan(&root).expect_err("expected test count failure");
+
+        assert!(error.to_string().contains("at most five"));
+    }
+
+    #[test]
+    fn generated_plan_ignores_prose_spec_mentions() {
+        let root = temp_dir("prose-spec-mention");
+        write_real_spec(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!(
+                "# IMPLEMENTATION_PLAN\n\nEvery task carries a single `Spec:` pointer.\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\n{}\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+                valid_generated_plan_task()
+            ),
+        )
+        .unwrap();
+
+        verify_generated_implementation_plan(&root)
+            .expect("prose mentions of field names should not be treated as fields");
     }
 
     #[test]
