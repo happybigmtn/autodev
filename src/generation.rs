@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate};
 
 use crate::codex_exec::run_codex_exec;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
-use crate::state::{load_state, save_state};
+use crate::state::{load_state, save_state, AutoState};
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
     list_markdown_files, timestamp_slug,
@@ -400,7 +400,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         .unwrap_or_else(|| repo_root.join("genesis"));
     ensure_planning_root_exists(&planning_root)?;
 
-    let output_dir = if args.plan_only {
+    let output_dir = if args.plan_only || args.sync_only {
         args.output_dir
             .clone()
             .or_else(|| state.latest_output_dir.clone())
@@ -434,18 +434,54 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
+    println!("sync only:   {}", if args.sync_only { "yes" } else { "no" });
 
-    if args.plan_only {
+    if args.plan_only || args.sync_only {
         if !output_dir.exists() {
             bail!(
-                "`{} --plan-only` requires an existing output dir, but {} does not exist",
+                "`{} {}` requires an existing output dir, but {} does not exist",
                 mode.command_label(),
+                if args.sync_only {
+                    "--sync-only"
+                } else {
+                    "--plan-only"
+                },
                 output_dir.display()
             );
         }
     } else {
         print_stage("prepare output dir", run_started_at);
         prepare_generation_output_dir(&output_dir)?;
+    }
+
+    if args.sync_only {
+        print_stage("verify generated outputs", run_started_at);
+        let generated_specs = verify_generated_specs(&output_dir)?;
+        let implementation_plan = verify_generated_implementation_plan(&output_dir)?;
+        let sync_summary = sync_verified_generation_outputs(SyncVerifiedGenerationOutputs {
+            repo_root: &repo_root,
+            mode,
+            planning_root: &planning_root,
+            output_dir: &output_dir,
+            generated_specs: &generated_specs,
+            implementation_plan: &implementation_plan,
+            state: &mut state,
+            run_started_at,
+        })?;
+        println!("{} complete", mode.command_label());
+        println!("output dir:  {}", output_dir.display());
+        println!(
+            "root specs:  {} appended, {} skipped",
+            sync_summary.root_specs.appended_paths.len(),
+            sync_summary.root_specs.skipped_count
+        );
+        if let Some(root_plan) = sync_summary.root_plan {
+            println!("root plan:   {}", root_plan.display());
+        } else {
+            println!("root plan:   unchanged");
+        }
+        println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
+        return Ok(());
     }
 
     print_stage("load planning corpus", run_started_at);
@@ -544,23 +580,16 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         implementation_plan = verify_generated_implementation_plan(&output_dir)?;
         Some(review)
     };
-    print_stage("sync generated specs to root", run_started_at);
-    let root_specs = sync_generated_specs_to_root(&repo_root, &generated_specs)?;
-    rewrite_generated_plan_spec_refs(&implementation_plan, &root_specs)?;
-    let root_plan = match mode {
-        GenerationMode::Gen => Some(sync_generated_plan_to_root_preserving_open_tasks(
-            &repo_root,
-            &implementation_plan,
-        )?),
-        GenerationMode::Reverse => None,
-    };
-    print_stage("scrub root outputs", run_started_at);
-    scrub_root_generated_outputs(&repo_root, mode)?;
-
-    print_stage("save generator state", run_started_at);
-    state.planning_root = Some(planning_root.clone());
-    state.latest_output_dir = Some(output_dir.clone());
-    save_state(&repo_root, &state)?;
+    let sync_summary = sync_verified_generation_outputs(SyncVerifiedGenerationOutputs {
+        repo_root: &repo_root,
+        mode,
+        planning_root: &planning_root,
+        output_dir: &output_dir,
+        generated_specs: &generated_specs,
+        implementation_plan: &implementation_plan,
+        state: &mut state,
+        run_started_at,
+    })?;
 
     println!("{} complete", mode.command_label());
     println!("repo root:   {}", repo_root.display());
@@ -585,10 +614,10 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("plan:        {}", implementation_plan.display());
     println!(
         "root specs:  {} appended, {} skipped",
-        root_specs.appended_paths.len(),
-        root_specs.skipped_count
+        sync_summary.root_specs.appended_paths.len(),
+        sync_summary.root_specs.skipped_count
     );
-    if let Some(root_plan) = root_plan {
+    if let Some(root_plan) = sync_summary.root_plan {
         println!("root plan:   {}", root_plan.display());
     } else {
         println!("root plan:   unchanged");
@@ -608,6 +637,57 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     }
     println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
+}
+
+struct SyncGeneratedOutputsSummary {
+    root_specs: SpecSyncSummary,
+    root_plan: Option<PathBuf>,
+}
+
+struct SyncVerifiedGenerationOutputs<'a> {
+    repo_root: &'a Path,
+    mode: GenerationMode,
+    planning_root: &'a Path,
+    output_dir: &'a Path,
+    generated_specs: &'a [GeneratedSpecDocument],
+    implementation_plan: &'a Path,
+    state: &'a mut AutoState,
+    run_started_at: Instant,
+}
+
+fn sync_verified_generation_outputs(
+    input: SyncVerifiedGenerationOutputs<'_>,
+) -> Result<SyncGeneratedOutputsSummary> {
+    let repo_root = input.repo_root;
+    let mode = input.mode;
+    let planning_root = input.planning_root;
+    let output_dir = input.output_dir;
+    let generated_specs = input.generated_specs;
+    let implementation_plan = input.implementation_plan;
+    let state = input.state;
+    let run_started_at = input.run_started_at;
+
+    print_stage("sync generated specs to root", run_started_at);
+    let root_specs = sync_generated_specs_to_root(repo_root, generated_specs)?;
+    rewrite_generated_plan_spec_refs(implementation_plan, &root_specs)?;
+    let root_plan = match mode {
+        GenerationMode::Gen => Some(sync_generated_plan_to_root_preserving_open_tasks(
+            repo_root,
+            implementation_plan,
+        )?),
+        GenerationMode::Reverse => None,
+    };
+    print_stage("scrub root outputs", run_started_at);
+    scrub_root_generated_outputs(repo_root, mode)?;
+
+    print_stage("save generator state", run_started_at);
+    state.planning_root = Some(planning_root.to_path_buf());
+    state.latest_output_dir = Some(output_dir.to_path_buf());
+    save_state(repo_root, state)?;
+    Ok(SyncGeneratedOutputsSummary {
+        root_specs,
+        root_plan,
+    })
 }
 
 fn print_stage(stage: &str, run_started_at: Instant) {
@@ -2512,6 +2592,7 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         &normalized,
         &available_specs,
         &format!("generated implementation plan {}", plan_path.display()),
+        true,
     )?;
     if normalized != markdown {
         atomic_write(&plan_path, normalized.as_bytes())
@@ -3193,6 +3274,7 @@ fn validate_plan_spec_refs(
     markdown: &str,
     available_specs: &std::collections::BTreeSet<String>,
     context_label: &str,
+    require_spec_ref: bool,
 ) -> Result<()> {
     for (line_index, line) in markdown.lines().enumerate() {
         let Some(spec_value) = plan_field_line_value(line, "Spec:") else {
@@ -3200,6 +3282,9 @@ fn validate_plan_spec_refs(
         };
         let refs = extract_spec_refs_from_line(spec_value);
         if refs.is_empty() {
+            if !require_spec_ref {
+                continue;
+            }
             bail!(
                 "{context_label} line {} contains `Spec:` but no `specs/*.md` path",
                 line_index + 1
@@ -3207,6 +3292,9 @@ fn validate_plan_spec_refs(
         }
         for spec_ref in refs {
             if !available_specs.contains(&spec_ref) {
+                if !require_spec_ref {
+                    continue;
+                }
                 bail!(
                     "{context_label} references missing spec `{spec_ref}` on line {}",
                     line_index + 1
@@ -3250,6 +3338,7 @@ fn scrub_root_generated_outputs(repo_root: &Path, mode: GenerationMode) -> Resul
                 &markdown,
                 &available_specs,
                 &format!("root implementation plan {}", root_plan.display()),
+                false,
             )?;
         }
     }
@@ -3469,10 +3558,10 @@ mod tests {
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
         normalize_generated_implementation_plan, normalize_generated_spec_markdown,
         rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_shapes,
-        sanitize_corpus_repo_root_paths, sync_generated_specs_to_root_for_date,
-        verify_corpus_execplan, verify_corpus_outputs, verify_generated_implementation_plan,
-        ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
-        SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        sanitize_corpus_repo_root_paths, scrub_root_generated_outputs,
+        sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
+        verify_generated_implementation_plan, ActivePlanSurface, CorpusPromptInputs,
+        GeneratedSpecDocument, GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use chrono::NaiveDate;
     use std::fs;
@@ -4860,6 +4949,38 @@ No external dependencies.
 
         verify_generated_implementation_plan(&root)
             .expect("prose mentions of field names should not be treated as fields");
+    }
+
+    #[test]
+    fn root_scrub_ignores_legacy_non_generated_spec_bullets() {
+        let root = temp_dir("root-legacy-spec-bullet");
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(specs_dir.join("050426-real.md"), "# Specification: Real\n").unwrap();
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [~] `OLD-001` Legacy task\n  - Spec: `SECURITY_PLAN.md`; `steward/RETIRE.md`.\n  - Why now: existing queue item.\n\n- [ ] `NEW-001` Generated task\n    Spec: `specs/050426-real.md`\n    Why now: generated queue item.\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .unwrap();
+
+        scrub_root_generated_outputs(&root, GenerationMode::Gen)
+            .expect("root scrub should ignore legacy non-generated Spec bullets");
+    }
+
+    #[test]
+    fn root_scrub_ignores_missing_legacy_spec_refs() {
+        let root = temp_dir("root-missing-legacy-spec-ref");
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(specs_dir.join("050426-real.md"), "# Specification: Real\n").unwrap();
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [~] `OLD-001` Legacy task\n  - Spec: `specs/olympiad/190426-missing.md`\n  - Why now: existing queue item.\n\n- [ ] `NEW-001` Generated task\n    Spec: `specs/050426-real.md`\n    Why now: generated queue item.\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .unwrap();
+
+        scrub_root_generated_outputs(&root, GenerationMode::Gen)
+            .expect("root scrub should ignore missing legacy spec refs");
     }
 
     #[test]

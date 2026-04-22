@@ -483,6 +483,10 @@ pub(crate) struct GenerationArgs {
     /// Skip spec regeneration and only refresh the plan inside an existing gen-* dir
     #[arg(long)]
     plan_only: bool,
+
+    /// Skip authoring and only verify/sync an existing gen-* output dir
+    #[arg(long)]
+    sync_only: bool,
 }
 
 #[derive(Args, Clone)]
