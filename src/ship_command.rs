@@ -218,15 +218,15 @@ fn resolve_base_branch(
         return Ok(branch);
     }
 
-    if let Some(branch) = KNOWN_PRIMARY_BRANCHES
-        .into_iter()
-        .find(|candidate| git_branch_exists(repo_root, candidate) && *candidate != current_branch)
-    {
-        return Ok(branch.to_string());
-    }
-
     if KNOWN_PRIMARY_BRANCHES.contains(&current_branch) {
         return Ok(current_branch.to_string());
+    }
+
+    if let Some(branch) = KNOWN_PRIMARY_BRANCHES
+        .into_iter()
+        .find(|candidate| git_branch_exists(repo_root, candidate))
+    {
+        return Ok(branch.to_string());
     }
 
     bail!(
@@ -257,7 +257,51 @@ fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::render_default_ship_prompt;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "auto-ship-test-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn init_git_repo(repo_root: &std::path::Path) {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("init")
+            .output()
+            .expect("git init failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .expect("git config email failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .expect("git config name failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .output()
+            .expect("git commit failed");
+    }
 
     #[test]
     fn default_ship_prompt_includes_operational_release_controls() {
@@ -268,5 +312,49 @@ mod tests {
         assert!(prompt.contains("feature flags"));
         assert!(prompt.contains("branch `main`"));
         assert!(prompt.contains("base branch `trunk`"));
+    }
+
+    #[test]
+    fn resolve_base_branch_prefers_current_branch_when_it_is_primary() {
+        let repo = test_dir("base-branch-prefers-current");
+        init_git_repo(&repo);
+
+        // Create both main and master branches, checkout main
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "master"])
+            .output()
+            .expect("git branch master failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["checkout", "-b", "main"])
+            .output()
+            .expect("git checkout main failed");
+
+        let current =
+            git_stdout(&repo, ["branch", "--show-current"]).expect("git branch --show-current failed");
+        assert_eq!(current.trim(), "main");
+
+        let base = resolve_base_branch(&repo, None, "main").expect("resolve_base_branch failed");
+        assert_eq!(base, "main", "expected main when currently on main, got {base}");
+    }
+
+    #[test]
+    fn resolve_base_branch_falls_back_to_other_primary_when_current_is_not_primary() {
+        let repo = test_dir("base-branch-fallback");
+        init_git_repo(&repo);
+
+        // Create a feature branch from master, leaving master as the only primary
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["checkout", "-b", "feature"])
+            .output()
+            .expect("git checkout feature failed");
+
+        let base = resolve_base_branch(&repo, None, "feature").expect("resolve_base_branch failed");
+        assert_eq!(base, "master", "expected master when on feature branch, got {base}");
     }
 }

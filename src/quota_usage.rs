@@ -72,6 +72,26 @@ pub(crate) struct AccountUsage {
 
 // ── Token refresh ─────────────────────────────────────────────────────
 
+fn apply_claude_token_response(
+    creds: &mut serde_json::Value,
+    token_resp: &serde_json::Value,
+) -> Result<()> {
+    let oauth = creds["claudeAiOauth"]
+        .as_object_mut()
+        .context("claudeAiOauth is not an object")?;
+
+    if let Some(at) = token_resp["access_token"].as_str() {
+        oauth.insert("accessToken".into(), serde_json::json!(at));
+    }
+    if let Some(rt) = token_resp["refresh_token"].as_str() {
+        oauth.insert("refreshToken".into(), serde_json::json!(rt));
+    }
+    let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
+    let new_expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+    oauth.insert("expiresAt".into(), serde_json::json!(new_expires_at));
+    Ok(())
+}
+
 async fn refresh_claude_if_needed(profile_dir: &Path) -> Result<()> {
     let creds_path = profile_dir.join(".credentials.json");
     let creds_text = fs::read_to_string(&creds_path)
@@ -132,20 +152,7 @@ async fn refresh_claude_if_needed(profile_dir: &Path) -> Result<()> {
         .context("failed to parse Claude token response")?;
 
     let mut creds: serde_json::Value = serde_json::from_str(&creds_text)?;
-    let oauth = creds["claudeAiOauth"]
-        .as_object_mut()
-        .context("claudeAiOauth is not an object")?;
-
-    if let Some(at) = token_resp["access_token"].as_str() {
-        oauth.insert("accessToken".into(), serde_json::json!(at));
-    }
-    if let Some(rt) = token_resp["refresh_token"].as_str() {
-        oauth.insert("refreshToken".into(), serde_json::json!(rt));
-    }
-    if let Some(expires_in) = token_resp["expires_in"].as_i64() {
-        let new_expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
-        oauth.insert("expiresAt".into(), serde_json::json!(new_expires_at));
-    }
+    apply_claude_token_response(&mut creds, &token_resp)?;
 
     write_0o600_if_unix(&creds_path, serde_json::to_string(&creds)?.as_bytes())?;
 
@@ -666,5 +673,55 @@ mod tests {
         ));
         assert_eq!(sanitized, "missing tokens.token in codex auth");
         assert_no_secret_markers(&sanitized);
+    }
+
+    #[test]
+    fn apply_claude_token_response_defaults_expires_in_to_3600_when_absent() {
+        let mut creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-token",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1000,
+            }
+        });
+        let token_resp = serde_json::json!({
+            "access_token": "new-token",
+            "refresh_token": "new-refresh",
+            // expires_in intentionally omitted
+        });
+
+        apply_claude_token_response(&mut creds, &token_resp).unwrap();
+
+        let oauth = creds["claudeAiOauth"].as_object().unwrap();
+        assert_eq!(oauth["accessToken"], "new-token");
+        assert_eq!(oauth["refreshToken"], "new-refresh");
+
+        let new_expires_at = oauth["expiresAt"].as_i64().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Should be roughly now + 3600s, within a few seconds tolerance
+        let diff_ms = (new_expires_at - (now_ms + 3600 * 1000)).abs();
+        assert!(diff_ms < 5000, "expiresAt should default to ~3600s from now, diff={diff_ms}ms");
+    }
+
+    #[test]
+    fn apply_claude_token_response_uses_provided_expires_in() {
+        let mut creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-token",
+                "expiresAt": 1000,
+            }
+        });
+        let token_resp = serde_json::json!({
+            "access_token": "new-token",
+            "expires_in": 7200,
+        });
+
+        apply_claude_token_response(&mut creds, &token_resp).unwrap();
+
+        let oauth = creds["claudeAiOauth"].as_object().unwrap();
+        let new_expires_at = oauth["expiresAt"].as_i64().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let diff_ms = (new_expires_at - (now_ms + 7200 * 1000)).abs();
+        assert!(diff_ms < 5000, "expiresAt should be ~7200s from now, diff={diff_ms}ms");
     }
 }
