@@ -18,7 +18,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: none (docs-only edit)
     Scope boundary: only the inventory line at `:11`, the inventory bullets at `:13-25`, the side-lane bullets at `:74-83`, the bug defaults bullet at `:39`, the Nemesis defaults bullet at `:54-55`, and the matching design-goal enumeration at `:1080-1082`. Do NOT add new detailed `### auto steward/audit/symphony` subsections in this task — that ships in TASK-002 to keep diffs focused.
     Acceptance criteria: README says "sixteen commands"; inventory list contains all 16 commands in the same order as `src/main.rs:52-96`; `:39` reads "Kimi `k2.6` finder, skeptic, fixer, and reviewer with a final `gpt-5.4` `high` Codex finalizer."; `:54-55` describes Nemesis as Kimi `k2.6` audit/synthesis/fixer plus Codex `gpt-5.4` finalizer rather than a PI audit pair; side-lane bullets call out steward/audit/symphony; design-goal enumeration matches.
-    Verification: `grep -n "thirteen\|sixteen" README.md` shows only "sixteen"; `grep -n "MiniMax finder\|PI audit pair by default" README.md` returns no matches; `grep -n "auto steward\|auto audit\|auto symphony" README.md` shows entries in both inventory and side-lane sections.
+    Verification: `rg -n 'sixteen commands' README.md`; `! rg -n 'thirteen|MiniMax finder|PI audit pair by default' README.md`; `rg -n 'auto steward|auto audit|auto symphony' README.md`.
     Required tests: none (docs-only)
     Completion artifacts: `README.md`
     Dependencies: none
@@ -34,7 +34,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: none
     Scope boundary: three new subsections (`### auto steward`, `### auto audit`, `### auto symphony`) inserted in the same Purpose/What it reads/What it produces/Defaults pattern used by existing subsections. Each must list the actual deliverables/artifact paths from the source-verified evidence above. No edits to Defaults section, no edits to PR/CI prose.
     Acceptance criteria: each new subsection has Purpose, What it reads, What it produces (with concrete file paths from the evidence), and Defaults; `auto steward` subsection lists all six STEWARD_DELIVERABLES; `auto audit` subsection states the doctrine default `audit/DOCTRINE.md` and the six verdict variants `CLEAN`/`DRIFT-SMALL`/`DRIFT-LARGE`/`SLOP`/`RETIRE`/`REFACTOR`; `auto symphony` subsection enumerates the three subcommands with one-line purposes.
-    Verification: `grep -nE "^### \`auto (steward|audit|symphony)\`" README.md` returns three matches; `grep -nE "DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md" README.md` returns six matches inside the new subsection; `grep -n "audit/DOCTRINE.md" README.md` returns at least one match in the audit subsection.
+    Verification: `rg -n '^### .*auto (steward|audit|symphony)' README.md`; `rg -n 'DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md' README.md`; `rg -n 'audit/DOCTRINE.md' README.md`.
     Required tests: none (docs-only)
     Completion artifacts: `README.md`
     Dependencies: TASK-001
@@ -50,7 +50,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: only `src/parallel_command.rs:16` (`run_codex_exec_with_env`), and the eight other callers using `run_codex_exec` (none touch tmux helpers).
     Scope boundary: delete the listed dead functions and the file-wide `#![allow(dead_code)]`. Keep `run_codex_exec`, `run_codex_exec_with_env`, `spawn_codex`, `write_worker_pid`, `clear_worker_pid`, `log_stderr`, `read_stream`, `shell_quote_path`, `shell_quote`, and `remove_if_exists` (all referenced by the surviving code paths). Do NOT introduce a new `LlmBackend` trait — that is research-only per spec.
     Acceptance criteria: `grep -n "#!\[allow(dead_code)\]" src/codex_exec.rs` returns no matches; `grep -nE "run_codex_exec_in_tmux_with_env|ensure_tmux_lanes|spawn_codex_in_tmux|render_tmux_codex_script|wait_for_tmux_completion|tmux_worker_is_alive|tmux_session_exists|tmux_window_exists|run_tmux_owned|TmuxCodexRunConfig" src/` returns zero matches; `cargo clippy --all-targets --all-features -- -D warnings` stays clean.
-    Verification: `cargo clippy -p autodev --lib --bins -- -D warnings` (stays clean); `cargo test --lib codex_exec` (currently zero tests — should remain zero and link cleanly); `cargo build` finishes without dead-code warnings against the dropped `#![allow]`.
+    Verification: `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test codex_exec`; `cargo build` finishes without dead-code warnings against the dropped `#![allow]`.
     Required tests: none (deletion-only refactor; existing `codex_stream` futility tests already cover the surviving exec path)
     Completion artifacts: `src/codex_exec.rs`
     Dependencies: none
@@ -66,12 +66,12 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `src/util.rs::atomic_write` (used by verdict writes); does not touch other modules.
     Scope boundary: add tests inside the existing `#[cfg(test)] mod tests` block. Do NOT change runtime behavior. Do NOT wire `FileVerdict::touched_paths` or `FileVerdict::escalate` (those are spec-flagged as deferred). If a helper needs a small visibility bump (e.g., extracting a pure dispatch helper from `apply_verdict` for testability), keep the change minimal and module-private.
     Acceptance criteria: new tests cover the unknown-verdict branch (returns `Pending`), CLEAN branch (returns `Audited` with no commit), missing-`patch.diff` downgrade-to-worklist branch, and the `--use-kimi-cli=false` bail; tests use a `tempfile::TempDir`-style approach already established by `src/util.rs:903-1099` test helpers (no new dev-deps).
-    Verification: `cargo test --lib audit_command::tests::` followed by the four new test names (`apply_verdict_clean_returns_audited`, `apply_verdict_unknown_leaves_pending`, `apply_verdict_drift_small_without_patch_promotes_to_worklist`, `run_audit_requires_use_kimi_cli`); also re-run the four existing tests `glob_match_handles_double_star_prefix`, `sha256_hex_is_deterministic`, `glob_match_handles_extension_wildcard`, `glob_match_handles_literal_path`.
+    Verification: `cargo test audit_command::tests::` followed by the four new test names (`apply_verdict_clean_returns_audited`, `apply_verdict_unknown_leaves_pending`, `apply_verdict_drift_small_without_patch_promotes_to_worklist`, `run_audit_requires_use_kimi_cli`); also re-run the four existing tests `glob_match_handles_double_star_prefix`, `sha256_hex_is_deterministic`, `glob_match_handles_extension_wildcard`, `glob_match_handles_literal_path`.
     Required tests: `apply_verdict_clean_returns_audited`, `apply_verdict_unknown_leaves_pending`, `apply_verdict_drift_small_without_patch_promotes_to_worklist`, `run_audit_requires_use_kimi_cli`
     Completion artifacts: `src/audit_command.rs`
     Dependencies: none
     Estimated scope: M
-    Completion signal: four new tests pass deterministically and `cargo test --lib audit_command` reports >=8 tests.
+    Completion signal: four new tests pass deterministically and `cargo test audit_command` reports >=8 tests.
 
 - [~] `TASK-005` Tighten Unix permissions on quota credential / config / state writes
 
@@ -82,7 +82,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `~/.config/quota-router/state.json`, `~/.config/quota-router/config.toml`, `~/.config/<provider>/profile/.credentials.json`. Does NOT touch `quota_exec.rs` swap paths or test-only writes inside `#[cfg(test)]` modules.
     Scope boundary: introduce a small helper `chmod_0o600_if_unix(path: &Path) -> Result<()>` (gated `#[cfg(unix)]`, no-op `#[cfg(not(unix))]`) co-located in `src/util.rs` next to `atomic_write`. Call it after each of the three production `fs::write` callsites. Do NOT migrate the writes to `atomic_write` (different acceptance contract; see TASK-006 hypothesis). Do NOT add encryption-at-rest (explicitly out of scope per spec).
     Acceptance criteria: each of the three writes is followed by `chmod_0o600_if_unix(&path)?`; the helper sets `0o600` via `std::os::unix::fs::PermissionsExt::set_mode`; on non-Unix the helper compiles and is a no-op.
-    Verification: `cargo test --lib util::tests::chmod_0o600_if_unix_sets_owner_only_mode` (new test); `cargo test --lib quota_config::tests::save_writes_owner_only` and `quota_state::tests::save_writes_owner_only` (new tests, gated `#[cfg(unix)]`).
+    Verification: `cargo test util::tests::chmod_0o600_if_unix_sets_owner_only_mode`; `cargo test quota_config::tests::save_writes_owner_only`; `cargo test quota_state::tests::save_writes_owner_only`.
     Required tests: `chmod_0o600_if_unix_sets_owner_only_mode`, `save_writes_owner_only` (in `quota_config`), `save_writes_owner_only` (in `quota_state`)
     Completion artifacts: `src/util.rs`, `src/quota_config.rs`, `src/quota_state.rs`, `src/quota_usage.rs`
     Dependencies: none
@@ -98,7 +98,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: callers in `src/quota_exec.rs` and `src/quota_status.rs` only — no API contract change for callers; the error-message text shrinks but the `Err` type stays the same.
     Scope boundary: replace the body-interpolation in the Claude refresh bail with a fixed message like `"Claude token refresh failed: provider=claude account=<name> http=<status>"` (no body, no chain); narrow the `{e:#}` in `quota_status.rs:75` to the first cause via `e.to_string()` after sanitizing; same for `quota_usage.rs:245`. Do NOT touch the Codex refresh path (`refresh_codex_with_cli`) — spec only requires Claude scrubbing today; document in code comment that Codex CLI stderr is left to the CLI's own redaction.
     Acceptance criteria: new tests assert the error message does NOT contain known-token markers (`access_token`, `refresh_token`, `Bearer `, `eyJ` JWT prefix) for both the refresh-bail and the status-print paths; tests use a stubbed `anyhow::Error::msg` carrying a fake token-bearing body to validate scrubbing works on real input shape.
-    Verification: `cargo test --lib quota_usage::tests::claude_refresh_error_does_not_leak_body`; `cargo test --lib quota_status::tests::print_does_not_leak_token_chain`.
+    Verification: `cargo test quota_usage::tests::claude_refresh_error_does_not_leak_body`; `cargo test quota_status::tests::print_does_not_leak_token_chain`.
     Required tests: `claude_refresh_error_does_not_leak_body`, `print_does_not_leak_token_chain`
     Completion artifacts: `src/quota_usage.rs`, `src/quota_status.rs`
     Dependencies: TASK-005
@@ -146,7 +146,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `auto symphony run` invocation path in `src/symphony_command.rs::run_symphony` and downstream `run_foreground`/`render_workflow`.
     Scope boundary: change the arg to `Option<PathBuf>` (no `default_value`), make it `--symphony-root` required for `auto symphony run` either via clap `required = true` OR via a runtime resolver that reads `AUTODEV_SYMPHONY_ROOT` env var first, then bails with a clear named-dependency error. Pick the env-var path because it matches the spec's "no operator-specific defaults" guidance and lets the env var be set in `~/.config/autodev/env` without touching the binary. Do NOT touch `auto symphony sync` or `auto symphony workflow` defaults — they don't read this arg.
     Acceptance criteria: `src/main.rs:277` no longer contains the literal `/home/r/coding/`; running `auto symphony run` with neither `--symphony-root` nor `AUTODEV_SYMPHONY_ROOT` exits non-zero with a clear "missing symphony root" error naming both override mechanisms; passing `--symphony-root <path>` or exporting `AUTODEV_SYMPHONY_ROOT=<path>` works; help text mentions both.
-    Verification: `cargo test --lib symphony_command::tests::run_requires_symphony_root_when_unset`; `grep -n "/home/r/coding" src/` returns zero matches.
+    Verification: `cargo test symphony_command::tests::run_requires_symphony_root_when_unset`; `! rg -n '/home/r/coding' src`.
     Required tests: `run_requires_symphony_root_when_unset`
     Completion artifacts: `src/main.rs`, `src/symphony_command.rs`
     Dependencies: none
@@ -162,7 +162,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `src/main.rs:74-80` (StewardArgs comment), `crate::StewardArgs.dry_run`/`report_only` flags (must continue to bypass the refusal so operators can preview).
     Scope boundary: when `planning_surface.is_empty()` AND `!args.dry_run` AND `!args.report_only`, bail with a concrete message naming the nine probed paths and recommending `auto corpus`. Keep `--dry-run` and `--report-only` as escape hatches that still print the plan and prompt path. Do NOT change deliverable list, models, or finalizer behavior.
     Acceptance criteria: new test stands up a tempdir-backed git repo with no planning files and asserts `run_steward` errors with a message containing `"no active planning surface"` and the recommendation `auto corpus`; `--dry-run` against the same fixture exits 0.
-    Verification: `cargo test --lib steward_command::tests::refuses_to_run_when_no_planning_surface_present`; `cargo test --lib steward_command::tests::dry_run_succeeds_without_planning_surface`.
+    Verification: `cargo test steward_command::tests::refuses_to_run_when_no_planning_surface_present`; `cargo test steward_command::tests::dry_run_succeeds_without_planning_surface`.
     Required tests: `refuses_to_run_when_no_planning_surface_present`, `dry_run_succeeds_without_planning_surface`
     Completion artifacts: `src/steward_command.rs`
     Dependencies: none
@@ -196,7 +196,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `src/completion_artifacts.rs::inspect_task_completion_evidence`, `src/loop_command.rs::run_loop` post-iteration check.
     Scope boundary: research-shaped task. Read three things — the spec acceptance criterion, the actual prompt that loop sends (currently lines 17-100+ of `loop_command.rs`), and `parallel_command.rs`'s receipt-check pattern — and write a one-page decision doc recommending one of: (a) enforce in Rust (downgrade `[x]` to `[~]` if the receipt is missing), (b) keep the prompt-only enforcement and document why, or (c) add a soft warning without rewriting markers. If the decision is (a), open a follow-up implementation task; do not implement here.
     Acceptance criteria: decision doc exists and explicitly cites the spec criterion + the two existing call sites; if recommendation is to implement, a follow-up TASK row is added to this plan with concrete acceptance criteria scoped to a single function.
-    Verification: review of the decision doc; if implementation lands later, `cargo test --lib loop_command::tests::downgrades_marker_when_receipt_missing`.
+    Verification: review of the decision doc; if implementation lands later, `cargo test loop_command::tests::downgrades_marker_when_receipt_missing`.
     Required tests: none for the decision pass; `downgrades_marker_when_receipt_missing` for the optional follow-up implementation
     Completion artifacts: `docs/decisions/loop-receipt-gating.md`
     Dependencies: TASK-011
@@ -228,7 +228,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: none (test-only addition)
     Scope boundary: add three tests inside the existing `#[cfg(test)] mod tests` block. Do NOT change `atomic_write` runtime behavior; if the rapid-collision test surfaces a real bug, open a separate task to fix it. Stay within the standard library and `tempfile`-style temp-dir creation already used elsewhere in the file.
     Acceptance criteria: tests exercise the three scenarios; the missing-parent test confirms `atomic_write` calls `create_dir_all`; the rapid-collision test spawns a small fixed number of threads writing to the same path and verifies all writes complete and the final file matches the last writer's bytes (or — if the test surfaces a deterministic collision — fails clearly so we file a real-fix task).
-    Verification: `cargo test --lib util::tests::atomic_write_creates_missing_parent_dir`; `cargo test --lib util::tests::atomic_write_handles_rapid_succession_collisions`; `cargo test --lib util::tests::atomic_write_works_outside_git_repo`.
+    Verification: `cargo test util::tests::atomic_write_creates_missing_parent_dir`; `cargo test util::tests::atomic_write_handles_rapid_succession_collisions`; `cargo test util::tests::atomic_write_works_outside_git_repo`.
     Required tests: `atomic_write_creates_missing_parent_dir`, `atomic_write_handles_rapid_succession_collisions`, `atomic_write_works_outside_git_repo`
     Completion artifacts: `src/util.rs`
     Dependencies: TASK-011
@@ -244,7 +244,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Integration touchpoints: `~/.config/<provider>/profile/auth.json`, `~/.config/quota-router/backup/`
     Scope boundary: after each `fs::copy` of a credential or backup file, call the `chmod_0o600_if_unix` helper added in TASK-005. Do NOT change rotation behavior or backup naming.
     Acceptance criteria: every credential-`fs::copy` callsite is followed by a chmod call; new test asserts the active `auth.json` has `0o600` after a swap (uses the existing test scaffolding pattern in the quota tests).
-    Verification: `cargo test --lib quota_exec::tests::swap_credentials_enforces_0o600`.
+    Verification: `cargo test quota_exec::tests::swap_credentials_enforces_0o600`.
     Required tests: `swap_credentials_enforces_0o600`
     Completion artifacts: `src/quota_exec.rs`
     Dependencies: TASK-005, TASK-011
