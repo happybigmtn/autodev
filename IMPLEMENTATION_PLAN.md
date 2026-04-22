@@ -9,7 +9,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
 
 ## Priority Work
 
-- [~] `TASK-001` Update README inventory and defaults to current 16-command surface
+- [x] `TASK-001` Update README inventory and defaults to current 16-command surface
 
     Spec: `specs/220426-readme-truth-pass.md`
     Why now: `README.md:11` claims "thirteen commands" and the inventory list at `README.md:13-25` omits `auto steward`, `auto audit`, and `auto symphony`; `README.md:39` still says MiniMax finder while `src/main.rs:514-515` defaults `--finder-model = "k2.6"`; `README.md:54-55` still says Nemesis runs a PI audit pair by default while `src/main.rs:1065-1116` defaults audit/synthesis/fixer to Kimi `k2.6` and Codex only for the finalizer. This is the highest-leverage user-visible truth gap and unblocks every downstream README truth pass.
