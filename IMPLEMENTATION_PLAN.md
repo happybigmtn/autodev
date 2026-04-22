@@ -89,7 +89,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: new tests pass under Linux; clippy stays clean; `metadata.permissions().mode() & 0o777 == 0o600` for every affected production path.
 
-- [~] `TASK-006` Scrub raw response bodies and full error chains from quota error surfaces
+- [x] `TASK-006` Scrub raw response bodies and full error chains from quota error surfaces
 
     Spec: `specs/220426-quota-routing-and-credential-hardening.md`
     Why now: `src/quota_usage.rs:126` interpolates the raw HTTP body into the bail message (`"Claude token refresh returned {status}: {body}"`); `src/quota_usage.rs:245` and `src/quota_status.rs:75` print full anyhow chains via `{e:#}`. A failed refresh that includes an invalid_grant body or a server-echoed token leaks the credential into stdout/logs.
