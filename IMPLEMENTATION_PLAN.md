@@ -73,7 +73,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: M
     Completion signal: four new tests pass deterministically and `cargo test --lib audit_command` reports >=8 tests.
 
-- [ ] `TASK-005` Tighten Unix permissions on quota credential / config / state writes
+- [~] `TASK-005` Tighten Unix permissions on quota credential / config / state writes
 
     Spec: `specs/220426-quota-routing-and-credential-hardening.md`
     Why now: `src/quota_config.rs:109`, `src/quota_state.rs:51`, and `src/quota_usage.rs:150` call plain `fs::write` for credentials/state/config under `~/.config/quota-router/` and the Claude OAuth credentials file. Anything not chmodded to 0o600 leaves OAuth refresh tokens readable to other users on multi-user hosts. This is a small, narrow security fix.
