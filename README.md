@@ -344,10 +344,11 @@ What it actually does:
 
 Default model layout:
 
-- finder: MiniMax `minimax/MiniMax-M2.7-highspeed` with `high`
-- skeptic: Kimi `kimi-coding/k2p6` with `high`
-- reviewer: Kimi `kimi-coding/k2p6` with `high`
-- implementer: `gpt-5.4` with `high`
+- finder: Kimi `k2.6` with `high`
+- skeptic: Kimi `k2.6` with `high`
+- reviewer: Kimi `k2.6` with `high`
+- fixer: Kimi `k2.6` with `high`
+- finalizer: Codex `gpt-5.4` with `high`
 
 Safety behavior:
 

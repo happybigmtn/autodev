@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::util::chmod_0o600_if_unix;
+use crate::util::write_0o600_if_unix;
 
 const CONFIG_DIR: &str = "quota-router";
 const CONFIG_FILE: &str = "config.toml";
@@ -108,9 +108,7 @@ impl QuotaConfig {
         let dir = Self::config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = toml::to_string_pretty(self).context("failed to serialize quota config")?;
-        fs::write(&path, text.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        chmod_0o600_if_unix(&path)
+        write_0o600_if_unix(&path, text.as_bytes())
     }
 
     pub(crate) fn find_account(&self, name: &str) -> Option<&AccountEntry> {

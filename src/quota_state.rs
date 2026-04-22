@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::quota_config::QuotaConfig;
-use crate::util::chmod_0o600_if_unix;
+use crate::util::write_0o600_if_unix;
 
 /// How long an exhausted account stays unavailable before auto-retrying.
 const EXHAUSTION_COOLDOWN_HOURS: i64 = 1;
@@ -49,9 +49,7 @@ impl QuotaState {
         let dir = QuotaConfig::config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = serde_json::to_string_pretty(self).context("failed to serialize quota state")?;
-        fs::write(&path, text.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        chmod_0o600_if_unix(&path)
+        write_0o600_if_unix(&path, text.as_bytes())
     }
 
     pub(crate) fn get(&self, name: &str) -> AccountState {

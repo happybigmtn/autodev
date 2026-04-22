@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::UNIX_EPOCH;
@@ -419,6 +421,30 @@ pub(crate) fn chmod_0o600_if_unix(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn write_0o600_if_unix(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if path.exists() {
+        chmod_0o600_if_unix(path)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    chmod_0o600_if_unix(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_0o600_if_unix(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
 #[cfg(test)]
 pub(crate) fn test_process_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -643,7 +669,7 @@ mod tests {
         atomic_write, auto_checkpoint_if_needed, checkpoint_status, chmod_0o600_if_unix,
         clip_line_for_display, ensure_repo_layout_with, is_checkpoint_excluded_path,
         prune_old_entries, push_branch_with_remote_sync, stage_checkpoint_changes,
-        sync_branch_with_remote, truncate_file_to_max_bytes,
+        sync_branch_with_remote, truncate_file_to_max_bytes, write_0o600_if_unix,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1214,6 +1240,36 @@ mod tests {
 
         chmod_0o600_if_unix(&path).expect("chmod helper should succeed");
 
+        let mode = fs::metadata(&path)
+            .expect("failed to stat credential file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_0o600_if_unix_tightens_existing_file_before_write() {
+        let dir = temp_repo_path("write-0600");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("credentials.json");
+        fs::write(&path, br#"{"token":"old"}"#).expect("failed to seed credential file");
+
+        let mut permissions = fs::metadata(&path)
+            .expect("failed to stat credential file")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).expect("failed to loosen credential permissions");
+
+        write_0o600_if_unix(&path, br#"{"token":"new"}"#).expect("owner-only write should succeed");
+
+        assert_eq!(
+            fs::read(&path).expect("failed to read credential file"),
+            br#"{"token":"new"}"#
+        );
         let mode = fs::metadata(&path)
             .expect("failed to stat credential file")
             .permissions()

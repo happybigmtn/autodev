@@ -255,6 +255,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     let plan = plan_audit_queue(
         &mut manifest,
         args.resume_mode,
+        &repo_root,
         &doctrine_hash,
         &rubric_hash,
     )?;
@@ -563,13 +564,17 @@ fn reconcile_manifest_with_tree(
 fn plan_audit_queue(
     manifest: &mut Manifest,
     mode: AuditResumeMode,
+    repo_root: &Path,
     doctrine_hash: &str,
     rubric_hash: &str,
 ) -> Result<Vec<ManifestEntry>> {
     let mut queue = Vec::new();
     for entry in &manifest.files {
-        let fresh_content = entry.content_hash.is_some();
-        let content_matches_last_audit = fresh_content; // recomputed per file below
+        let current_content = fs::read(repo_root.join(&entry.path))
+            .with_context(|| format!("failed to read {}", repo_root.join(&entry.path).display()))?;
+        let current_content_hash = sha256_hex(&current_content);
+        let content_matches_last_audit =
+            entry.content_hash.as_deref() == Some(current_content_hash.as_str());
         let doctrine_matches = entry
             .audited_doctrine_hash
             .as_deref()
@@ -582,7 +587,8 @@ fn plan_audit_queue(
             .unwrap_or(false);
         let is_audited = matches!(entry.status, EntryStatus::Audited);
         let is_applied_failed = matches!(entry.status, EntryStatus::ApplyFailed);
-        let needs_reaudit = is_audited && (!doctrine_matches || !rubric_matches);
+        let needs_reaudit =
+            is_audited && (!content_matches_last_audit || !doctrine_matches || !rubric_matches);
         match mode {
             AuditResumeMode::Fresh => queue.push(entry.clone()),
             AuditResumeMode::Resume => {
@@ -596,7 +602,6 @@ fn plan_audit_queue(
                 }
             }
         }
-        let _ = content_matches_last_audit;
     }
     Ok(queue)
 }
@@ -1151,7 +1156,10 @@ mod tests {
 
     use crate::{AuditArgs, AuditResumeMode};
 
-    use super::{apply_verdict, glob_match, run_auditor, sha256_hex, EntryStatus, FileVerdict};
+    use super::{
+        apply_verdict, glob_match, plan_audit_queue, run_auditor, sha256_hex, EntryStatus,
+        FileVerdict, Manifest, ManifestEntry,
+    };
 
     fn temp_repo_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1222,6 +1230,25 @@ mod tests {
         }
     }
 
+    fn audited_manifest(path: &str, content: &[u8]) -> Manifest {
+        Manifest {
+            started_at: "unix:0".to_string(),
+            repo_head: "head".to_string(),
+            doctrine_hash: "doctrine-new".to_string(),
+            rubric_hash: "rubric-new".to_string(),
+            files: vec![ManifestEntry {
+                path: path.to_string(),
+                status: EntryStatus::Audited,
+                content_hash: Some(sha256_hex(content)),
+                audited_doctrine_hash: Some("doctrine-new".to_string()),
+                audited_rubric_hash: Some("rubric-new".to_string()),
+                verdict: Some("CLEAN".to_string()),
+                audited_at: Some("unix:0".to_string()),
+                commit: None,
+            }],
+        }
+    }
+
     #[test]
     fn glob_match_handles_double_star_prefix() {
         assert!(glob_match("**/target/**", "foo/target/bar"));
@@ -1248,6 +1275,43 @@ mod tests {
         let b = sha256_hex(b"hello");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn resume_reaudits_when_file_content_hash_changes() {
+        let repo = TestTempDir::new("resume-content-drift");
+        fs::write(repo.path().join("README.md"), "# changed\n").expect("failed to write README");
+        let mut manifest = audited_manifest("README.md", b"# old\n");
+
+        let queue = plan_audit_queue(
+            &mut manifest,
+            AuditResumeMode::Resume,
+            repo.path(),
+            "doctrine-new",
+            "rubric-new",
+        )
+        .expect("plan should succeed");
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, "README.md");
+    }
+
+    #[test]
+    fn resume_skips_when_file_content_and_prompts_match() {
+        let repo = TestTempDir::new("resume-no-drift");
+        fs::write(repo.path().join("README.md"), "# same\n").expect("failed to write README");
+        let mut manifest = audited_manifest("README.md", b"# same\n");
+
+        let queue = plan_audit_queue(
+            &mut manifest,
+            AuditResumeMode::Resume,
+            repo.path(),
+            "doctrine-new",
+            "rubric-new",
+        )
+        .expect("plan should succeed");
+
+        assert!(queue.is_empty());
     }
 
     #[test]

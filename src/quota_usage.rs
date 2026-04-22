@@ -9,7 +9,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 
 use crate::quota_config::Provider;
-use crate::util::chmod_0o600_if_unix;
+use crate::util::write_0o600_if_unix;
 
 // OAuth token endpoints and client IDs
 const CLAUDE_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
@@ -147,9 +147,7 @@ async fn refresh_claude_if_needed(profile_dir: &Path) -> Result<()> {
         oauth.insert("expiresAt".into(), serde_json::json!(new_expires_at));
     }
 
-    fs::write(&creds_path, serde_json::to_string(&creds)?.as_bytes())
-        .with_context(|| format!("failed to write {}", creds_path.display()))?;
-    chmod_0o600_if_unix(&creds_path)?;
+    write_0o600_if_unix(&creds_path, serde_json::to_string(&creds)?.as_bytes())?;
 
     eprintln!("[quota-router] Claude OAuth token refreshed");
     Ok(())
