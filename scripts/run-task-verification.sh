@@ -18,7 +18,13 @@ bash -lc '"$@"' bash "$@"
 status=$?
 set -e
 
-python3 scripts/verification_receipt.py record -- "$task_id" "$command" "$status" || {
+receipt_args=(scripts/verification_receipt.py record)
+for arg in "$@"; do
+  receipt_args+=("--argv=$arg")
+done
+receipt_args+=(-- "$task_id" "$command" "$status")
+
+python3 "${receipt_args[@]}" || {
     echo "verification-receipt: warning: failed to record receipt" >&2
 }
 exit "$status"

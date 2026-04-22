@@ -1,9 +1,9 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use shlex::split as shell_split;
 
 use crate::util::atomic_write;
 
@@ -339,6 +339,8 @@ struct VerificationReceipt {
 struct VerificationReceiptCommand {
     command: String,
     #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
     status: Option<String>,
@@ -395,13 +397,16 @@ fn inspect_verification_receipt(
         }
     };
 
-    let expected = expected_commands.iter().cloned().collect::<HashSet<_>>();
-    let recorded = receipt
-        .commands
+    let mut missing = expected_commands
         .iter()
-        .map(|entry| entry.command.clone())
-        .collect::<HashSet<_>>();
-    let mut missing = expected.difference(&recorded).cloned().collect::<Vec<_>>();
+        .filter(|command| {
+            !receipt
+                .commands
+                .iter()
+                .any(|entry| verification_receipt_command_matches(entry, command))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     missing.sort();
     if !missing.is_empty() {
         return (
@@ -418,14 +423,20 @@ fn inspect_verification_receipt(
         );
     }
 
-    let mut failed = receipt
-        .commands
+    let mut failed = expected_commands
         .iter()
-        .filter(|entry| {
-            expected.contains(&entry.command)
-                && (entry.status.as_deref() != Some("passed") || entry.exit_code != Some(0))
+        .filter(|command| {
+            let matching_entries = receipt
+                .commands
+                .iter()
+                .filter(|entry| verification_receipt_command_matches(entry, command))
+                .collect::<Vec<_>>();
+            !matching_entries.is_empty()
+                && matching_entries.iter().all(|entry| {
+                    entry.status.as_deref() != Some("passed") || entry.exit_code != Some(0)
+                })
         })
-        .map(|entry| entry.command.clone())
+        .cloned()
         .collect::<Vec<_>>();
     failed.sort();
     if !failed.is_empty() {
@@ -444,6 +455,23 @@ fn inspect_verification_receipt(
     }
 
     (true, None)
+}
+
+fn verification_receipt_command_matches(
+    entry: &VerificationReceiptCommand,
+    expected_command: &str,
+) -> bool {
+    if entry.command == expected_command {
+        return true;
+    }
+
+    if entry.argv.is_empty() {
+        return false;
+    }
+
+    shell_split(expected_command)
+        .map(|expected_argv| expected_argv == entry.argv)
+        .unwrap_or(false)
 }
 
 fn executable_commands_from_verification_step(step: &str) -> Vec<String> {
@@ -948,6 +976,35 @@ Dependencies: none
             .missing_reasons()
             .join("\n")
             .contains("is missing command(s)"));
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_accepts_quoted_command_receipts_with_argv() {
+        let root = temp_dir("quoted-receipt");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-12`\n",
+        )
+        .expect("failed to write review");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-12.json"),
+            r#"{"commands":[{"command":"sh -c echo \"hello world\"","argv":["sh","-c","echo \"hello world\""],"exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-12",
+            "- [ ] `TASK-12` Example\nVerification:\n  - `sh -c 'echo \"hello world\"'`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+        assert!(evidence.missing_reasons().is_empty());
     }
 
     #[test]

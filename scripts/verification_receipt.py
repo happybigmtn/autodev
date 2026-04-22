@@ -72,6 +72,7 @@ def record(args: argparse.Namespace) -> None:
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
     entries[command] = {
         "command": command,
+        "argv": args.argv,
         "exit_code": args.exit_code,
         "recorded_at": timestamp,
         "status": "passed" if args.exit_code == 0 else "failed",
@@ -91,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     record_parser = subparsers.add_parser("record")
+    record_parser.add_argument("--argv", action="append", default=[])
     record_parser.add_argument("task_id")
     record_parser.add_argument("command")
     record_parser.add_argument("exit_code", type=int)
