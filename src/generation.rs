@@ -164,12 +164,6 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         run_started_at,
     );
     ensure_planning_root_ready_for_corpus(&planning_root)?;
-    print_stage("prepare planning root", run_started_at);
-    let previous_snapshot = if args.dry_run {
-        None
-    } else {
-        prepare_planning_root_for_corpus(&repo_root, &planning_root)?
-    };
 
     if let Some(idea) = args.idea.as_deref() {
         println!("idea:        {}", idea);
@@ -207,10 +201,44 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
+    if args.verify_only {
+        println!("mode:        verify-only");
+    }
     if args.dry_run {
         println!("mode:        dry-run");
         return Ok(());
     }
+    if args.verify_only {
+        ensure_planning_root_exists(&planning_root)?;
+        let summary = sanitize_verify_and_save_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            args.focus.is_some(),
+            &active_plan_surface,
+            run_started_at,
+        )?;
+        println!();
+        println!("corpus complete");
+        println!("assessment:  {}", summary.assessment_path.display());
+        println!("spec:        {}", summary.spec_path.display());
+        println!("plans index: {}", summary.plans_index_path.display());
+        println!("report:      {}", summary.report_path.display());
+        if let Some(design) = summary.design_path {
+            println!("design:      {}", design.display());
+        }
+        if let Some(focus) = summary.focus_path {
+            println!("focus brief: {}", focus.display());
+        }
+        if let Some(idea) = summary.idea_path {
+            println!("idea brief:  {}", idea.display());
+        }
+        println!("plan files:  {}", summary.plan_count);
+        println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
+        return Ok(());
+    }
+
+    print_stage("prepare planning root", run_started_at);
+    let previous_snapshot = prepare_planning_root_for_corpus(&repo_root, &planning_root)?;
 
     print_stage("create corpus skeleton", run_started_at);
     fs::create_dir_all(planning_root.join("plans")).with_context(|| {
@@ -288,20 +316,13 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         )
     };
 
-    print_stage("sanitize corpus outputs", run_started_at);
-    sanitize_corpus_outputs(&repo_root, &planning_root)?;
-
-    print_stage("verify corpus outputs", run_started_at);
-    let summary = verify_corpus_outputs(
+    let summary = sanitize_verify_and_save_corpus_outputs(
         &repo_root,
         &planning_root,
         args.focus.is_some(),
         &active_plan_surface,
+        run_started_at,
     )?;
-    print_stage("save corpus state", run_started_at);
-    let mut state = load_state(&repo_root)?;
-    state.planning_root = Some(planning_root.clone());
-    save_state(&repo_root, &state)?;
 
     println!();
     println!("corpus complete");
@@ -333,6 +354,30 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     }
     println!("elapsed:     {}", format_duration(run_started_at.elapsed()));
     Ok(())
+}
+
+fn sanitize_verify_and_save_corpus_outputs(
+    repo_root: &Path,
+    planning_root: &Path,
+    focus_requested: bool,
+    active_plan_surface: &ActivePlanSurface,
+    run_started_at: Instant,
+) -> Result<CorpusOutputSummary> {
+    print_stage("sanitize corpus outputs", run_started_at);
+    sanitize_corpus_outputs(repo_root, planning_root)?;
+
+    print_stage("verify corpus outputs", run_started_at);
+    let summary = verify_corpus_outputs(
+        repo_root,
+        planning_root,
+        focus_requested,
+        active_plan_surface,
+    )?;
+    print_stage("save corpus state", run_started_at);
+    let mut state = load_state(repo_root)?;
+    state.planning_root = Some(planning_root.to_path_buf());
+    save_state(repo_root, &state)?;
+    Ok(summary)
 }
 
 pub(crate) async fn run_gen(args: GenerationArgs) -> Result<()> {

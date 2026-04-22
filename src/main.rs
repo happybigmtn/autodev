@@ -421,6 +421,10 @@ pub(crate) struct CorpusArgs {
     #[arg(long)]
     skip_codex_review: bool,
 
+    /// Sanitize and verify the existing planning corpus without invoking authoring or review models
+    #[arg(long)]
+    verify_only: bool,
+
     /// Maximum Claude turns
     #[arg(long, default_value_t = 200)]
     max_turns: usize,
