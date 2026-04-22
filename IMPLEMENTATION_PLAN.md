@@ -25,7 +25,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: README inventory, bug defaults paragraph, and Nemesis defaults paragraph match the live CLI surface; no diff produced by `grep -n "thirteen\|MiniMax finder\|PI audit pair by default" README.md`.
 
-- [ ] `TASK-002` Add `### auto steward`, `### auto audit`, `### auto symphony` detailed-guide subsections to README
+- [~] `TASK-002` Add `### auto steward`, `### auto audit`, `### auto symphony` detailed-guide subsections to README
 
     Spec: `specs/220426-readme-truth-pass.md`
     Why now: `README.md` has detailed `###` subsections for the 13 historical commands (`README.md:86-849`) but none for the three commands added since the README was last truthful. Operators currently have no entry-point doc for these three commands.
