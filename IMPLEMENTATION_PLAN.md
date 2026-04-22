@@ -153,7 +153,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: hardcoded operator path is gone, missing-root produces a clear named error, env-var override works.
 
-- [ ] `TASK-010` Enforce "no planning surface" refusal in `auto steward`
+- [~] `TASK-010` Enforce "no planning surface" refusal in `auto steward`
 
     Spec: `specs/220426-steward-mid-flight-reconciliation.md`
     Why now: `detect_planning_surface` at `src/steward_command.rs:251-267` may return an empty list, but `run_steward` (`src/steward_command.rs:30-220`) currently continues and only embeds a "(none detected — consider `auto corpus` instead)" hint inside the prompt. Spec acceptance criterion #1 explicitly says steward must "refuse to run or flag the repo as no active planning surface" — current behavior silently runs anyway and pays for an entire Codex turn.
