@@ -137,7 +137,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: `actionlint` and `zizmor` both pass against the new workflow with zero warnings, and the three commands the workflow runs all pass locally.
 
-- [~] `TASK-009` Replace the operator-specific hardcoded default in `auto symphony run`
+- [x] `TASK-009` Replace the operator-specific hardcoded default in `auto symphony run`
 
     Spec: `specs/220426-symphony-linear-orchestration.md`
     Why now: `src/main.rs:277` hardcodes `default_value = "/home/r/coding/symphony/elixir"` for `--symphony-root`. Anyone but the original operator hits a path that doesn't exist and gets a confusing error instead of a clean missing-arg error. Spec explicitly flags this as a DX defect that the symphony spec wants removed.
