@@ -289,7 +289,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     };
 
     print_stage("sanitize corpus outputs", run_started_at);
-    sanitize_corpus_repo_root_paths(&repo_root, &planning_root)?;
+    sanitize_corpus_outputs(&repo_root, &planning_root)?;
 
     print_stage("verify corpus outputs", run_started_at);
     let summary = verify_corpus_outputs(
@@ -1014,6 +1014,54 @@ fn is_numbered_corpus_plan_file(path: &Path) -> bool {
     bytes.len() > 4 && bytes[..3].iter().all(|byte| byte.is_ascii_digit()) && bytes[3] == b'-'
 }
 
+fn sanitize_corpus_outputs(repo_root: &Path, planning_root: &Path) -> Result<()> {
+    sanitize_corpus_numbered_plan_front_matter(planning_root)?;
+    sanitize_corpus_repo_root_paths(repo_root, planning_root)
+}
+
+fn sanitize_corpus_numbered_plan_front_matter(planning_root: &Path) -> Result<()> {
+    let plans_dir = planning_root.join("plans");
+    if !plans_dir.is_dir() {
+        return Ok(());
+    }
+    for path in list_markdown_files(&plans_dir)?
+        .into_iter()
+        .filter(|path| is_numbered_corpus_plan_file(path))
+    {
+        let markdown = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let Some(sanitized) = strip_leading_yaml_front_matter_before_title(&markdown) else {
+            continue;
+        };
+        atomic_write(&path, sanitized.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn strip_leading_yaml_front_matter_before_title(markdown: &str) -> Option<String> {
+    let mut offset = 0;
+    let mut lines = markdown.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end_matches(&['\r', '\n'][..]) != "---" {
+        return None;
+    }
+    offset += first.len();
+
+    for line in lines {
+        let line_end = offset + line.len();
+        if line.trim_end_matches(&['\r', '\n'][..]) == "---" {
+            let rest = markdown[line_end..].trim_start_matches(&['\r', '\n'][..]);
+            if rest.starts_with("# ") {
+                return Some(rest.to_string());
+            }
+            return None;
+        }
+        offset = line_end;
+    }
+    None
+}
+
 fn sanitize_corpus_repo_root_paths(repo_root: &Path, planning_root: &Path) -> Result<()> {
     let repo_root_literal = repo_root.display().to_string();
     for path in list_markdown_files(planning_root)? {
@@ -1418,6 +1466,7 @@ Each numbered plan under `{planning_root}/plans/` must be a full ExecPlan, not a
 
 ExecPlan requirements for every numbered plan:
 - start with a markdown H1 title
+- do not include YAML front matter or metadata blocks before the H1
 - include the living-document paragraph from the root `PLANS.md` skeleton: "This ExecPlan is a living document..." and say it must be maintained in accordance with root `PLANS.md` when that file exists
 - be fully self-contained for a novice who has only the current working tree and that single plan file
 - define every non-obvious term in plain language and tie it to concrete repo files or commands
@@ -1883,7 +1932,7 @@ Output requirements:
 - `Spec:` values must point to `specs/*.md`
 - Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames
 - Keep the plan concrete, file-grounded, and executable
-- `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there. Tasks whose only output is a git ref (annotated tag, branch) MUST write the ref path directly, e.g. `Owns: refs/tags/v0.2.0` or `Owns: refs/heads/release/0.3` — prose like `git tags only` is rejected
+- `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docker-compose.yml`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there. Tasks whose only output is a git ref (annotated tag, branch) MUST write the ref path directly, e.g. `Owns: refs/tags/v0.2.0` or `Owns: refs/heads/release/0.3` — prose like `git tags only` is rejected
 - `Integration touchpoints:` should name concrete adjacent modules, route prefixes, commands, or config files; if none exist, write `none`
 - Do not include lane prose, staffing prose, or meta commentary
 - Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
@@ -2540,7 +2589,7 @@ fn verify_generated_plan_task_has_concrete_ownership(block: &PlanTaskBlock) -> R
     if !body_contains_path_like_owner(normalized) {
         bail!(
             "generated implementation plan task `{}` must give concrete path-like ownership in `Owns:` \
-             (e.g. `crates/foo/src/lib.rs`, `crates/foo/`, `docs`, or for git-ref-only tasks `refs/tags/<tag>`); \
+             (e.g. `crates/foo/src/lib.rs`, `crates/foo/`, `docker-compose.yml`, `docs`, or for git-ref-only tasks `refs/tags/<tag>`); \
              got `{}`",
             block.task_id,
             normalized
@@ -2561,11 +2610,7 @@ fn token_looks_like_plan_owner(token: &str) -> bool {
     if token.is_empty() || token.contains('*') || token.starts_with('-') || token.starts_with('$') {
         return false;
     }
-    if token.contains('/')
-        || token.ends_with(".rs")
-        || token.ends_with(".toml")
-        || token.ends_with(".md")
-    {
+    if token.contains('/') || token_has_known_file_extension(token) {
         return true;
     }
     matches!(
@@ -2589,6 +2634,16 @@ fn token_looks_like_plan_owner(token: &str) -> bool {
         && token
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')))
+}
+
+fn token_has_known_file_extension(token: &str) -> bool {
+    [
+        ".css", ".html", ".js", ".json", ".lock", ".md", ".py", ".rs", ".sh", ".sql", ".toml",
+        ".ts", ".tsx", ".yaml", ".yml",
+    ]
+    .into_iter()
+    .any(|extension| token.ends_with(extension))
+        || matches!(token, "Dockerfile" | "Makefile" | "justfile")
 }
 
 fn verify_generated_plan_task_prose_gates_are_explicit(block: &PlanTaskBlock) -> Result<()> {
@@ -3223,10 +3278,11 @@ mod tests {
         generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
         lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
         normalize_generated_implementation_plan, normalize_generated_spec_markdown,
-        rewrite_plan_spec_refs_to_root, sanitize_corpus_repo_root_paths,
-        sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
-        verify_generated_implementation_plan, ActivePlanSurface, CorpusPromptInputs,
-        GeneratedSpecDocument, GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_front_matter,
+        sanitize_corpus_repo_root_paths, sync_generated_specs_to_root_for_date,
+        verify_corpus_execplan, verify_corpus_outputs, verify_generated_implementation_plan,
+        ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
+        SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
     };
     use chrono::NaiveDate;
     use std::fs;
@@ -3772,6 +3828,107 @@ Use the existing `example::proof` module; no new external service is required.
         )
         .unwrap();
 
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_sanitizer_strips_numbered_plan_front_matter_before_verify() {
+        let repo_root = temp_dir("corpus-frontmatter");
+        let planning_root = repo_root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("001-example.md");
+        fs::write(
+            &plan_path,
+            r#"---
+id: GENESIS-001
+title: Example Slice
+status: active
+---
+
+# Example Slice
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Create one proof artifact.
+
+## Requirements Trace
+
+R1: The artifact exists.
+
+## Scope Boundaries
+
+No runtime behavior changes.
+
+## Progress
+
+- [ ] Start.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep it small.
+  Rationale: Easier to verify.
+  Date/Author: 2026-04-22 / test
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+Read `docs/example.md`.
+
+## Plan of Work
+
+Update the example document.
+
+## Implementation Units
+
+Unit 1.
+Goal: Update the example.
+Requirements advanced: R1.
+Dependencies: none.
+Files to create or modify: `docs/example.md`.
+Tests to add or modify: add one focused test.
+Approach: edit the file.
+Specific test scenarios: run the focused test.
+
+## Concrete Steps
+
+    cargo test -p example example_test
+
+## Validation and Acceptance
+
+The focused test passes.
+
+## Idempotence and Recovery
+
+Rerun the same command safely.
+
+## Artifacts and Notes
+
+No notes.
+
+## Interfaces and Dependencies
+
+No new dependencies.
+"#,
+        )
+        .unwrap();
+
+        sanitize_corpus_numbered_plan_front_matter(&planning_root).unwrap();
+
+        let sanitized = fs::read_to_string(&plan_path).unwrap();
+        assert!(sanitized.starts_with("# Example Slice\n"));
+        assert!(!sanitized.contains("id: GENESIS-001"));
         verify_corpus_execplan(&plan_path).unwrap();
     }
 
@@ -4587,6 +4744,17 @@ No external dependencies.
 
         verify_generated_implementation_plan(&root)
             .expect("backticked directory owners with trailing slash should be accepted");
+    }
+
+    #[test]
+    fn generated_plan_accepts_root_file_owner() {
+        let root = temp_dir("root-file-owner");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace("Owns: docs", "Owns: `docker-compose.yml`");
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root)
+            .expect("root-level file owners should be accepted");
     }
 
     #[test]
