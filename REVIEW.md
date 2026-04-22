@@ -41,3 +41,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib util::tests::chmod_0o600_if_unix_sets_owner_only_mode`, `cargo test --lib quota_config::tests::save_writes_owner_only`
 - Completion artifacts: `src/util.rs`, `src/quota_config.rs`, `src/quota_state.rs`, `src/quota_usage.rs`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib util::tests::chmod_0o600_if_unix_sets_owner_only_mode`, `cargo test --lib quota_config::tests::save_writes_owner_only`
+
+## `TASK-006`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_status.rs`, `src/quota_usage.rs`
+- Scope exceptions: none recorded by host.
+- Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib quota_usage::tests::claude_refresh_error_does_not_leak_body`, `cargo test --lib quota_status::tests::print_does_not_leak_token_chain`
+- Completion artifacts: `src/quota_usage.rs`, `src/quota_status.rs`
+- Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib quota_usage::tests::claude_refresh_error_does_not_leak_body`, `cargo test --lib quota_status::tests::print_does_not_leak_token_chain`
