@@ -251,7 +251,7 @@ Verified current-state baseline (2026-04-22, branch `main`):
     Estimated scope: S
     Completion signal: test passes; complementary coverage to TASK-005.
 
-- [ ] `TASK-016` Tag `v0.2.0` once the priority + first follow-on cluster is verified clean
+- [~] `TASK-016` Tag `v0.2.0` once the priority + first follow-on cluster is verified clean
 
     Spec: `specs/220426-release-ship.md`
     Why now: `Cargo.toml` is still on `0.1.0`; once the visible drift (README, CI, dead code, hardening) is closed, cutting a `0.2.0` annotated tag locks the verified baseline. Spec frames this as a preservation contract; the only new work here is the actual tag.

@@ -121,3 +121,11 @@ Awaiting auto review:
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-011.json`
 - Completion artifacts: `COMPLETED.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `TASK-016`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `Cargo.lock`, `Cargo.toml`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-016.json` is missing command(s): `git cat-file -p v0.2.0`, `git tag -l v0.2.0`
+- Completion artifacts: `COMPLETED.md`, `refs/tags/v0.2.0`
+- Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-016.json` is missing command(s): `git cat-file -p v0.2.0`, `git tag -l v0.2.0`; missing completion artifact(s): `refs/tags/v0.2.0`
