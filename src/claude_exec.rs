@@ -204,8 +204,7 @@ async fn spawn_claude(
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
     let stream_label = context_label.to_string();
     let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
-    let resolved_threshold =
-        futility_threshold.unwrap_or(codex_stream::CLAUDE_FUTILITY_THRESHOLD);
+    let resolved_threshold = futility_threshold.unwrap_or(codex_stream::CLAUDE_FUTILITY_THRESHOLD);
     let stdout_task = tokio::spawn(async move {
         codex_stream::stream_claude_output_with_threshold(
             stdout,

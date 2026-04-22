@@ -53,6 +53,12 @@ struct BugFinding {
     evidence: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BugIdRewrite {
+    old_id: String,
+    new_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SkepticVerdict {
     bug_id: String,
@@ -469,14 +475,12 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     } else {
         try_resume_final_review_results(&output_dir, &all_verified, args.resume)?
     };
-    let code_phase_commit_before = if args.report_only
-        || all_verified.is_empty()
-        || resumed_final_review_results.is_some()
-    {
-        None
-    } else {
-        Some(git_stdout(&repo_root, ["rev-parse", "HEAD"])?)
-    };
+    let code_phase_commit_before =
+        if args.report_only || all_verified.is_empty() || resumed_final_review_results.is_some() {
+            None
+        } else {
+            Some(git_stdout(&repo_root, ["rev-parse", "HEAD"])?)
+        };
     let fixes = per_chunk_fixes;
     let final_reviews = if args.report_only || all_verified.is_empty() {
         Vec::new()
@@ -617,7 +621,7 @@ async fn run_finder_phase(
         &response_path,
     )
     .await?;
-    validate_findings(chunk, &findings)?;
+    let findings = normalize_and_validate_finder_findings(chunk, &findings_json_path, findings)?;
     Ok(findings)
 }
 
@@ -841,10 +845,9 @@ async fn load_or_run_fix_phase_for_chunk(
 ) -> Result<Vec<FixResult>> {
     if args.resume {
         let results_json_path = chunk_dir.join("implementation-results.json");
-        if let Some(results) = try_load_existing_json::<Vec<FixResult>>(
-            &results_json_path,
-            "implementation results",
-        )? {
+        if let Some(results) =
+            try_load_existing_json::<Vec<FixResult>>(&results_json_path, "implementation results")?
+        {
             match validate_fix_results(verified, &results) {
                 Ok(()) => {
                     println!(
@@ -1065,8 +1068,8 @@ fn try_resume_finder_findings(
         return Ok(None);
     };
 
-    match validate_findings(chunk, &findings) {
-        Ok(()) => {
+    match normalize_and_validate_finder_findings(chunk, findings_json_path, findings) {
+        Ok(findings) => {
             println!("resume:      {} finder findings", chunk.id);
             Ok(Some(findings))
         }
@@ -1201,7 +1204,6 @@ fn is_kimi_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
-
 
 fn display_phase_model(config: &PhaseConfig) -> String {
     PiProvider::detect(&config.model)
@@ -1458,9 +1460,8 @@ async fn run_backend_prompt(
             // Reuse the PI output helper: kimi-cli stream-json frames are
             // JSON lines, same shape family; capture_pi_output preserves raw
             // output + drives the heartbeat.
-            let stdout_task = tokio::spawn(async move {
-                capture_pi_output(stdout, &heartbeat_label, 15).await
-            });
+            let stdout_task =
+                tokio::spawn(async move { capture_pi_output(stdout, &heartbeat_label, 15).await });
             let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
 
             let wait_result = time::timeout(timeout, child.wait()).await;
@@ -1488,9 +1489,11 @@ async fn run_backend_prompt(
             if !status.success() {
                 bail!(
                     "kimi-cli bug phase failed: {}",
-                    stderr_text
-                        .trim()
-                        .if_empty_then(parse_kimi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
+                    stderr_text.trim().if_empty_then(
+                        parse_kimi_error(&stdout)
+                            .as_deref()
+                            .unwrap_or(stdout.trim())
+                    )
                 );
             }
             if let Some(detail) = parse_kimi_error(&stdout) {
@@ -1993,6 +1996,46 @@ fn render_prompt_files(files: &[String]) -> String {
         .map(|file| format!("- `{file}`"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn normalize_and_validate_finder_findings(
+    chunk: &RepoChunk,
+    findings_json_path: &Path,
+    findings: Vec<BugFinding>,
+) -> Result<Vec<BugFinding>> {
+    let (findings, rewrites) = normalize_finder_findings(chunk, findings);
+    if !rewrites.is_empty() {
+        for rewrite in &rewrites {
+            println!(
+                "warning: normalized finder bug id `{}` -> `{}` for {}",
+                rewrite.old_id, rewrite.new_id, chunk.id
+            );
+        }
+        let json = serde_json::to_vec_pretty(&findings)
+            .context("failed to serialize normalized finder findings")?;
+        atomic_write(findings_json_path, &json)?;
+    }
+
+    validate_findings(chunk, &findings)?;
+    Ok(findings)
+}
+
+fn normalize_finder_findings(
+    chunk: &RepoChunk,
+    mut findings: Vec<BugFinding>,
+) -> (Vec<BugFinding>, Vec<BugIdRewrite>) {
+    let mut rewrites = Vec::new();
+    for (index, finding) in findings.iter_mut().enumerate() {
+        let canonical_id = format!("BUG-{:03}-{:02}", chunk.ordinal, index + 1);
+        if finding.bug_id != canonical_id {
+            rewrites.push(BugIdRewrite {
+                old_id: finding.bug_id.clone(),
+                new_id: canonical_id.clone(),
+            });
+            finding.bug_id = canonical_id;
+        }
+    }
+    (findings, rewrites)
 }
 
 fn validate_findings(chunk: &RepoChunk, findings: &[BugFinding]) -> Result<()> {
@@ -3083,9 +3126,10 @@ mod tests {
 
     use super::{
         build_final_review_prompt, build_fix_prompt, collect_repo_chunks,
-        escape_unescaped_quotes_in_json_strings, load_json_file, repair_llm_json,
-        run_backend_prompt, run_backend_prompt_with_fallback, should_audit_path, slugify,
-        validate_accepted_findings, AcceptedFinding, BugFinding, LlmBackend, SkepticVerdict,
+        escape_unescaped_quotes_in_json_strings, load_json_file, normalize_finder_findings,
+        repair_llm_json, run_backend_prompt, run_backend_prompt_with_fallback, should_audit_path,
+        slugify, validate_accepted_findings, validate_findings, AcceptedFinding, BugFinding,
+        LlmBackend, RepoChunk, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
 
@@ -3111,6 +3155,29 @@ mod tests {
 
     fn write_fake_pi_script(path: &Path) {
         write_fake_script(path, "#!/bin/sh\nprintf '[]\\n'\n");
+    }
+
+    fn test_chunk(ordinal: usize) -> RepoChunk {
+        RepoChunk {
+            ordinal,
+            id: format!("chunk-{ordinal:03}-test"),
+            scope_label: "test".to_string(),
+            files: vec!["src/lib.rs".to_string()],
+        }
+    }
+
+    fn test_finding(bug_id: &str) -> BugFinding {
+        BugFinding {
+            bug_id: bug_id.to_string(),
+            title: "title".to_string(),
+            location: "src/lib.rs:1".to_string(),
+            impact: "medium".to_string(),
+            points: 5,
+            description: "desc".to_string(),
+            why_plausible: "why".to_string(),
+            falsification_checks: vec!["check".to_string()],
+            evidence: vec!["evidence".to_string()],
+        }
     }
 
     #[test]
@@ -3178,6 +3245,52 @@ mod tests {
         ));
         assert!(prompt.contains("`confirmed` means the implementation pass already fixed the bug"));
         assert!(prompt.contains("Push to `origin/main` after each successful commit."));
+    }
+
+    #[test]
+    fn normalizes_finder_bug_ids_to_chunk_order() {
+        let chunk = test_chunk(3);
+        let findings = vec![
+            test_finding("BUG-001-01"),
+            test_finding("BUG-001-04"),
+            test_finding("BUG-003-09"),
+        ];
+
+        let (findings, rewrites) = normalize_finder_findings(&chunk, findings);
+
+        let ids = findings
+            .iter()
+            .map(|finding| finding.bug_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["BUG-003-01", "BUG-003-02", "BUG-003-03"]);
+        assert_eq!(rewrites.len(), 3);
+        validate_findings(&chunk, &findings).expect("normalized findings should validate");
+    }
+
+    #[test]
+    fn leaves_canonical_finder_bug_ids_unchanged() {
+        let chunk = test_chunk(3);
+        let findings = vec![test_finding("BUG-003-01"), test_finding("BUG-003-02")];
+
+        let (findings, rewrites) = normalize_finder_findings(&chunk, findings);
+
+        assert!(rewrites.is_empty());
+        assert_eq!(findings[0].bug_id, "BUG-003-01");
+        assert_eq!(findings[1].bug_id, "BUG-003-02");
+        validate_findings(&chunk, &findings).expect("canonical findings should validate");
+    }
+
+    #[test]
+    fn normalization_keeps_substantive_finder_validation_strict() {
+        let chunk = test_chunk(3);
+        let mut finding = test_finding("BUG-001-01");
+        finding.points = 10;
+
+        let (findings, rewrites) = normalize_finder_findings(&chunk, vec![finding]);
+
+        assert_eq!(rewrites.len(), 1);
+        let err = validate_findings(&chunk, &findings).expect_err("points mismatch should fail");
+        assert!(err.to_string().contains("finder points mismatch"));
     }
 
     #[test]

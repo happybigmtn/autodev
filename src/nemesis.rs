@@ -519,9 +519,8 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             .await?;
             let response_path = output_dir.join("implementation-response.log");
             if !response.trim().is_empty() {
-                atomic_write(&response_path, response.as_bytes()).with_context(|| {
-                    format!("failed to write {}", response_path.display())
-                })?;
+                atomic_write(&response_path, response.as_bytes())
+                    .with_context(|| format!("failed to write {}", response_path.display()))?;
             }
             let _ = stderr_log; // stderr capture already handled by backend helpers
 
@@ -558,9 +557,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
                 .join("logs")
                 .join(format!("nemesis-{}-finalizer-prompt.md", timestamp_slug()));
             atomic_write(&finalizer_prompt_path, finalizer_prompt.as_bytes())
-                .with_context(|| {
-                    format!("failed to write {}", finalizer_prompt_path.display())
-                })?;
+                .with_context(|| format!("failed to write {}", finalizer_prompt_path.display()))?;
             print_phase_header("finalizer", &finalizer_backend);
             let finalizer_response = run_nemesis_backend(
                 &repo_root,
@@ -570,10 +567,9 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             )
             .await?;
             let finalizer_response_path = output_dir.join("final-review.md");
-            atomic_write(&finalizer_response_path, finalizer_response.as_bytes())
-                .with_context(|| {
-                    format!("failed to write {}", finalizer_response_path.display())
-                })?;
+            atomic_write(&finalizer_response_path, finalizer_response.as_bytes()).with_context(
+                || format!("failed to write {}", finalizer_response_path.display()),
+            )?;
             println!(
                 "finalizer:   wrote review to {}",
                 finalizer_response_path.display()
@@ -667,7 +663,6 @@ fn is_kimi_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
-
 
 fn ensure_kimi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
     if !is_kimi_model(&config.model) && PiProvider::detect(&config.model).is_none() {
@@ -1091,9 +1086,11 @@ async fn run_kimi_cli(
     if !status.success() {
         bail!(
             "kimi-cli nemesis run failed: {}",
-            stderr
-                .trim()
-                .if_empty_then(parse_kimi_error(&stdout).as_deref().unwrap_or(stdout.trim()))
+            stderr.trim().if_empty_then(
+                parse_kimi_error(&stdout)
+                    .as_deref()
+                    .unwrap_or(stdout.trim())
+            )
         );
     }
     if let Some(detail) = parse_kimi_error(&stdout) {

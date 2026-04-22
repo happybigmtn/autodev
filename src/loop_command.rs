@@ -15,14 +15,14 @@ use crate::LoopArgs;
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
 pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
-0b. Study `IMPLEMENTATION_PLAN.md` and identify the first pending task marked `- [ ]` whose explicit dependencies are already satisfied. Treat tasks marked `- [!]` as blocked and skip them unless they are later unblocked.
+0b. Study `IMPLEMENTATION_PLAN.md` and identify the first actionable unfinished task marked `- [ ]` or `- [~]` whose explicit dependencies are already satisfied. Treat tasks marked `- [!]` as blocked and skip them unless they are later unblocked. If a `- [~]` row explicitly names `Completion path: <TASK-ID>`, treat it as a historical gap record and implement the named completion-path task instead of replaying the old row.
 0c. Study `specs/*` with full repo context, but when multiple dated specs cover the same surface, treat the newest spec referenced by the current unchecked task as authoritative. Older or duplicate specs are historical context only.
 0d. Use the specs, plan, and the live codebase as a single contract. If they disagree, treat the code and the current task's authoritative specs as evidence, record the conflict truthfully, and do not bluff your way through it.
 0e. For every current-state fact, trust the live codebase over planning artifacts unless the code is plainly stale and the repo includes stronger primary-source evidence.
 0f. When additional repositories are listed below, inspect and edit them directly when the current task's owned surfaces, acceptance criteria, or blocker evidence point there. Read each touched repo's own `AGENTS.md` and operational docs before editing it.
 
 1. Your task is to implement functionality per the specifications using the full repository context.
-   - Follow `IMPLEMENTATION_PLAN.md` in order and take the next pending `- [ ]` task from top to bottom.
+   - Follow `IMPLEMENTATION_PLAN.md` in order and take the next actionable unfinished `- [ ]` or `- [~]` task from top to bottom.
    - Do not reprioritize the queue yourself.
    - Do not stop on earlier `- [!]` tasks; they are blocked and not runnable in this iteration.
    - Before making changes, search the codebase, tests, and planning artifacts. Do not assume a surface is missing until you verify it.
@@ -50,7 +50,8 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 
 4. Keep the planning artifacts current:
    - When you discover important implementation facts, blockers, or scope corrections, update `IMPLEMENTATION_PLAN.md`.
-   - When you finish a task, remove its entry from `IMPLEMENTATION_PLAN.md` so the plan remains an active queue of unfinished work only.
+   - When you finish a task, preserve its row in `IMPLEMENTATION_PLAN.md` and mark it `- [x]` only when local verification, review handoff, and required completion artifacts are actually in place.
+   - If code lands but the local evidence is still incomplete, mark the task `- [~]` instead of bluffing it to done.
    - When a task is blocked by an external dependency or owner decision, mark it as `- [!]` and record the blocker under that task.
    - Append a concise record to `COMPLETED.md` with task id, what was completed, the validation command(s), and commit sha.
    - If you notice worthwhile out-of-scope work, append a concise item to `WORKLIST.md` instead of quietly broadening scope.
@@ -68,13 +69,13 @@ pub(crate) const DEFAULT_LOOP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 6. If you hit a real blocker after genuine debugging:
    - Convert the task marker from `- [ ]` to `- [!]` and record the blocker under the task in `IMPLEMENTATION_PLAN.md`.
    - Commit the planning update if it materially changes the execution record.
-   - Move to the next pending `- [ ]` task instead of repeating the same failed attempt.
+   - Move to the next actionable unfinished `- [ ]` or `- [~]` task instead of repeating the same failed attempt.
 
 7. Task-order rule:
    - Treat the order in `IMPLEMENTATION_PLAN.md` as authoritative.
-   - Work on the first pending `- [ ]` task unless its explicit dependencies are still unchecked.
+   - Work on the first actionable unfinished `- [ ]` or `- [~]` task unless its explicit dependencies are still unchecked.
    - Treat `- [!]` tasks as blocked and skip them while selecting work.
-   - If the current task is already satisfied, remove it from `IMPLEMENTATION_PLAN.md`, append a truthful note to `COMPLETED.md`, and continue downward.
+   - If the current task is already satisfied, mark it `- [x]`, append a truthful note to `COMPLETED.md`, and continue downward.
 
 8. Branch rule:
    - Work only on branch `{branch}`.
@@ -183,7 +184,7 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
         let queue = inspect_loop_queue(&repo_root)?;
         if queue.pending_ids.is_empty() {
             if queue.blocked_ids.is_empty() {
-                println!("no pending `- [ ]` tasks remain; stopping.");
+                println!("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
             } else {
                 println!(
                     "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
@@ -340,7 +341,7 @@ fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> S
         )
     };
     format!(
-        "{prompt_template}\n\nCurrent queue state for this iteration:\n- First actionable task marked `- [ ]`: `{}`\n- Pending task count: {}\n- {}\n\nExecute the instructions above.",
+        "{prompt_template}\n\nCurrent queue state for this iteration:\n- First actionable unfinished task: `{}`\n- Unfinished task count: {}\n- {}\n\nExecute the instructions above.",
         queue.pending_ids[0],
         queue.pending_ids.len(),
         blocked_clause
@@ -687,7 +688,8 @@ mod tests {
         assert!(prompt.contains("newest spec referenced by the current unchecked task"));
         assert!(prompt.contains("historical context only"));
         assert!(prompt.contains("Treat tasks marked `- [!]` as blocked"));
-        assert!(prompt.contains("next pending `- [ ]` task"));
+        assert!(prompt.contains("next actionable unfinished `- [ ]` or `- [~]` task"));
+        assert!(prompt.contains("Completion path: <TASK-ID>"));
     }
 
     #[test]
@@ -805,8 +807,8 @@ mod tests {
         };
         let prompt = build_iteration_prompt("base prompt", &queue);
 
-        assert!(prompt.contains("First actionable task marked `- [ ]`: `META-001`"));
-        assert!(prompt.contains("Pending task count: 2"));
+        assert!(prompt.contains("First actionable unfinished task: `META-001`"));
+        assert!(prompt.contains("Unfinished task count: 2"));
         assert!(prompt.contains("Blocked tasks marked `- [!]` to skip this iteration: DEC-001"));
     }
 

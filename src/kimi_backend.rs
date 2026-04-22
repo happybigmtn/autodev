@@ -46,10 +46,14 @@ pub(crate) fn resolve_kimi_cli_model(short_id: &str) -> String {
         return short_id.trim().to_string();
     }
     match lower.as_str() {
-        "k2.6" | "kimi" | "kimi-2.6" | "kimi-k2.6" | "kimi-k2.6-code-preview"
-        | "kimi-2.6-code-preview" | "k2p6" | "kimi-for-coding" => {
-            KIMI_CLI_DEFAULT_MODEL.to_string()
-        }
+        "k2.6"
+        | "kimi"
+        | "kimi-2.6"
+        | "kimi-k2.6"
+        | "kimi-k2.6-code-preview"
+        | "kimi-2.6-code-preview"
+        | "k2p6"
+        | "kimi-for-coding" => KIMI_CLI_DEFAULT_MODEL.to_string(),
         "k2.5" | "kimi-2.5" | "kimi-k2.5" | "k2p5" => "kimi-code/kimi-for-coding-k2p5".to_string(),
         _ => KIMI_CLI_DEFAULT_MODEL.to_string(),
     }
@@ -128,7 +132,11 @@ pub(crate) fn extract_final_text(line: &str) -> Option<String> {
             }
         }
     }
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Decode a kimi-cli-reported error from a stream-json payload. kimi-cli
@@ -303,10 +311,7 @@ mod tests {
     #[test]
     fn parse_kimi_error_reads_nested_api_error() {
         let stdout = r#"{"type":"error","error":{"message":"invalid api key"}}"#;
-        assert_eq!(
-            parse_kimi_error(stdout).as_deref(),
-            Some("invalid api key")
-        );
+        assert_eq!(parse_kimi_error(stdout).as_deref(), Some("invalid api key"));
     }
 
     #[test]

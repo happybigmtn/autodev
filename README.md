@@ -581,12 +581,15 @@ What it actually does:
 - Uses the quota router for Codex workers, including the 10% weekly quota floor
 - Runs a host preflight once per parallel run and injects the report into lane prompts. The
   preflight calls out common shared blockers such as missing `agent-browser`, inactive Docker
-  Compose services, and unavailable local regtest RPC.
+  Compose services, and unavailable explicit local regtest RPC.
 - Defaults `--cargo-target auto`, which uses lane-local Cargo target directories for multi-lane
   Rust repos. This avoids cross-lane artifact contamination and Cargo-lock pileups during final
   proof. Use `--cargo-target shared` only when shared build-cache speed is worth the risk.
 - Lane prompts reject `0 tests` as passing evidence and reject direct target-dir test binaries as
   final proof unless the lane just built that exact artifact from its current sources.
+- Host reconciliation requires receipt-backed proof for executable `Verification:` commands. If a
+  repo has executable verification but no `scripts/run-task-verification.sh`, the host leaves the
+  task `[~]` instead of marking it complete from a prose handoff alone.
 - Lanes can mark external infrastructure failures with `AUTO_ENV_BLOCKER: <reason>`; the host logs
   those separately from code failures and retries with explicit recovery context while retries
   remain.
@@ -800,6 +803,11 @@ What it actually does:
   and fix surfaces when the reviewed item points there
 - Merges any `--reference-repo <dir>` entries on top of that default sibling repo set
 - Reviews each item as a claim that must be verified
+- Handles mixed `REVIEW.md` queues that contain both `## TASK` sections and top-level
+  ``- `TASK`: ...`` backfill bullets, including multi-ID bullets split across
+  continuation lines
+- Skips an unchanged stale batch for the rest of the current run, then continues with later
+  queued items instead of looping forever on one blocked prefix
 - Reconstructs changed files and blast radius before clearing an item
 - Reviews correctness, readability, architecture, security, trust boundaries, and performance
 - Applies a bounded simplification pass on reviewed code when it clearly improves readability

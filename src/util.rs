@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
@@ -25,6 +25,7 @@ const PI_RUNTIME_LOG_MAX_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointExcludeRule {
     Root(&'static str),
+    PathPrefix(&'static str),
     TopLevelPrefix(&'static str),
 }
 
@@ -32,6 +33,7 @@ impl CheckpointExcludeRule {
     fn git_pathspec(self) -> String {
         match self {
             Self::Root(root) => format!(":(exclude){root}"),
+            Self::PathPrefix(prefix) => format!(":(exclude){prefix}*"),
             Self::TopLevelPrefix(prefix) => format!(":(exclude){prefix}*"),
         }
     }
@@ -40,13 +42,18 @@ impl CheckpointExcludeRule {
         let first_segment = path.split('/').next().unwrap_or(path);
         match self {
             Self::Root(root) => first_segment == root,
+            Self::PathPrefix(prefix) => {
+                let prefix = prefix.trim_end_matches('/');
+                path == prefix || path.starts_with(&format!("{prefix}/"))
+            }
             Self::TopLevelPrefix(prefix) => first_segment.starts_with(prefix),
         }
     }
 }
 
-const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 4] = [
+const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 5] = [
     CheckpointExcludeRule::Root(".auto"),
+    CheckpointExcludeRule::PathPrefix(".claude/worktrees"),
     CheckpointExcludeRule::Root("bug"),
     CheckpointExcludeRule::Root("nemesis"),
     CheckpointExcludeRule::TopLevelPrefix("gen-"),
@@ -81,7 +88,7 @@ pub(crate) fn git_stdout<'a>(
         bail!(
             "git command failed in {}: {}",
             repo_root.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            git_failure_message(&output)
         );
     }
     String::from_utf8(output.stdout).context("git stdout was not valid UTF-8")
@@ -100,11 +107,15 @@ pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a s
     bail!(
         "git command failed in {}: {}",
         repo_root.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
+        git_failure_message(&output)
     );
 }
 
 fn checkpoint_status(repo_root: &Path) -> Result<String> {
+    git_status_short_filtered(repo_root)
+}
+
+pub(crate) fn git_status_short_filtered(repo_root: &Path) -> Result<String> {
     let mut args = vec!["status", "--short", "--", "."];
     let excludes = checkpoint_exclude_pathspecs();
     args.extend(excludes.iter().map(String::as_str));
@@ -130,6 +141,14 @@ pub(crate) fn auto_checkpoint_if_needed(
     }
 
     stage_checkpoint_changes(repo_root)?;
+    if !has_staged_changes(repo_root)? {
+        eprintln!(
+            "warning: pre-existing worktree changes did not produce stageable checkpoint changes; \
+             continuing without checkpoint"
+        );
+        return Ok(None);
+    }
+
     let message = format!("{}: {message_suffix}", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
@@ -141,6 +160,38 @@ pub(crate) fn auto_checkpoint_if_needed(
         );
     }
     Ok(Some(commit))
+}
+
+fn git_failure_message(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
+}
+
+fn has_staged_changes(repo_root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--cached", "--quiet", "--exit-code"])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(true);
+    }
+    bail!(
+        "git command failed in {}: {}",
+        repo_root.display(),
+        git_failure_message(&output)
+    );
 }
 
 pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<bool> {
@@ -180,7 +231,7 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
     bail!(
         "git command failed in {}: {}{}",
         repo_root.display(),
-        stderr.trim(),
+        git_failure_message(&output),
         conflict_note
     );
 }
@@ -202,7 +253,7 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
         bail!(
             "git command failed in {}: {}",
             repo_root.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            git_failure_message(&output)
         );
     }
     Ok(!output.stdout.is_empty())
@@ -711,6 +762,8 @@ mod tests {
         for excluded in [
             ".auto",
             ".auto/logs/run.log",
+            ".claude/worktrees",
+            ".claude/worktrees/agent-a123",
             "bug",
             "bug/BUG_REPORT.md",
             "nemesis",
@@ -766,6 +819,48 @@ mod tests {
         assert_eq!(actual, expected);
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn auto_checkpoint_skips_dirty_submodule_when_nothing_is_stageable() {
+        let source = init_repo("checkpoint-dirty-submodule-source");
+        let repo = init_repo("checkpoint-dirty-submodule-super");
+        fs::create_dir_all(repo.join(".claude").join("worktrees"))
+            .expect("failed to create submodule parent");
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().expect("source path utf-8"),
+                "vendor/agent-a",
+            ])
+            .output()
+            .expect("failed to launch git submodule add");
+        assert!(
+            output.status.success(),
+            "submodule add failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        run_git_in(&repo, ["commit", "-m", "add submodule"]);
+
+        fs::write(repo.join("vendor/agent-a/README.md"), "# dirty submodule\n")
+            .expect("failed to dirty submodule");
+        let status = checkpoint_status(&repo).expect("checkpoint status should see submodule dirt");
+        assert!(status.contains("vendor/agent-a"));
+
+        let checkpoint = auto_checkpoint_if_needed(&repo, "master", "auto parallel checkpoint")
+            .expect("dirty submodule should not abort checkpointing");
+        assert_eq!(checkpoint, None);
+        assert_eq!(run_git_in(&repo, ["diff", "--cached", "--name-only"]), "");
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+        fs::remove_dir_all(&source).expect("failed to remove temp source repo");
     }
 
     #[test]

@@ -12,8 +12,6 @@ use crate::symphony_command::{parse_tasks, task_contract_fingerprint, TaskStatus
 const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 const TASK_SENTINEL_PREFIX: &str = "<!-- auto-symphony:";
 const DEFAULT_IN_PROGRESS_STATE: &str = "In Progress";
-const DEFAULT_DONE_STATE: &str = "Done";
-const GENERIC_TERMINAL_STATES: [&str; 4] = ["closed", "cancelled", "canceled", "duplicate"];
 
 const FETCH_PROJECT_QUERY: &str = r#"
 query AutoParallelProject($slug: String!) {
@@ -71,6 +69,14 @@ mutation AutoParallelUpdateIssueState($id: String!, $stateId: String!) {
         name
       }
     }
+  }
+}
+"#;
+
+const ARCHIVE_ISSUE_MUTATION: &str = r#"
+mutation AutoParallelArchiveIssue($id: String!) {
+  issueArchive(id: $id) {
+    success
   }
 }
 "#;
@@ -145,8 +151,6 @@ pub(crate) struct LinearTracker {
     project: LinearProject,
     in_progress_state_id: String,
     in_progress_state_name: String,
-    done_state_id: String,
-    done_state_name: String,
     terminal_state_names: HashSet<String>,
     issues_by_task_id: HashMap<String, TrackedIssue>,
     last_plan_fingerprint: Option<u64>,
@@ -171,19 +175,11 @@ impl LinearTracker {
         let client = LinearGraphqlClient::from_env()?;
         let project = client.fetch_project(&project_slug).await?;
         let in_progress_state_name = derive_in_progress_state_name(&config);
-        let done_state_name = derive_done_state_name(&config);
         let in_progress_state_id = project.state_id(&in_progress_state_name).ok_or_else(|| {
             anyhow!(
                 "Linear project `{}` does not expose state `{}`",
                 project.slug,
                 in_progress_state_name
-            )
-        })?;
-        let done_state_id = project.state_id(&done_state_name).ok_or_else(|| {
-            anyhow!(
-                "Linear project `{}` does not expose state `{}`",
-                project.slug,
-                done_state_name
             )
         })?;
         let mut tracker = Self {
@@ -192,8 +188,6 @@ impl LinearTracker {
             project,
             in_progress_state_id,
             in_progress_state_name,
-            done_state_id,
-            done_state_name,
             issues_by_task_id: HashMap::new(),
             last_plan_fingerprint: None,
             last_auto_sync_attempt_fingerprint: None,
@@ -204,8 +198,8 @@ impl LinearTracker {
 
     pub(crate) fn summary(&self) -> String {
         format!(
-            "host sync -> Linear project `{}` (dispatch `{}`, done `{}`)",
-            self.project.slug, self.in_progress_state_name, self.done_state_name
+            "host sync -> Linear project `{}` (dispatch `{}`, archive on completion)",
+            self.project.slug, self.in_progress_state_name
         )
     }
 
@@ -231,7 +225,7 @@ impl LinearTracker {
         let mut drift = LinearCoverageDrift::default();
         for task in parse_tasks(plan_text) {
             match task.status {
-                TaskStatus::Pending => {
+                TaskStatus::Pending | TaskStatus::Partial => {
                     let Some(issue) = self.issues_by_task_id.get(&task.id) else {
                         drift.missing_task_ids.push(task.id);
                         continue;
@@ -301,14 +295,15 @@ impl LinearTracker {
     }
 
     pub(crate) async fn note_done(&mut self, task_id: &str) -> Result<()> {
-        let Some(issue) = self.issues_by_task_id.get_mut(task_id) else {
+        let Some(issue_id) = self
+            .issues_by_task_id
+            .get(task_id)
+            .map(|issue| issue.id.clone())
+        else {
             return Ok(());
         };
-        let updated_state = self
-            .client
-            .update_issue_state(&issue.id, &self.done_state_id)
-            .await?;
-        issue.state = Some(updated_state.unwrap_or_else(|| self.done_state_name.clone()));
+        self.client.archive_issue(&issue_id).await?;
+        self.issues_by_task_id.remove(task_id);
         Ok(())
     }
 
@@ -458,6 +453,23 @@ impl LinearGraphqlClient {
             .and_then(|state| optional_string(state, "name")))
     }
 
+    async fn archive_issue(&self, issue_id: &str) -> Result<()> {
+        let payload = self
+            .graphql(ARCHIVE_ISSUE_MUTATION, json!({ "id": issue_id }))
+            .await?;
+        let archive = payload
+            .get("issueArchive")
+            .ok_or_else(|| anyhow!("Linear issueArchive response missing payload"))?;
+        if !archive
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("Linear issueArchive returned success=false");
+        }
+        Ok(())
+    }
+
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let resp = self
             .http
@@ -513,15 +525,6 @@ fn derive_in_progress_state_name(config: &WorkflowConfig) -> String {
         .cloned()
         .or_else(|| config.active_states.last().cloned())
         .unwrap_or_else(|| DEFAULT_IN_PROGRESS_STATE.to_string())
-}
-
-fn derive_done_state_name(config: &WorkflowConfig) -> String {
-    config
-        .terminal_states
-        .iter()
-        .find(|state| !GENERIC_TERMINAL_STATES.contains(&normalize_name(state).as_str()))
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_DONE_STATE.to_string())
 }
 
 fn markdown_front_matter(markdown: &str) -> Option<&str> {
@@ -697,10 +700,10 @@ fn plan_fingerprint(plan_text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_done_state_name, derive_in_progress_state_name, front_matter_list,
-        front_matter_scalar, issue_contract_fingerprint, issue_task_id_from_description,
-        plan_fingerprint, LinearGraphqlClient, LinearProject, LinearTeam, LinearTracker,
-        TrackedIssue, WorkflowConfig,
+        derive_in_progress_state_name, front_matter_list, front_matter_scalar,
+        issue_contract_fingerprint, issue_task_id_from_description, plan_fingerprint,
+        LinearGraphqlClient, LinearProject, LinearTeam, LinearTracker, TrackedIssue,
+        WorkflowConfig,
     };
     use crate::symphony_command::{parse_tasks, render_issue_description};
     use reqwest::Client;
@@ -736,13 +739,11 @@ mod tests {
             ],
         };
         assert_eq!(derive_in_progress_state_name(&config), "Building");
-        assert_eq!(derive_done_state_name(&config), "Shipped");
     }
 
     #[test]
     fn description_task_id_parser_reads_symphony_sentinel() {
-        let description =
-            "<!-- auto-symphony: repo=autonomy task_id=P-021 base_branch=trunk fingerprint=0123456789abcdef -->\n\nBody";
+        let description = "<!-- auto-symphony: repo=autonomy task_id=P-021 base_branch=trunk fingerprint=0123456789abcdef -->\n\nBody";
         assert_eq!(
             issue_task_id_from_description(description),
             Some("P-021".to_string())
@@ -790,8 +791,6 @@ mod tests {
             },
             in_progress_state_id: "s1".to_string(),
             in_progress_state_name: "In Progress".to_string(),
-            done_state_id: "s2".to_string(),
-            done_state_name: "Done".to_string(),
             terminal_state_names: HashSet::new(),
             issues_by_task_id,
             last_plan_fingerprint: None,
@@ -831,8 +830,6 @@ mod tests {
             },
             in_progress_state_id: "s1".to_string(),
             in_progress_state_name: "In Progress".to_string(),
-            done_state_id: "s2".to_string(),
-            done_state_name: "Done".to_string(),
             terminal_state_names: HashSet::from(["Done".to_string()]),
             issues_by_task_id,
             last_plan_fingerprint: None,

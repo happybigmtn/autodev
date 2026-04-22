@@ -114,7 +114,7 @@ const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Follow-On Work",
     "## Completed / Already Satisfied",
 ];
-const REQUIRED_PLAN_TASK_FIELDS: [&str; 12] = [
+const REQUIRED_PLAN_TASK_FIELDS: [&str; 13] = [
     "Spec:",
     "Why now:",
     "Codebase evidence:",
@@ -124,6 +124,7 @@ const REQUIRED_PLAN_TASK_FIELDS: [&str; 12] = [
     "Acceptance criteria:",
     "Verification:",
     "Required tests:",
+    "Completion artifacts:",
     "Dependencies:",
     "Estimated scope:",
     "Completion signal:",
@@ -1134,16 +1135,40 @@ fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
             plan_path.display()
         );
     }
-    for required_fragment in ["goal", "files", "test"] {
-        if !markdown_section_contains(&markdown, "## Implementation Units", |line| {
-            line.to_ascii_lowercase().contains(required_fragment)
-        }) {
-            bail!(
-                "corpus plan {} must describe {} in `## Implementation Units`",
-                plan_path.display(),
-                required_fragment
-            );
-        }
+    let has_standard_unit_shape = ["goal", "files", "test"].into_iter().all(|fragment| {
+        markdown_section_contains(&markdown, "## Implementation Units", |line| {
+            line.to_ascii_lowercase().contains(fragment)
+        })
+    });
+    let has_artifact_only_unit_shape =
+        markdown_section_contains(&markdown, "## Implementation Units", |line| {
+            line.to_ascii_lowercase()
+                .contains("test expectation: none --")
+        }) && markdown_section_contains(&markdown, "## Implementation Units", |line| {
+            let lowered = line.to_ascii_lowercase();
+            ["artifact", "index", "checkpoint", "report", "note", "file"]
+                .into_iter()
+                .any(|fragment| lowered.contains(fragment))
+        }) && markdown_section_contains(&markdown, "## Implementation Units", |line| {
+            let lowered = line.to_ascii_lowercase();
+            [
+                "goal",
+                "emit",
+                "document",
+                "capture",
+                "produce",
+                "record",
+                "delegated to",
+                "no direct implementation units",
+            ]
+            .into_iter()
+            .any(|fragment| lowered.contains(fragment))
+        });
+    if !has_standard_unit_shape && !has_artifact_only_unit_shape {
+        bail!(
+            "corpus plan {} must describe implementation-unit goal/files/tests or an explicit artifact-only unit in `## Implementation Units`",
+            plan_path.display()
+        );
     }
     Ok(())
 }
@@ -1426,7 +1451,7 @@ Section requirements for numbered ExecPlans:
 - `## Surprises & Discoveries`, `## Decision Log`, and `## Outcomes & Retrospective` must exist even before implementation starts; use "None yet" only when that is true, and include the rationale for initial plan-shaping decisions in the decision log
 - `## Context and Orientation` names the relevant repository-relative files, functions, modules, commands, and current behavior so a novice can navigate without prior context
 - `## Plan of Work` describes the sequence of edits and additions in prose, with file paths and concrete locations where possible
-- `## Implementation Units` breaks work into independently verifiable units; each unit must name the goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only or checkpoint plans, include the artifact to create and write `Test expectation: none -- <reason>` only when no code behavior changes.
+- `## Implementation Units` breaks work into independently verifiable units; each unit must name the goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only, checkpoint, or index/master plans, include the artifact to create, name the file it produces or updates, and write `Test expectation: none -- <reason>` only when no code behavior changes.
 - `## Concrete Steps` gives exact commands to run from the repository root and short expected observations where useful
 - `## Validation and Acceptance` phrases acceptance as observable behavior with specific inputs, commands, outputs, or artifacts; name tests that should fail before the work and pass after when applicable
 - `## Idempotence and Recovery` explains how to rerun steps safely and how to recover from partial completion
@@ -1553,7 +1578,7 @@ Corpus-specific validation:
 - Numbered ExecPlans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
 - Reject or rewrite any absolute repo-root path that appears in the corpus. Use repository-relative references, "the repository root" in prose, or `cd "$(git rev-parse --show-toplevel)"` in shell examples instead.
 - Every numbered ExecPlan must include non-empty sections for `Purpose / Big Picture`, `Requirements Trace`, `Scope Boundaries`, `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, `Context and Orientation`, `Plan of Work`, `Implementation Units`, `Concrete Steps`, `Validation and Acceptance`, `Idempotence and Recovery`, `Artifacts and Notes`, and `Interfaces and Dependencies`.
-- `Progress` must include checkbox bullets. `Implementation Units` must name goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only work, name the artifact and explain why no code test is expected.
+- `Progress` must include checkbox bullets. `Implementation Units` must name goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only, checkpoint, or index/master work, name the artifact or index file being produced and explain why no code test is expected.
 - Add checkpoint or decision-gate plans after each risky cluster or every 2-3 numbered plans when later work depends on unresolved evidence.
 
 Validation expectations:
@@ -1635,7 +1660,7 @@ Generated spec validation:
 Generated implementation plan validation:
 - `{output_dir}/IMPLEMENTATION_PLAN.md` must start with `# IMPLEMENTATION_PLAN`.
 - It must include `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`.
-- Every unfinished task must include `Spec:`, `Why now:`, `Codebase evidence:`, `Owns:`, `Integration touchpoints:`, `Scope boundary:`, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
+- Every unfinished task must include `Spec:`, `Why now:`, `Codebase evidence:`, `Owns:`, `Integration touchpoints:`, `Scope boundary:`, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Completion artifacts:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
 - Every `Spec:` reference must point to a spec file that exists under `{output_dir}/specs/`.
 - Behavior-changing tasks should prefer a prove-it validation path: failing test or repro first, green proof, then broader regression check.
 - Research or design tasks must name the closing artifact or decision and must not promise implementation details before the prerequisite evidence exists.
@@ -1850,6 +1875,7 @@ Output requirements:
   - `Acceptance criteria:`
   - `Verification:`
   - `Required tests:`
+  - `Completion artifacts:`
   - `Dependencies:`
   - `Estimated scope:`
   - `Completion signal:`
@@ -1871,6 +1897,7 @@ Output requirements:
 - Do not write `decomposition required`, `split before implementation`, or similar placeholders; the generated plan is responsible for doing that decomposition now
 - `Required tests:` must list concrete test names or an explicit `none` for docs-only tasks; never write `See spec`, `TBD`, or a broad module name
 - No unfinished task may list more than five required tests; split the task if it needs more
+- `Completion artifacts:` must list concrete repo-relative evidence files or directories that must exist before the task can truthfully become done; write `none` only when the task has no durable artifact beyond code/tests/review handoff
 - `Verification:` must stay narrow: prefer exact test-name filters and affected-crate checks; do not use `cargo check --workspace`, `cargo test --workspace`, `cargo test --all`, or equivalent broad workspace sweeps as the primary item verification
 - Every `cargo test` verification command must include a concrete test-name/filter token after package or target flags; reject package-wide commands such as `cargo test -p crate`, `cargo test -p crate --lib`, or `cargo test -p crate --test integration_file`
 - Put only unfinished work in the unchecked queue sections
@@ -2279,13 +2306,24 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
         );
     }
 
-    let required_tests = plan_task_field_body(block, "Required tests:", "Dependencies:")
+    let required_tests = plan_task_field_body(block, "Required tests:", "Completion artifacts:")
+        .or_else(|| plan_task_field_body(block, "Required tests:", "Dependencies:"))
         .with_context(|| format!("task `{}` missing `Required tests:` body", block.task_id))?;
     verify_required_tests_are_scoped(block, &required_tests)?;
 
     let verification = plan_task_field_body(block, "Verification:", "Required tests:")
         .with_context(|| format!("task `{}` missing `Verification:` body", block.task_id))?;
     verify_verification_commands_are_scoped(block, &verification)?;
+    let completion_artifacts =
+        plan_task_field_body(block, "Completion artifacts:", "Dependencies:")
+            .or_else(|| plan_task_field_body(block, "Completion artifacts:", "Estimated scope:"))
+            .with_context(|| {
+                format!(
+                    "task `{}` missing `Completion artifacts:` body",
+                    block.task_id
+                )
+            })?;
+    verify_completion_artifacts_are_concrete(block, &completion_artifacts)?;
     verify_generated_plan_task_has_concrete_ownership(block)?;
     verify_generated_plan_task_prose_gates_are_explicit(block)?;
 
@@ -2367,6 +2405,46 @@ fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result
     if bullet_count == 0 && normalized != "none" {
         bail!(
             "generated implementation plan task `{}` must list concrete required test names or `Required tests: none`",
+            block.task_id
+        );
+    }
+
+    Ok(())
+}
+
+fn verify_completion_artifacts_are_concrete(block: &PlanTaskBlock, body: &str) -> Result<()> {
+    let normalized = body.trim();
+    if normalized.is_empty() {
+        bail!(
+            "generated implementation plan task `{}` must name `Completion artifacts:` or `none`",
+            block.task_id
+        );
+    }
+
+    let lowercase = normalized.to_ascii_lowercase();
+    if lowercase == "none" {
+        return Ok(());
+    }
+    for forbidden in ["see spec", "tbd", "todo", "same as verification"] {
+        if lowercase.contains(forbidden) {
+            bail!(
+                "generated implementation plan task `{}` has vague `Completion artifacts:` content `{forbidden}`",
+                block.task_id
+            );
+        }
+    }
+
+    let has_path_like_entry = normalized.lines().any(|line| {
+        let trimmed = strip_list_bullet(line).trim();
+        trimmed.contains('`')
+            || trimmed.contains('/')
+            || trimmed.ends_with(".md")
+            || trimmed.ends_with(".json")
+            || trimmed.starts_with(".auto/")
+    });
+    if !has_path_like_entry {
+        bail!(
+            "generated implementation plan task `{}` must list concrete repo-relative artifact paths in `Completion artifacts:` or write `none`",
             block.task_id
         );
     }
@@ -3049,7 +3127,7 @@ fn parse_section_header(line: &str) -> Option<PlanSection> {
 
 fn parse_plan_task_header(line: &str) -> Option<(bool, String, String)> {
     let trimmed = line.trim_start();
-    let checked = if trimmed.starts_with("- [ ] ") {
+    let checked = if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [~] ") {
         false
     } else if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
         true
@@ -3152,6 +3230,7 @@ mod tests {
             "    ```",
             "Required tests:",
             "    - `exact_docs_test`",
+            "Completion artifacts: none",
             "Dependencies: none",
             "Estimated scope: S",
             "Completion signal: merged",
@@ -3644,6 +3723,89 @@ Add the final test transcript here after implementation.
 ## Interfaces and Dependencies
 
 Use the existing `example::proof` module; no new external service is required.
+"#,
+        )
+        .unwrap();
+
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_execplan_validator_accepts_index_only_artifact_unit() {
+        let root = temp_dir("corpus-execplan-index");
+        let plan_path = root.join("001-master-plan.md");
+        fs::write(
+            &plan_path,
+            r#"# 001 - Master Index
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Emit the index file that ties the subordinate plan set together.
+
+## Requirements Trace
+
+R1: The generated plan set stays navigable for a novice operator.
+
+## Scope Boundaries
+
+This plan only emits the index and does not change runtime code.
+
+## Progress
+
+- [ ] Emit the index file.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Keep the master plan index-only.
+  Rationale: Downstream work lives in the subordinate plans.
+  Date/Author: 2026-04-18 / auto corpus
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+Look at `genesis/PLANS.md` and the numbered files under `genesis/plans/`.
+
+## Plan of Work
+
+Write the index, then delegate implementation to the downstream plans.
+
+## Implementation Units
+
+This master plan has no direct implementation units; every work item is delegated to plans 002 through 010.
+Artifact: `genesis/plans/001-master-plan.md`.
+Approach: emit the index file and keep downstream ownership explicit.
+Test expectation: none -- index-only file with no code behavior change.
+
+## Concrete Steps
+
+    ls genesis/plans/
+
+## Validation and Acceptance
+
+The numbered plan set is indexed and navigable.
+
+## Idempotence and Recovery
+
+Rewriting the index file is safe and deterministic.
+
+## Artifacts and Notes
+
+Capture downstream evidence in the subordinate plans.
+
+## Interfaces and Dependencies
+
+Depends on `genesis/PLANS.md` and the numbered subordinate plan files.
 "#,
         )
         .unwrap();
@@ -4153,7 +4315,7 @@ No external dependencies.
         .unwrap();
         fs::write(
             root.join("IMPLEMENTATION_PLAN.md"),
-            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\nSpec: `specs/060426-missing.md`\nWhy now: needed\nCodebase evidence: present\nOwns: docs\nIntegration touchpoints: none\nScope boundary: docs only\nAcceptance criteria: docs land\nVerification: check file\nRequired tests: none\nDependencies: none\nEstimated scope: S\nCompletion signal: merged\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\nSpec: `specs/060426-missing.md`\nWhy now: needed\nCodebase evidence: present\nOwns: docs\nIntegration touchpoints: none\nScope boundary: docs only\nAcceptance criteria: docs land\nVerification: check file\nRequired tests: none\nCompletion artifacts: none\nDependencies: none\nEstimated scope: S\nCompletion signal: merged\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
         )
         .unwrap();
 

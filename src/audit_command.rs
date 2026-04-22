@@ -204,7 +204,10 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     }
 
     let include_globs = if args.include_paths.is_empty() {
-        DEFAULT_INCLUDE_GLOBS.iter().map(|s| (*s).to_string()).collect()
+        DEFAULT_INCLUDE_GLOBS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     } else {
         args.include_paths.clone()
     };
@@ -249,14 +252,27 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         }
     };
 
-    let plan = plan_audit_queue(&mut manifest, args.resume_mode, &doctrine_hash, &rubric_hash)?;
+    let plan = plan_audit_queue(
+        &mut manifest,
+        args.resume_mode,
+        &doctrine_hash,
+        &rubric_hash,
+    )?;
     let total = plan.len();
-    let cap = if args.max_files == 0 { total } else { args.max_files.min(total) };
+    let cap = if args.max_files == 0 {
+        total
+    } else {
+        args.max_files.min(total)
+    };
 
     println!("auto audit");
     println!("repo root:    {}", repo_root.display());
     println!("output dir:   {}", output_dir.display());
-    println!("doctrine:     {} ({})", doctrine_path.display(), &doctrine_hash[..12]);
+    println!(
+        "doctrine:     {} ({})",
+        doctrine_path.display(),
+        &doctrine_hash[..12]
+    );
     println!(
         "rubric:       {} ({})",
         args.rubric_prompt
@@ -272,7 +288,10 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         tracked_files.len(),
         manifest.files.len()
     );
-    println!("queue:        {} file(s) to audit this run (cap {})", total, cap);
+    println!(
+        "queue:        {} file(s) to audit this run (cap {})",
+        total, cap
+    );
     if args.report_only {
         println!("mode:         report-only");
     }
@@ -296,11 +315,9 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     }
 
     if !args.report_only && !current_branch.is_empty() {
-        if let Some(commit) = auto_checkpoint_if_needed(
-            &repo_root,
-            current_branch.as_str(),
-            "audit checkpoint",
-        )? {
+        if let Some(commit) =
+            auto_checkpoint_if_needed(&repo_root, current_branch.as_str(), "audit checkpoint")?
+        {
             println!("checkpoint:  committed pre-existing changes at {commit}");
         }
     }
@@ -373,13 +390,18 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
                 continue;
             }
         };
-        atomic_write(&file_dir.join("response.log"), response.as_bytes())
-            .with_context(|| format!("failed to write {}", file_dir.join("response.log").display()))?;
+        atomic_write(&file_dir.join("response.log"), response.as_bytes()).with_context(|| {
+            format!(
+                "failed to write {}",
+                file_dir.join("response.log").display()
+            )
+        })?;
 
         let verdict_path = file_dir.join("verdict.json");
-        let verdict = match fs::read_to_string(&verdict_path).ok().and_then(|raw| {
-            serde_json::from_str::<FileVerdict>(&raw).ok()
-        }) {
+        let verdict = match fs::read_to_string(&verdict_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<FileVerdict>(&raw).ok())
+        {
             Some(v) => v,
             None => {
                 eprintln!(
@@ -512,9 +534,10 @@ fn reconcile_manifest_with_tree(
     tracked: &[String],
     _repo_root: &Path,
 ) -> Result<()> {
-    let tracked_set: std::collections::HashSet<&str> =
-        tracked.iter().map(String::as_str).collect();
-    manifest.files.retain(|entry| tracked_set.contains(entry.path.as_str()));
+    let tracked_set: std::collections::HashSet<&str> = tracked.iter().map(String::as_str).collect();
+    manifest
+        .files
+        .retain(|entry| tracked_set.contains(entry.path.as_str()));
     let existing: std::collections::HashSet<String> = manifest
         .files
         .iter()
@@ -726,7 +749,12 @@ fn build_file_prompt(
     })?;
     let file_dir = file_artifact_dir(output_dir, rel_path);
     let file_dir_rel = file_dir
-        .strip_prefix(abs_path.parent().and_then(Path::parent).unwrap_or(Path::new(".")))
+        .strip_prefix(
+            abs_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new(".")),
+        )
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file_dir.display().to_string());
     Ok(format!(
@@ -916,12 +944,8 @@ fn record_worklist_entry(
     let worklist_path = repo_root.join("WORKLIST.md");
     let stage_path = file_dir.join("worklist-entry.md");
     let staged = fs::read_to_string(&stage_path).ok();
-    let entry = staged.unwrap_or_else(|| {
-        format!(
-            "- `{}` audit {verdict_tag}: {}",
-            rel_path, rationale
-        )
-    });
+    let entry =
+        staged.unwrap_or_else(|| format!("- `{}` audit {verdict_tag}: {}", rel_path, rationale));
     let mut current = if worklist_path.exists() {
         fs::read_to_string(&worklist_path)
             .with_context(|| format!("failed to read {}", worklist_path.display()))?
@@ -1000,7 +1024,10 @@ fn write_progress_snapshot(
     }
     let mut body = String::new();
     body.push_str("# AUDIT-PROGRESS\n\n");
-    body.push_str(&format!("- total files tracked: {}\n", manifest.files.len()));
+    body.push_str(&format!(
+        "- total files tracked: {}\n",
+        manifest.files.len()
+    ));
     body.push_str(&format!("- pending: {pending}\n"));
     body.push_str(&format!(
         "- audited this run: {audited} ({clean} CLEAN, {applied} applied patches, \
@@ -1024,11 +1051,7 @@ async fn run_auditor(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result
     }
 }
 
-async fn run_auditor_kimi(
-    repo_root: &Path,
-    prompt: &str,
-    args: &AuditArgs,
-) -> Result<String> {
+async fn run_auditor_kimi(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
     let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
     let model = resolve_kimi_cli_model(&args.model);
     let exec_args = kimi_exec_args(&model, &args.reasoning_effort, prompt);
@@ -1057,8 +1080,7 @@ async fn run_auditor_kimi(
     let stdout_task =
         tokio::spawn(async move { capture_pi_output(stdout, "auto audit kimi-cli", 30).await });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
-    let wait_result =
-        time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
+    let wait_result = time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
     let timed_out = wait_result.is_err();
     if timed_out {
         let _ = child.kill().await;

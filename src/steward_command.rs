@@ -3,8 +3,8 @@
 //! Both passes run through Codex (gpt-5.4 by default). The first pass reads
 //! the repo + planning surface and writes audit artifacts; the second pass is
 //! an independent Codex review that verifies the first pass's GHOST / ORPHAN
-//! rows against the live tree and applies the approved IMPLEMENTATION_PLAN.md
-//! / WORKLIST.md / LEARNINGS.md edits.
+//! rows against the live tree and applies approved active plan/spec
+//! promotions.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,12 +18,13 @@ use crate::util::{
 };
 use crate::StewardArgs;
 
-const STEWARD_DELIVERABLES: [&str; 5] = [
+const STEWARD_DELIVERABLES: [&str; 6] = [
     "DRIFT.md",
     "HINGES.md",
     "RETIRE.md",
     "HAZARDS.md",
     "STEWARDSHIP-REPORT.md",
+    "PROMOTIONS.md",
 ];
 
 pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
@@ -147,8 +148,8 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         output_dir.display()
     );
 
-    // Post-steward checkpoint so the audit artifacts + any append-only plan
-    // edits land even if the finalizer pass fails or is skipped.
+    // Post-steward checkpoint so the audit artifacts plus any active plan/spec
+    // promotions land even if the finalizer pass fails or is skipped.
     if !args.report_only && !current_branch.is_empty() {
         if let Some(commit) = auto_checkpoint_if_needed(
             &repo_root,
@@ -232,9 +233,9 @@ fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<Pa
         } else {
             repo_root.join(path)
         };
-        let canonical = absolute.canonicalize().with_context(|| {
-            format!("failed to resolve reference repo {}", absolute.display())
-        })?;
+        let canonical = absolute
+            .canonicalize()
+            .with_context(|| format!("failed to resolve reference repo {}", absolute.display()))?;
         if !canonical.is_dir() {
             bail!("reference repo {} is not a directory", canonical.display());
         }
@@ -330,24 +331,45 @@ fn build_steward_prompt(
             .join("\n")
     };
     let apply_clause = if report_only {
-        "You are in REPORT-ONLY mode. Produce the five deliverables below but do \
-         NOT edit `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `LEARNINGS.md`, or any \
-         other planning file. Put proposed edits inside `STEWARDSHIP-REPORT.md` \
-         under a `Proposed plan edits` section for the Codex finalizer to apply."
+        "You are in REPORT-ONLY mode. Produce the six deliverables below but do \
+         NOT edit `IMPLEMENTATION_PLAN.md`, `SECURITY_PLAN.md`, `WORKLIST.md`, \
+         `LEARNINGS.md`, `ARCHIVED.md`, `specs/`, or any other planning file. \
+         Put proposed active spec/plan promotions inside `PROMOTIONS.md` and \
+         summarize them inside `STEWARDSHIP-REPORT.md` under a `Proposed plan/spec \
+         promotions` section for a human or later non-report steward run to apply."
     } else {
-        "After writing the five deliverables, make the following in-place edits \
-         to the active planning surface:\n\n\
-         - `IMPLEMENTATION_PLAN.md`: append new tasks for every high-confidence \
-           GHOST or drift finding. Use the repo's existing item-id convention \
+        "After writing the six deliverables, promote every high-confidence \
+         GHOST, DRIFT, ORPHAN, or hinge finding into active automation-ready \
+         work:\n\n\
+         - `specs/`: create a dated spec stub when the finding needs design, \
+           cross-repo contract definition, or acceptance criteria that do not \
+           already exist. The stub must include Purpose, Scope, Non-goals, \
+           Acceptance, Verification, and Plan items.\n\
+         - `IMPLEMENTATION_PLAN.md`: append active plan items for implementation \
+           or cleanup work. Use the repo's existing item-id convention \
            (`W2-NS-*`, `NEM-*`, `BIT-NS-*`, `P-*`, etc.) and match the shape of \
-           surrounding items (Owns / Scope / Acceptance / Verification / \
-           Required tests / Dependencies / Estimated scope).\n\
-         - `WORKLIST.md`: append severity-tagged findings for medium-confidence \
-           issues that need reviewer attention but not a full plan entry.\n\
-         - `LEARNINGS.md`: append durable lessons observed from drift patterns.\n\n\
-         Do NOT edit `REVIEW.md`, `ARCHIVED.md`, or code. Do NOT delete or \
-         rewrite existing items — append only. The finalizer pass reviews your \
-         edits and trims or flags them."
+           surrounding items: Spec / Why now / Owns / Integration touchpoints / \
+           Scope boundary / Acceptance criteria / Verification / Required tests / \
+           Dependencies / Estimated scope / Completion signal.\n\
+           Only append items that should be eligible for `auto parallel`. \
+           Deferred or not-shipped ideas belong in `PROMOTIONS.md`, \
+           `STEWARDSHIP-REPORT.md`, or a blocked `- [!]` row with an explicit \
+           missing decision; never create an unchecked `- [ ]` row whose title \
+           says `DEFERRED` or `not shipped`.\n\
+         - `SECURITY_PLAN.md`: append or update security rows for security-owned \
+           work; do not hide security blockers in general worklists.\n\
+         - `WORKLIST.md`: append severity-tagged findings only for \
+           medium-confidence issues that need reviewer attention but are not ready \
+           for auto-parallel.\n\
+         - `LEARNINGS.md`: append durable lessons observed from repeated drift \
+           patterns.\n\n\
+         Treat `PROMOTIONS.md` as the audit ledger for these changes. It must \
+         list each promoted item/spec, target file, status (`applied`, \
+         `deferred`, `rejected`), and a one-line reason. Do NOT edit code. Do \
+         NOT rewrite existing plan history except for narrow status/prose \
+         corrections that are directly verified and necessary to prevent \
+         automation from claiming false completion. The finalizer pass reviews \
+         your edits and trims or flags them."
     };
     format!(
         r#"You are the **steward** of this repository at `{repo_root}`, branch `{branch}`.
@@ -367,7 +389,7 @@ A steward is not a re-planner. This repo already has an active planning surface 
 
 ## Deliverables
 
-Write all five files into `{steward_dir}/`. Do NOT write `genesis/`, numbered ExecPlans, or any competing master plan — that is `auto corpus`'s job and this repo already has its own active planning.
+Write all six files into `{steward_dir}/`. Do NOT write `genesis/`, numbered ExecPlans, or any competing master plan — that is `auto corpus`'s job and this repo already has its own active planning.
 
 ### 1. `{steward_dir}/DRIFT.md`
 
@@ -415,8 +437,28 @@ Executive summary, 2-3 pages max:
 - `## Hinges ranked` — ordered.
 - `## Retirement batch` — summary of RETIRE.md.
 - `## Mainnet launch blockers` — the mainnet-blocking column of HAZARDS.md.
-- `## Proposed plan edits` — ordered list of explicit append-only edits (file + exact markdown + rationale). Finalizer reads this.
+- `## Proposed plan/spec promotions` — ordered list of explicit active
+  promotions (target file + exact markdown or spec path + rationale).
+  Finalizer reads this.
 - `## Decision log` — Taste or User Challenge calls classified.
+
+### 6. `{steward_dir}/PROMOTIONS.md`
+
+This is the machine-useful bridge from stewardship to `auto parallel`.
+
+Start with a table:
+
+| target | action | id/path | status | reason |
+|---|---|---|---|---|
+
+Then include exact markdown for every plan item or spec stub you applied or
+would apply. Every open plan item must be ready for a parallel worker to claim:
+it needs a stable id, owner files, scope boundary, acceptance criteria,
+verification commands, required tests, dependencies, estimated scope, and a
+completion signal. If the finding is not ready for parallel implementation,
+mark it `deferred` in `PROMOTIONS.md` only and explain the missing decision.
+Do not emit unchecked `- [ ]` plan rows for deferred or not-shipped work; use a
+blocked `- [!]` row only when it must remain on the active dependency graph.
 
 ## How to work
 
@@ -432,7 +474,11 @@ Executive summary, 2-3 pages max:
 Each deliverable <= 20 KB. Tables > prose. Skip preamble.
 "#,
         repo_root = repo_root.display(),
-        branch = if branch.is_empty() { "(detached)" } else { branch },
+        branch = if branch.is_empty() {
+            "(detached)"
+        } else {
+            branch
+        },
         planning_listing = planning_listing,
         reference_clause = reference_clause,
         steward_dir = steward_dir,
@@ -453,21 +499,26 @@ fn build_finalizer_prompt(
         .to_string();
     let apply_clause = if report_only {
         "The first pass ran in report-only mode; you are also in report-only \
-         mode. Review the deliverables for plausibility, write your verdict, \
-         and stop. Do NOT edit any planning surface."
+         mode. Review the deliverables and promotions for plausibility, write \
+         your verdict, and stop. Do NOT edit any planning surface."
     } else {
-        "The first Codex pass has either (a) written its proposed edits \
-         directly into `IMPLEMENTATION_PLAN.md` / `WORKLIST.md` / `LEARNINGS.md`, \
-         or (b) staged them inside the `## Proposed plan edits` section of \
-         `STEWARDSHIP-REPORT.md`. Your job: verify and reconcile:\n\n\
+        "The first Codex pass has either (a) written active spec/plan \
+         promotions directly into `specs/`, `IMPLEMENTATION_PLAN.md`, \
+         `SECURITY_PLAN.md`, `WORKLIST.md`, or `LEARNINGS.md`, or (b) staged \
+         them inside `PROMOTIONS.md` and the `## Proposed plan/spec promotions` \
+         section of `STEWARDSHIP-REPORT.md`. Your job: verify and reconcile:\n\n\
          - Read the cited files in the repo to confirm each claim holds.\n\
-         - If the first pass wrote directly into a planning surface and the \
-           claim holds, leave it. If the entry shape does not match the \
-           surrounding file's convention, fix it or remove it.\n\
-         - If the first pass staged edits in `STEWARDSHIP-REPORT.md` and they \
-           hold, apply them in-place to the planning surface.\n\
+         - If the first pass wrote directly into a planning surface or `specs/` \
+           and the claim holds, leave it. If the entry shape is not \
+           auto-parallel-ready, fix it or remove it.\n\
+         - Reject or remove any newly added unchecked `- [ ]` item whose title \
+           says `DEFERRED` or `not shipped`; convert it to a blocked `- [!]` \
+           row only when it must remain on the active dependency graph.\n\
+         - If the first pass staged promotions in `PROMOTIONS.md` and they \
+           hold, apply them in-place to the planning surface and/or `specs/`.\n\
          - Never delete or rewrite existing plan items during this pass; only \
-           append or trim.\n\n\
+           append, trim invalid additions, or make narrow verified status/prose \
+           corrections needed to prevent false completion.\n\n\
          Write your verdict to `steward/final-review.md` with sections \
          `## Accepted`, `## Rejected`, `## Deferred`, `## Plan-surface diff \
          summary`. End with a `PASS | CONCERNS | FAIL` verdict.\n\n\
@@ -485,6 +536,7 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 - `{steward_dir}/RETIRE.md`
 - `{steward_dir}/HAZARDS.md`
 - `{steward_dir}/STEWARDSHIP-REPORT.md`
+- `{steward_dir}/PROMOTIONS.md`
 - Planning surface at repo root (`IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `SECURITY_PLAN.md`, `WORKLIST.md`, `LEARNINGS.md` if present).
 - Branch: `{branch}`
 
@@ -493,7 +545,8 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 1. Sample every `GHOST` row from DRIFT.md: confirm the cited files really do not exist.
 2. Sample every `ORPHAN` row: confirm the code path really exists without a plan entry.
 3. For every entry in HINGES.md, confirm the "follow-on items that become obsolete" claim by looking at the named items.
-4. For the mainnet-blocking column of HAZARDS.md, confirm every item is actually in `SECURITY_PLAN.md` under a launch-gate annotation.
+4. For the mainnet-blocking column of HAZARDS.md, confirm every item is either in `SECURITY_PLAN.md` under a launch-gate annotation or in another active planning surface with explicit launch-blocking text. If not, treat that as a risk-triage mismatch rather than silently accepting it.
+5. For every `PROMOTIONS.md` entry marked `applied`, confirm the target file contains an auto-parallel-ready item or spec stub. For every staged entry, either apply it or reject/defer it with a concrete reason.
 
 ## Plan-edit policy
 
@@ -506,7 +559,11 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 - Stay on branch `{branch}`.
 "#,
         steward_dir = steward_dir,
-        branch = if branch.is_empty() { "(detached)" } else { branch },
+        branch = if branch.is_empty() {
+            "(detached)"
+        } else {
+            branch
+        },
         apply_clause = apply_clause,
     )
 }
@@ -557,7 +614,8 @@ mod tests {
         );
         assert!(prompt.contains("REPORT-ONLY"));
         assert!(prompt.contains("do NOT edit"));
-        assert!(!prompt.contains("append new tasks for every high-confidence"));
+        assert!(prompt.contains("PROMOTIONS.md"));
+        assert!(!prompt.contains("After writing the six deliverables, promote"));
         fs::remove_dir_all(temp).expect("cleanup");
     }
 
@@ -573,7 +631,10 @@ mod tests {
             &[temp.join("IMPLEMENTATION_PLAN.md")],
             false,
         );
-        assert!(prompt.contains("append new tasks for every high-confidence"));
+        assert!(prompt.contains("promote every high-confidence"));
+        assert!(prompt.contains("create a dated spec stub"));
+        assert!(prompt.contains("parallel worker to claim"));
+        assert!(prompt.contains("PROMOTIONS.md"));
         assert!(prompt.contains("WORKLIST.md"));
         assert!(prompt.contains("LEARNINGS.md"));
         assert!(!prompt.contains("REPORT-ONLY"));
@@ -608,6 +669,8 @@ mod tests {
         assert!(prompt.contains("Do NOT rewrite"));
         assert!(prompt.contains("final-review.md"));
         assert!(prompt.contains("Accepted"));
+        assert!(prompt.contains("PROMOTIONS.md"));
+        assert!(prompt.contains("auto-parallel-ready"));
         fs::remove_dir_all(temp).expect("cleanup");
     }
 }

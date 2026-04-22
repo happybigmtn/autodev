@@ -1,3 +1,4 @@
+mod audit_command;
 mod bug_command;
 mod claude_exec;
 mod codex_exec;
@@ -5,13 +6,11 @@ mod codex_stream;
 mod completion_artifacts;
 mod corpus;
 mod generation;
-mod audit_command;
 mod health_command;
 mod kimi_backend;
 mod linear_tracker;
 mod loop_command;
 mod nemesis;
-mod steward_command;
 mod parallel_command;
 mod pi_backend;
 mod qa_command;
@@ -27,6 +26,7 @@ mod quota_usage;
 mod review_command;
 mod ship_command;
 mod state;
+mod steward_command;
 mod symphony_command;
 mod util;
 
@@ -664,7 +664,7 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Additional repository roots the parallel worker may inspect or edit
+    /// Additional repository roots the parallel worker may inspect as read-only context
     #[arg(long = "reference-repo")]
     reference_repos: Vec<PathBuf>,
 
@@ -784,8 +784,8 @@ pub(crate) struct StewardArgs {
     #[arg(long = "reference-repo")]
     reference_repos: Vec<PathBuf>,
 
-    /// Read-only mode. Produce the steward artifacts but never edit
-    /// IMPLEMENTATION_PLAN.md / WORKLIST.md / LEARNINGS.md.
+    /// Read-only mode. Produce the steward artifacts but never edit active
+    /// planning files or specs.
     #[arg(long)]
     report_only: bool,
 
@@ -798,7 +798,7 @@ pub(crate) struct StewardArgs {
     branch: Option<String>,
 
     /// Codex model for the first steward pass — writes drift + hinge + retire +
-    /// hazard artifacts and proposes IMPLEMENTATION_PLAN.md edits.
+    /// hazard artifacts and promotes active plan/spec work.
     #[arg(long, default_value = "gpt-5.4")]
     model: String,
 

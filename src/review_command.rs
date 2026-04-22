@@ -1,15 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
 use crate::claude_exec::{describe_claude_harness, run_claude_with_futility};
 use crate::codex_exec::run_codex_exec;
 use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
+use crate::completion_artifacts::review_contains_task;
 use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
-    push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
+    git_status_short_filtered, git_stdout, push_branch_with_remote_sync, sync_branch_with_remote,
+    timestamp_slug,
 };
 use crate::ReviewArgs;
 
@@ -60,8 +63,9 @@ const DIRECT_REVIEW_QUEUE_REVIEW_CLAUSE: &str = r#"
 Repo-specific direct `REVIEW.md` mode:
 - This repo forbids root `COMPLETED.md`, `WORKLIST.md`, and `ARCHIVED.md`.
   These bullets override any generic tracker instructions above.
-- Review the items already in `REVIEW.md`; do not create or hand off from
-  `COMPLETED.md`.
+- Review the items already in `REVIEW.md`. Startup harvest moves completed
+  `IMPLEMENTATION_PLAN.md` rows directly into `REVIEW.md`; do not create or
+  hand off from `COMPLETED.md`.
 - If a review item passes, remove it from `REVIEW.md`. Git history is the
   archive.
 - If a review item fails and cannot be fixed in this pass, leave it in
@@ -81,11 +85,16 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let review_path = repo_root.join("REVIEW.md");
     let archived_path = repo_root.join("ARCHIVED.md");
     let direct_review_queue = repo_forbids_legacy_review_trackers(&repo_root);
-    let moved_items = if direct_review_queue {
+    let plan_harvest = if direct_review_queue {
         ensure_review_doc(&review_path)?;
-        0
+        harvest_completed_plan_items_for_review(&repo_root, true)?
     } else {
         ensure_review_docs(&review_path, &archived_path)?;
+        harvest_completed_plan_items_for_review(&repo_root, false)?
+    };
+    let moved_items = if direct_review_queue {
+        0
+    } else {
         handoff_completed_items_to_review_queue(&completed_path, &review_path)?
     };
     if !review_path.exists() || !has_reviewable_items(&review_path)? {
@@ -175,6 +184,17 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             "handoff:     moved {} item(s) from COMPLETED.md",
             moved_items
         );
+    }
+    if plan_harvest.removed_count > 0 {
+        let destination = if direct_review_queue {
+            "REVIEW.md"
+        } else {
+            "COMPLETED.md -> REVIEW.md"
+        };
+        println!(
+            "handoff:     moved {} completed IMPLEMENTATION_PLAN.md item(s) to {} ({} already reviewed/queued)",
+            plan_harvest.removed_count, destination, plan_harvest.skipped_count
+        );
     } else if direct_review_queue {
         println!("handoff:     direct REVIEW.md mode");
     }
@@ -191,22 +211,36 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     let mut iteration = 0usize;
     let mut previous_batch_identity: Option<Vec<String>> = None;
     let mut stale_batch_counts: HashMap<Vec<String>, usize> = HashMap::new();
+    let mut skipped_stale_identities: HashSet<String> = HashSet::new();
     while args.max_iterations == 0 || iteration < args.max_iterations {
         if !has_reviewable_items(&review_path)? {
             println!();
             println!("REVIEW.md is empty; stopping.");
             break;
         }
-        let (batch, total) = select_review_batch(&review_path, args.batch_size)?;
+        let (batch, total, skipped_total) = select_review_batch_excluding(
+            &review_path,
+            args.batch_size,
+            &skipped_stale_identities,
+        )?;
         if batch.is_empty() {
             println!();
-            println!("no reviewable items selected; stopping.");
+            if skipped_total > 0 {
+                println!(
+                    "no non-stale reviewable items selected; {} stale item(s) were skipped in this run.",
+                    skipped_total
+                );
+            } else {
+                println!("no reviewable items selected; stopping.");
+            }
             break;
         }
 
         let batch_identity = batch_identity_set(&batch);
         if previous_batch_identity.as_ref() == Some(&batch_identity) {
-            let counter = stale_batch_counts.entry(batch_identity.clone()).or_insert(0);
+            let counter = stale_batch_counts
+                .entry(batch_identity.clone())
+                .or_insert(0);
             *counter += 1;
             if *counter >= 1 {
                 eprintln!();
@@ -217,12 +251,31 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
                     iteration,
                     batch_identity.join(", ")
                 );
+                let triage =
+                    mechanically_triage_stale_review_items(&repo_root, &review_path, &batch)?;
                 eprintln!(
-                    "stopping to avoid an infinite loop. Convert these items into \
-                     IMPLEMENTATION_PLAN.md follow-ups or remove them from REVIEW.md \
-                     manually, then re-run `auto review`."
+                    "mechanically triaged stale batch: removed {} item(s) from REVIEW.md \
+                     and appended {} follow-up(s) to {}.",
+                    triage.removed_count,
+                    triage.appended_count,
+                    triage.followup_path.display()
                 );
-                break;
+                if let Some(commit) = auto_checkpoint_if_needed(
+                    &repo_root,
+                    push_branch.as_str(),
+                    "review stale batch triage",
+                )? {
+                    println!("checkpoint:  committed stale-batch triage at {commit}");
+                    if push_branch_with_remote_sync(&repo_root, push_branch.as_str())? {
+                        println!("remote sync: rebased onto origin/{}", push_branch);
+                    }
+                } else {
+                    for identity in &batch_identity {
+                        skipped_stale_identities.insert(identity.clone());
+                    }
+                }
+                previous_batch_identity = None;
+                continue;
             }
         }
 
@@ -247,11 +300,13 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
         println!("prompt log:  {}", prompt_path.display());
-        println!(
-            "batch:       {} of {} queued item(s)",
-            batch.len(),
-            total
-        );
+        println!("batch:       {} of {} queued item(s)", batch.len(), total);
+        if skipped_total > 0 {
+            println!(
+                "stale skip:  {} item(s) skipped for this run",
+                skipped_total
+            );
+        }
         println!("batch ids:   {}", batch_identity.join(", "));
 
         if args.dry_run {
@@ -369,6 +424,227 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct StaleTriageResult {
+    followup_path: PathBuf,
+    removed_count: usize,
+    appended_count: usize,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PlanReviewHarvestResult {
+    removed_count: usize,
+    appended_count: usize,
+    skipped_count: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CompletedPlanItem {
+    task_id: String,
+    markdown: String,
+}
+
+fn harvest_completed_plan_items_for_review(
+    repo_root: &Path,
+    direct_review_queue: bool,
+) -> Result<PlanReviewHarvestResult> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(PlanReviewHarvestResult::default());
+    }
+
+    let plan_text = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let (updated_plan, completed_items) = extract_completed_plan_items(&plan_text);
+    if completed_items.is_empty() {
+        return Ok(PlanReviewHarvestResult::default());
+    }
+
+    atomic_write(&plan_path, updated_plan.as_bytes())
+        .with_context(|| format!("failed to write {}", plan_path.display()))?;
+
+    let review_path = repo_root.join("REVIEW.md");
+    let review_text = fs::read_to_string(&review_path).unwrap_or_default();
+    let archived_text = if direct_review_queue {
+        String::new()
+    } else {
+        fs::read_to_string(repo_root.join("ARCHIVED.md")).unwrap_or_default()
+    };
+    let completed_text = if direct_review_queue {
+        String::new()
+    } else {
+        fs::read_to_string(repo_root.join("COMPLETED.md")).unwrap_or_default()
+    };
+    let review_history = if direct_review_queue {
+        collect_historical_review_docs(repo_root)?
+    } else {
+        Vec::new()
+    };
+
+    let mut handoff_items = Vec::new();
+    let mut skipped_count = 0usize;
+    for item in &completed_items {
+        let already_queued_or_reviewed = review_contains_task(&review_text, &item.task_id)
+            || review_contains_task(&completed_text, &item.task_id)
+            || review_contains_task(&archived_text, &item.task_id)
+            || review_history
+                .iter()
+                .any(|historic| review_contains_task(historic, &item.task_id));
+        if already_queued_or_reviewed {
+            skipped_count += 1;
+            continue;
+        }
+        handoff_items.push(render_completed_plan_review_item(item));
+    }
+
+    if !handoff_items.is_empty() {
+        if direct_review_queue {
+            append_review_items_preserving_doc(&review_path, REVIEW_HEADER, &handoff_items)?;
+        } else {
+            append_review_items_preserving_doc(
+                &repo_root.join("COMPLETED.md"),
+                EMPTY_COMPLETED_DOC.trim(),
+                &handoff_items,
+            )?;
+        }
+    }
+
+    Ok(PlanReviewHarvestResult {
+        removed_count: completed_items.len(),
+        appended_count: handoff_items.len(),
+        skipped_count,
+    })
+}
+
+fn extract_completed_plan_items(plan_text: &str) -> (String, Vec<CompletedPlanItem>) {
+    #[derive(Default)]
+    struct PendingBlock {
+        completed_task_id: Option<String>,
+        lines: Vec<String>,
+    }
+
+    fn flush(
+        pending: &mut Option<PendingBlock>,
+        kept_lines: &mut Vec<String>,
+        completed_items: &mut Vec<CompletedPlanItem>,
+    ) {
+        let Some(block) = pending.take() else {
+            return;
+        };
+        if let Some(task_id) = block.completed_task_id {
+            completed_items.push(CompletedPlanItem {
+                task_id,
+                markdown: block.lines.join("\n"),
+            });
+        } else {
+            kept_lines.extend(block.lines);
+        }
+    }
+
+    let mut kept_lines = Vec::new();
+    let mut completed_items = Vec::new();
+    let mut pending = None::<PendingBlock>;
+
+    for line in plan_text.lines() {
+        if is_top_level_plan_task_header(line) {
+            flush(&mut pending, &mut kept_lines, &mut completed_items);
+            pending = Some(PendingBlock {
+                completed_task_id: completed_plan_task_id(line),
+                lines: vec![line.to_string()],
+            });
+            continue;
+        }
+
+        if let Some(block) = &mut pending {
+            block.lines.push(line.to_string());
+        } else {
+            kept_lines.push(line.to_string());
+        }
+    }
+    flush(&mut pending, &mut kept_lines, &mut completed_items);
+
+    let mut updated = kept_lines.join("\n");
+    if plan_text.ends_with('\n') {
+        updated.push('\n');
+    }
+    (updated, completed_items)
+}
+
+fn is_top_level_plan_task_header(line: &str) -> bool {
+    line.starts_with("- [")
+}
+
+fn completed_plan_task_id(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("- [x]")
+        .or_else(|| trimmed.strip_prefix("- [X]"))?
+        .trim_start();
+    let rest = rest.strip_prefix('`')?;
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+fn render_completed_plan_review_item(item: &CompletedPlanItem) -> String {
+    let mut rendered = format!(
+        "- `{}`: Implementation plan completion handoff; status `awaiting_auto_review`.\n\
+  - Source: `IMPLEMENTATION_PLAN.md`.\n\
+  - Original IMPLEMENTATION_PLAN.md item:\n\
+    ```md\n",
+        item.task_id
+    );
+    for line in item.markdown.lines() {
+        rendered.push_str("    ");
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered.push_str("    ```");
+    rendered
+}
+
+fn append_review_items_preserving_doc(
+    path: &Path,
+    default_header: &str,
+    items: &[String],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut content = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        let mut header = default_header.trim_end().to_string();
+        header.push_str("\n\n");
+        header
+    };
+    ensure_trailing_blank_line(&mut content);
+    content.push_str(&items.join("\n\n"));
+    content.push('\n');
+    atomic_write(path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn collect_historical_review_docs(repo_root: &Path) -> Result<Vec<String>> {
+    let hashes = git_stdout(
+        repo_root,
+        ["log", "--all", "--format=%H", "--", "REVIEW.md"],
+    )?;
+    let mut docs = Vec::new();
+    for hash in hashes.lines() {
+        let spec = format!("{hash}:REVIEW.md");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["show", &spec])
+            .output()
+            .with_context(|| format!("failed to read historical REVIEW.md at {hash}"))?;
+        if output.status.success() {
+            docs.push(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+    Ok(docs)
+}
+
 pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -377,19 +653,146 @@ pub(crate) fn has_reviewable_items(path: &Path) -> Result<bool> {
 
 /// Read REVIEW.md and return the first `batch_size` items. A `batch_size` of 0
 /// means "pick every item" (legacy behavior — brittle on large queues).
+#[cfg(test)]
 pub(crate) fn select_review_batch(
     review_path: &Path,
     batch_size: usize,
 ) -> Result<(Vec<String>, usize)> {
+    let (batch, total, _) =
+        select_review_batch_excluding(review_path, batch_size, &HashSet::new())?;
+    Ok((batch, total))
+}
+
+/// Read REVIEW.md and return the first `batch_size` items whose stable
+/// identity is not present in `excluded_identities`. The total still reflects
+/// the entire queue so the operator can see how much review work remains.
+pub(crate) fn select_review_batch_excluding(
+    review_path: &Path,
+    batch_size: usize,
+    excluded_identities: &HashSet<String>,
+) -> Result<(Vec<String>, usize, usize)> {
     let content = fs::read_to_string(review_path)
         .with_context(|| format!("failed to read {}", review_path.display()))?;
     let items = extract_review_items(&content);
     let total = items.len();
-    if batch_size == 0 || items.len() <= batch_size {
-        return Ok((items, total));
+    let skipped = items
+        .iter()
+        .filter(|item| excluded_identities.contains(&item_identity(item)))
+        .count();
+    let candidates = items
+        .into_iter()
+        .filter(|item| !excluded_identities.contains(&item_identity(item)))
+        .collect::<Vec<_>>();
+    if batch_size == 0 || candidates.len() <= batch_size {
+        return Ok((candidates, total, skipped));
     }
-    let batch = items.into_iter().take(batch_size).collect();
-    Ok((batch, total))
+    let batch = candidates.into_iter().take(batch_size).collect();
+    Ok((batch, total, skipped))
+}
+
+fn mechanically_triage_stale_review_items(
+    repo_root: &Path,
+    review_path: &Path,
+    stale_items: &[String],
+) -> Result<StaleTriageResult> {
+    let stale_identities = stale_items
+        .iter()
+        .map(|item| item_identity(item))
+        .collect::<HashSet<_>>();
+    let review_content = fs::read_to_string(review_path)
+        .with_context(|| format!("failed to read {}", review_path.display()))?;
+    let review_items = extract_review_items(&review_content);
+    let before_count = review_items.len();
+    let remaining_items = review_items
+        .into_iter()
+        .filter(|item| !stale_identities.contains(&item_identity(item)))
+        .collect::<Vec<_>>();
+    let removed_count = before_count.saturating_sub(remaining_items.len());
+    write_queue(review_path, REVIEW_HEADER, &remaining_items)?;
+
+    let followup_path = stale_followup_path(repo_root);
+    let appended_count = append_stale_review_followups(&followup_path, stale_items)?;
+
+    Ok(StaleTriageResult {
+        followup_path,
+        removed_count,
+        appended_count,
+    })
+}
+
+fn stale_followup_path(repo_root: &Path) -> PathBuf {
+    let implementation_plan = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if implementation_plan.exists() {
+        implementation_plan
+    } else {
+        repo_root.join("WORKLIST.md")
+    }
+}
+
+fn append_stale_review_followups(path: &Path, stale_items: &[String]) -> Result<usize> {
+    let mut content = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        format!(
+            "# {}\n\n",
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("FOLLOWUPS")
+                .replace('-', " ")
+                .to_ascii_uppercase()
+        )
+    };
+
+    if !content.contains("## Auto Review Stale Follow-ups") {
+        ensure_trailing_blank_line(&mut content);
+        content.push_str("## Auto Review Stale Follow-ups\n\n");
+    } else {
+        ensure_trailing_blank_line(&mut content);
+    }
+
+    let mut appended = 0usize;
+    for item in stale_items {
+        let identity = item_identity(item);
+        let marker = format!("Auto-review stale item: {identity}");
+        if content.contains(&marker) {
+            continue;
+        }
+        appended += 1;
+        content.push_str(&format!("- [ ] {marker}\n"));
+        content.push_str(
+            "  - Source: `REVIEW.md`.\n\
+             - Reason: `auto review` processed this item and then selected the \
+             identical item set again, which means the reviewer did not archive, \
+             remove, or convert it.\n\
+             - Required outcome: review the current tree and either archive/remove \
+             the stale REVIEW item if it is proven, or implement/document the \
+             concrete blocker as a normal plan item.\n\
+             - Original REVIEW.md item:\n",
+        );
+        content.push_str("    ```md\n");
+        for line in item.lines() {
+            content.push_str("    ");
+            content.push_str(line);
+            content.push('\n');
+        }
+        content.push_str("    ```\n\n");
+    }
+
+    atomic_write(path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(appended)
+}
+
+fn ensure_trailing_blank_line(content: &mut String) {
+    while content.ends_with("\n\n\n") {
+        content.pop();
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
 }
 
 /// Extract `path/file.ext`-shaped tokens from a REVIEW.md item body. Only the
@@ -487,9 +890,8 @@ pub(crate) struct IterationSnapshot {
 impl IterationSnapshot {
     pub(crate) fn capture(repo_root: &Path, review_path: &Path) -> Result<Self> {
         let review_count = if review_path.exists() {
-            let content = fs::read_to_string(review_path).with_context(|| {
-                format!("failed to read {}", review_path.display())
-            })?;
+            let content = fs::read_to_string(review_path)
+                .with_context(|| format!("failed to read {}", review_path.display()))?;
             extract_review_items(&content).len()
         } else {
             0
@@ -563,8 +965,8 @@ pub(crate) fn format_iteration_summary(
     }
     if before.head_commit != after.head_commit && !before.head_commit.is_empty() {
         let range = format!("{}..{}", before.head_commit, after.head_commit);
-        let commit_log = git_stdout(repo_root, ["log", "--oneline", range.as_str()])
-            .unwrap_or_default();
+        let commit_log =
+            git_stdout(repo_root, ["log", "--oneline", range.as_str()]).unwrap_or_default();
         let commit_lines: Vec<&str> = commit_log.lines().filter(|l| !l.is_empty()).collect();
         out.push_str(&format!(
             "  - new commits:       {} ({}..{})\n",
@@ -844,7 +1246,7 @@ fn collect_tracked_repo_states(
         let Ok(head) = git_stdout(&path, ["rev-parse", "HEAD"]) else {
             continue;
         };
-        let status = git_stdout(&path, ["status", "--short"]).unwrap_or_default();
+        let status = git_status_short_filtered(&path).unwrap_or_default();
         states.push(TrackedRepoState {
             name: path
                 .file_name()
@@ -945,30 +1347,103 @@ pub(crate) fn handoff_completed_items_to_review_queue(
 }
 
 fn extract_review_items(content: &str) -> Vec<String> {
-    if content.lines().any(|line| line.starts_with("## ")) {
-        return extract_section_review_items(content);
+    #[derive(Clone, Copy)]
+    enum ItemKind {
+        Section,
+        Bullet,
     }
-    extract_bullet_review_items(content)
-}
 
-fn extract_section_review_items(content: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut current = Vec::new();
-    for line in content.lines() {
-        if line.starts_with("## ") {
+    let mut kind: Option<ItemKind> = None;
+
+    let flush =
+        |items: &mut Vec<String>, current: &mut Vec<String>, kind: &mut Option<ItemKind>| {
             if !current.is_empty() {
-                items.push(current.join("\n").trim_end().to_string());
+                let item = current.join("\n").trim_end().to_string();
+                if matches!(*kind, Some(ItemKind::Section)) || is_review_bullet_item(&item) {
+                    items.push(item);
+                }
                 current.clear();
             }
+            *kind = None;
+        };
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end();
+        if line.starts_with("## ") {
+            flush(&mut items, &mut current, &mut kind);
             current.push(line.to_string());
-        } else if !current.is_empty() {
+            kind = Some(ItemKind::Section);
+            continue;
+        }
+        if is_bullet_review_item_start(line) {
+            flush(&mut items, &mut current, &mut kind);
             current.push(line.to_string());
+            kind = Some(ItemKind::Bullet);
+            continue;
+        }
+
+        match kind {
+            Some(ItemKind::Section) => current.push(line.to_string()),
+            Some(ItemKind::Bullet) => {
+                if line.trim().is_empty() || raw_line.starts_with(' ') || raw_line.starts_with('\t')
+                {
+                    current.push(line.to_string());
+                } else {
+                    flush(&mut items, &mut current, &mut kind);
+                }
+            }
+            None => {}
         }
     }
-    if !current.is_empty() {
-        items.push(current.join("\n").trim_end().to_string());
-    }
+    flush(&mut items, &mut current, &mut kind);
     items
+}
+
+fn is_bullet_review_item_start(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("- `") else {
+        return false;
+    };
+    let Some(end_tick) = rest.find('`') else {
+        return false;
+    };
+    let identity = &rest[..end_tick];
+    looks_like_review_identity(identity)
+}
+
+fn looks_like_review_identity(identity: &str) -> bool {
+    let identity = identity.trim();
+    !identity.is_empty()
+        && identity.len() <= 100
+        && !identity.contains('/')
+        && !identity.contains('\\')
+        && !identity.contains('.')
+        && !identity.chars().any(char::is_whitespace)
+        && identity
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+        && identity
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+}
+
+fn is_review_bullet_item(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    let has_review_marker = lower.contains("awaiting_auto_review")
+        || lower.contains("implementation handoff")
+        || lower.contains("validation")
+        || lower.contains("changed surfaces")
+        || lower.contains("remaining blockers")
+        || lower.contains("completed at")
+        || lower.contains("symphony/linear");
+    let looks_like_archive_note = lower.contains("were archived")
+        || lower.contains("was archived")
+        || lower.contains("already archived")
+        || lower.contains("were removed")
+        || lower.contains("was removed");
+
+    has_review_marker || !looks_like_archive_note
 }
 
 fn write_queue(path: &Path, title: &str, items: &[String]) -> Result<()> {
@@ -998,48 +1473,9 @@ fn ensure_review_docs(review_path: &Path, archived_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_bullet_review_items(content: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut current = Vec::new();
-
-    for raw_line in content.lines() {
-        let line = raw_line.trim_end();
-        if line.starts_with("- ") {
-            if !current.is_empty() {
-                items.push(current.join("\n").trim_end().to_string());
-                current.clear();
-            }
-            current.push(line.to_string());
-            continue;
-        }
-
-        if current.is_empty() {
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            current.push(String::new());
-            continue;
-        }
-
-        if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
-            current.push(line.to_string());
-            continue;
-        }
-
-        items.push(current.join("\n").trim_end().to_string());
-        current.clear();
-    }
-
-    if !current.is_empty() {
-        items.push(current.join("\n").trim_end().to_string());
-    }
-
-    items
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1047,10 +1483,12 @@ mod tests {
     use super::{
         append_reference_repo_clause, batch_identity_set, build_live_tree_annotation,
         collect_tracked_repo_states, discover_sibling_git_repos, ensure_review_docs,
-        extract_cited_paths, extract_review_items, format_batch_block, format_iteration_summary,
-        item_identity, repo_forbids_legacy_review_trackers, resolve_reference_repos,
-        select_review_batch, summarize_repo_progress, IterationSnapshot, RepoProgress,
-        TrackedRepoState, ARCHIVED_HEADER, REVIEW_HEADER,
+        extract_cited_paths, extract_completed_plan_items, extract_review_items,
+        format_batch_block, format_iteration_summary, harvest_completed_plan_items_for_review,
+        item_identity, mechanically_triage_stale_review_items, repo_forbids_legacy_review_trackers,
+        resolve_reference_repos, select_review_batch, select_review_batch_excluding,
+        summarize_repo_progress, IterationSnapshot, RepoProgress, TrackedRepoState,
+        ARCHIVED_HEADER, EMPTY_COMPLETED_DOC, REVIEW_HEADER,
     };
 
     #[test]
@@ -1076,6 +1514,49 @@ mod tests {
     }
 
     #[test]
+    fn extracts_mixed_section_and_bullet_review_items() {
+        let content = "# REVIEW\n\n## `WEB-CRAPS-E`\n- Changed surfaces: `web/client/test/craps-catalog.test.ts`\n- Remaining blockers: failing full web suite\n\n- `WEB-HOUSE-AUDIT`: Symphony/Linear completion backfill recorded; status `awaiting_auto_review`.\n\n- `WEB-CHANNEL-COVERAGE`: Symphony/Linear completion backfill recorded; status `awaiting_auto_review`.\n\n## `PROD-GATE-CRAPS-PRODUCTION`\n- Files: `docs/ops/operator-evidence/production-confidence-2026-04-18.md`\n- Remaining blockers: release proof missing\n";
+        let items = extract_review_items(content);
+        assert_eq!(items.len(), 4);
+        assert!(items[0].starts_with("## `WEB-CRAPS-E`"));
+        assert!(items[1].starts_with("- `WEB-HOUSE-AUDIT`:"));
+        assert!(items[2].starts_with("- `WEB-CHANNEL-COVERAGE`:"));
+        assert!(items[3].starts_with("## `PROD-GATE-CRAPS-PRODUCTION`"));
+        assert!(
+            !items[0].contains("WEB-HOUSE-AUDIT"),
+            "top-level backfill bullets must not be swallowed by the preceding section"
+        );
+    }
+
+    #[test]
+    fn extracts_multiline_multi_id_bullet_review_item() {
+        let content = "# REVIEW\n\n- `V70-W-2e`, `V70-W-2f`, `V70-W-2l`, `V70-W-2p`,\n  `V70-W-3b-pre`, `V70-W-3b`, `V70-W-3e`, `V70-W-3f`:\n  remaining implementation-plan items completed at 2026-04-21 10:40 local;\n  validation `cargo test`; remaining blockers none.\n\n- `W2-NS-17`: Plane 2 exchange primitives completed at 2026-04-20 15:04 UTC;\n  validation `cargo test`; remaining blockers none.\n";
+        let items = extract_review_items(content);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].starts_with("- `V70-W-2e`, `V70-W-2f`"));
+        assert!(items[0].contains("`V70-W-3f`:"));
+        assert!(items[1].starts_with("- `W2-NS-17`:"));
+    }
+
+    #[test]
+    fn does_not_split_section_on_required_backtick_bullets() {
+        let content = "# REVIEW\n\n## `P-034A` Epoch Pipeline Orchestrator\n- `barely-human/src/governance/epoch_pipeline.rs`\n- `Required` Current-tree `cargo fmt -p barely-human -- --check` failed on unrelated drift.\n- `cargo test -p barely-human --lib epoch_pipeline_e1_through_e8_execute_deterministically_in_order` -> passed\n";
+        let items = extract_review_items(content);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("`Required` Current-tree"));
+    }
+
+    #[test]
+    fn ignores_explanatory_backtick_bullets_that_are_not_queue_items() {
+        let content = "# REVIEW\n\nNo reviewable items remain.\n\n- `TASK-A`, `TASK-B`, and `TASK-C` were archived.\n";
+        let items = extract_review_items(content);
+        assert!(
+            items.is_empty(),
+            "comma-delimited explanatory bullets should not reopen an empty queue: {items:?}"
+        );
+    }
+
+    #[test]
     fn initializes_review_and_archived_docs() {
         let temp = unique_temp_dir();
         fs::create_dir_all(&temp).expect("create temp dir");
@@ -1092,6 +1573,94 @@ mod tests {
             fs::read_to_string(archived_path).expect("read archived"),
             format!("{ARCHIVED_HEADER}\n\n")
         );
+
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn extracts_completed_plan_items_and_leaves_unfinished_tasks() {
+        let plan = "# Plan\n\n- [x] `TASK-1` Done\n  - Verification: `cargo test one`\n\n- [ ] `TASK-2` Todo\n  - Verification: `cargo test two`\n";
+        let (updated, completed) = extract_completed_plan_items(plan);
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].task_id, "TASK-1");
+        assert!(completed[0].markdown.contains("Verification"));
+        assert!(!updated.contains("TASK-1"));
+        assert!(updated.contains("TASK-2"));
+    }
+
+    #[test]
+    fn harvest_completed_plan_items_flows_through_completed_queue() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        fs::write(
+            temp.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n\n- [x] `TASK-1` Done\n  - Verification: `cargo test one`\n\n- [ ] `TASK-2` Todo\n",
+        )
+        .expect("write plan");
+        fs::write(temp.join("REVIEW.md"), format!("{REVIEW_HEADER}\n\n")).expect("write review");
+        fs::write(temp.join("ARCHIVED.md"), format!("{ARCHIVED_HEADER}\n\n"))
+            .expect("write archived");
+
+        let harvest =
+            harvest_completed_plan_items_for_review(&temp, false).expect("harvest plan items");
+        assert_eq!(harvest.removed_count, 1);
+        assert_eq!(harvest.appended_count, 1);
+        assert_eq!(harvest.skipped_count, 0);
+        assert!(!fs::read_to_string(temp.join("IMPLEMENTATION_PLAN.md"))
+            .expect("read plan")
+            .contains("TASK-1"));
+
+        let moved = super::handoff_completed_items_to_review_queue(
+            &temp.join("COMPLETED.md"),
+            &temp.join("REVIEW.md"),
+        )
+        .expect("move completed to review");
+        assert_eq!(moved, 1);
+        assert_eq!(
+            fs::read_to_string(temp.join("COMPLETED.md")).expect("read completed"),
+            EMPTY_COMPLETED_DOC
+        );
+        let review = fs::read_to_string(temp.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("`TASK-1`"));
+
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn direct_harvest_preserves_review_preamble_and_skips_historical_reviewed_items() {
+        let temp = unique_temp_dir();
+        init_git_repo(&temp);
+        fs::write(
+            temp.join("REVIEW.md"),
+            "# REVIEW\n\nThis preamble stays.\n\n- `TASK-OLD`: reviewed already; status `awaiting_auto_review`.\n",
+        )
+        .expect("write review");
+        run_git_in(&temp, ["add", "REVIEW.md"]);
+        run_git_in(&temp, ["commit", "-m", "review old task"]);
+        fs::write(temp.join("REVIEW.md"), "# REVIEW\n\nThis preamble stays.\n")
+            .expect("remove old task");
+        run_git_in(&temp, ["add", "REVIEW.md"]);
+        run_git_in(&temp, ["commit", "-m", "archive old task"]);
+        fs::write(
+            temp.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n\n- [x] `TASK-OLD` Done before\n\n- [x] `TASK-NEW` Done now\n  - Verification: `cargo test new`\n",
+        )
+        .expect("write plan");
+
+        let harvest = harvest_completed_plan_items_for_review(&temp, true).expect("direct harvest");
+        assert_eq!(harvest.removed_count, 2);
+        assert_eq!(harvest.appended_count, 1);
+        assert_eq!(harvest.skipped_count, 1);
+
+        let review = fs::read_to_string(temp.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("This preamble stays."));
+        assert!(!review.contains("TASK-OLD"));
+        assert!(review.contains("`TASK-NEW`"));
+        assert!(!temp.join("COMPLETED.md").exists());
+        let plan = fs::read_to_string(temp.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(!plan.contains("TASK-OLD"));
+        assert!(!plan.contains("TASK-NEW"));
 
         fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
@@ -1183,12 +1752,8 @@ mod tests {
         init_git_repo(&sibling_repo);
         init_git_repo(&explicit_repo);
 
-        let resolved = resolve_reference_repos(
-            &repo_root,
-            &[PathBuf::from("../sharedlib")],
-            false,
-        )
-        .expect("resolve repos");
+        let resolved = resolve_reference_repos(&repo_root, &[PathBuf::from("../sharedlib")], false)
+            .expect("resolve repos");
 
         assert_eq!(
             resolved,
@@ -1228,18 +1793,107 @@ mod tests {
         let review_path = temp.join("REVIEW.md");
         fs::write(
             &review_path,
-            "# REVIEW\n\n- `A` one\n- `B` two\n- `C` three\n- `D` four\n",
+            "# REVIEW\n\n- `A-1` one\n- `B-2` two\n- `C-3` three\n- `D-4` four\n",
         )
         .expect("write review");
 
         let (batch, total) = select_review_batch(&review_path, 2).expect("select");
         assert_eq!(total, 4);
         assert_eq!(batch.len(), 2);
-        assert!(batch[0].starts_with("- `A`"));
-        assert!(batch[1].starts_with("- `B`"));
+        assert!(batch[0].starts_with("- `A-1`"));
+        assert!(batch[1].starts_with("- `B-2`"));
 
         let (all_batch, _) = select_review_batch(&review_path, 0).expect("select all");
-        assert_eq!(all_batch.len(), 4, "batch_size 0 must fall back to all items");
+        assert_eq!(
+            all_batch.len(),
+            4,
+            "batch_size 0 must fall back to all items"
+        );
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn select_review_batch_excluding_skips_stale_identities() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let review_path = temp.join("REVIEW.md");
+        fs::write(
+            &review_path,
+            "# REVIEW\n\n- `A-1` one\n- `B-2` two\n- `C-3` three\n",
+        )
+        .expect("write review");
+        let excluded = HashSet::from(["`A-1` one".to_string(), "`B-2` two".to_string()]);
+
+        let (batch, total, skipped) =
+            select_review_batch_excluding(&review_path, 2, &excluded).expect("select");
+
+        assert_eq!(total, 3);
+        assert_eq!(skipped, 2);
+        assert_eq!(batch, vec!["- `C-3` three".to_string()]);
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_review_triage_moves_items_into_implementation_plan_followups() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let review_path = temp.join("REVIEW.md");
+        let plan_path = temp.join("IMPLEMENTATION_PLAN.md");
+        fs::write(
+            &review_path,
+            "# REVIEW\n\n## 2026-04-21 Loom E2E QA Remediation Handoff\n\n- Required: durable proof.\n\n- `OLYMPIAD-SOLVER-HEURISTIC-BUNDLE-1`: proof passed.\n\n- `NEXT-ITEM` keep me\n",
+        )
+        .expect("write review");
+        fs::write(&plan_path, "# IMPLEMENTATION_PLAN\n\n").expect("write plan");
+        let stale_items = vec![
+            "## 2026-04-21 Loom E2E QA Remediation Handoff\n\n- Required: durable proof."
+                .to_string(),
+            "- `OLYMPIAD-SOLVER-HEURISTIC-BUNDLE-1`: proof passed.".to_string(),
+        ];
+
+        let result = mechanically_triage_stale_review_items(&temp, &review_path, &stale_items)
+            .expect("triage stale items");
+
+        assert_eq!(result.followup_path, plan_path);
+        assert_eq!(result.removed_count, 2);
+        assert_eq!(result.appended_count, 2);
+        let review = fs::read_to_string(&review_path).expect("read review");
+        assert!(!review.contains("Loom E2E"));
+        assert!(!review.contains("OLYMPIAD-SOLVER-HEURISTIC-BUNDLE-1"));
+        assert!(review.contains("`NEXT-ITEM` keep me"));
+        let plan = fs::read_to_string(&plan_path).expect("read plan");
+        assert!(plan.contains("## Auto Review Stale Follow-ups"));
+        assert!(plan.contains("Auto-review stale item: 2026-04-21 Loom E2E QA Remediation Handoff"));
+        assert!(plan.contains(
+            "Auto-review stale item: `OLYMPIAD-SOLVER-HEURISTIC-BUNDLE-1`: proof passed."
+        ));
+        assert!(plan.contains("Original REVIEW.md item"));
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_review_triage_falls_back_to_worklist_without_plan() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let review_path = temp.join("REVIEW.md");
+        fs::write(&review_path, "# REVIEW\n\n- `A-1` stuck\n").expect("write review");
+
+        let result = mechanically_triage_stale_review_items(
+            &temp,
+            &review_path,
+            &["- `A-1` stuck".to_string()],
+        )
+        .expect("triage stale item");
+
+        assert_eq!(result.followup_path, temp.join("WORKLIST.md"));
+        assert_eq!(result.removed_count, 1);
+        let worklist = fs::read_to_string(temp.join("WORKLIST.md")).expect("read worklist");
+        assert!(worklist.contains("Auto-review stale item: `A-1` stuck"));
+        let review = fs::read_to_string(&review_path).expect("read review");
+        assert_eq!(review, "# REVIEW\n\n");
 
         fs::remove_dir_all(temp).expect("cleanup");
     }
@@ -1378,12 +2032,7 @@ mod tests {
             TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
         ];
         let after = vec![
-            TrackedRepoState::new(
-                "bitpoker",
-                "/tmp/bitpoker",
-                "aaa111",
-                " M src/main.rs",
-            ),
+            TrackedRepoState::new("bitpoker", "/tmp/bitpoker", "aaa111", " M src/main.rs"),
             TrackedRepoState::new("robopokermulti", "/tmp/robopokermulti", "bbb111", ""),
         ];
 
@@ -1423,6 +2072,26 @@ mod tests {
             .status()
             .expect("failed to run git init");
         assert!(status.success(), "git init should succeed");
+    }
+
+    fn run_git_in<'a>(path: &PathBuf, args: impl IntoIterator<Item = &'a str>) {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Autodev Tests",
+                "-c",
+                "user.email=autodev-tests@example.com",
+            ])
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git command failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     fn commit_empty_change(path: &PathBuf) {

@@ -14,11 +14,15 @@ use tokio::task::JoinSet;
 
 use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec_with_env;
+use crate::completion_artifacts::{
+    assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
+    verification_plan, CompletionGapKind,
+};
 use crate::linear_tracker::LinearTracker;
 use crate::symphony_command::run_sync;
 use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, clear_and_recreate_dir, ensure_repo_layout,
-    git_repo_root, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
+    git_status_short_filtered, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
     sync_branch_with_remote, timestamp_slug,
 };
 use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
@@ -67,11 +71,6 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     let run_root = parallel_run_root(&repo_root, &args);
     let reference_repos =
         resolve_reference_repos(&repo_root, &args.reference_repos, args.include_siblings)?;
-    if args.max_concurrent_workers > 1 && !reference_repos.is_empty() {
-        bail!(
-            "auto parallel does not yet support additional reference repos; rerun without `--reference-repo` / `--include-siblings`"
-        );
-    }
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     let current_branch = current_branch.trim().to_string();
@@ -276,7 +275,7 @@ fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> S
         )
     };
     format!(
-        "{prompt_template}\n\nCurrent queue state for this iteration:\n- First actionable task marked `- [ ]`: `{}`\n- Pending task count: {}\n- {}\n\nExecute the instructions above.",
+        "{prompt_template}\n\nCurrent queue state for this iteration:\n- First actionable unfinished task: `{}`\n- Unfinished task count: {}\n- {}\n\nExecute the instructions above.",
         queue.pending_ids[0],
         queue.pending_ids.len(),
         blocked_clause
@@ -514,6 +513,7 @@ fn extract_task_id(task_line: &str) -> Option<String> {
 enum LoopTaskStatus {
     Pending,
     Blocked,
+    Partial,
     Done,
 }
 
@@ -524,6 +524,7 @@ struct LoopTask {
     status: LoopTaskStatus,
     dependencies: Vec<String>,
     estimated_scope: Option<String>,
+    completion_path_target: Option<String>,
     markdown: String,
 }
 
@@ -533,11 +534,20 @@ struct LoopPlanSnapshot {
 }
 
 impl LoopPlanSnapshot {
+    fn task(&self, task_id: &str) -> Option<&LoopTask> {
+        self.tasks.iter().find(|task| task.id == task_id)
+    }
+
     fn queue_snapshot(&self) -> LoopQueueSnapshot {
         let mut queue = LoopQueueSnapshot::default();
         for task in &self.tasks {
             match task.status {
                 LoopTaskStatus::Pending => queue.pending_ids.push(task.id.clone()),
+                LoopTaskStatus::Partial => {
+                    if !self.is_completion_path_placeholder(task) {
+                        queue.pending_ids.push(task.id.clone());
+                    }
+                }
                 LoopTaskStatus::Blocked => queue.blocked_ids.push(task.id.clone()),
                 LoopTaskStatus::Done => {}
             }
@@ -546,31 +556,110 @@ impl LoopPlanSnapshot {
     }
 
     fn ready_tasks(&self, inflight: &BTreeSet<String>) -> Vec<LoopTask> {
-        let unresolved = self
+        let unresolved = self.unresolved_dependency_ids(inflight);
+
+        self.tasks
+            .iter()
+            .filter(|task| self.is_actionable_unfinished(task))
+            .filter(|task| !inflight.contains(&task.id))
+            .filter(|task| {
+                task.dependencies
+                    .iter()
+                    .all(|dep| !unresolved.contains(dep))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn is_actionable_unfinished(&self, task: &LoopTask) -> bool {
+        matches!(
+            task.status,
+            LoopTaskStatus::Pending | LoopTaskStatus::Partial
+        ) && !self.is_completion_path_placeholder(task)
+    }
+
+    fn unresolved_dependency_ids(&self, inflight: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut unresolved = self
             .tasks
             .iter()
             .filter(|task| {
                 matches!(
                     task.status,
-                    LoopTaskStatus::Pending | LoopTaskStatus::Blocked
+                    LoopTaskStatus::Pending | LoopTaskStatus::Blocked | LoopTaskStatus::Partial
                 )
             })
-            .map(|task| task.id.as_str())
-            .chain(inflight.iter().map(String::as_str))
+            .filter(|task| !self.is_completion_path_placeholder(task))
+            .map(|task| task.id.clone())
+            .chain(inflight.iter().cloned())
             .collect::<BTreeSet<_>>();
 
+        for task in &self.tasks {
+            let Some(target_id) = self.completion_path_target(task) else {
+                continue;
+            };
+            if unresolved.contains(target_id) {
+                unresolved.insert(task.id.clone());
+            }
+        }
+
+        unresolved
+    }
+
+    fn completion_path_target<'a>(&'a self, task: &'a LoopTask) -> Option<&'a str> {
+        if task.status != LoopTaskStatus::Partial {
+            return None;
+        }
+        let target = task.completion_path_target.as_deref()?;
+        if target == task.id {
+            return None;
+        }
         self.tasks
             .iter()
-            .filter(|task| task.status == LoopTaskStatus::Pending)
-            .filter(|task| !inflight.contains(&task.id))
-            .filter(|task| {
-                task.dependencies
-                    .iter()
-                    .all(|dep| !unresolved.contains(dep.as_str()))
-            })
-            .cloned()
+            .any(|candidate| candidate.id == target)
+            .then_some(target)
+    }
+
+    fn is_completion_path_placeholder(&self, task: &LoopTask) -> bool {
+        self.completion_path_target(task).is_some()
+    }
+
+    fn direct_unfinished_dependents(&self, task_id: &str) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|task| self.is_actionable_unfinished(task))
+            .filter(|task| task.id != task_id)
+            .filter(|task| task.dependencies.iter().any(|dep| dep == task_id))
+            .map(|task| task.id.clone())
             .collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParallelBlockerKind {
+    Pending,
+    Blocked,
+    Shelved,
+    DeferredPartial,
+    InFlight,
+}
+
+impl ParallelBlockerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Blocked => "blocked",
+            Self::Shelved => "shelved",
+            Self::DeferredPartial => "deferred-partial",
+            Self::InFlight => "in-flight",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParallelBlockerDetail {
+    task_id: String,
+    kind: ParallelBlockerKind,
+    downstream: Vec<String>,
 }
 
 fn parse_loop_plan(plan: &str) -> LoopPlanSnapshot {
@@ -604,10 +693,17 @@ fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
     let header = header?;
     let (mut status, id, title) = parse_task_header(&header)?;
     let markdown = lines.join("\n");
-    if matches!(status, LoopTaskStatus::Pending | LoopTaskStatus::Blocked)
-        && task_is_non_actionable_placeholder(&title, &markdown)
-    {
-        status = LoopTaskStatus::Done;
+    if matches!(
+        status,
+        LoopTaskStatus::Pending | LoopTaskStatus::Blocked | LoopTaskStatus::Partial
+    ) {
+        if task_is_deferred_not_shipped_placeholder(&title, &markdown) {
+            status = LoopTaskStatus::Blocked;
+        } else if matches!(status, LoopTaskStatus::Pending | LoopTaskStatus::Blocked)
+            && task_is_non_actionable_placeholder(&title, &markdown)
+        {
+            status = LoopTaskStatus::Done;
+        }
     }
     Some(LoopTask {
         id,
@@ -615,6 +711,7 @@ fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
         status,
         dependencies: parse_task_dependencies(&markdown),
         estimated_scope: task_field_line_value(&markdown, "Estimated scope:"),
+        completion_path_target: parse_task_completion_path(&markdown),
         markdown,
     })
 }
@@ -637,12 +734,25 @@ fn task_is_non_actionable_placeholder(title: &str, markdown: &str) -> bool {
     })
 }
 
+fn task_is_deferred_not_shipped_placeholder(title: &str, markdown: &str) -> bool {
+    std::iter::once(title).chain(markdown.lines()).any(|line| {
+        let normalized = line
+            .chars()
+            .map(|ch| if ch.is_ascii_punctuation() { ' ' } else { ch })
+            .collect::<String>()
+            .to_ascii_lowercase();
+        normalized.contains("deferred") && normalized.contains("not shipped")
+    })
+}
+
 fn parse_task_header(line: &str) -> Option<(LoopTaskStatus, String, String)> {
     let trimmed = line.trim_start();
     let (status, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
         (LoopTaskStatus::Pending, rest)
     } else if let Some(rest) = trimmed.strip_prefix("- [!] ") {
         (LoopTaskStatus::Blocked, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [~] ") {
+        (LoopTaskStatus::Partial, rest)
     } else if let Some(rest) = trimmed
         .strip_prefix("- [x] ")
         .or_else(|| trimmed.strip_prefix("- [X] "))
@@ -722,6 +832,34 @@ fn task_field_line_value(markdown: &str, field: &str) -> Option<String> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string())
+    })
+}
+
+fn parse_task_completion_path(markdown: &str) -> Option<String> {
+    markdown.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if let Some(start) = lower.find("completion path:") {
+            let refs = collect_task_refs(line[start + "completion path:".len()..].trim());
+            if let Some(target) = refs.into_iter().next() {
+                return Some(target);
+            }
+        }
+
+        if let Some(start) = lower.find("completion path is") {
+            let refs = collect_task_refs(line[start + "completion path is".len()..].trim());
+            if let Some(target) = refs.into_iter().next() {
+                return Some(target);
+            }
+        }
+
+        if let Some(end) = lower.find("for the completion path") {
+            let refs = collect_task_refs(line[..end].trim());
+            if let Some(target) = refs.into_iter().last() {
+                return Some(target);
+            }
+        }
+
+        None
     })
 }
 
@@ -870,6 +1008,46 @@ enum LaneRepoProgress {
     NewCommitsWithDirty(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CherryPickFailurePolicy {
+    Abort,
+    LeaveInProgress,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LaneLandingOutcome {
+    Landed {
+        auto_repaired: bool,
+        completion_status: LoopTaskStatus,
+    },
+    NeedsRecovery(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LaneLandingRecoveryPrep {
+    RebasedCleanly,
+    NeedsWorkerResolution(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LinearAutoSyncState {
+    disabled_reason: Option<String>,
+}
+
+impl LinearAutoSyncState {
+    fn is_disabled(&self) -> bool {
+        self.disabled_reason.is_some()
+    }
+
+    fn disable_for_run(&mut self, reason: impl Into<String>) -> bool {
+        if self.disabled_reason.is_some() {
+            return false;
+        }
+        self.disabled_reason = Some(reason.into());
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ParallelEventLogger {
     live_log_path: PathBuf,
@@ -957,14 +1135,10 @@ fn append_idle_status_to_free_lanes(
             continue;
         }
         let lane_root = run_root.join("lanes").join(format!("lane-{lane_index}"));
-        let task_id = read_lane_task_id(&lane_root)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "[idle]".to_string());
         append_lane_host_event(
             &lane_root.join("stdout.log"),
             lane_index,
-            &task_id,
+            "[idle]",
             &format!("idle: {summary}"),
         );
     }
@@ -1045,21 +1219,18 @@ fn run_parallel_preflight(
     let task_text = plan
         .tasks
         .iter()
-        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .filter(|task| {
+            matches!(
+                task.status,
+                LoopTaskStatus::Pending | LoopTaskStatus::Partial
+            )
+        })
         .map(|task| format!("{} {}\n{}", task.id, task.title, task.markdown))
         .collect::<Vec<_>>()
         .join("\n")
         .to_ascii_lowercase();
 
-    let needs_browser = contains_any(
-        &task_text,
-        &["agent-browser", "playwright", "browser", "e2e", "web"],
-    );
-    let needs_docker = contains_any(
-        &task_text,
-        &["docker", "compose", "regtest", "rbtc", "live"],
-    ) || repo_root.join("docker-compose.yml").exists();
-    let needs_regtest = contains_any(&task_text, &["regtest", "rbtc"]);
+    let preflight_needs = classify_parallel_preflight_needs(&task_text, repo_root);
 
     if repo_uses_cargo(repo_root) {
         report.add(
@@ -1069,15 +1240,15 @@ fn run_parallel_preflight(
         );
     }
 
-    if needs_browser {
+    if preflight_needs.browser {
         if command_exists("agent-browser") {
             let socket = default_agent_browser_socket();
-            if socket.exists() {
+            if socket.exists() || try_warm_agent_browser_daemon(repo_root, &socket) {
                 report.add(
                     PreflightStatus::Ok,
                     "agent-browser",
                     format!(
-                        "CLI present and daemon socket exists at {}",
+                        "CLI present and daemon socket is ready at {}",
                         socket.display()
                     ),
                 );
@@ -1086,7 +1257,7 @@ fn run_parallel_preflight(
                     PreflightStatus::Warn,
                     "agent-browser",
                     format!(
-                        "CLI present but daemon socket is missing at {}; browser lanes should start/repair it or report AUTO_ENV_BLOCKER",
+                        "CLI present but daemon socket is still missing at {} after warm-up; browser lanes should report AUTO_ENV_BLOCKER if they cannot repair it",
                         socket.display()
                     ),
                 );
@@ -1100,7 +1271,7 @@ fn run_parallel_preflight(
         }
     }
 
-    if needs_docker {
+    if preflight_needs.docker {
         if !command_exists("docker") {
             report.add(
                 PreflightStatus::Warn,
@@ -1152,12 +1323,12 @@ fn run_parallel_preflight(
             report.add(
                 PreflightStatus::Warn,
                 "docker compose",
-                "tasks mention Docker/regtest/live infrastructure but no compose file was found",
+                "tasks mention Docker or explicit regtest infrastructure but no compose file was found",
             );
         }
     }
 
-    if needs_regtest {
+    if preflight_needs.regtest {
         if command_exists("curl") {
             match command_stdout(
                 repo_root,
@@ -1199,7 +1370,7 @@ fn run_parallel_preflight(
         report.add(
             PreflightStatus::Ok,
             "general",
-            "no browser, Docker, regtest, or Cargo preflight checks were triggered by pending tasks",
+            "no browser, Docker, explicit regtest, or Cargo preflight checks were triggered by pending tasks",
         );
     }
 
@@ -1224,6 +1395,64 @@ fn run_parallel_preflight(
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn contains_term(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_term_char(ch));
+        let end = start + needle.len();
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_term_char(ch));
+        before_ok && after_ok
+    })
+}
+
+fn contains_any_term(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| contains_term(haystack, needle))
+}
+
+fn is_term_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParallelPreflightNeeds {
+    browser: bool,
+    docker: bool,
+    regtest: bool,
+}
+
+fn classify_parallel_preflight_needs(task_text: &str, repo_root: &Path) -> ParallelPreflightNeeds {
+    let browser = contains_any(
+        task_text,
+        &["agent-browser", "playwright", "browser", "e2e", "web"],
+    );
+    let regtest = contains_any(task_text, &["regtest", "rbtc-regtest", "bitcoin-regtest"]);
+    let docker = contains_any_term(task_text, &["docker", "podman"])
+        || contains_any(
+            task_text,
+            &[
+                "docker compose",
+                "docker-compose",
+                "compose.yml",
+                "compose.yaml",
+            ],
+        )
+        || regtest
+        || repo_root.join("docker-compose.yml").exists()
+        || repo_root.join("compose.yml").exists()
+        || repo_root.join("compose.yaml").exists();
+
+    ParallelPreflightNeeds {
+        browser,
+        docker,
+        regtest,
+    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -1260,6 +1489,22 @@ fn default_agent_browser_socket() -> PathBuf {
         .join(uid.trim())
         .join("agent-browser")
         .join("default.sock")
+}
+
+fn try_warm_agent_browser_daemon(repo_root: &Path, socket: &Path) -> bool {
+    let open = Command::new("agent-browser")
+        .args(["open", "about:blank"])
+        .current_dir(repo_root)
+        .output();
+    if !open.as_ref().is_ok_and(|output| output.status.success()) {
+        return false;
+    }
+
+    let _ = Command::new("agent-browser")
+        .arg("close")
+        .current_dir(repo_root)
+        .output();
+    socket.exists()
 }
 
 fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
@@ -1326,23 +1571,38 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         .collect::<Vec<_>>();
     lanes.sort_by_key(|(index, _)| *index);
 
+    let preflight_warnings = preflight_warning_names(&run_root);
+    let recent_host_warnings = recent_parallel_host_warnings(&run_root, 200);
+    let stop_state = last_parallel_stop_state(&run_root);
+    let mut active_recovery_lanes = Vec::new();
+    let mut active_task_ids = BTreeSet::new();
+
     println!("lanes:");
     for (lane_index, lane_root) in lanes {
-        let task_id = read_lane_task_id(&lane_root)
+        let stored_task_id = read_lane_task_id(&lane_root)
             .ok()
             .flatten()
             .unwrap_or_else(|| "[unknown]".to_string());
-        let pid_state = match read_worker_pid(&lane_root.join("worker.pid")) {
+        let (worker_running, pid_state) = match read_worker_pid(&lane_root.join("worker.pid")) {
             Ok(Some(pid)) => match worker_pid_is_alive(pid) {
-                Ok(true) => format!("running pid {pid}"),
-                Ok(false) => format!("stale pid {pid}"),
-                Err(err) => format!("pid {pid} liveness unknown: {err:#}"),
+                Ok(true) => {
+                    active_task_ids.insert(stored_task_id.clone());
+                    (true, format!("running pid {pid}"))
+                }
+                Ok(false) => (false, format!("stale pid {pid}")),
+                Err(err) => (false, format!("pid {pid} liveness unknown: {err:#}")),
             },
-            Ok(None) => "no worker pid".to_string(),
-            Err(err) => format!("worker pid unreadable: {err:#}"),
+            Ok(None) => (false, "no worker pid".to_string()),
+            Err(err) => (false, format!("worker pid unreadable: {err:#}")),
         };
-        let repo_status = lane_repo_status_summary(&lane_root.join("repo"));
+        let repo_root = lane_root.join("repo");
+        let recovery_active = lane_repo_has_active_cherry_pick(&repo_root);
+        if recovery_active {
+            active_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
+        }
+        let repo_status = lane_repo_status_summary(&repo_root);
         let (log_age, log_line) = latest_lane_log_line(&lane_root);
+        let task_id = lane_status_task_id(&stored_task_id, worker_running, log_line.as_deref());
         println!(
             "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
         );
@@ -1350,13 +1610,59 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             println!("    {line}");
         }
     }
+    if let Ok(plan) = inspect_loop_plan(&repo_root) {
+        let shelved = stop_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .shelved
+                    .iter()
+                    .map(|task_id| {
+                        let markdown = plan
+                            .task(task_id)
+                            .map(|task| task.markdown.clone())
+                            .unwrap_or_default();
+                        (task_id.clone(), markdown)
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let deferred = stop_state
+            .as_ref()
+            .map(|state| state.deferred.clone())
+            .unwrap_or_default();
+        if let Some(frontier) =
+            format_parallel_blocker_frontier(&plan, &active_task_ids, &shelved, &deferred, 8)
+        {
+            println!("frontier:    {frontier}");
+        }
+    }
+    println!(
+        "health:      {}",
+        render_parallel_health_summary(
+            &preflight_warnings,
+            &recent_host_warnings,
+            &active_recovery_lanes,
+        )
+    );
     Ok(())
 }
 
 fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
-    command_stdout(Path::new("."), ["pgrep", "-af", "/auto parallel"])
+    command_stdout(Path::new("."), ["pgrep", "-af", "auto parallel"])
         .unwrap_or_default()
         .lines()
+        .filter(|line| {
+            line.split_once(' ')
+                .map(|(_, command)| {
+                    let command = command.trim_start();
+                    command.starts_with("auto parallel ")
+                        || command.split_once(' ').is_some_and(|(program, rest)| {
+                            program.ends_with("/auto") && rest.trim_start().starts_with("parallel ")
+                        })
+                })
+                .unwrap_or(false)
+        })
         .filter(|line| !line.contains(" parallel status"))
         .filter(|line| process_line_cwd_matches_repo(line, repo_root))
         .map(str::to_string)
@@ -1382,10 +1688,81 @@ fn lane_repo_status_summary(repo_root: &Path) -> String {
     let mut lines = branch.lines();
     let head = lines.next().unwrap_or("## unknown").trim();
     let dirty_count = lines.count();
-    if dirty_count == 0 {
-        format!("{head}; clean")
+    let recovery_clause = if lane_repo_has_active_cherry_pick(repo_root) {
+        "; cherry-pick recovery"
     } else {
-        format!("{head}; {dirty_count} dirty path(s)")
+        ""
+    };
+    if dirty_count == 0 {
+        format!("{head}{recovery_clause}; clean")
+    } else {
+        format!("{head}{recovery_clause}; {dirty_count} dirty path(s)")
+    }
+}
+
+fn preflight_warning_names(run_root: &Path) -> Vec<String> {
+    let path = run_root.join("preflight.txt");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for line in content.lines() {
+        let Some(rest) = line.trim().strip_prefix("- warn ") else {
+            continue;
+        };
+        let name = rest.split(':').next().unwrap_or(rest).trim();
+        if !name.is_empty() && !warnings.iter().any(|existing| existing == name) {
+            warnings.push(name.to_string());
+        }
+    }
+    warnings
+}
+
+fn recent_parallel_host_warnings(run_root: &Path, max_lines: usize) -> Vec<String> {
+    let Ok(log_text) = read_recent_log_text(&run_root.join("live.log"), max_lines) else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for line in log_text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("warning:") {
+            continue;
+        }
+        if !warnings.iter().any(|existing| existing == trimmed) {
+            warnings.push(trimmed.to_string());
+        }
+    }
+    warnings
+}
+
+fn render_parallel_health_summary(
+    preflight_warnings: &[String],
+    recent_host_warnings: &[String],
+    active_recovery_lanes: &[String],
+) -> String {
+    let mut issues = Vec::new();
+    if !preflight_warnings.is_empty() {
+        issues.push(format!(
+            "preflight warnings: {}",
+            preflight_warnings.join(", ")
+        ));
+    }
+    if !recent_host_warnings.is_empty() {
+        issues.push(format!(
+            "recent host warnings: {}",
+            recent_host_warnings.join(" | ")
+        ));
+    }
+    if !active_recovery_lanes.is_empty() {
+        issues.push(format!(
+            "active recovery lanes: {}",
+            active_recovery_lanes.join(", ")
+        ));
+    }
+    if issues.is_empty() {
+        "healthy".to_string()
+    } else {
+        format!("degraded ({})", issues.join("; "))
     }
 }
 
@@ -1406,6 +1783,44 @@ fn latest_lane_log_line(lane_root: &Path) -> (String, Option<String>) {
         return ("never".to_string(), None);
     };
     (format_system_time_age(modified), Some(line))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LastParallelStopState {
+    shelved: BTreeSet<String>,
+    deferred: BTreeSet<String>,
+}
+
+fn last_parallel_stop_state(run_root: &Path) -> Option<LastParallelStopState> {
+    let log_text = read_recent_log_text(&run_root.join("live.log"), 400).ok()?;
+    let stop_line = log_text
+        .lines()
+        .rev()
+        .find(|line| line.contains("no dependency-ready tasks remain to dispatch"))?;
+    Some(LastParallelStopState {
+        shelved: parse_parallel_stop_ids(stop_line, "shelved:"),
+        deferred: parse_parallel_stop_ids(stop_line, "deferred:"),
+    })
+}
+
+fn parse_parallel_stop_ids(line: &str, label: &str) -> BTreeSet<String> {
+    const LABELS: [&str; 5] = ["pending:", "blocked:", "shelved:", "deferred:", "frontier:"];
+    let Some(start) = line.find(label).map(|index| index + label.len()) else {
+        return BTreeSet::new();
+    };
+    let tail = &line[start..];
+    let end = LABELS
+        .into_iter()
+        .filter(|candidate| *candidate != label)
+        .filter_map(|candidate| tail.find(candidate))
+        .min()
+        .unwrap_or(tail.len());
+    tail[..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && *item != "none")
+        .map(str::to_string)
+        .collect()
 }
 
 fn read_last_nonempty_line(path: &Path) -> Result<Option<String>> {
@@ -1462,7 +1877,7 @@ async fn run_serial_loop(
         let queue = plan.queue_snapshot();
         if queue.pending_ids.is_empty() {
             if queue.blocked_ids.is_empty() {
-                println!("no pending `- [ ]` tasks remain; stopping.");
+                println!("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
             } else {
                 println!(
                     "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
@@ -1522,6 +1937,7 @@ async fn run_serial_loop(
                 None,
                 "auto parallel",
                 &worker_env.extra_env,
+                None,
                 None,
             )
             .await?
@@ -1642,8 +2058,18 @@ async fn run_parallel_loop(
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
+    let mut attempted_partial_followups = BTreeSet::<String>::new();
+    let mut deferred_partial_tasks = BTreeSet::<String>::new();
+    let mut unblock_attempted_tasks = BTreeSet::<String>::new();
+    let mut linear_auto_sync_state = LinearAutoSyncState::default();
     let mut landed = 0usize;
-    let mut plan = refresh_parallel_plan(repo_root, linear_tracker, parallel_logger).await?;
+    let mut plan = refresh_parallel_plan(
+        repo_root,
+        linear_tracker,
+        &mut linear_auto_sync_state,
+        parallel_logger,
+    )
+    .await?;
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
@@ -1652,12 +2078,20 @@ async fn run_parallel_loop(
         repo_root,
         target_branch,
         &mut resumable_lanes,
+        &mut attempted_partial_followups,
+        &mut deferred_partial_tasks,
         linear_tracker,
         parallel_logger,
     )
     .await?;
-    plan =
-        refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger).await;
+    plan = refresh_parallel_plan_or_last_good(
+        repo_root,
+        linear_tracker,
+        &mut linear_auto_sync_state,
+        &plan,
+        parallel_logger,
+    )
+    .await;
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
     let mut rediscovered_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
     preserve_resume_recovery_notes(&mut rediscovered_lanes, &resumable_lanes);
@@ -1666,15 +2100,32 @@ async fn run_parallel_loop(
 
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes);
-        plan =
-            refresh_parallel_plan_or_last_good(repo_root, linear_tracker, &plan, parallel_logger)
-                .await;
+        plan = refresh_parallel_plan_or_last_good(
+            repo_root,
+            linear_tracker,
+            &mut linear_auto_sync_state,
+            &plan,
+            parallel_logger,
+        )
+        .await;
         try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
                 .iter()
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.markdown == *markdown)
+        });
+        attempted_partial_followups.retain(|task_id| {
+            plan.tasks
+                .iter()
+                .find(|task| task.id == *task_id)
+                .is_some_and(|task| task.status == LoopTaskStatus::Partial)
+        });
+        deferred_partial_tasks.retain(|task_id| {
+            plan.tasks
+                .iter()
+                .find(|task| task.id == *task_id)
+                .is_some_and(|task| task.status == LoopTaskStatus::Partial)
         });
 
         if args
@@ -1708,15 +2159,135 @@ async fn run_parallel_loop(
                 break;
             }
 
-            let ready = plan
-                .ready_tasks(&active_tasks)
-                .into_iter()
-                .filter(|task| !shelved_tasks.contains_key(&task.id))
-                .collect::<Vec<_>>();
+            let ready = prioritize_ready_parallel_tasks(
+                repo_root,
+                ready_parallel_tasks(
+                    &plan,
+                    &active_tasks,
+                    &shelved_tasks,
+                    &deferred_partial_tasks,
+                ),
+            );
             if ready.is_empty() {
+                if let Some(candidate) = next_parallel_unblock_candidate(
+                    &plan,
+                    &active_tasks,
+                    &shelved_tasks,
+                    &deferred_partial_tasks,
+                    &resumable_lanes,
+                    &unblock_attempted_tasks,
+                ) {
+                    let (lane_index, resume_candidate) = if let Some((
+                        lane_index,
+                        candidate_resume,
+                    )) = take_resume_candidate_for_task(
+                        &mut resumable_lanes,
+                        &candidate.task.id,
+                        &active_lanes,
+                    ) {
+                        (lane_index, Some(candidate_resume))
+                    } else {
+                        (
+                            next_free_lane_index(args.max_concurrent_workers, &active_lanes)
+                                .context("failed to find a free loop lane for unblock recovery")?,
+                            None,
+                        )
+                    };
+                    parallel_logger.info(format!(
+                        "unblock:     lane-{} -> {} [{}] because the normal ready queue is empty; downstream: {}",
+                        lane_index,
+                        candidate.task.id,
+                        candidate.kind.label(),
+                        if candidate.downstream.is_empty() {
+                            "none".to_string()
+                        } else {
+                            candidate.downstream.join(", ")
+                        }
+                    ));
+                    unblock_attempted_tasks.insert(candidate.task.id.clone());
+                    match candidate.kind {
+                        ParallelUnblockCandidateKind::ShelvedResume => {
+                            shelved_tasks.remove(&candidate.task.id);
+                        }
+                        ParallelUnblockCandidateKind::DeferredPartialCloseout => {
+                            deferred_partial_tasks.remove(&candidate.task.id);
+                        }
+                    }
+                    let mut assignment = match prepare_parallel_lane_assignment_with_fallback(
+                        repo_root,
+                        run_root,
+                        target_branch,
+                        lane_index,
+                        candidate.task.clone(),
+                        resume_candidate,
+                    ) {
+                        Ok(assignment) => assignment,
+                        Err(err) => {
+                            parallel_logger.warn(format!(
+                                "warning: failed preparing lane-{} for unblock task `{}`; keeping it parked for this run: {err:#}",
+                                lane_index,
+                                candidate.task.id
+                            ));
+                            match candidate.kind {
+                                ParallelUnblockCandidateKind::ShelvedResume => {
+                                    shelved_tasks.insert(
+                                        candidate.task.id.clone(),
+                                        candidate.task.markdown.clone(),
+                                    );
+                                }
+                                ParallelUnblockCandidateKind::DeferredPartialCloseout => {
+                                    deferred_partial_tasks.insert(candidate.task.id.clone());
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    attach_partial_follow_up_note(
+                        repo_root,
+                        &mut assignment,
+                        &attempted_partial_followups,
+                    );
+                    prepend_host_recovery_note(
+                        &mut assignment,
+                        &render_parallel_unblock_note(&candidate),
+                    );
+                    if let Err(err) = spawn_parallel_lane_attempt(
+                        &mut join_set,
+                        &lane_config,
+                        prompt_template,
+                        &plan,
+                        &mut assignment,
+                        target_branch,
+                    ) {
+                        parallel_logger.warn(format!(
+                            "warning: failed starting unblock lane-{} `{}`; keeping it parked for this run: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        ));
+                        match candidate.kind {
+                            ParallelUnblockCandidateKind::ShelvedResume => {
+                                shelved_tasks.insert(
+                                    candidate.task.id.clone(),
+                                    candidate.task.markdown.clone(),
+                                );
+                            }
+                            ParallelUnblockCandidateKind::DeferredPartialCloseout => {
+                                deferred_partial_tasks.insert(candidate.task.id.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    active_tasks.insert(assignment.task.id.clone());
+                    active_lanes.insert(assignment.lane_index, assignment);
+                    last_idle_summary = None;
+                    continue;
+                }
                 if active_lanes.len() < args.max_concurrent_workers {
-                    let idle_summary =
-                        describe_parallel_idle_state(&plan, &active_tasks, &shelved_tasks);
+                    let idle_summary = describe_parallel_idle_state(
+                        &plan,
+                        &active_tasks,
+                        &shelved_tasks,
+                        &deferred_partial_tasks,
+                    );
                     if last_idle_summary.as_deref() != Some(idle_summary.as_str()) {
                         parallel_logger.info(format!(
                             "idle:        {} of {} lanes active; {}",
@@ -1781,6 +2352,7 @@ async fn run_parallel_loop(
                     continue;
                 }
             };
+            attach_partial_follow_up_note(repo_root, &mut assignment, &attempted_partial_followups);
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -1832,7 +2404,7 @@ async fn run_parallel_loop(
             let queue = plan.queue_snapshot();
             if queue.pending_ids.is_empty() {
                 if queue.blocked_ids.is_empty() {
-                    parallel_logger.info("no pending `- [ ]` tasks remain; stopping.");
+                    parallel_logger.info("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
                 } else {
                     parallel_logger.info(format!(
                         "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
@@ -1842,14 +2414,12 @@ async fn run_parallel_loop(
                 break;
             }
 
-            parallel_logger.info(format!(
-                "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}",
-                queue.pending_ids.join(", "),
-                if queue.blocked_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    queue.blocked_ids.join(", ")
-                }
+            parallel_logger.info(no_dependency_ready_stop_message(
+                &plan,
+                &active_tasks,
+                &queue,
+                &shelved_tasks,
+                &deferred_partial_tasks,
             ));
             break;
         }
@@ -1919,75 +2489,126 @@ async fn run_parallel_loop(
             };
             match progress {
                 LaneRepoProgress::NewCommits => {
-                    if let Err(err) =
-                        land_parallel_lane_result(repo_root, target_branch, &assignment)
-                    {
-                        let recovery_note =
-                            landing_recovery_note(target_branch, &format!("{err:#}"));
-                        match try_spawn_lane_recovery_attempt(
-                            &mut join_set,
-                            &lane_config,
-                            prompt_template,
-                            &plan,
-                            &mut assignment,
-                            target_branch,
-                            args.max_retries,
-                            parallel_logger,
-                            "failed to land committed work after a non-zero worker exit",
-                            recovery_note,
-                        ) {
-                            Ok(true) => {
-                                active_tasks.insert(assignment.task.id.clone());
-                                active_lanes.insert(assignment.lane_index, assignment);
-                                continue;
-                            }
-                            Ok(false) => {
-                                parallel_logger.warn(format!(
-                                    "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain: {err:#}",
-                                    assignment.lane_index, assignment.task.id
-                                ));
-                                if let Err(salvage_err) =
-                                    write_parallel_salvage_record(&assignment, &format!("{err:#}"))
-                                {
+                    match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+                        Ok(LaneLandingOutcome::Landed {
+                            auto_repaired,
+                            completion_status,
+                        }) => {
+                            if completion_status == LoopTaskStatus::Done {
+                                if let Some(tracker) = linear_tracker.as_mut() {
+                                    if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                                        eprintln!(
+                                            "warning: failed to archive `{}` in Linear: {err:#}",
+                                            assignment.task.id
+                                        );
+                                    }
+                                }
+                            };
+                            landed += 1;
+                            let status_suffix = completion_status_suffix(
+                                &assignment.task.id,
+                                completion_status,
+                                &mut attempted_partial_followups,
+                                &mut deferred_partial_tasks,
+                            );
+                            parallel_logger.info(format!(
+                                "landed:      [{}] {} via lane-{} after non-zero worker exit{}{} (total landed: {})",
+                                classify_task_execution_kind(&assignment.task),
+                                assignment.task.id,
+                                assignment.lane_index,
+                                if auto_repaired {
+                                    " after host auto-repair"
+                                } else {
+                                    ""
+                                },
+                                status_suffix,
+                                landed
+                            ));
+                            append_lane_host_event(
+                                &assignment.stdout_log_path,
+                                assignment.lane_index,
+                                &assignment.task.id,
+                                if auto_repaired {
+                                    if completion_status == LoopTaskStatus::Partial {
+                                        "landed: host auto-repaired and harvested committed work after non-zero worker exit; task remains [~] until local evidence is complete"
+                                    } else {
+                                        "landed: host auto-repaired and harvested committed work after non-zero worker exit"
+                                    }
+                                } else if completion_status == LoopTaskStatus::Partial {
+                                    "landed: host harvested committed work after non-zero worker exit; task remains [~] until local evidence is complete"
+                                } else {
+                                    "landed: host harvested committed work after non-zero worker exit"
+                                },
+                            );
+                            last_idle_summary = None;
+                            continue;
+                        }
+                        Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+                            match try_spawn_lane_recovery_attempt(
+                                &mut join_set,
+                                &lane_config,
+                                prompt_template,
+                                &plan,
+                                &mut assignment,
+                                target_branch,
+                                args.max_retries,
+                                parallel_logger,
+                                "failed to land committed work after a non-zero worker exit",
+                                recovery_note,
+                            ) {
+                                Ok(true) => {
+                                    active_tasks.insert(assignment.task.id.clone());
+                                    active_lanes.insert(assignment.lane_index, assignment);
+                                    continue;
+                                }
+                                Ok(false) => {
                                     parallel_logger.warn(format!(
-                                        "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                        "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain",
+                                        assignment.lane_index, assignment.task.id
+                                    ));
+                                    if let Err(salvage_err) = write_parallel_salvage_record(
+                                        &assignment,
+                                        "host exhausted landing-recovery attempts after a non-zero worker exit",
+                                    ) {
+                                        parallel_logger.warn(format!(
+                                            "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                            assignment.lane_index, assignment.task.id
+                                        ));
+                                    }
+                                }
+                                Err(retry_err) => {
+                                    parallel_logger.warn(format!(
+                                        "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}",
                                         assignment.lane_index, assignment.task.id
                                     ));
                                 }
                             }
-                            Err(retry_err) => {
+                            shelved_tasks.insert(
+                                assignment.task.id.clone(),
+                                assignment.task.markdown.clone(),
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            parallel_logger.warn(format!(
+                                "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain: {err:#}",
+                                assignment.lane_index, assignment.task.id
+                            ));
+                            if let Err(salvage_err) =
+                                write_parallel_salvage_record(&assignment, &format!("{err:#}"))
+                            {
                                 parallel_logger.warn(format!(
-                                    "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; original landing error: {err:#}",
+                                    "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
                                     assignment.lane_index, assignment.task.id
                                 ));
                             }
-                        }
-                        shelved_tasks
-                            .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
-                        continue;
-                    }
-                    if let Some(tracker) = linear_tracker.as_mut() {
-                        if let Err(err) = tracker.note_done(&assignment.task.id).await {
-                            eprintln!(
-                                "warning: failed to move `{}` to done in Linear: {err:#}",
-                                assignment.task.id
+                            shelved_tasks.insert(
+                                assignment.task.id.clone(),
+                                assignment.task.markdown.clone(),
                             );
+                            continue;
                         }
                     }
-                    landed += 1;
-                    parallel_logger.info(format!(
-                        "landed:      [{}] {} via lane-{} after non-zero worker exit (total landed: {})",
-                        classify_task_execution_kind(&assignment.task),
-                        assignment.task.id, assignment.lane_index, landed
-                    ));
-                    append_lane_host_event(
-                        &assignment.stdout_log_path,
-                        assignment.lane_index,
-                        &assignment.task.id,
-                        "landed: host harvested committed work after non-zero worker exit",
-                    );
-                    last_idle_summary = None;
-                    continue;
                 }
                 LaneRepoProgress::Dirty(_)
                 | LaneRepoProgress::NewCommitsWithDirty(_)
@@ -2101,6 +2722,7 @@ async fn run_parallel_loop(
             let plan_for_prompt = refresh_parallel_plan_or_last_good(
                 repo_root,
                 linear_tracker,
+                &mut linear_auto_sync_state,
                 &plan,
                 parallel_logger,
             )
@@ -2135,7 +2757,8 @@ async fn run_parallel_loop(
         };
         match progress {
             LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status) => {
-                let recovery_note = dirty_worktree_recovery_note(&status);
+                let recovery_note =
+                    lane_repo_recovery_note(&assignment.lane_repo_root, target_branch, &status);
                 match try_spawn_lane_recovery_attempt(
                     &mut join_set,
                     &lane_config,
@@ -2194,73 +2817,121 @@ async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::NewCommits => {
-                if let Err(err) = land_parallel_lane_result(repo_root, target_branch, &assignment) {
-                    let recovery_note = landing_recovery_note(target_branch, &format!("{err:#}"));
-                    match try_spawn_lane_recovery_attempt(
-                        &mut join_set,
-                        &lane_config,
-                        prompt_template,
-                        &plan,
-                        &mut assignment,
-                        target_branch,
-                        args.max_retries,
-                        parallel_logger,
-                        "failed to land committed work",
-                        recovery_note,
-                    ) {
-                        Ok(true) => {
-                            active_tasks.insert(assignment.task.id.clone());
-                            active_lanes.insert(assignment.lane_index, assignment);
-                            continue;
+                match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+                    Ok(LaneLandingOutcome::Landed {
+                        auto_repaired,
+                        completion_status,
+                    }) => {
+                        if completion_status == LoopTaskStatus::Done {
+                            if let Some(tracker) = linear_tracker.as_mut() {
+                                if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                                    eprintln!(
+                                        "warning: failed to archive `{}` in Linear: {err:#}",
+                                        assignment.task.id
+                                    );
+                                }
+                            }
                         }
-                        Ok(false) => {
-                            parallel_logger.warn(format!(
-                                "warning: failed landing lane-{} `{}` and no recovery attempts remain; shelving for the rest of this run: {err:#}",
-                                assignment.lane_index, assignment.task.id
-                            ));
-                            if let Err(salvage_err) =
-                                write_parallel_salvage_record(&assignment, &format!("{err:#}"))
-                            {
+                        landed += 1;
+                        let status_suffix = completion_status_suffix(
+                            &assignment.task.id,
+                            completion_status,
+                            &mut attempted_partial_followups,
+                            &mut deferred_partial_tasks,
+                        );
+                        parallel_logger.info(format!(
+                            "landed:      [{}] {} via lane-{}{}{} (total landed: {})",
+                            classify_task_execution_kind(&assignment.task),
+                            assignment.task.id,
+                            assignment.lane_index,
+                            if auto_repaired {
+                                " after host auto-repair"
+                            } else {
+                                ""
+                            },
+                            status_suffix,
+                            landed
+                        ));
+                        append_lane_host_event(
+                            &assignment.stdout_log_path,
+                            assignment.lane_index,
+                            &assignment.task.id,
+                            if auto_repaired {
+                                if completion_status == LoopTaskStatus::Partial {
+                                    "landed: host auto-repaired and harvested committed work; task remains [~] until local evidence is complete"
+                                } else {
+                                    "landed: host auto-repaired and harvested committed work"
+                                }
+                            } else if completion_status == LoopTaskStatus::Partial {
+                                "landed: host harvested committed work; task remains [~] until local evidence is complete"
+                            } else {
+                                "landed: host harvested committed work"
+                            },
+                        );
+                        last_idle_summary = None;
+                    }
+                    Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+                        match try_spawn_lane_recovery_attempt(
+                            &mut join_set,
+                            &lane_config,
+                            prompt_template,
+                            &plan,
+                            &mut assignment,
+                            target_branch,
+                            args.max_retries,
+                            parallel_logger,
+                            "failed to land committed work",
+                            recovery_note,
+                        ) {
+                            Ok(true) => {
+                                active_tasks.insert(assignment.task.id.clone());
+                                active_lanes.insert(assignment.lane_index, assignment);
+                                continue;
+                            }
+                            Ok(false) => {
                                 parallel_logger.warn(format!(
-                                    "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                    "warning: failed landing lane-{} `{}` and no recovery attempts remain",
+                                    assignment.lane_index, assignment.task.id
+                                ));
+                                if let Err(salvage_err) = write_parallel_salvage_record(
+                                    &assignment,
+                                    "host exhausted landing-recovery attempts",
+                                ) {
+                                    parallel_logger.warn(format!(
+                                        "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                        assignment.lane_index, assignment.task.id
+                                    ));
+                                }
+                            }
+                            Err(retry_err) => {
+                                parallel_logger.warn(format!(
+                                    "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}",
                                     assignment.lane_index, assignment.task.id
                                 ));
                             }
                         }
-                        Err(retry_err) => {
+                        shelved_tasks
+                            .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                        continue;
+                    }
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed landing lane-{} `{}` and no recovery attempts remain; shelving for the rest of this run: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        ));
+                        if let Err(salvage_err) =
+                            write_parallel_salvage_record(&assignment, &format!("{err:#}"))
+                        {
                             parallel_logger.warn(format!(
-                                "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; original landing error: {err:#}",
+                                "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
                                 assignment.lane_index, assignment.task.id
                             ));
                         }
-                    }
-                    shelved_tasks
-                        .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
-                    continue;
-                }
-                if let Some(tracker) = linear_tracker.as_mut() {
-                    if let Err(err) = tracker.note_done(&assignment.task.id).await {
-                        eprintln!(
-                            "warning: failed to move `{}` to done in Linear: {err:#}",
-                            assignment.task.id
-                        );
+                        shelved_tasks
+                            .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                        continue;
                     }
                 }
-                landed += 1;
-                parallel_logger.info(format!(
-                    "landed:      [{}] {} via lane-{} (total landed: {})",
-                    classify_task_execution_kind(&assignment.task),
-                    assignment.task.id,
-                    assignment.lane_index,
-                    landed
-                ));
-                append_lane_host_event(
-                    &assignment.stdout_log_path,
-                    assignment.lane_index,
-                    &assignment.task.id,
-                    "landed: host harvested committed work",
-                );
-                last_idle_summary = None;
             }
         }
     }
@@ -2326,6 +2997,47 @@ Original host landing error:
     )
 }
 
+fn prepared_landing_recovery_note(branch: &str, error: &str, repair_error: &str) -> String {
+    format!(
+        r#"The host could not land this lane's committed work onto `{branch}` automatically, so it already put this lane repo into landing-recovery mode.
+
+Current repo state:
+1. The lane repo has already been reset onto the latest `{branch}` from its lane remote.
+2. The lane's committed task range has already been re-applied with `git cherry-pick`.
+3. Git stopped on a conflict and left that in-progress cherry-pick in place for you to finish.
+
+Required recovery:
+1. Run `git status --short` and `git status` to inspect the conflicted paths and the in-progress cherry-pick summary.
+2. Resolve conflicts semantically against the latest `{branch}`. Do not blindly choose one side.
+3. Finish with `GIT_EDITOR=true git cherry-pick --continue` or `git -c core.editor=true cherry-pick --continue` so the lane cannot block on an editor.
+4. If you truly must restart the repair, inspect the existing task commit(s) first, then use `git cherry-pick --abort` and re-apply them intentionally onto the latest `{branch}`. Do not discard task-owned work.
+5. End with local task commit(s) based on the latest `{branch}` and a clean `git status --short`.
+6. Do not push or edit shared queue files; the host still owns landing and queue reconciliation.
+
+Original host landing error:
+{error}
+
+Host-side recovery status:
+{repair_error}"#
+    )
+}
+
+fn resumed_landing_recovery_note(branch: &str, status: &str) -> String {
+    format!(
+        r#"This lane repo still has an in-progress landing-recovery cherry-pick against the latest `{branch}`.
+
+Required recovery:
+1. Run `git status --short` and `git status` to inspect the conflicted paths and cherry-pick summary.
+2. Resolve conflicts semantically against the latest `{branch}`. Do not blindly choose one side.
+3. Finish with `GIT_EDITOR=true git cherry-pick --continue` or `git -c core.editor=true cherry-pick --continue`.
+4. End with local task commit(s) based on the latest `{branch}` and a clean `git status --short`.
+5. Do not push or edit shared queue files; the host still owns landing and queue reconciliation.
+
+Dirty status seen by the host:
+{status}"#
+    )
+}
+
 fn dirty_worktree_recovery_note(status: &str) -> String {
     format!(
         r#"The previous attempt exited successfully, but the lane worktree was still dirty.
@@ -2340,6 +3052,27 @@ Required recovery:
 Dirty status seen by the host:
 {status}"#
     )
+}
+
+fn lane_repo_recovery_note(lane_repo_root: &Path, branch: &str, status: &str) -> String {
+    if lane_repo_has_active_cherry_pick(lane_repo_root) {
+        resumed_landing_recovery_note(branch, status)
+    } else {
+        dirty_worktree_recovery_note(status)
+    }
+}
+
+fn lane_repo_has_active_cherry_pick(lane_repo_root: &Path) -> bool {
+    if !lane_repo_root.join(".git").exists() {
+        return false;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(lane_repo_root)
+        .args(["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn environment_blocker_recovery_note(reason: &str, preflight_report: &str) -> String {
@@ -2361,7 +3094,70 @@ Required recovery:
 1. Re-check the missing service/tool/browser/Docker dependency before changing code.
 2. If the infrastructure can be repaired from this lane without touching shared queue files, do that and rerun the exact verification.
 3. If the infrastructure is still unavailable, print `AUTO_ENV_BLOCKER: <short reason>` and exit non-zero without pretending code proof failed.
-4. If you did make task-owned code changes before finding the blocker, keep them only when they are independently correct, committed, and leave `git status --short` clean."#
+        4. If you did make task-owned code changes before finding the blocker, keep them only when they are independently correct, committed, and leave `git status --short` clean."#
+    )
+}
+
+fn no_dependency_ready_stop_message(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    queue: &LoopQueueSnapshot,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+) -> String {
+    let blocked = if queue.blocked_ids.is_empty() {
+        "none".to_string()
+    } else {
+        queue.blocked_ids.join(", ")
+    };
+    let frontier_suffix = format_parallel_blocker_frontier(
+        plan,
+        active_tasks,
+        shelved_tasks,
+        deferred_partial_tasks,
+        6,
+    )
+    .map(|summary| format!(" frontier: {summary}"))
+    .unwrap_or_default();
+    let deferred = if deferred_partial_tasks.is_empty() {
+        None
+    } else {
+        Some(
+            deferred_partial_tasks
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    if shelved_tasks.is_empty() {
+        if let Some(deferred) = deferred {
+            return format!(
+                "no dependency-ready tasks remain to dispatch; stopping with partial follow-up tasks deferred for the rest of this run. pending: {} blocked: {} deferred: {}{}",
+                queue.pending_ids.join(", "),
+                blocked,
+                deferred,
+                frontier_suffix
+            );
+        }
+        return format!(
+            "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}{}",
+            queue.pending_ids.join(", "),
+            blocked,
+            frontier_suffix
+        );
+    }
+    let shelved = shelved_tasks.keys().cloned().collect::<Vec<_>>().join(", ");
+    let deferred_suffix = deferred
+        .map(|deferred| format!(" deferred: {deferred}"))
+        .unwrap_or_default();
+    format!(
+        "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: {} blocked: {} shelved: {}{}{}",
+        queue.pending_ids.join(", "),
+        blocked,
+        shelved,
+        deferred_suffix,
+        frontier_suffix
     )
 }
 
@@ -2421,6 +3217,37 @@ The lane has clean committed work that the host could not land automatically. Re
         &format!("salvage: wrote {}", path.display()),
     );
     Ok(())
+}
+
+fn parallel_salvage_record_path(lane_root: &Path, task_id: &str, lane_index: usize) -> PathBuf {
+    let run_root = lane_root
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(lane_root);
+    run_root.join(SALVAGE_DIR).join(format!(
+        "lane-{}-{}.md",
+        lane_index,
+        sanitize_salvage_filename(task_id)
+    ))
+}
+
+fn salvage_recovery_note(
+    lane_root: &Path,
+    lane_index: usize,
+    task_id: &str,
+    target_branch: &str,
+) -> Option<String> {
+    let path = parallel_salvage_record_path(lane_root, task_id, lane_index);
+    let content = fs::read_to_string(&path).ok()?;
+    let landing_error = task_field_body(&content, "## Landing Error", "## Recovery")
+        .map(|body| {
+            body.lines()
+                .filter(|line| !line.trim_start().starts_with("```"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| "previous host landing failure recorded in salvage note".to_string());
+    Some(landing_recovery_note(target_branch, landing_error.trim()))
 }
 
 fn sanitize_salvage_filename(raw: &str) -> String {
@@ -2513,15 +3340,20 @@ fn checkpoint_parallel_host_queue_changes(
     target_branch: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<Option<String>> {
+    let queue_files = host_queue_state_files_for_repo(repo_root);
+    if queue_files.is_empty() {
+        return Ok(None);
+    }
+
     let mut status_args = vec!["status", "--short", "--"];
-    status_args.extend(HOST_QUEUE_STATE_FILES);
+    status_args.extend(queue_files.iter().copied());
     let status = git_stdout(repo_root, status_args)?;
     if status.trim().is_empty() {
         return Ok(None);
     }
 
     let mut add_args = vec!["add", "--all", "--"];
-    add_args.extend(HOST_QUEUE_STATE_FILES);
+    add_args.extend(queue_files.iter().copied());
     run_git(repo_root, add_args)?;
     let message = format!("{}: parallel host queue sync", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
@@ -2551,6 +3383,26 @@ fn try_checkpoint_parallel_host_queue_changes(
             "warning: failed syncing host-owned queue state; continuing without a host queue commit: {err:#}"
         ));
     }
+}
+
+fn host_queue_state_files_for_repo(repo_root: &Path) -> Vec<&'static str> {
+    HOST_QUEUE_STATE_FILES
+        .into_iter()
+        .filter(|relative| repo_path_exists_or_is_tracked(repo_root, relative))
+        .collect()
+}
+
+fn repo_path_exists_or_is_tracked(repo_root: &Path, relative: &str) -> bool {
+    if repo_root.join(relative).exists() {
+        return true;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--error-unmatch", "--", relative])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn inspect_lane_repo_progress_or_shelve(
@@ -2597,16 +3449,65 @@ fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
     Ok(parse_loop_plan(&plan))
 }
 
+fn audit_parallel_completion_drift(
+    repo_root: &Path,
+    plan_text: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<String> {
+    let snapshot = parse_loop_plan(plan_text);
+    let mut updated = plan_text.to_string();
+    let mut demoted = Vec::new();
+
+    for task in snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Done)
+    {
+        let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        if evidence.is_fully_evidenced() {
+            continue;
+        }
+        updated = update_task_completion_in_plan_text(&updated, &task.id, LoopTaskStatus::Partial);
+        demoted.push(task.id.clone());
+    }
+
+    if updated != plan_text {
+        let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+        atomic_write(&plan_path, updated.as_bytes())
+            .with_context(|| format!("failed to write {}", plan_path.display()))?;
+        parallel_logger.warn(format!(
+            "warning: demoted {} completed task(s) to `[~]` because repo-local completion evidence drifted ({})",
+            demoted.len(),
+            demoted.join(", ")
+        ));
+    }
+
+    Ok(updated)
+}
+
 async fn refresh_parallel_plan(
     repo_root: &Path,
     linear_tracker: &mut Option<LinearTracker>,
+    linear_auto_sync_state: &mut LinearAutoSyncState,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
+    plan_text = audit_parallel_completion_drift(repo_root, &plan_text, parallel_logger)?;
     if let Some(tracker) = linear_tracker.as_mut() {
         if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
-            eprintln!("warning: failed to refresh Linear task cache from updated plan: {err:#}");
-        } else if tracker.should_attempt_auto_sync(&plan_text) {
+            if !maybe_disable_linear_auto_sync_for_run(
+                &err,
+                linear_auto_sync_state,
+                parallel_logger,
+                "refreshing the Linear task cache from the updated plan",
+            ) {
+                parallel_logger.warn(format!(
+                    "warning: failed to refresh Linear task cache from updated plan: {err:#}"
+                ));
+            }
+        } else if !linear_auto_sync_state.is_disabled()
+            && tracker.should_attempt_auto_sync(&plan_text)
+        {
             let drift = tracker.coverage_drift(&plan_text);
             if !drift.is_empty() {
                 let mut reasons = Vec::new();
@@ -2641,15 +3542,29 @@ async fn refresh_parallel_plan(
                 })
                 .await
                 {
-                    parallel_logger.warn(format!(
-                        "warning: automatic `auto symphony sync --no-ai-planner` failed; continuing without refreshed Linear coverage: {err:#}"
-                    ));
+                    if !maybe_disable_linear_auto_sync_for_run(
+                        &err,
+                        linear_auto_sync_state,
+                        parallel_logger,
+                        "automatic `auto symphony sync --no-ai-planner`",
+                    ) {
+                        parallel_logger.warn(format!(
+                            "warning: automatic `auto symphony sync --no-ai-planner` failed; continuing without refreshed Linear coverage: {err:#}"
+                        ));
+                    }
                 } else {
                     plan_text = read_loop_plan(repo_root)?;
                     if let Err(err) = tracker.refresh_after_sync(&plan_text).await {
-                        parallel_logger.warn(format!(
-                            "warning: failed refreshing Linear cache after automatic sync: {err:#}"
-                        ));
+                        if !maybe_disable_linear_auto_sync_for_run(
+                            &err,
+                            linear_auto_sync_state,
+                            parallel_logger,
+                            "refreshing the Linear cache after automatic sync",
+                        ) {
+                            parallel_logger.warn(format!(
+                                "warning: failed refreshing Linear cache after automatic sync: {err:#}"
+                            ));
+                        }
                     } else {
                         parallel_logger.info(
                             "linear:      automatic `auto symphony sync --no-ai-planner` completed",
@@ -2665,10 +3580,18 @@ async fn refresh_parallel_plan(
 async fn refresh_parallel_plan_or_last_good(
     repo_root: &Path,
     linear_tracker: &mut Option<LinearTracker>,
+    linear_auto_sync_state: &mut LinearAutoSyncState,
     last_good_plan: &LoopPlanSnapshot,
     parallel_logger: &ParallelEventLogger,
 ) -> LoopPlanSnapshot {
-    match refresh_parallel_plan(repo_root, linear_tracker, parallel_logger).await {
+    match refresh_parallel_plan(
+        repo_root,
+        linear_tracker,
+        linear_auto_sync_state,
+        parallel_logger,
+    )
+    .await
+    {
         Ok(plan) => plan,
         Err(err) => {
             parallel_logger.warn(format!(
@@ -2677,6 +3600,33 @@ async fn refresh_parallel_plan_or_last_good(
             last_good_plan.clone()
         }
     }
+}
+
+fn is_linear_usage_limit_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("usage_limit_exceeded")
+        || message.contains("usage limit exceeded")
+        || message.contains("exceeded the free issue limit")
+        || message.contains("\"activeissuecount\"")
+}
+
+fn maybe_disable_linear_auto_sync_for_run(
+    err: &anyhow::Error,
+    linear_auto_sync_state: &mut LinearAutoSyncState,
+    parallel_logger: &ParallelEventLogger,
+    context: &str,
+) -> bool {
+    if !is_linear_usage_limit_error(err) {
+        return false;
+    }
+
+    let warning = format!(
+        "warning: {context} hit Linear workspace usage limits; disabling further automatic Linear sync for this run and continuing from IMPLEMENTATION_PLAN.md only: {err:#}"
+    );
+    if linear_auto_sync_state.disable_for_run(warning.clone()) {
+        parallel_logger.warn(warning);
+    }
+    true
 }
 
 fn setup_parallel_tmux_windows(run_root: &Path, lanes: usize, host_pid: u32) -> Result<()> {
@@ -2948,12 +3898,9 @@ fn describe_parallel_idle_state(
     plan: &LoopPlanSnapshot,
     active_tasks: &BTreeSet<String>,
     shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
 ) -> String {
-    let ready = plan
-        .ready_tasks(active_tasks)
-        .into_iter()
-        .filter(|task| !shelved_tasks.contains_key(&task.id))
-        .collect::<Vec<_>>();
+    let ready = ready_parallel_tasks(plan, active_tasks, shelved_tasks, deferred_partial_tasks);
     let (verification_only, executable_ready): (Vec<_>, Vec<_>) =
         ready.into_iter().partition(is_verification_only_task);
     if executable_ready.is_empty() && !verification_only.is_empty() {
@@ -2967,24 +3914,157 @@ fn describe_parallel_idle_state(
         );
     }
 
-    let unresolved = plan
-        .tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.status,
-                LoopTaskStatus::Pending | LoopTaskStatus::Blocked
+    let waiting_on = unresolved_frontier_dependency_ids(
+        plan,
+        active_tasks,
+        shelved_tasks,
+        deferred_partial_tasks,
+    );
+    if waiting_on.is_empty() {
+        if deferred_partial_tasks.is_empty() {
+            "no dependency-ready task is currently available".to_string()
+        } else {
+            format!(
+                "partial follow-up tasks parked for this run: {}",
+                deferred_partial_tasks
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
-        })
-        .map(|task| task.id.as_str())
-        .chain(active_tasks.iter().map(String::as_str))
-        .collect::<BTreeSet<_>>();
-    let waiting_on = plan
-        .tasks
+        }
+    } else {
+        let waiting = format!(
+            "waiting on dependencies: {}",
+            waiting_on.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        let frontier_suffix = format_parallel_blocker_frontier(
+            plan,
+            active_tasks,
+            shelved_tasks,
+            deferred_partial_tasks,
+            4,
+        )
+        .map(|summary| format!("; frontier: {summary}"))
+        .unwrap_or_default();
+        if deferred_partial_tasks.is_empty() {
+            format!("{waiting}{frontier_suffix}")
+        } else {
+            format!(
+                "{}{}; partial follow-up tasks parked for this run: {}",
+                waiting,
+                frontier_suffix,
+                deferred_partial_tasks
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+}
+
+fn ready_parallel_tasks(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+) -> Vec<LoopTask> {
+    let ready = plan
+        .ready_tasks(active_tasks)
+        .into_iter()
+        .filter(|task| !shelved_tasks.contains_key(&task.id))
+        .filter(|task| !deferred_partial_tasks.contains(&task.id))
+        .collect::<Vec<_>>();
+    let (mut pending, partials): (Vec<_>, Vec<_>) = ready
+        .into_iter()
+        .partition(|task| task.status == LoopTaskStatus::Pending);
+    pending.extend(partials);
+    pending
+}
+
+fn prioritize_ready_parallel_tasks(repo_root: &Path, ready: Vec<LoopTask>) -> Vec<LoopTask> {
+    let dirty_paths = repo_dirty_paths_for_parallel_dispatch(repo_root);
+    if dirty_paths.is_empty() {
+        return ready;
+    }
+
+    let (pending, partials): (Vec<_>, Vec<_>) = ready
+        .into_iter()
+        .partition(|task| task.status == LoopTaskStatus::Pending);
+    let mut ordered = stable_partition_tasks_by_dirty_overlap(pending, &dirty_paths);
+    ordered.extend(stable_partition_tasks_by_dirty_overlap(
+        partials,
+        &dirty_paths,
+    ));
+    ordered
+}
+
+fn stable_partition_tasks_by_dirty_overlap(
+    tasks: Vec<LoopTask>,
+    dirty_paths: &BTreeSet<String>,
+) -> Vec<LoopTask> {
+    let mut clean = Vec::new();
+    let mut overlapping = Vec::new();
+    for task in tasks {
+        if task_overlaps_dirty_canonical_paths(&task, dirty_paths) {
+            overlapping.push(task);
+        } else {
+            clean.push(task);
+        }
+    }
+    clean.extend(overlapping);
+    clean
+}
+
+fn repo_dirty_paths_for_parallel_dispatch(repo_root: &Path) -> BTreeSet<String> {
+    git_stdout(
+        repo_root,
+        ["status", "--short", "--untracked-files=all", "--", "."],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(parse_parallel_status_path)
+    .filter(|path| !parallel_dispatch_path_is_ignored(path))
+    .collect()
+}
+
+fn parse_parallel_status_path(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("##") {
+        return None;
+    }
+    let path = trimmed.get(3..)?.trim();
+    let path = path.rsplit_once(" -> ").map(|(_, rhs)| rhs).unwrap_or(path);
+    let path = path.trim_matches('"').trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn parallel_dispatch_path_is_ignored(path: &str) -> bool {
+    let first_segment = path.split('/').next().unwrap_or(path);
+    first_segment == ".auto"
+        || first_segment == "bug"
+        || first_segment == "nemesis"
+        || first_segment.starts_with("gen-")
+}
+
+fn task_overlaps_dirty_canonical_paths(task: &LoopTask, dirty_paths: &BTreeSet<String>) -> bool {
+    dirty_paths.iter().any(|path| task.markdown.contains(path))
+}
+
+fn unresolved_frontier_dependency_ids(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let unresolved = plan.unresolved_dependency_ids(active_tasks);
+    plan.tasks
         .iter()
-        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .filter(|task| plan.is_actionable_unfinished(task))
         .filter(|task| !active_tasks.contains(&task.id))
         .filter(|task| !shelved_tasks.contains_key(&task.id))
+        .filter(|task| !deferred_partial_tasks.contains(&task.id))
         .flat_map(|task| {
             task.dependencies
                 .iter()
@@ -2992,14 +4072,300 @@ fn describe_parallel_idle_state(
                 .cloned()
                 .collect::<Vec<_>>()
         })
-        .collect::<BTreeSet<_>>();
-    if waiting_on.is_empty() {
-        "no dependency-ready task is currently available".to_string()
+        .collect()
+}
+
+fn parallel_blocker_frontier(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+) -> Vec<ParallelBlockerDetail> {
+    let mut details = unresolved_frontier_dependency_ids(
+        plan,
+        active_tasks,
+        shelved_tasks,
+        deferred_partial_tasks,
+    )
+    .into_iter()
+    .map(|task_id| {
+        let kind = if active_tasks.contains(&task_id) {
+            ParallelBlockerKind::InFlight
+        } else if shelved_tasks.contains_key(&task_id) {
+            ParallelBlockerKind::Shelved
+        } else if deferred_partial_tasks.contains(&task_id) {
+            ParallelBlockerKind::DeferredPartial
+        } else {
+            match plan.task(&task_id).map(|task| task.status) {
+                Some(LoopTaskStatus::Blocked) => ParallelBlockerKind::Blocked,
+                _ => ParallelBlockerKind::Pending,
+            }
+        };
+        let downstream = plan.direct_unfinished_dependents(&task_id);
+        ParallelBlockerDetail {
+            task_id,
+            kind,
+            downstream,
+        }
+    })
+    .collect::<Vec<_>>();
+    details.sort_by(|left, right| {
+        right
+            .downstream
+            .len()
+            .cmp(&left.downstream.len())
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    details
+}
+
+fn format_parallel_blocker_frontier(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    max_items: usize,
+) -> Option<String> {
+    let rendered =
+        parallel_blocker_frontier(plan, active_tasks, shelved_tasks, deferred_partial_tasks)
+            .into_iter()
+            .take(max_items)
+            .map(|detail| {
+                let downstream = if detail.downstream.is_empty() {
+                    "no direct unfinished dependents".to_string()
+                } else {
+                    detail.downstream.join(", ")
+                };
+                format!(
+                    "{} [{}] -> {}",
+                    detail.task_id,
+                    detail.kind.label(),
+                    downstream
+                )
+            })
+            .collect::<Vec<_>>();
+    (!rendered.is_empty()).then(|| rendered.join(" | "))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartialFollowUpDisposition {
+    RetryLaterThisRun,
+    ParkForRestOfRun,
+}
+
+fn record_partial_follow_up(
+    task_id: &str,
+    attempted_partial_followups: &mut BTreeSet<String>,
+    deferred_partial_tasks: &mut BTreeSet<String>,
+) -> PartialFollowUpDisposition {
+    if attempted_partial_followups.insert(task_id.to_string()) {
+        deferred_partial_tasks.remove(task_id);
+        PartialFollowUpDisposition::RetryLaterThisRun
     } else {
-        format!(
-            "waiting on dependencies: {}",
-            waiting_on.into_iter().collect::<Vec<_>>().join(", ")
-        )
+        deferred_partial_tasks.insert(task_id.to_string());
+        PartialFollowUpDisposition::ParkForRestOfRun
+    }
+}
+
+fn clear_partial_follow_up_tracking(
+    task_id: &str,
+    attempted_partial_followups: &mut BTreeSet<String>,
+    deferred_partial_tasks: &mut BTreeSet<String>,
+) {
+    attempted_partial_followups.remove(task_id);
+    deferred_partial_tasks.remove(task_id);
+}
+
+fn attach_partial_follow_up_note(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    attempted_partial_followups: &BTreeSet<String>,
+) {
+    if assignment.task.status != LoopTaskStatus::Partial || assignment.host_recovery_note.is_some()
+    {
+        return;
+    }
+
+    let evidence =
+        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let assessment = assess_task_completion_gap(&assignment.task.markdown, &evidence);
+    let pass_label = if attempted_partial_followups.contains(&assignment.task.id) {
+        "This is the automatic evidence-repair pass for a task that already landed code earlier in this run."
+    } else {
+        "This task is already marked `- [~]`; treat this lane as follow-up work to close the remaining evidence gap rather than redoing landed implementation."
+    };
+    let gap_kind = match assessment.kind {
+        CompletionGapKind::None => {
+            "The host currently sees no missing local evidence, so verify whether the partial marker is stale and finish the task cleanly if it is."
+        }
+        CompletionGapKind::LocalRepairable => {
+            "The remaining gap looks repo-local: focus on missing verification evidence and declared artifacts from this lane."
+        }
+        CompletionGapKind::ExternalOrLiveFollowUp => {
+            "The remaining gap appears to depend on live or external proof. First check whether the repo now contains enough scaffolding to satisfy it locally; if not, capture the blocker precisely instead of broadening scope."
+        }
+    };
+    let missing = if assessment.missing_reasons.is_empty() {
+        "none recorded by the host".to_string()
+    } else {
+        assessment.missing_reasons.join("; ")
+    };
+    let verification_commands = if assessment.verification_commands.is_empty() {
+        "- none parsed as literal shell commands from the task's `Verification:` block".to_string()
+    } else {
+        assessment
+            .verification_commands
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let verification_guidance = if assessment.verification_guidance.is_empty() {
+        "- none".to_string()
+    } else {
+        assessment
+            .verification_guidance
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assignment.host_recovery_note = Some(format!(
+        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
+    ));
+}
+
+fn completion_status_suffix(
+    task_id: &str,
+    completion_status: LoopTaskStatus,
+    attempted_partial_followups: &mut BTreeSet<String>,
+    deferred_partial_tasks: &mut BTreeSet<String>,
+) -> &'static str {
+    match completion_status {
+        LoopTaskStatus::Done => {
+            clear_partial_follow_up_tracking(
+                task_id,
+                attempted_partial_followups,
+                deferred_partial_tasks,
+            );
+            ""
+        }
+        LoopTaskStatus::Partial => match record_partial_follow_up(
+            task_id,
+            attempted_partial_followups,
+            deferred_partial_tasks,
+        ) {
+            PartialFollowUpDisposition::RetryLaterThisRun => {
+                " [~ evidence gap remains; follow-up pass queued]"
+            }
+            PartialFollowUpDisposition::ParkForRestOfRun => {
+                " [~ evidence gap remains; parked after follow-up]"
+            }
+        },
+        LoopTaskStatus::Pending | LoopTaskStatus::Blocked => "",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParallelUnblockCandidateKind {
+    ShelvedResume,
+    DeferredPartialCloseout,
+}
+
+impl ParallelUnblockCandidateKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ShelvedResume => "shelved-resume",
+            Self::DeferredPartialCloseout => "tail-closeout",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParallelUnblockCandidate {
+    task: LoopTask,
+    kind: ParallelUnblockCandidateKind,
+    downstream: Vec<String>,
+}
+
+fn next_parallel_unblock_candidate(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    resumable_lanes: &BTreeMap<usize, LaneResumeCandidate>,
+    unblock_attempted_tasks: &BTreeSet<String>,
+) -> Option<ParallelUnblockCandidate> {
+    let mut candidates = plan
+        .ready_tasks(active_tasks)
+        .into_iter()
+        .filter(|task| !unblock_attempted_tasks.contains(&task.id))
+        .filter_map(|task| {
+            let downstream = plan.direct_unfinished_dependents(&task.id);
+            if shelved_tasks.contains_key(&task.id) {
+                resumable_lanes
+                    .values()
+                    .any(|candidate| candidate.task.id == task.id)
+                    .then_some(ParallelUnblockCandidate {
+                        task,
+                        kind: ParallelUnblockCandidateKind::ShelvedResume,
+                        downstream,
+                    })
+            } else if deferred_partial_tasks.contains(&task.id) {
+                Some(ParallelUnblockCandidate {
+                    task,
+                    kind: ParallelUnblockCandidateKind::DeferredPartialCloseout,
+                    downstream,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .downstream
+            .len()
+            .cmp(&left.downstream.len())
+            .then_with(|| {
+                unblock_candidate_priority(left.kind).cmp(&unblock_candidate_priority(right.kind))
+            })
+            .then_with(|| left.task.id.cmp(&right.task.id))
+    });
+    candidates.into_iter().next()
+}
+
+fn unblock_candidate_priority(kind: ParallelUnblockCandidateKind) -> usize {
+    match kind {
+        ParallelUnblockCandidateKind::ShelvedResume => 0,
+        ParallelUnblockCandidateKind::DeferredPartialCloseout => 1,
+    }
+}
+
+fn prepend_host_recovery_note(assignment: &mut ActiveLaneAssignment, note: &str) {
+    assignment.host_recovery_note = Some(match assignment.host_recovery_note.take() {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{}\n\n{}", note.trim(), existing.trim())
+        }
+        _ => note.trim().to_string(),
+    });
+}
+
+fn render_parallel_unblock_note(candidate: &ParallelUnblockCandidate) -> String {
+    let downstream = if candidate.downstream.is_empty() {
+        "no direct unfinished dependents recorded in the plan".to_string()
+    } else {
+        candidate.downstream.join(", ")
+    };
+    match candidate.kind {
+        ParallelUnblockCandidateKind::ShelvedResume => format!(
+            "This lane is a host-directed dependency-unblock attempt. The normal ready queue is empty because this previously shelved task is still load-bearing.\n\nDownstream tasks blocked by `{}`: {}\n\nFocus on salvaging and landing the already-started work instead of broadening scope.",
+            candidate.task.id, downstream
+        ),
+        ParallelUnblockCandidateKind::DeferredPartialCloseout => format!(
+            "This lane is the final same-run closeout pass for a parked `[~]` task. The normal ready queue is empty and the remaining frontier depends on closing this task honestly.\n\nDownstream tasks blocked by `{}`: {}\n\nDo not redo landed implementation. Focus only on the remaining review/verification/artifact gap.",
+            candidate.task.id, downstream
+        ),
     }
 }
 
@@ -3038,7 +4404,7 @@ fn prepare_parallel_lane_assignment(
     }
 
     let lane_root = run_root.join("lanes").join(format!("lane-{lane_index}"));
-    clear_and_recreate_dir(&lane_root)?;
+    reset_parallel_lane_root(&lane_root)?;
     let lane_repo_root = lane_root.join("repo");
     clone_loop_lane_repo(repo_root, target_branch, &lane_repo_root)?;
     let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?;
@@ -3058,6 +4424,52 @@ fn prepare_parallel_lane_assignment(
         terminate_requested_at: None,
         host_recovery_note: None,
     })
+}
+
+fn reset_parallel_lane_root(lane_root: &Path) -> Result<()> {
+    if lane_root.exists() {
+        let stale_root = reserve_stale_lane_root_path(lane_root)?;
+        fs::rename(lane_root, &stale_root).with_context(|| {
+            format!(
+                "failed to move stale lane root {} aside",
+                lane_root.display()
+            )
+        })?;
+        if let Err(err) = fs::remove_dir_all(&stale_root) {
+            eprintln!(
+                "warning: failed removing stale lane root {} after reset: {err}",
+                stale_root.display()
+            );
+        }
+    }
+    fs::create_dir_all(lane_root)
+        .with_context(|| format!("failed to create {}", lane_root.display()))?;
+    Ok(())
+}
+
+fn reserve_stale_lane_root_path(lane_root: &Path) -> Result<PathBuf> {
+    let parent = lane_root
+        .parent()
+        .with_context(|| format!("lane root {} had no parent", lane_root.display()))?;
+    let stem = lane_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .with_context(|| format!("lane root {} had no file name", lane_root.display()))?;
+    for attempt in 0..100usize {
+        let candidate = if attempt == 0 {
+            format!("{stem}.stale-{}", timestamp_slug())
+        } else {
+            format!("{stem}.stale-{}-{attempt}", timestamp_slug())
+        };
+        let path = parent.join(candidate);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "failed reserving stale lane root path near {}",
+        lane_root.display()
+    );
 }
 
 fn prepare_parallel_lane_assignment_with_fallback(
@@ -3111,7 +4523,12 @@ fn discover_resume_candidates(
     let pending_tasks = plan
         .tasks
         .iter()
-        .filter(|task| task.status == LoopTaskStatus::Pending)
+        .filter(|task| {
+            matches!(
+                task.status,
+                LoopTaskStatus::Pending | LoopTaskStatus::Partial
+            )
+        })
         .map(|task| (task.id.clone(), task.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut candidates = BTreeMap::new();
@@ -3202,10 +4619,15 @@ fn discover_resume_candidates(
                 continue;
             }
         };
-        let host_recovery_note = match inspect_lane_repo_progress(&lane_repo_root, &base_commit) {
+        let mut host_recovery_note = match inspect_lane_repo_progress(&lane_repo_root, &base_commit)
+        {
             Ok(LaneRepoProgress::None) => continue,
             Ok(LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status)) => {
-                Some(dirty_worktree_recovery_note(&status))
+                Some(lane_repo_recovery_note(
+                    &lane_repo_root,
+                    target_branch,
+                    &status,
+                ))
             }
             Ok(LaneRepoProgress::NewCommits) => None,
             Err(err) => {
@@ -3216,6 +4638,10 @@ fn discover_resume_candidates(
                 continue;
             }
         };
+        if host_recovery_note.is_none() {
+            host_recovery_note =
+                salvage_recovery_note(&lane_root, lane_index, &task_id, target_branch);
+        }
 
         candidates.insert(
             lane_index,
@@ -3240,6 +4666,8 @@ async fn harvest_resumable_lane_results(
     repo_root: &Path,
     target_branch: &str,
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
+    attempted_partial_followups: &mut BTreeSet<String>,
+    deferred_partial_tasks: &mut BTreeSet<String>,
     linear_tracker: &mut Option<LinearTracker>,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<usize> {
@@ -3273,7 +4701,7 @@ async fn harvest_resumable_lane_results(
         let Some(candidate) = resumable_lanes.remove(&lane_index) else {
             continue;
         };
-        let assignment = ActiveLaneAssignment {
+        let mut assignment = ActiveLaneAssignment {
             lane_index: candidate.lane_index,
             attempts: 0,
             task: candidate.task,
@@ -3288,21 +4716,60 @@ async fn harvest_resumable_lane_results(
             terminate_requested_at: None,
             host_recovery_note: candidate.host_recovery_note,
         };
-        match land_parallel_lane_result(repo_root, target_branch, &assignment) {
-            Ok(()) => {
-                if let Some(tracker) = linear_tracker.as_mut() {
-                    if let Err(err) = tracker.note_done(&assignment.task.id).await {
-                        eprintln!(
-                            "warning: failed to move `{}` to done in Linear: {err:#}",
-                            assignment.task.id
-                        );
+        match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+            Ok(LaneLandingOutcome::Landed {
+                auto_repaired,
+                completion_status,
+            }) => {
+                if completion_status == LoopTaskStatus::Done {
+                    if let Some(tracker) = linear_tracker.as_mut() {
+                        if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                            eprintln!(
+                                "warning: failed to archive `{}` in Linear: {err:#}",
+                                assignment.task.id
+                            );
+                        }
                     }
                 }
                 landed += 1;
+                let status_suffix = completion_status_suffix(
+                    &assignment.task.id,
+                    completion_status,
+                    attempted_partial_followups,
+                    deferred_partial_tasks,
+                );
                 parallel_logger.info(format!(
-                    "resumed:     landed {} from lane-{} before dispatch (total landed: {})",
-                    assignment.task.id, assignment.lane_index, landed
+                    "resumed:     landed {} from lane-{} before dispatch{}{} (total landed: {})",
+                    assignment.task.id,
+                    assignment.lane_index,
+                    if auto_repaired {
+                        " after host auto-repair"
+                    } else {
+                        ""
+                    },
+                    status_suffix,
+                    landed
                 ));
+            }
+            Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+                parallel_logger.warn(format!(
+                    "warning: resume harvest for lane-{} `{}` prepared a landing-recovery attempt instead of landing; keeping lane resumable",
+                    assignment.lane_index, assignment.task.id
+                ));
+                resumable_lanes.insert(
+                    lane_index,
+                    LaneResumeCandidate {
+                        lane_index: assignment.lane_index,
+                        task: assignment.task,
+                        lane_root: assignment.lane_root,
+                        lane_repo_root: assignment.lane_repo_root,
+                        base_commit: assignment.base_commit,
+                        stdout_log_path: assignment.stdout_log_path,
+                        stderr_log_path: assignment.stderr_log_path,
+                        worker_pid_path: assignment.worker_pid_path,
+                        host_recovery_note: Some(recovery_note),
+                    },
+                );
             }
             Err(error) => {
                 parallel_logger.warn(format!(
@@ -3458,6 +4925,7 @@ fn spawn_parallel_lane_attempt(
                 &context_label,
                 &extra_env,
                 Some(&worker_pid_path),
+                None,
             )
             .await
         } else {
@@ -3700,6 +5168,23 @@ fn read_lane_task_id(lane_root: &Path) -> Result<Option<String>> {
     Ok(latest_prompt.map(|(_, task_id)| task_id))
 }
 
+fn lane_status_task_id(
+    stored_task_id: &str,
+    worker_running: bool,
+    log_line: Option<&str>,
+) -> String {
+    if worker_running {
+        return stored_task_id.to_string();
+    }
+    if log_line
+        .map(str::trim)
+        .is_some_and(|line| line.contains("] idle:"))
+    {
+        return "[idle]".to_string();
+    }
+    stored_task_id.to_string()
+}
+
 fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
     let stem = file_name.strip_suffix("-prompt.md")?;
     let (task_id, attempt) = stem.rsplit_once("-attempt-")?;
@@ -3807,14 +5292,32 @@ fn build_parallel_lane_prompt(
         .is_empty()
         .then(String::new)
         .unwrap_or_else(|| format!("\nHost preflight report:\n{}\n", preflight_clause.trim()));
+    let verification = verification_plan(&task.markdown);
+    let verification_commands_clause = if verification.executable_commands.is_empty() {
+        "none parsed".to_string()
+    } else {
+        verification
+            .executable_commands
+            .iter()
+            .map(|command| format!("`{command}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let verification_guidance_clause = if verification.narrative_guidance.is_empty() {
+        "none".to_string()
+    } else {
+        verification.narrative_guidance.join(" | ")
+    };
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run every command from the task's `Verification:` block through that wrapper instead of invoking the command bare. Use the exact command text from the `Verification:` block so the verification receipt matches the task contract.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Pending task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
         branch = branch,
         protected_clause = protected_clause,
         cargo_target_clause = cargo_target_clause,
+        verification_commands_clause = verification_commands_clause,
+        verification_guidance_clause = verification_guidance_clause,
         preflight_clause = preflight_clause,
         recovery_clause = recovery_clause,
         pending_count = queue.pending_ids.len(),
@@ -3895,41 +5398,159 @@ fn lane_scope_budget(task: &LoopTask) -> LaneScopeBudget {
 fn land_parallel_lane_result(
     repo_root: &Path,
     target_branch: &str,
-    assignment: &ActiveLaneAssignment,
-) -> Result<()> {
-    let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
-    let lane_head = lane_head.trim().to_string();
-    fetch_lane_commit(repo_root, &assignment.lane_repo_root, &lane_head)?;
-    let landing_base = git_stdout(repo_root, ["merge-base", "HEAD", "FETCH_HEAD"])?;
-    let landing_base = landing_base.trim().to_string();
-    let range_base = if landing_base.is_empty() {
-        assignment.base_commit.as_str()
-    } else {
-        landing_base.as_str()
+    assignment: &mut ActiveLaneAssignment,
+) -> Result<LaneLandingOutcome> {
+    let mut auto_repaired = false;
+    let mut canonical_checkpointed = false;
+    let (final_lane_head, final_range_base) = loop {
+        let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
+        let lane_head = lane_head.trim().to_string();
+        fetch_lane_commit(repo_root, &assignment.lane_repo_root, &lane_head)?;
+        let landing_base = git_stdout(repo_root, ["merge-base", "HEAD", "FETCH_HEAD"])?;
+        let landing_base = landing_base.trim().to_string();
+        let range_base = if landing_base.is_empty() {
+            assignment.base_commit.clone()
+        } else {
+            landing_base
+        };
+        if !git_ref_is_ancestor(repo_root, "FETCH_HEAD", "HEAD")? {
+            if let Err(err) = cherry_pick_lane_range(
+                repo_root,
+                &range_base,
+                "FETCH_HEAD",
+                CherryPickFailurePolicy::Abort,
+            ) {
+                if !canonical_checkpointed
+                    && landing_error_suggests_dirty_canonical_worktree(&err)
+                    && try_auto_checkpoint_canonical_for_landing(
+                        repo_root,
+                        target_branch,
+                        assignment,
+                        "before retrying lane landing against local canonical changes",
+                    )?
+                {
+                    canonical_checkpointed = true;
+                    continue;
+                }
+                if auto_repaired {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed landing lane-{} task `{}` from {} after host auto-repair",
+                            assignment.lane_index,
+                            assignment.task.id,
+                            assignment.lane_repo_root.display()
+                        )
+                    });
+                }
+                match prepare_lane_landing_recovery(
+                    assignment,
+                    target_branch,
+                    &range_base,
+                    &format!("{err:#}"),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed preparing lane-{} task `{}` for landing recovery",
+                        assignment.lane_index, assignment.task.id
+                    )
+                })? {
+                    LaneLandingRecoveryPrep::RebasedCleanly => {
+                        auto_repaired = true;
+                        continue;
+                    }
+                    LaneLandingRecoveryPrep::NeedsWorkerResolution(recovery_note) => {
+                        return Ok(LaneLandingOutcome::NeedsRecovery(recovery_note));
+                    }
+                }
+            }
+        }
+        break (lane_head, range_base);
     };
-    if !git_ref_is_ancestor(repo_root, "FETCH_HEAD", "HEAD")? {
-        cherry_pick_lane_range(repo_root, range_base, "FETCH_HEAD").with_context(|| {
-            format!(
-                "failed landing lane-{} task `{}` from {}",
-                assignment.lane_index,
-                assignment.task.id,
-                assignment.lane_repo_root.display()
-            )
-        })?;
+    let changed_files = lane_changed_files(
+        &assignment.lane_repo_root,
+        &final_range_base,
+        &final_lane_head,
+    )?;
+    let completion_status = reconcile_parallel_landed_task(repo_root, assignment, &changed_files)?;
+    if completion_status == LoopTaskStatus::Done {
+        assignment.task.status = LoopTaskStatus::Done;
+    } else if completion_status == LoopTaskStatus::Partial {
+        assignment.task.status = LoopTaskStatus::Partial;
     }
-    if remove_task_from_plan(repo_root, &assignment.task.id)? {
+    if repo_has_staged_queue_updates(repo_root)? {
         let message = format!(
             "{}: {} queue sync",
             repo_name(repo_root),
             assignment.task.id
         );
-        run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
         run_git(repo_root, ["commit", "-m", &message])?;
     }
     if push_branch_with_remote_sync(repo_root, target_branch)? {
         println!("remote sync: rebased onto origin/{}", target_branch);
     }
-    Ok(())
+    Ok(LaneLandingOutcome::Landed {
+        auto_repaired,
+        completion_status,
+    })
+}
+
+fn lane_changed_files(repo_root: &Path, base_commit: &str, head_ref: &str) -> Result<Vec<String>> {
+    if base_commit == head_ref {
+        return Ok(Vec::new());
+    }
+    let range = format!("{base_commit}..{head_ref}");
+    let output = git_stdout(repo_root, ["diff", "--name-only", &range])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn reconcile_parallel_landed_task(
+    repo_root: &Path,
+    assignment: &ActiveLaneAssignment,
+    changed_files: &[String],
+) -> Result<LoopTaskStatus> {
+    let evidence_before =
+        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let review_added = ensure_host_review_handoff(
+        repo_root,
+        &assignment.task.id,
+        changed_files,
+        &evidence_before,
+    )?;
+    let evidence_after =
+        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let completion_status = if evidence_after.is_fully_evidenced() {
+        LoopTaskStatus::Done
+    } else {
+        LoopTaskStatus::Partial
+    };
+
+    let plan_updated =
+        update_task_completion_in_plan(repo_root, &assignment.task.id, completion_status)?;
+    if review_added || plan_updated {
+        let mut queue_files = Vec::new();
+        if review_added {
+            queue_files.push("REVIEW.md");
+        }
+        if plan_updated {
+            queue_files.push("IMPLEMENTATION_PLAN.md");
+        }
+        if !queue_files.is_empty() {
+            let mut args = vec!["add"];
+            args.extend(queue_files);
+            run_git(repo_root, args)?;
+        }
+    }
+    Ok(completion_status)
+}
+
+fn repo_has_staged_queue_updates(repo_root: &Path) -> Result<bool> {
+    let output = git_stdout(repo_root, ["diff", "--cached", "--name-only"])?;
+    Ok(output.lines().any(|line| !line.trim().is_empty()))
 }
 
 fn git_ref_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
@@ -3972,7 +5593,64 @@ fn fetch_lane_commit(repo_root: &Path, lane_repo_root: &Path, lane_head: &str) -
     );
 }
 
-fn cherry_pick_lane_range(repo_root: &Path, base_commit: &str, head_ref: &str) -> Result<()> {
+fn prepare_lane_landing_recovery(
+    assignment: &mut ActiveLaneAssignment,
+    target_branch: &str,
+    range_base: &str,
+    landing_error: &str,
+) -> Result<LaneLandingRecoveryPrep> {
+    let status = git_stdout(&assignment.lane_repo_root, ["status", "--short"])?;
+    let status = status.trim();
+    if !status.is_empty() {
+        bail!(
+            "lane-{} `{}` cannot enter landing recovery because its repo is already dirty:\n{}",
+            assignment.lane_index,
+            assignment.task.id,
+            status
+        );
+    }
+
+    let original_lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
+    let original_lane_head = original_lane_head.trim().to_string();
+    let remote_name = lane_remote_name(&assignment.lane_repo_root)?;
+    run_git(
+        &assignment.lane_repo_root,
+        ["fetch", "--quiet", &remote_name, target_branch],
+    )?;
+    let recovery_base = git_stdout(&assignment.lane_repo_root, ["rev-parse", "FETCH_HEAD"])?;
+    let recovery_base = recovery_base.trim().to_string();
+    if recovery_base.is_empty() {
+        bail!(
+            "lane-{} `{}` landing recovery could not resolve FETCH_HEAD",
+            assignment.lane_index,
+            assignment.task.id
+        );
+    }
+
+    run_git(
+        &assignment.lane_repo_root,
+        ["reset", "--hard", recovery_base.as_str()],
+    )?;
+    assignment.base_commit = recovery_base;
+    match cherry_pick_lane_range(
+        &assignment.lane_repo_root,
+        range_base,
+        &original_lane_head,
+        CherryPickFailurePolicy::LeaveInProgress,
+    ) {
+        Ok(()) => Ok(LaneLandingRecoveryPrep::RebasedCleanly),
+        Err(err) => Ok(LaneLandingRecoveryPrep::NeedsWorkerResolution(
+            prepared_landing_recovery_note(target_branch, landing_error, &format!("{err:#}")),
+        )),
+    }
+}
+
+fn cherry_pick_lane_range(
+    repo_root: &Path,
+    base_commit: &str,
+    head_ref: &str,
+    failure_policy: CherryPickFailurePolicy,
+) -> Result<()> {
     let range = format!("{base_commit}..{head_ref}");
     let output = Command::new("git")
         .arg("-C")
@@ -3985,7 +5663,9 @@ fn cherry_pick_lane_range(repo_root: &Path, base_commit: &str, head_ref: &str) -
         return Ok(());
     }
 
-    let _ = run_git(repo_root, ["cherry-pick", "--abort"]);
+    if failure_policy == CherryPickFailurePolicy::Abort {
+        let _ = run_git(repo_root, ["cherry-pick", "--abort"]);
+    }
     bail!(
         "git cherry-pick failed in {}: {}",
         repo_root.display(),
@@ -3993,7 +5673,42 @@ fn cherry_pick_lane_range(repo_root: &Path, base_commit: &str, head_ref: &str) -
     );
 }
 
-fn remove_task_from_plan(repo_root: &Path, task_id: &str) -> Result<bool> {
+fn landing_error_suggests_dirty_canonical_worktree(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("would be overwritten by merge")
+        || message.contains("please commit your changes or stash them")
+        || message.contains("untracked working tree files would be overwritten")
+}
+
+fn try_auto_checkpoint_canonical_for_landing(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+    reason: &str,
+) -> Result<bool> {
+    let Some(commit) =
+        auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
+    else {
+        return Ok(false);
+    };
+    println!(
+        "checkpoint:  committed canonical changes at {commit} {reason} for lane-{} `{}`",
+        assignment.lane_index, assignment.task.id
+    );
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &format!("checkpoint: committed canonical changes at {commit} {reason}"),
+    );
+    Ok(true)
+}
+
+fn update_task_completion_in_plan(
+    repo_root: &Path,
+    task_id: &str,
+    status: LoopTaskStatus,
+) -> Result<bool> {
     let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
     if !plan_path.exists() {
         return Ok(false);
@@ -4001,7 +5716,7 @@ fn remove_task_from_plan(repo_root: &Path, task_id: &str) -> Result<bool> {
 
     let plan = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
-    let updated = remove_task_from_plan_text(&plan, task_id);
+    let updated = update_task_completion_in_plan_text(&plan, task_id, status);
     if updated == plan {
         return Ok(false);
     }
@@ -4011,29 +5726,53 @@ fn remove_task_from_plan(repo_root: &Path, task_id: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn remove_task_from_plan_text(plan: &str, task_id: &str) -> String {
+fn update_task_completion_in_plan_text(
+    plan: &str,
+    task_id: &str,
+    status: LoopTaskStatus,
+) -> String {
     let mut updated = String::new();
-    let mut skipping = false;
 
     for chunk in plan.split_inclusive('\n') {
         let line = chunk.trim_end_matches('\n').trim_end_matches('\r');
-        let task_header = parse_task_header(line);
-        if let Some((_, current_task_id, _)) = task_header {
+        if let Some((_, current_task_id, _)) = parse_task_header(line) {
             if current_task_id == task_id {
-                skipping = true;
+                updated.push_str(&mark_task_header_status(chunk, status));
                 continue;
             }
-            if skipping {
-                skipping = false;
-            }
         }
-
-        if !skipping {
-            updated.push_str(chunk);
-        }
+        updated.push_str(chunk);
     }
 
     updated
+}
+
+fn mark_task_header_status(line: &str, status: LoopTaskStatus) -> String {
+    let newline = if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("- [!] "))
+        .or_else(|| trimmed.strip_prefix("- [~] "))
+        .or_else(|| trimmed.strip_prefix("- [x] "))
+        .or_else(|| trimmed.strip_prefix("- [X] "))
+        .unwrap_or(trimmed);
+    let marker = match status {
+        LoopTaskStatus::Pending => "- [ ]",
+        LoopTaskStatus::Blocked => "- [!]",
+        LoopTaskStatus::Partial => "- [~]",
+        LoopTaskStatus::Done => "- [x]",
+    };
+    format!("{indent}{marker} {rest}{newline}")
 }
 
 fn render_default_parallel_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
@@ -4066,7 +5805,7 @@ fn append_reference_repo_clause(prompt: String, reference_repos: &[PathBuf]) -> 
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{prompt}\n\nAdditional repositories you may inspect or edit when the task contract points there:\n{listing}\n\nRepository-crossing rules:\n- If the current task's owned surfaces live in one of these repos, implement the code change there instead of pretending the queue repo should own it.\n- Keep `IMPLEMENTATION_PLAN.md` truthful as the active queue for this run even when code lands in another repo.\n- Read each touched repo's `AGENTS.md`, tests, and operational docs before editing it.\n- Commit and push each touched repo separately.\n"
+        "{prompt}\n\nAdditional repositories you may inspect as read-only context:\n{listing}\n\nRepository-crossing rules:\n- Treat every additional repository as read-only. Do not edit, format, stage, commit, push, or run mutating generators in those repos.\n- Implement only the assigned repo's owned surfaces from this lane. If the current task needs code changes in a reference repo, leave a precise follow-up plan item or blocker instead of writing through another repo's canonical worktree.\n- You may read a reference repo's `AGENTS.md`, tests, and operational docs to verify contracts and shape local adapters or fixtures.\n"
     )
 }
 
@@ -4194,7 +5933,7 @@ fn collect_tracked_repo_states(
         let Ok(head) = git_stdout(&path, ["rev-parse", "HEAD"]) else {
             continue;
         };
-        let status = git_stdout(&path, ["status", "--short"]).unwrap_or_default();
+        let status = git_status_short_filtered(&path).unwrap_or_default();
         states.push(TrackedRepoState {
             name: repo_name(&path),
             path,
@@ -4318,27 +6057,40 @@ fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use anyhow::anyhow;
+
     use crate::{ParallelArgs, ParallelCargoTarget};
 
     use super::{
-        build_iteration_prompt, build_parallel_lane_prompt, default_cargo_build_jobs_for,
-        dirty_worktree_recovery_note, discover_sibling_git_repos,
+        audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
+        classify_parallel_preflight_needs, clear_partial_follow_up_tracking,
+        default_cargo_build_jobs_for, dirty_worktree_recovery_note, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, environment_blocker_reason,
-        inspect_lane_repo_progress, is_verification_only_task, landing_recovery_note,
-        lane_scope_budget, parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
-        prepare_parallel_startup, preserve_resume_recovery_notes, read_lane_task_id,
-        remove_task_from_plan_text, render_default_parallel_prompt,
-        repo_forbids_legacy_review_trackers, resolve_loop_worker_env, resolve_reference_repos,
-        take_resume_candidate_for_task, task_id_from_prompt_filename,
-        try_checkpoint_parallel_host_queue_changes, ActiveLaneAssignment, LaneRepoProgress,
-        LaneResumeCandidate, LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelEventLogger,
-        ParallelStartupPrep,
+        host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
+        is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
+        landing_recovery_note, lane_repo_has_active_cherry_pick, lane_repo_recovery_note,
+        lane_repo_status_summary, lane_scope_budget, lane_status_task_id, last_parallel_stop_state,
+        maybe_disable_linear_auto_sync_for_run, next_parallel_unblock_candidate,
+        no_dependency_ready_stop_message, parallel_blocker_frontier, parallel_tmux_command,
+        parallel_tmux_session_name, parse_loop_plan, parse_parallel_stop_ids,
+        preflight_warning_names, prepare_lane_landing_recovery, prepare_parallel_startup,
+        prepared_landing_recovery_note, preserve_resume_recovery_notes,
+        prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
+        recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
+        render_parallel_health_summary, repo_forbids_legacy_review_trackers,
+        reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
+        salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
+        try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
+        ActiveLaneAssignment, LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate,
+        LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind,
+        ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
+        ParallelUnblockCandidateKind, PartialFollowUpDisposition,
     };
 
     #[test]
@@ -4349,10 +6101,12 @@ mod tests {
         assert!(prompt.contains("Study `AGENTS.md` for repo-specific build"));
         assert!(prompt.contains("RED/GREEN/REFACTOR"));
         assert!(prompt.contains("failing test"));
-        assert!(prompt.contains("identify the first pending task marked `- [ ]`"));
+        assert!(prompt
+            .contains("identify the first actionable unfinished task marked `- [ ]` or `- [~]`"));
         assert!(prompt.contains("historical context only"));
-        assert!(prompt.contains("next pending `- [ ]` task"));
-        assert!(prompt.contains("remove its entry from `IMPLEMENTATION_PLAN.md`"));
+        assert!(prompt.contains("first actionable unfinished `- [ ]` or `- [~]` task"));
+        assert!(prompt.contains("Completion path: <TASK-ID>"));
+        assert!(prompt.contains("mark it `- [x]` only when local verification, review handoff, and required completion artifacts are actually in place"));
     }
 
     #[test]
@@ -4361,9 +6115,10 @@ mod tests {
             "main",
             &[PathBuf::from("/home/r/coding/robopokermulti")],
         );
-        assert!(prompt.contains("Additional repositories you may inspect or edit"));
+        assert!(prompt.contains("Additional repositories you may inspect as read-only context"));
         assert!(prompt.contains("/home/r/coding/robopokermulti"));
-        assert!(prompt.contains("owned surfaces live in one of these repos"));
+        assert!(prompt.contains("Do not edit, format, stage, commit, push"));
+        assert!(prompt.contains("leave a precise follow-up plan item or blocker"));
     }
 
     #[test]
@@ -4419,6 +6174,8 @@ mod tests {
         let repo_root = unique_temp_dir("parallel-host-queue-warning-repo");
         fs::create_dir_all(&run_root).expect("failed to create run root");
         fs::create_dir_all(&repo_root).expect("failed to create repo root");
+        fs::write(repo_root.join("IMPLEMENTATION_PLAN.md"), "# plan\n")
+            .expect("failed to write queue file");
 
         let logger = ParallelEventLogger::new(&run_root).expect("parallel logger should init");
         try_checkpoint_parallel_host_queue_changes(&repo_root, "main", &logger);
@@ -4457,9 +6214,29 @@ mod tests {
         assert!(prompt.contains("reports `0 tests`"));
         assert!(prompt.contains("direct target-dir test binaries"));
         assert!(prompt.contains("AUTO_ENV_BLOCKER"));
+        assert!(prompt.contains("Host-parsed executable verification commands"));
+        assert!(
+            prompt.contains("Do not treat narrative `Verification:` prose as literal shell input")
+        );
         assert!(prompt.contains("Host preflight report:"));
         assert!(prompt.contains("Host recovery context:"));
         assert!(prompt.contains("Resolve the previous landing conflict."));
+    }
+
+    #[test]
+    fn lane_status_task_id_reports_idle_when_latest_log_is_idle() {
+        assert_eq!(
+            lane_status_task_id(
+                "OLD-TASK",
+                false,
+                Some("[auto parallel host lane-5 [idle]] idle: waiting on dependencies"),
+            ),
+            "[idle]"
+        );
+        assert_eq!(
+            lane_status_task_id("OLD-TASK", true, Some("anything")),
+            "OLD-TASK"
+        );
     }
 
     #[test]
@@ -4469,6 +6246,16 @@ mod tests {
         assert!(landing.contains("GIT_EDITOR=true git rebase --continue"));
         assert!(landing.contains("based on the latest `trunk`"));
         assert!(landing.contains("conflict in src/lib.rs"));
+
+        let prepared = prepared_landing_recovery_note(
+            "trunk",
+            "git cherry-pick failed",
+            "git cherry-pick stopped at src/lib.rs",
+        );
+        assert!(prepared.contains("landing-recovery mode"));
+        assert!(prepared.contains("git cherry-pick"));
+        assert!(prepared.contains("cherry-pick --continue"));
+        assert!(prepared.contains("git cherry-pick stopped at src/lib.rs"));
 
         let dirty = dirty_worktree_recovery_note("M src/lib.rs");
         assert!(dirty.contains("Run `git status --short`"));
@@ -4516,6 +6303,491 @@ mod tests {
         assert_eq!(default_cargo_build_jobs_for(12, 4), 2);
         assert_eq!(default_cargo_build_jobs_for(3, 2), 1);
         assert_eq!(default_cargo_build_jobs_for(1, 1), 1);
+    }
+
+    #[test]
+    fn no_dependency_ready_stop_message_calls_out_shelved_tasks() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-1` First
+  Dependencies: `TASK-3`
+- [ ] `TASK-2` Second
+  Dependencies: `TASK-4`
+- [ ] `TASK-3` Blocker one
+  Dependencies: none
+- [ ] `TASK-4` Blocker two
+  Dependencies: none
+"#,
+        );
+        let queue = LoopQueueSnapshot {
+            pending_ids: vec!["TASK-1".to_string(), "TASK-2".to_string()],
+            blocked_ids: vec!["TASK-9".to_string()],
+        };
+        let mut shelved = BTreeMap::new();
+        shelved.insert("TASK-3".to_string(), "- [ ] `TASK-3`".to_string());
+        shelved.insert("TASK-4".to_string(), "- [ ] `TASK-4`".to_string());
+        let deferred = BTreeSet::from(["TASK-5".to_string()]);
+
+        let message =
+            no_dependency_ready_stop_message(&plan, &BTreeSet::new(), &queue, &shelved, &deferred);
+        assert!(message.contains("stopping with unresolved shelved tasks"));
+        assert!(message.contains("pending: TASK-1, TASK-2"));
+        assert!(message.contains("blocked: TASK-9"));
+        assert!(message.contains("shelved: TASK-3, TASK-4"));
+        assert!(message.contains("deferred: TASK-5"));
+        assert!(message.contains("frontier: TASK-3 [shelved]"));
+    }
+
+    #[test]
+    fn parallel_blocker_frontier_classifies_shelved_and_deferred_dependencies() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-A` waits on shelved
+  Dependencies: `TASK-S`
+- [ ] `TASK-B` waits on deferred
+  Dependencies: `TASK-P`
+- [ ] `TASK-S` shelved blocker
+  Dependencies: none
+- [~] `TASK-P` partial blocker
+  Dependencies: none
+"#,
+        );
+        let shelved = BTreeMap::from([(
+            "TASK-S".to_string(),
+            "- [ ] `TASK-S` shelved blocker".to_string(),
+        )]);
+        let deferred = BTreeSet::from(["TASK-P".to_string()]);
+
+        let frontier = parallel_blocker_frontier(&plan, &BTreeSet::new(), &shelved, &deferred);
+        assert_eq!(frontier[0].task_id, "TASK-P");
+        assert_eq!(frontier[0].kind, ParallelBlockerKind::DeferredPartial);
+        assert_eq!(frontier[1].task_id, "TASK-S");
+        assert_eq!(frontier[1].kind, ParallelBlockerKind::Shelved);
+    }
+
+    #[test]
+    fn next_parallel_unblock_candidate_prefers_resumable_shelved_blocker() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-A` blocked by shelved
+  Dependencies: `TASK-S`
+- [ ] `TASK-B` blocked by shelved
+  Dependencies: `TASK-S`
+- [ ] `TASK-C` blocked by deferred
+  Dependencies: `TASK-P`
+- [ ] `TASK-S` ready shelved blocker
+  Dependencies: none
+- [~] `TASK-P` ready deferred blocker
+  Dependencies: none
+"#,
+        );
+        let task_s = plan.task("TASK-S").expect("TASK-S should exist").clone();
+        let shelved = BTreeMap::from([("TASK-S".to_string(), task_s.markdown.clone())]);
+        let deferred = BTreeSet::from(["TASK-P".to_string()]);
+        let resumable = BTreeMap::from([(
+            2usize,
+            LaneResumeCandidate {
+                lane_index: 2,
+                task: task_s,
+                lane_root: PathBuf::from("/tmp/lane-2"),
+                lane_repo_root: PathBuf::from("/tmp/lane-2/repo"),
+                base_commit: "abc123".to_string(),
+                stdout_log_path: PathBuf::from("/tmp/lane-2/stdout.log"),
+                stderr_log_path: PathBuf::from("/tmp/lane-2/stderr.log"),
+                worker_pid_path: PathBuf::from("/tmp/lane-2/worker.pid"),
+                host_recovery_note: Some("recover".to_string()),
+            },
+        )]);
+
+        let candidate = next_parallel_unblock_candidate(
+            &plan,
+            &BTreeSet::new(),
+            &shelved,
+            &deferred,
+            &resumable,
+            &BTreeSet::new(),
+        )
+        .expect("expected an unblock candidate");
+        assert_eq!(candidate.task.id, "TASK-S");
+        assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+    }
+
+    #[test]
+    fn parse_parallel_stop_ids_extracts_fields() {
+        let line = "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: A, B blocked: none shelved: C, D deferred: E frontier: C [shelved] -> A, B";
+        assert_eq!(
+            parse_parallel_stop_ids(line, "shelved:"),
+            BTreeSet::from(["C".to_string(), "D".to_string()])
+        );
+        assert_eq!(
+            parse_parallel_stop_ids(line, "deferred:"),
+            BTreeSet::from(["E".to_string()])
+        );
+    }
+
+    #[test]
+    fn last_parallel_stop_state_reads_latest_stop_line() {
+        let run_root = unique_temp_dir("parallel-stop-state");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        fs::write(
+            run_root.join("live.log"),
+            "idle: something\nno dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: A blocked: none shelved: C, D deferred: E frontier: C [shelved] -> A\n",
+        )
+        .expect("failed to write live log");
+        let state = last_parallel_stop_state(&run_root).expect("expected stop state");
+        assert_eq!(
+            state.shelved,
+            BTreeSet::from(["C".to_string(), "D".to_string()])
+        );
+        assert_eq!(state.deferred, BTreeSet::from(["E".to_string()]));
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn salvage_recovery_note_reuses_saved_landing_error() {
+        let run_root = unique_temp_dir("parallel-salvage-note");
+        let lane_root = run_root.join("lanes").join("lane-3");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        fs::create_dir_all(run_root.join("salvage")).expect("failed to create salvage dir");
+        fs::write(
+            run_root.join("salvage").join("lane-3-TASK-1.md"),
+            "# auto parallel salvage\n\n## Landing Error\n\n```text\ngit cherry-pick failed in /tmp/repo: conflict\n```\n\n## Recovery\n\nReconcile it.\n",
+        )
+        .expect("failed to write salvage note");
+
+        let note = salvage_recovery_note(&lane_root, 3, "TASK-1", "main").expect("expected note");
+        assert!(note.contains("git cherry-pick failed in /tmp/repo: conflict"));
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn dirty_canonical_landing_errors_are_detected() {
+        let err = anyhow!(
+            "git cherry-pick failed in /tmp/repo: error: Your local changes to the following files would be overwritten by merge:\n  src/lib.rs\nPlease commit your changes or stash them before you merge.\nAborting\nfatal: cherry-pick failed"
+        );
+        assert!(landing_error_suggests_dirty_canonical_worktree(&err));
+    }
+
+    #[test]
+    fn host_queue_state_files_skip_missing_untracked_docs() {
+        let repo = unique_temp_dir("parallel-host-queue-files");
+        init_git_repo(&repo);
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), "# plan\n").expect("failed to write plan");
+        fs::write(repo.join("COMPLETED.md"), "# completed\n").expect("failed to write completed");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md", "COMPLETED.md"]);
+        run_git_in(&repo, ["commit", "-m", "queue docs"]);
+        fs::remove_file(repo.join("COMPLETED.md")).expect("failed to remove completed");
+
+        let files = host_queue_state_files_for_repo(&repo);
+        assert!(files.contains(&"IMPLEMENTATION_PLAN.md"));
+        assert!(files.contains(&"COMPLETED.md"));
+        assert!(!files.contains(&"WORKLIST.md"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn parallel_health_summary_reports_preflight_host_and_recovery_issues() {
+        let run_root = unique_temp_dir("parallel-health-summary");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        fs::write(
+            run_root.join("preflight.txt"),
+            "- ok cargo: Rust workspace detected\n- warn agent-browser: missing\n- warn docker compose: missing\n",
+        )
+        .expect("failed to write preflight");
+        fs::write(
+            run_root.join("live.log"),
+            "warning: failed syncing host-owned queue state\nwarning: failed syncing host-owned queue state\nwarning: lane-1 something else\n",
+        )
+        .expect("failed to write live log");
+
+        let preflight = preflight_warning_names(&run_root);
+        let host_warnings = recent_parallel_host_warnings(&run_root, 50);
+        let summary = render_parallel_health_summary(
+            &preflight,
+            &host_warnings,
+            &["lane-1 TASK-1".to_string(), "lane-3 TASK-3".to_string()],
+        );
+        assert_eq!(
+            preflight,
+            vec!["agent-browser".to_string(), "docker compose".to_string()]
+        );
+        assert_eq!(
+            host_warnings,
+            vec![
+                "warning: failed syncing host-owned queue state".to_string(),
+                "warning: lane-1 something else".to_string()
+            ]
+        );
+        assert!(summary.contains("degraded"));
+        assert!(summary.contains("preflight warnings: agent-browser, docker compose"));
+        assert!(summary
+            .contains("recent host warnings: warning: failed syncing host-owned queue state"));
+        assert!(summary.contains("active recovery lanes: lane-1 TASK-1, lane-3 TASK-3"));
+
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn preflight_classification_does_not_treat_rbtc_mainnet_as_regtest() {
+        let repo = unique_temp_dir("parallel-preflight-mainnet");
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+
+        let needs = classify_parallel_preflight_needs(
+            "bitino rbtc mainnet settlement proof and wallet signing",
+            &repo,
+        );
+        assert_eq!(
+            needs,
+            ParallelPreflightNeeds {
+                browser: false,
+                docker: false,
+                regtest: false,
+            }
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn preflight_classification_detects_explicit_regtest_and_browser_infra() {
+        let repo = unique_temp_dir("parallel-preflight-regtest");
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+
+        let needs = classify_parallel_preflight_needs(
+            "browser smoke against rbtc-regtest with docker compose",
+            &repo,
+        );
+        assert_eq!(
+            needs,
+            ParallelPreflightNeeds {
+                browser: true,
+                docker: true,
+                regtest: true,
+            }
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn preflight_classification_does_not_treat_compose_prose_as_docker() {
+        let repo = unique_temp_dir("parallel-preflight-compose-prose");
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+
+        let needs = classify_parallel_preflight_needs(
+            "per-game canvases compose via canvas_prelude rather than re-implementing edge iteration",
+            &repo,
+        );
+        assert_eq!(
+            needs,
+            ParallelPreflightNeeds {
+                browser: false,
+                docker: false,
+                regtest: false,
+            }
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn linear_usage_limit_error_detection_matches_linear_graphql_payloads() {
+        let usage_limit = anyhow!(
+            "Linear GraphQL returned errors: [{{\"extensions\":{{\"code\":\"USAGE_LIMIT_EXCEEDED\",\"meta\":{{\"usageMetric\":\"activeIssueCount\"}}}},\"message\":\"usage limit exceeded\"}}]"
+        );
+        let unrelated = anyhow!("Linear project `demo` not found");
+
+        assert!(is_linear_usage_limit_error(&usage_limit));
+        assert!(!is_linear_usage_limit_error(&unrelated));
+    }
+
+    #[test]
+    fn linear_usage_limit_disables_auto_sync_for_the_rest_of_the_run() {
+        let run_root = unique_temp_dir("parallel-linear-usage-limit");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("failed to create logger");
+        let err = anyhow!(
+            "Linear GraphQL returned errors: [{{\"extensions\":{{\"code\":\"USAGE_LIMIT_EXCEEDED\",\"meta\":{{\"usageMetric\":\"activeIssueCount\"}}}},\"message\":\"You've exceeded the free issue limit for this workspace.\"}}]"
+        );
+        let mut state = LinearAutoSyncState::default();
+
+        assert!(maybe_disable_linear_auto_sync_for_run(
+            &err,
+            &mut state,
+            &logger,
+            "automatic `auto symphony sync --no-ai-planner`",
+        ));
+        assert!(state.is_disabled());
+        assert!(maybe_disable_linear_auto_sync_for_run(
+            &err,
+            &mut state,
+            &logger,
+            "automatic `auto symphony sync --no-ai-planner`",
+        ));
+
+        let live_log =
+            fs::read_to_string(run_root.join("live.log")).expect("failed to read live log");
+        assert_eq!(
+            live_log
+                .matches("disabling further automatic Linear sync for this run")
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn prepare_lane_landing_recovery_rebases_cleanly_when_possible() {
+        let (root, remote, upstream, _worker) =
+            init_remote_and_clones("parallel-landing-recovery-clean", "main");
+        let lane = root.join("lane-clean");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane, ["config", "user.email", "autodev@example.com"]);
+        run_git_in(&lane, ["remote", "rename", "origin", "canonical"]);
+
+        let base_commit = git_output(&lane, ["rev-parse", "HEAD"]);
+        fs::write(lane.join("lane.txt"), "lane change\n").expect("failed to write lane file");
+        run_git_in(&lane, ["add", "lane.txt"]);
+        run_git_in(&lane, ["commit", "-m", "lane change"]);
+
+        fs::write(upstream.join("main.txt"), "main change\n").expect("failed to write main file");
+        run_git_in(&upstream, ["add", "main.txt"]);
+        run_git_in(&upstream, ["commit", "-m", "main change"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+        let remote_head = git_output(&upstream, ["rev-parse", "HEAD"]);
+
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-CLEAN".to_string(),
+                title: "clean recovery".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                markdown: "- [ ] `TASK-CLEAN` clean recovery\n".to_string(),
+            },
+            resumed: false,
+            lane_root: root.join("lane-clean-root"),
+            lane_repo_root: lane.clone(),
+            base_commit: base_commit.clone(),
+            stdout_log_path: root.join("lane-clean.stdout.log"),
+            stderr_log_path: root.join("lane-clean.stderr.log"),
+            worker_pid_path: root.join("lane-clean.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let prep = prepare_lane_landing_recovery(
+            &mut assignment,
+            "main",
+            &base_commit,
+            "git cherry-pick failed",
+        )
+        .expect("landing recovery should prepare");
+        assert_eq!(prep, LaneLandingRecoveryPrep::RebasedCleanly);
+        assert_eq!(assignment.base_commit, remote_head);
+        assert_eq!(run_git_in(&lane, ["status", "--short"]), "");
+        assert!(!lane_repo_has_active_cherry_pick(&lane));
+        let log = run_git_in(&lane, ["log", "--format=%s", "-2"]);
+        assert_eq!(log, "lane change\nmain change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn prepare_lane_landing_recovery_leaves_conflict_for_worker() {
+        let (root, remote, upstream, _worker) =
+            init_remote_and_clones("parallel-landing-recovery-conflict", "main");
+        let lane = root.join("lane-conflict");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane, ["config", "user.email", "autodev@example.com"]);
+        run_git_in(&lane, ["remote", "rename", "origin", "canonical"]);
+
+        let base_commit = git_output(&lane, ["rev-parse", "HEAD"]);
+        fs::write(lane.join("shared.txt"), "lane version\n").expect("failed to write lane file");
+        run_git_in(&lane, ["add", "shared.txt"]);
+        run_git_in(&lane, ["commit", "-m", "lane conflict"]);
+
+        fs::write(upstream.join("shared.txt"), "main version\n")
+            .expect("failed to write upstream file");
+        run_git_in(&upstream, ["add", "shared.txt"]);
+        run_git_in(&upstream, ["commit", "-m", "main conflict"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+        let remote_head = git_output(&upstream, ["rev-parse", "HEAD"]);
+
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 2,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-CONFLICT".to_string(),
+                title: "conflict recovery".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                markdown: "- [ ] `TASK-CONFLICT` conflict recovery\n".to_string(),
+            },
+            resumed: false,
+            lane_root: root.join("lane-conflict-root"),
+            lane_repo_root: lane.clone(),
+            base_commit: base_commit.clone(),
+            stdout_log_path: root.join("lane-conflict.stdout.log"),
+            stderr_log_path: root.join("lane-conflict.stderr.log"),
+            worker_pid_path: root.join("lane-conflict.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let prep = prepare_lane_landing_recovery(
+            &mut assignment,
+            "main",
+            &base_commit,
+            "git cherry-pick failed",
+        )
+        .expect("landing recovery should prepare");
+        let note = match prep {
+            LaneLandingRecoveryPrep::NeedsWorkerResolution(note) => note,
+            other => panic!("expected worker-resolution prep, got {other:?}"),
+        };
+        assert_eq!(assignment.base_commit, remote_head);
+        assert!(lane_repo_has_active_cherry_pick(&lane));
+        let status = run_git_in(&lane, ["status", "--short"]);
+        assert!(status.contains("shared.txt"));
+        assert!(lane_repo_status_summary(&lane).contains("cherry-pick recovery"));
+        assert!(note.contains("landing-recovery mode"));
+        assert!(note.contains("cherry-pick --continue"));
+
+        let resumed = lane_repo_recovery_note(&lane, "main", status.trim());
+        assert!(resumed.contains("in-progress landing-recovery cherry-pick"));
+        assert!(resumed.contains("shared.txt"));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
 
     #[test]
@@ -4753,6 +7025,50 @@ mod tests {
     }
 
     #[test]
+    fn reset_parallel_lane_root_rehomes_existing_contents() {
+        let lane_root = unique_temp_dir("parallel-lane-reset");
+        fs::create_dir_all(lane_root.join("repo")).expect("failed to create lane repo");
+        fs::write(lane_root.join("repo").join("stale.txt"), "stale")
+            .expect("failed to write stale file");
+
+        reset_parallel_lane_root(&lane_root).expect("lane root should reset");
+
+        assert!(lane_root.exists(), "lane root should exist after reset");
+        assert!(
+            fs::read_dir(&lane_root)
+                .expect("lane root should be readable")
+                .next()
+                .is_none(),
+            "lane root should be recreated empty"
+        );
+
+        let parent = lane_root.parent().expect("lane root should have parent");
+        let prefix = format!(
+            "{}.stale-",
+            lane_root
+                .file_name()
+                .expect("lane root should have file name")
+                .to_string_lossy()
+        );
+        let stale_dirs = fs::read_dir(parent)
+            .expect("parent should be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stale_dirs.is_empty(),
+            "stale lane roots should be pruned after reset"
+        );
+
+        fs::remove_dir_all(&lane_root).expect("failed to remove lane root");
+    }
+
+    #[test]
     fn resume_candidate_matches_requested_task() {
         let ready_tasks = [
             LoopTask {
@@ -4761,6 +7077,7 @@ mod tests {
                 status: LoopTaskStatus::Pending,
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
                 markdown: String::new(),
             },
             LoopTask {
@@ -4769,6 +7086,7 @@ mod tests {
                 status: LoopTaskStatus::Pending,
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
                 markdown: String::new(),
             },
         ];
@@ -4876,6 +7194,7 @@ mod tests {
             status: LoopTaskStatus::Pending,
             dependencies: Vec::new(),
             estimated_scope: Some("XS".to_string()),
+            completion_path_target: None,
             markdown: String::new(),
         };
         let medium = LoopTask {
@@ -4884,6 +7203,7 @@ mod tests {
             status: LoopTaskStatus::Pending,
             dependencies: Vec::new(),
             estimated_scope: Some("M".to_string()),
+            completion_path_target: None,
             markdown: String::new(),
         };
 
@@ -4901,6 +7221,7 @@ mod tests {
             status: LoopTaskStatus::Pending,
             dependencies: vec!["WEB-CRAPS-B".to_string()],
             estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
             markdown: "- [ ] `WEB-CRAPS-C` Checkpoint\n  Scope boundary: verification only.\n  Acceptance criteria:\n    - pass".to_string(),
         };
         let normal = LoopTask {
@@ -4909,6 +7230,7 @@ mod tests {
             status: LoopTaskStatus::Pending,
             dependencies: vec!["WEB-CRAPS-C".to_string()],
             estimated_scope: Some("M".to_string()),
+            completion_path_target: None,
             markdown: "- [ ] `WEB-CRAPS-D` Real work\n  Scope boundary: state source only.\n  Acceptance criteria:\n    - ship".to_string(),
         };
 
@@ -4966,6 +7288,42 @@ mod tests {
         assert!(queue.blocked_ids.is_empty());
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[1].status, LoopTaskStatus::Done);
+    }
+
+    #[test]
+    fn parse_loop_plan_blocks_deferred_not_shipped_rows() {
+        let plan = r#"
+- [ ] `TASK-A` Implement deferred queue handling
+  Dependencies:
+  - None
+- [ ] `TASK-D` Future feature — **DEFERRED, not shipped**
+  Dependencies:
+  - None
+- [ ] `TASK-E` Depends on deferred feature
+  Dependencies:
+  - `TASK-D`
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["TASK-A", "TASK-E"]);
+        assert_eq!(queue.blocked_ids, vec!["TASK-D"]);
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .find(|task| task.id == "TASK-D")
+                .map(|task| task.status),
+            Some(LoopTaskStatus::Blocked)
+        );
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["TASK-A"]
+        );
     }
 
     #[test]
@@ -5048,7 +7406,226 @@ mod tests {
     }
 
     #[test]
-    fn remove_task_from_plan_text_drops_entire_task_block() {
+    fn parse_loop_plan_treats_partial_tasks_as_unfinished_dependencies() {
+        let plan = r#"
+- [~] `TASK-001` Evidence gap
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-002` Depends on partial
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["TASK-001", "TASK-002"]);
+        assert!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+                == vec!["TASK-001"]
+        );
+    }
+
+    #[test]
+    fn parse_loop_plan_skips_partial_completion_path_placeholders() {
+        let plan = r#"
+- [~] `TASK-001` Historical evidence gap. Completion path: `TASK-010`.
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-010` Real follow-on
+  Dependencies: none
+  Estimated scope: M
+- [ ] `TASK-020` Depends on placeholder alias
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["TASK-010", "TASK-020"]);
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["TASK-010"]
+        );
+    }
+
+    #[test]
+    fn parse_loop_plan_skips_partial_prose_completion_path_placeholders() {
+        let plan = r#"
+- [~] `TASK-001` Historical evidence gap. Reconciled via `TASK-099` (see `TASK-010` for the completion path).
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-010` Real follow-on
+  Dependencies: none
+  Estimated scope: M
+- [ ] `TASK-020` Depends on placeholder alias
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["TASK-010", "TASK-020"]);
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["TASK-010"]
+        );
+    }
+
+    #[test]
+    fn ready_parallel_tasks_skips_partials_deferred_for_this_run() {
+        let plan = r#"
+- [~] `TASK-001` Evidence gap still needs follow-up
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-002` Independent ready task
+  Dependencies: none
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from(["TASK-001".to_string()]),
+        );
+        assert_eq!(
+            ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-002"]
+        );
+    }
+
+    #[test]
+    fn ready_parallel_tasks_prioritizes_pending_before_partial_followups() {
+        let plan = r#"
+- [~] `TASK-001` Evidence gap still needs follow-up
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-002` Fresh ready task
+  Dependencies: none
+  Estimated scope: S
+- [~] `TASK-003` Another partial
+  Dependencies: none
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-002", "TASK-001", "TASK-003"]
+        );
+    }
+
+    #[test]
+    fn prioritize_ready_parallel_tasks_avoids_canonical_dirty_paths() {
+        let repo = unique_temp_dir("parallel-ready-priority");
+        init_git_repo(&repo);
+        fs::write(repo.join("src.txt"), "base\n").expect("failed to write src file");
+        run_git_in(&repo, ["add", "src.txt"]);
+        run_git_in(&repo, ["commit", "-m", "initial"]);
+        fs::write(repo.join("src.txt"), "dirty\n").expect("failed to dirty src file");
+
+        let ready = vec![
+            LoopTask {
+                id: "TASK-001".to_string(),
+                title: "touches dirty file".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                markdown: "- [ ] `TASK-001`\n  Owns: `src.txt`\n".to_string(),
+            },
+            LoopTask {
+                id: "TASK-002".to_string(),
+                title: "clean task".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                markdown: "- [ ] `TASK-002`\n  Owns: `docs/proof.md`\n".to_string(),
+            },
+        ];
+
+        let ordered = prioritize_ready_parallel_tasks(&repo, ready);
+        assert_eq!(
+            ordered.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-002", "TASK-001"]
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn record_partial_follow_up_gives_one_retry_then_parks() {
+        let mut attempted = BTreeSet::new();
+        let mut deferred = BTreeSet::new();
+
+        assert_eq!(
+            record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
+            PartialFollowUpDisposition::RetryLaterThisRun
+        );
+        assert!(attempted.contains("TASK-001"));
+        assert!(!deferred.contains("TASK-001"));
+
+        assert_eq!(
+            record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
+            PartialFollowUpDisposition::ParkForRestOfRun
+        );
+        assert!(attempted.contains("TASK-001"));
+        assert!(deferred.contains("TASK-001"));
+
+        clear_partial_follow_up_tracking("TASK-001", &mut attempted, &mut deferred);
+        assert!(!attempted.contains("TASK-001"));
+        assert!(!deferred.contains("TASK-001"));
+    }
+
+    #[test]
+    fn completion_path_alias_resolves_once_follow_on_is_done() {
+        let plan = r#"
+- [~] `TASK-001` Historical evidence gap. Completion path: `TASK-010`.
+  Dependencies: none
+  Estimated scope: S
+- [x] `TASK-010` Real follow-on
+  Dependencies: none
+  Estimated scope: M
+- [ ] `TASK-020` Depends on placeholder alias
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let queue = snapshot.queue_snapshot();
+        assert_eq!(queue.pending_ids, vec!["TASK-020"]);
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["TASK-020"]
+        );
+    }
+
+    #[test]
+    fn update_task_completion_in_plan_text_marks_partial_instead_of_dropping_block() {
         let plan = r#"- [ ] `TASK-001` First task
   Dependencies:
   - None
@@ -5059,11 +7636,38 @@ mod tests {
   Estimated scope: medium
 "#;
 
-        let updated = remove_task_from_plan_text(plan, "TASK-001");
+        let updated =
+            update_task_completion_in_plan_text(plan, "TASK-001", LoopTaskStatus::Partial);
 
-        assert!(!updated.contains("- [ ] `TASK-001` First task"));
+        assert!(updated.contains("- [~] `TASK-001` First task"));
         assert!(updated.contains("TASK-002"));
-        assert!(updated.starts_with("- [ ] `TASK-002`"));
+        assert!(updated.starts_with("- [~] `TASK-001`"));
+    }
+
+    #[test]
+    fn audit_parallel_completion_drift_demotes_done_without_review_handoff() {
+        let repo = unique_temp_dir("parallel-drift-audit");
+        let run_root = unique_temp_dir("parallel-drift-audit-run");
+        fs::create_dir_all(&repo).expect("failed to create repo dir");
+        fs::create_dir_all(&run_root).expect("failed to create run dir");
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-001` First task\n  Dependencies: none\n  Estimated scope: S\n",
+        )
+        .expect("failed to write plan");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        let updated = audit_parallel_completion_drift(
+            &repo,
+            &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
+            &logger,
+        )
+        .expect("drift audit should succeed");
+
+        assert!(updated.contains("- [~] `TASK-001` First task"));
+        let persisted =
+            fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
+        assert!(persisted.contains("- [~] `TASK-001` First task"));
     }
 
     #[test]
@@ -5074,8 +7678,8 @@ mod tests {
         };
         let prompt = build_iteration_prompt("base prompt", &queue);
 
-        assert!(prompt.contains("First actionable task marked `- [ ]`: `META-001`"));
-        assert!(prompt.contains("Pending task count: 2"));
+        assert!(prompt.contains("First actionable unfinished task: `META-001`"));
+        assert!(prompt.contains("Unfinished task count: 2"));
         assert!(prompt.contains("Blocked tasks marked `- [!]` to skip this iteration: DEC-001"));
     }
 
