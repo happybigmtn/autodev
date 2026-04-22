@@ -42,7 +42,10 @@ def receipt_path(root: Path, task_id: str) -> Path:
 def load_receipt(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.decoder.JSONDecodeError as exc:
+        fail(f"corrupted receipt at {path}: {exc}")
 
 
 def write_receipt(path: Path, payload: dict) -> None:
@@ -64,8 +67,6 @@ def record(args: argparse.Namespace) -> None:
     entries = {}
     for entry in receipt.get("commands", []):
         if isinstance(entry, dict) and isinstance(entry.get("command"), str):
-            if entry.get("status") == "failed":
-                continue
             entries[entry["command"]] = entry
 
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()

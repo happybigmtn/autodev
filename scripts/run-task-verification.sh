@@ -8,15 +8,17 @@ fi
 
 task_id=$1
 shift 2
-command=$*
+command="$*"
 repo_root=$(git rev-parse --show-toplevel)
 
 cd "$repo_root"
 
 set +e
-bash -lc "$command"
+bash -lc '"$@"' bash "$@"
 status=$?
 set -e
 
-python3 scripts/verification_receipt.py record -- "$task_id" "$command" "$status"
+python3 scripts/verification_receipt.py record -- "$task_id" "$command" "$status" || {
+    echo "verification-receipt: warning: failed to record receipt" >&2
+}
 exit "$status"

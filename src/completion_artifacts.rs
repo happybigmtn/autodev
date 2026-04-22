@@ -873,6 +873,58 @@ Dependencies: none
     }
 
     #[test]
+    fn inspect_task_completion_evidence_rejects_corrupted_receipts() {
+        let root = temp_dir("corrupted-receipt");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-6.json"),
+            "{\"commands\":[",
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-6",
+            "- [ ] `TASK-6` Example\nVerification:\n  - `cargo test -p demo corrupted`\nDependencies: none\n",
+        );
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("invalid verification receipt"));
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_rejects_mixed_failed_receipts() {
+        let root = temp_dir("mixed-failed-receipt");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-11.json"),
+            r#"{"commands":[{"command":"cargo test -p demo first","exit_code":0,"status":"passed"},{"command":"cargo test -p demo second","exit_code":101,"status":"failed"}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-11",
+            "- [ ] `TASK-11` Example\nVerification:\n  - `cargo test -p demo first`\n  - `cargo test -p demo second`\nDependencies: none\n",
+        );
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("has failed command(s)"));
+    }
+
+    #[test]
     fn inspect_task_completion_evidence_rejects_incomplete_receipts() {
         let root = temp_dir("partial-receipt");
         fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
