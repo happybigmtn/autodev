@@ -260,35 +260,18 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
             active_plan_surface: &active_plan_surface,
         },
     );
-    let prompt_path = repo_root
-        .join(".auto")
-        .join("logs")
-        .join(format!("corpus-{}-prompt.md", timestamp_slug()));
-    atomic_write(&prompt_path, prompt.as_bytes())
-        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
-    println!("prompt log:  {}", prompt_path.display());
-
     print_stage("run corpus model", run_started_at);
-    let response = run_claude_prompt(
+    let author_phase = run_logged_author_phase(
         &repo_root,
+        "corpus",
         &prompt,
         &args.model,
         &args.reasoning_effort,
         args.max_turns,
-        "corpus generation",
-        &prompt_path,
-    )?;
-    let response_path = prompt_path.with_file_name(
-        prompt_path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("corpus-response.txt")
-            .replace("-prompt.md", "-response.txt"),
-    );
-    if !response.trim().is_empty() {
-        atomic_write(&response_path, response.as_bytes())
-            .with_context(|| format!("failed to write {}", response_path.display()))?;
-    }
+        &args.codex_bin,
+    )
+    .await
+    .context("corpus generation failed")?;
 
     let codex_review = if args.skip_codex_review {
         None
@@ -343,9 +326,11 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         println!("prior input: {}", previous.display());
     }
     println!("plan files:  {}", summary.plan_count);
-    println!("prompt log:  {}", prompt_path.display());
-    if response_path.exists() {
-        println!("model log:   {}", response_path.display());
+    println!("prompt log:  {}", author_phase.prompt_path.display());
+    if let Some(response_path) = &author_phase.response_path {
+        if response_path.exists() {
+            println!("model log:   {}", response_path.display());
+        }
     }
     if let Some(review) = codex_review {
         println!("codex prompt: {}", review.prompt_path.display());
