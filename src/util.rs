@@ -401,6 +401,30 @@ pub(crate) fn binary_provenance_line() -> String {
     )
 }
 
+#[cfg(unix)]
+pub(crate) fn chmod_0o600_if_unix(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to set owner-only permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn chmod_0o600_if_unix(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_process_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -615,10 +639,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        atomic_write, auto_checkpoint_if_needed, checkpoint_status, clip_line_for_display,
-        ensure_repo_layout_with, is_checkpoint_excluded_path, prune_old_entries,
-        push_branch_with_remote_sync, stage_checkpoint_changes, sync_branch_with_remote,
-        truncate_file_to_max_bytes,
+        atomic_write, auto_checkpoint_if_needed, checkpoint_status, chmod_0o600_if_unix,
+        clip_line_for_display, ensure_repo_layout_with, is_checkpoint_excluded_path,
+        prune_old_entries, push_branch_with_remote_sync, stage_checkpoint_changes,
+        sync_branch_with_remote, truncate_file_to_max_bytes,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1051,6 +1075,32 @@ mod tests {
             .collect::<Vec<_>>();
         entries.sort();
         assert_eq!(entries, vec!["result.json".to_string()]);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_0o600_if_unix_sets_owner_only_mode() {
+        let dir = temp_repo_path("chmod-0600");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("credentials.json");
+        fs::write(&path, br#"{"token":"secret"}"#).expect("failed to seed credential file");
+
+        let mut permissions = fs::metadata(&path)
+            .expect("failed to stat credential file")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).expect("failed to loosen credential permissions");
+
+        chmod_0o600_if_unix(&path).expect("chmod helper should succeed");
+
+        let mode = fs::metadata(&path)
+            .expect("failed to stat credential file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }

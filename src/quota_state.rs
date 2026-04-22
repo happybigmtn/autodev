@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::quota_config::QuotaConfig;
+use crate::util::chmod_0o600_if_unix;
 
 /// How long an exhausted account stays unavailable before auto-retrying.
 const EXHAUSTION_COOLDOWN_HOURS: i64 = 1;
@@ -49,7 +50,8 @@ impl QuotaState {
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = serde_json::to_string_pretty(self).context("failed to serialize quota state")?;
         fs::write(&path, text.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        chmod_0o600_if_unix(&path)
     }
 
     pub(crate) fn get(&self, name: &str) -> AccountState {
@@ -126,6 +128,59 @@ fn is_zero(value: &u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    struct TempConfigHome {
+        root: PathBuf,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempConfigHome {
+        fn new(label: &str) -> Self {
+            let lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("autodev-{label}-{}-{stamp}", std::process::id()));
+            fs::create_dir_all(&root).expect("failed to create temp config root");
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &root);
+            Self {
+                root,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempConfigHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn cooldown_clears_after_duration() {
@@ -214,5 +269,23 @@ mod tests {
         state.release_lease("test");
         state.release_lease("test");
         assert_eq!(state.get("test").active_leases, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only() {
+        let _config_home = TempConfigHome::new("quota-state-save");
+        let now = Utc::now();
+        let mut state = QuotaState::default();
+        state.mark_exhausted("test", now);
+
+        state.save().expect("state save should succeed");
+
+        let mode = fs::metadata(QuotaState::state_path())
+            .expect("failed to stat saved state")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

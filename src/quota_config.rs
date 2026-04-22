@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::util::chmod_0o600_if_unix;
+
 const CONFIG_DIR: &str = "quota-router";
 const CONFIG_FILE: &str = "config.toml";
 const PROFILES_DIR: &str = "profiles";
@@ -107,7 +109,8 @@ impl QuotaConfig {
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = toml::to_string_pretty(self).context("failed to serialize quota config")?;
         fs::write(&path, text.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        chmod_0o600_if_unix(&path)
     }
 
     pub(crate) fn find_account(&self, name: &str) -> Option<&AccountEntry> {
@@ -266,6 +269,57 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    struct TempConfigHome {
+        root: PathBuf,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempConfigHome {
+        fn new(label: &str) -> Self {
+            let lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("autodev-{label}-{}-{stamp}", std::process::id()));
+            fs::create_dir_all(&root).expect("failed to create temp config root");
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &root);
+            Self {
+                root,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempConfigHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn parse_config_round_trip() {
         let config = QuotaConfig {
@@ -335,5 +389,28 @@ mod tests {
         assert_eq!(codex_accounts.len(), 2);
         let claude_accounts = config.accounts_for_provider(Provider::Claude);
         assert_eq!(claude_accounts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only() {
+        let _config_home = TempConfigHome::new("quota-config-save");
+        let config = QuotaConfig {
+            accounts: vec![AccountEntry {
+                name: "work-codex".into(),
+                provider: Provider::Codex,
+            }],
+            selected_codex_account: Some("work-codex".into()),
+            selected_claude_account: None,
+        };
+
+        config.save().expect("config save should succeed");
+
+        let mode = fs::metadata(QuotaConfig::config_path())
+            .expect("failed to stat saved config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
