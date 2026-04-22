@@ -17,3 +17,11 @@ Awaiting auto review:
 - Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `grep -nE "^### \`, `grep -nE "DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md" README.md`, `grep -n "audit/DOCTRINE.md" README.md`
 - Completion artifacts: `README.md`
 - Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `grep -nE "^### \`, `grep -nE "DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md" README.md`, `grep -n "audit/DOCTRINE.md" README.md`
+
+## `TASK-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/audit_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib audit_command::tests::`
+- Completion artifacts: `src/audit_command.rs`
+- Remaining blockers: missing REVIEW.md handoff; missing scripts/run-task-verification.sh; executable Verification command(s) need receipt-backed proof: `cargo test --lib audit_command::tests::`
