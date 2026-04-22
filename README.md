@@ -852,6 +852,115 @@ Useful flags:
 - `--run-root <dir>` to change review log location
 - `--model` and `--reasoning-effort` to tune the review worker
 
+### `auto steward`
+
+Purpose:
+
+- Replace `auto corpus` + `auto gen` for repos that already have an active planning surface
+- Run a two-pass Codex stewardship flow: first write drift / hinge / retire / hazard artifacts,
+  then optionally review and apply bounded plan/spec promotions
+
+What it reads:
+
+- The live repository
+- Existing planning-surface files detected from `IMPLEMENTATION_PLAN.md`, `REVIEW.md`,
+  `SECURITY_PLAN.md`, `WORKLIST.md`, `LEARNINGS.md`, `ARCHIVED.md`, `AGENTS.md`, `CLAUDE.md`,
+  and `PLANS.md`
+- Any extra sibling or explicit `--reference-repo <dir>` inputs you pass
+
+What it produces:
+
+- `steward/DRIFT.md`
+- `steward/HINGES.md`
+- `steward/RETIRE.md`
+- `steward/HAZARDS.md`
+- `steward/STEWARDSHIP-REPORT.md`
+- `steward/PROMOTIONS.md`
+- prompt logs under `.auto/logs/steward-*-prompt.md`
+
+Defaults:
+
+- Output directory defaults to `<repo>/steward`
+- The first steward pass defaults to Codex `gpt-5.4` with `high`
+- The finalizer pass defaults to Codex `gpt-5.4` with `high`
+- It uses the current checked-out branch unless you pass `--branch`
+- It runs through `codex` unless you override `--codex-bin`
+- `--skip-finalizer` leaves the six stewardship deliverables in place without the review/apply
+  pass
+
+### `auto audit`
+
+Purpose:
+
+- Audit tracked files one by one against an operator-authored doctrine
+- Keep clean files untouched, patch bounded drift or slop, and escalate larger retire/refactor
+  calls with a durable artifact trail
+
+What it reads:
+
+- `audit/DOCTRINE.md` by default, or `--doctrine-prompt <path>`
+- The bundled audit rubric shipped in the binary
+- Tracked files that match the default include globs or the `--paths` / `--exclude` filters you
+  supply
+
+What it produces:
+
+- `audit/MANIFEST.json`
+- `audit/files/<hash-prefix>/prompt.md`
+- `audit/files/<hash-prefix>/response.log`
+- `audit/files/<hash-prefix>/verdict.json`
+- `audit/files/<hash-prefix>/patch.diff` for patchable verdicts
+- `audit/files/<hash-prefix>/worklist-entry.md` or `audit/files/<hash-prefix>/retire-reason.md`
+  for escalated verdicts
+
+Defaults:
+
+- Doctrine prompt defaults to `audit/DOCTRINE.md`
+- Output directory defaults to `<repo>/audit`
+- Resume mode defaults to `resume`
+- The primary auditor defaults to Kimi `k2.6` with `high` via `kimi-cli`
+- Escalations default to Codex `gpt-5.4` with `high`
+- Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
+
+### `auto symphony`
+
+Purpose:
+
+- Bridge `IMPLEMENTATION_PLAN.md` into a Linear project and launch the local Symphony runtime
+- Keep the repo's plan, rendered workflow, and Linear issue state aligned instead of drifting
+  apart
+
+What it reads:
+
+- `IMPLEMENTATION_PLAN.md`
+- Existing `.auto/symphony/WORKFLOW.md` when resolving saved project configuration
+- Git remote metadata plus repo defaults needed to render the workflow
+- Linear project state via the configured API credentials
+
+What it produces:
+
+- `.auto/symphony/WORKFLOW.md` by default from `auto symphony workflow`
+- `.auto/symphony/sync-planner-prompt.md`,
+  `.auto/symphony/sync-planner-response.jsonl`, and
+  `.auto/symphony/sync-planner-result.json` when `auto symphony sync` uses the AI planner
+- `.auto/symphony/logs/log/symphony.log` when `auto symphony run` launches the local runtime
+- Linear issue creates, updates, reopenings, and terminal-state sync from `auto symphony sync`
+
+Subcommands:
+
+- `sync` reads unchecked implementation-plan items and syncs them into a Linear project
+- `workflow` renders the repo-specific `.auto/symphony/WORKFLOW.md`
+- `run` refreshes the workflow and launches the local Symphony dashboard in the foreground
+
+Defaults:
+
+- `sync` defaults `--todo-state` to `Todo`, planner model to `gpt-5.4`, planner effort to
+  `high`, and planner binary to `codex`
+- `workflow` defaults to `.auto/symphony/WORKFLOW.md`, `max_concurrent_agents = 1`,
+  `poll_interval_ms = 5000`, model `gpt-5.4`, effort `high`, `In Progress`, and `Done`
+- `run` reuses the workflow defaults, can `--sync-first` before launch, and writes logs under
+  `.auto/symphony/logs/` unless you override `--logs-root`
+
 ### `auto ship`
 
 Purpose:
