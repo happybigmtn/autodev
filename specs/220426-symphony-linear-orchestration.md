@@ -13,11 +13,22 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 - `SymphonyWorkflowArgs` (`src/main.rs:151-200+`): `--repo-root`, `--project-slug`, `--output`, `--workspace-root`, `--base-branch`, `--max-concurrent-agents` (default `1`), `--poll-interval-ms` (default `5_000`), `--model` (default `"gpt-5.4"`), `--reasoning-effort` (default `"high"`), `--in-progress-state` (default `"In Progress"`), `--done-state` (default `"Done"`), `--blocked-state` (optional).
 - `SymphonyRunArgs` (`src/main.rs:201-286`) includes `--symphony-root` with a hardcoded default `/home/r/coding/symphony/elixir` (`src/main.rs:274-278`) that is operator-specific and likely should be configurable or required.
 - `symphony_command.rs` is ~3,062 LOC (corpus ASSESSMENT). Tests ~18 covering GraphQL query construction and state parsing.
-- GraphQL queries live in `src/linear_tracker.rs`:
+- Host-side `auto parallel` GraphQL tracker queries live in `src/linear_tracker.rs`:
   - `FETCH_PROJECT_QUERY` (`linear_tracker.rs:16`) for project/team/state lookup.
   - `FETCH_PROJECT_ISSUES_QUERY` (`linear_tracker.rs:42`) paginates issues.
   - `UPDATE_ISSUE_STATE_MUTATION` (`linear_tracker.rs:62`).
   - `ARCHIVE_ISSUE_MUTATION` (`linear_tracker.rs:76`).
+- `auto symphony sync` GraphQL queries live in `src/symphony_command.rs`:
+  - `FETCH_PROJECT_QUERY` (`symphony_command.rs:30`) for project/team/state lookup.
+  - `FETCH_PROJECT_ISSUES_QUERY` (`symphony_command.rs:56`) paginates issues with archived, priority, and blocker-relation fields.
+  - `CREATE_ISSUE_MUTATION` (`symphony_command.rs:96`).
+  - `UPDATE_ISSUE_MUTATION` (`symphony_command.rs:143`).
+  - `UPDATE_ISSUE_AND_STATE_MUTATION` (`symphony_command.rs:186`).
+  - `ARCHIVE_ISSUE_MUTATION` (`symphony_command.rs:231`).
+  - `UNARCHIVE_ISSUE_MUTATION` (`symphony_command.rs:239`).
+  - `DELETE_RELATION_MUTATION` (`symphony_command.rs:247`).
+  - `CREATE_RELATION_MUTATION` (`symphony_command.rs:255`).
+- `src/symphony_command.rs` also renders workflow prompt examples for external Symphony worker use via `linear_graphql`: `IssueContext`, `UpdateIssueState`, and `AddComment` (`symphony_command.rs:2152-2186`). These are prompt contract, not direct Rust HTTP egress.
 - Drift-category fields (`linear_tracker.rs:128-131`):
   - `missing_task_ids`: in plan, not in Linear (`linear_tracker.rs:230`).
   - `stale_task_ids`: content/title drifted (`linear_tracker.rs:244`).
@@ -54,7 +65,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 - Drift detection marks a Linear issue `completed_active` when Linear reports done/closed but the plan row is still active.
 - Drift detection marks `missing` when a plan row has no Linear issue at all.
 - Drift detection marks `stale` when title / body / metadata drifted between Linear and plan.
-- GraphQL queries in `linear_tracker.rs` are the only egress points for Linear API calls; no ad-hoc REST calls.
+- Linear API egress stays GraphQL-only with no ad-hoc REST calls. Direct Rust egress is intentionally split between host-side `linear_tracker.rs` operations and `auto symphony sync` operations in `symphony_command.rs`; `docs/decisions/symphony-graphql-surface.md` names the current operation contract.
 - Symphony runs do not retry requests silently; failures surface to the operator.
 - Missing `codex` binary under `sync` with `--no-ai-planner=false` yields a named-dependency non-zero exit.
 - `auto symphony` is added to the README inventory with at least a one-line purpose description.
