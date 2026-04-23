@@ -341,7 +341,7 @@
 
 ## Follow-On Work
 
-- [ ] `AD-F01` Snapshot-only generation implementation
+- [x] `AD-F01` Snapshot-only generation implementation
 
   Spec: `specs/230426-planning-corpus-and-generation.md`
   Why now: The generator needs an explicit snapshot-only path so planning runs can produce `gen-*` outputs without mutating root specs, root implementation plan, `genesis/`, or source files.
