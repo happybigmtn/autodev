@@ -146,7 +146,7 @@
   Estimated scope: M
   Completion signal: Quota restore tests cover Claude home JSON and existing Codex human-refresh error surfacing still passes.
 
-- [ ] `AD-010` Quota credential safety checkpoint
+- [x] `AD-010` Quota credential safety checkpoint
 
   Spec: `specs/230426-checkpoint-security-and-artifact-policy.md`
   Why now: Credential capture and restore are security-sensitive, and downstream checkpoint, CI, release, and automation work should not proceed until the quota hardening results are recorded with any blockers.
