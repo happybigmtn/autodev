@@ -34,7 +34,7 @@
   Estimated scope: M
   Completion signal: Shared parser tests pass and no existing command parser has been removed or behavior-changed yet.
 
-- [ ] `AD-003` Preserve blocked tasks during generated plan merges
+- [x] `AD-003` Preserve blocked tasks during generated plan merges
 
   Spec: `specs/230426-planning-corpus-and-generation.md`
   Why now: `auto gen` merges generated plans with existing open tasks, but the current generation parser does not recognize `[!]`, so blocked tasks can be lost or ignored during regeneration unless generation moves to the shared parser path.
