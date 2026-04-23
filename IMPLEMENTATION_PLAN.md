@@ -441,7 +441,7 @@
 
 - [x] `SAT-001` `Cargo.toml` already declares package `autodev` version `0.2.0` and binary `auto` at `src/main.rs`.
 
-- [~] `SAT-002` `build.rs` already embeds git SHA, dirty state, and build profile, and `src/util.rs` exposes that metadata through `CLI_LONG_VERSION`.
+- [x] `SAT-002` `build.rs` already embeds git SHA, dirty state, and build profile, and `src/util.rs` exposes that metadata through `CLI_LONG_VERSION`.
 
 - [x] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
 
