@@ -439,18 +439,18 @@
 
 ## Completed / Already Satisfied
 
-- [x] `SAT-001` `Cargo.toml` already declares package `autodev` version `0.2.0` and binary `auto` at `src/main.rs`.
+- [~] `SAT-001` `Cargo.toml` already declares package `autodev` version `0.2.0` and binary `auto` at `src/main.rs`.
 
-- [x] `SAT-002` `build.rs` already embeds git SHA, dirty state, and build profile, and `src/util.rs` exposes that metadata through `CLI_LONG_VERSION`.
+- [~] `SAT-002` `build.rs` already embeds git SHA, dirty state, and build profile, and `src/util.rs` exposes that metadata through `CLI_LONG_VERSION`.
 
-- [x] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
+- [~] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
 
-- [x] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
+- [~] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
 
-- [x] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
+- [~] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
 
-- [x] `SAT-006` `auto parallel status` is already implemented as a status-only action that reports repo, branch, run root, tmux state, host processes, lanes, frontier, and health without launching new work.
+- [~] `SAT-006` `auto parallel status` is already implemented as a status-only action that reports repo, branch, run root, tmux state, host processes, lanes, frontier, and health without launching new work.
 
-- [x] `SAT-007` `src/completion_artifacts.rs` already requires review handoff, verification receipt presence when executable verification exists, and declared completion artifact existence before task completion is fully evidenced.
+- [~] `SAT-007` `src/completion_artifacts.rs` already requires review handoff, verification receipt presence when executable verification exists, and declared completion artifact existence before task completion is fully evidenced.
 
-- [x] `SAT-008` `src/symphony_command.rs` already requires `--symphony-root` or `AUTODEV_SYMPHONY_ROOT` for foreground Symphony runs and has deterministic parser tests for pending, blocked, partial, and completed task rows.
+- [~] `SAT-008` `src/symphony_command.rs` already requires `--symphony-root` or `AUTODEV_SYMPHONY_ROOT` for foreground Symphony runs and has deterministic parser tests for pending, blocked, partial, and completed task rows.
