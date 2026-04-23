@@ -50,7 +50,7 @@
   Estimated scope: S
   Completion signal: Generated plan merge preserves blocked rows and the parallel and Symphony parser regressions still pass.
 
-- [ ] `AD-004` Parser and generation checkpoint
+- [x] `AD-004` Parser and generation checkpoint
 
   Spec: `specs/230426-verification-receipts-and-completion-evidence.md`
   Why now: Shared parsing and generated-plan merge preservation are central queue-truth risks; a checkpoint keeps future work from widening parser adoption before the blocked-task preservation proof is reviewed.
