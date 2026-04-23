@@ -290,7 +290,7 @@
   Estimated scope: XS
   Completion signal: Review handoff states the release lifecycle is ready for CI and ship-gate implementation or names concrete blockers.
 
-- [~] `TASK-002` Add `### auto steward`, `### auto audit`, `### auto symphony` detailed-guide subsections to README
+- [x] `TASK-002` Add `### auto steward`, `### auto audit`, `### auto symphony` detailed-guide subsections to README
 
     Spec: `specs/220426-readme-truth-pass.md`
     Why now: `README.md` has detailed `###` subsections for the 13 historical commands (`README.md:86-849`) but none for the three commands added since the README was last truthful. Operators currently have no entry-point doc for these three commands.
