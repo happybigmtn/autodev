@@ -389,7 +389,7 @@
   Estimated scope: M
   Completion signal: Backend policy metadata serializes all inventoried provider families without changing runtime invocation behavior.
 
-- [ ] `AD-F04` Migrate executor adapters to shared parser
+- [x] `AD-F04` Migrate executor adapters to shared parser
 
   Spec: `specs/230426-shared-task-parser-and-blocked-preservation.md`
   Why now: After the shared parser and generation preservation checkpoint, parallel, Symphony, review harvest, and completion evidence should agree on statuses, dependencies, verification, and artifacts through adapters instead of duplicated parsers.
