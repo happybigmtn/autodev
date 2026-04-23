@@ -18,7 +18,7 @@
   Estimated scope: S
   Completion signal: Backend policy file exists, names all verified invocation surfaces, and states that no default or behavior change shipped in this task.
 
-- [ ] `AD-002` Shared implementation-plan parser core
+- [x] `AD-002` Shared implementation-plan parser core
 
   Spec: `specs/230426-shared-task-parser-and-blocked-preservation.md`
   Why now: Generation, parallel, Symphony, review, and completion evidence currently parse task status and fields independently, and generation recognizes `[ ]`, `[~]`, and `[x]` but not `[!]`; a shared core is the safest prerequisite for preserving blocked work.
