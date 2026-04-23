@@ -802,6 +802,38 @@ mod tests {
         );
     }
 
+    fn write_repo_file(repo: &Path, path: &str, contents: &str) {
+        let path = repo.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("failed to create parent dir");
+        }
+        fs::write(path, contents).expect("failed to write repo file");
+    }
+
+    fn seed_tracked_checkpoint_excluded_files(repo: &Path) {
+        for path in [
+            ".auto/review/log.txt",
+            ".claude/worktrees/agent-a123/README.md",
+            "bug/BUG_REPORT.md",
+            "nemesis/nemesis-audit.md",
+            "gen-001/SPEC.md",
+        ] {
+            write_repo_file(repo, path, "initial\n");
+            run_git_in(repo, ["add", "-f", path]);
+        }
+        run_git_in(repo, ["commit", "-m", "seed excluded files"]);
+
+        for path in [
+            ".auto/review/log.txt",
+            ".claude/worktrees/agent-a123/README.md",
+            "bug/BUG_REPORT.md",
+            "nemesis/nemesis-audit.md",
+            "gen-001/SPEC.md",
+        ] {
+            write_repo_file(repo, path, "changed\n");
+        }
+    }
+
     fn init_remote_and_clones(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let root = temp_repo_path(name);
         let remote = root.join("remote.git");
@@ -859,12 +891,7 @@ mod tests {
     #[test]
     fn checkpoint_status_ignores_autodev_generated_dirs() {
         let repo = init_repo("checkpoint-status");
-        fs::create_dir_all(repo.join(".auto").join("review")).expect("failed to create .auto");
-        fs::create_dir_all(repo.join("bug")).expect("failed to create bug dir");
-        fs::write(repo.join(".auto").join("review").join("log.txt"), "log\n")
-            .expect("failed to write .auto file");
-        fs::write(repo.join("bug").join("BUG_REPORT.md"), "# bug\n")
-            .expect("failed to write bug report");
+        seed_tracked_checkpoint_excluded_files(&repo);
 
         let raw_status = run_git_in(&repo, ["status", "--short"]);
         assert!(
@@ -882,16 +909,8 @@ mod tests {
     #[test]
     fn checkpoint_stage_skips_autodev_generated_dirs() {
         let repo = init_repo("checkpoint-stage");
-        fs::write(repo.join(".gitignore"), ".auto/\n").expect("failed to write .gitignore");
-        run_git_in(&repo, ["add", ".gitignore"]);
-        run_git_in(&repo, ["commit", "-m", "ignore auto"]);
-        fs::create_dir_all(repo.join(".auto").join("review")).expect("failed to create .auto");
-        fs::create_dir_all(repo.join("bug")).expect("failed to create bug dir");
+        seed_tracked_checkpoint_excluded_files(&repo);
         fs::create_dir_all(repo.join("src")).expect("failed to create src dir");
-        fs::write(repo.join(".auto").join("review").join("log.txt"), "log\n")
-            .expect("failed to write .auto file");
-        fs::write(repo.join("bug").join("BUG_REPORT.md"), "# bug\n")
-            .expect("failed to write bug report");
         fs::write(repo.join("README.md"), "# changed\n").expect("failed to update README");
         fs::write(repo.join("src").join("new.txt"), "new\n").expect("failed to write new file");
 
