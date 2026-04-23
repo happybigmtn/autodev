@@ -82,7 +82,7 @@
   Estimated scope: XS
   Completion signal: Snapshot-only product shape is recorded as a decision with explicit non-goals and implementation prerequisites.
 
-- [~] `AD-006` First-run no-model preflight decision
+- [x] `AD-006` First-run no-model preflight decision
 
   Spec: `specs/230426-first-run-ci-and-installed-binary-proof.md`
   Why now: The repo is developer-facing and has no no-model first-success command; `auto health` invokes Codex, so new contributors cannot prove local layout, help, and installed-binary basics without credentials.
