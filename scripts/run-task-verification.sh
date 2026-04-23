@@ -20,7 +20,7 @@ trap cleanup EXIT
 cd "$repo_root"
 
 set +e
-bash -lc '"$@"' bash "$@" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+bash -lc "$command" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
 status=$?
 set -e
 
