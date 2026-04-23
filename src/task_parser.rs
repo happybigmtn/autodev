@@ -143,6 +143,9 @@ fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
     {
         return Vec::new();
     }
+    if lower.starts_with("external dependency:") {
+        return collect_task_refs(trimmed);
+    }
 
     let without_parens = strip_parenthetical_groups(trimmed);
     let narrative_cut = without_parens.split(['.', ';']).next().unwrap_or("").trim();

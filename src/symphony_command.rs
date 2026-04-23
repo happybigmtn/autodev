@@ -18,6 +18,10 @@ use crate::completion_artifacts::{
 };
 use crate::quota_config::Provider;
 use crate::quota_exec;
+use crate::task_parser::{
+    parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks,
+    TaskStatus as SharedTaskStatus,
+};
 use crate::util::{atomic_write, git_repo_root, git_stdout, repo_name};
 use crate::{
     SymphonyArgs, SymphonyRunArgs, SymphonySubcommand, SymphonySyncArgs, SymphonyWorkflowArgs,
@@ -1794,122 +1798,30 @@ fn resolve_base_branch(repo_root: &Path, override_branch: Option<String>) -> Res
 }
 
 pub(crate) fn parse_tasks(plan: &str) -> Vec<SymphonyTask> {
-    let mut tasks = Vec::new();
-    let mut current_header = None::<String>;
-    let mut current_lines = Vec::<String>::new();
-
-    for line in plan.lines() {
-        let trimmed = line.trim_start();
-        let is_task = trimmed.starts_with("- [ ] ")
-            || trimmed.starts_with("- [!] ")
-            || trimmed.starts_with("- [~] ")
-            || trimmed.starts_with("- [x] ")
-            || trimmed.starts_with("- [X] ");
-        if is_task {
-            if let Some(task) = finalize_task(current_header.take(), &current_lines) {
-                tasks.push(task);
-            }
-            current_header = Some(line.to_string());
-            current_lines = vec![line.to_string()];
-            continue;
-        }
-        if current_header.is_some() {
-            current_lines.push(line.to_string());
-        }
-    }
-
-    if let Some(task) = finalize_task(current_header, &current_lines) {
-        tasks.push(task);
-    }
-    tasks
+    parse_shared_tasks(plan)
+        .into_iter()
+        .map(|task| SymphonyTask {
+            id: task.id,
+            title: task.title,
+            status: symphony_task_status(task.status),
+            dependencies: task.dependencies,
+            markdown: task.markdown,
+        })
+        .collect()
 }
 
-fn finalize_task(header: Option<String>, lines: &[String]) -> Option<SymphonyTask> {
-    let header = header?;
-    let (status, id, title) = parse_task_header(&header)?;
-    let markdown = lines.join("\n");
-    let dependencies = parse_task_dependencies(&markdown);
-    Some(SymphonyTask {
-        id,
-        title,
-        status,
-        dependencies,
-        markdown,
-    })
+fn symphony_task_status(status: SharedTaskStatus) -> TaskStatus {
+    match status {
+        SharedTaskStatus::Pending => TaskStatus::Pending,
+        SharedTaskStatus::Blocked => TaskStatus::Blocked,
+        SharedTaskStatus::Partial => TaskStatus::Partial,
+        SharedTaskStatus::Done => TaskStatus::Done,
+    }
 }
 
 fn parse_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
-    let trimmed = line.trim_start();
-    let (status, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
-        (TaskStatus::Pending, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("- [!] ") {
-        (TaskStatus::Blocked, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("- [~] ") {
-        (TaskStatus::Partial, rest)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- [x] ")
-        .or_else(|| trimmed.strip_prefix("- [X] "))
-    {
-        (TaskStatus::Done, rest)
-    } else {
-        return None;
-    };
-    let rest = rest.strip_prefix('`')?;
-    let end = rest.find('`')?;
-    let id = rest[..end].to_string();
-    let title = rest[end + 1..].trim().to_string();
-    Some((status, id, title))
-}
-
-fn parse_task_dependencies(markdown: &str) -> Vec<String> {
-    let Some(body) = task_field_body(markdown, "Dependencies:", "Estimated scope:") else {
-        return Vec::new();
-    };
-
-    let first_meaningful = body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.trim_start_matches('-').trim().to_ascii_lowercase());
-    if first_meaningful
-        .as_deref()
-        .is_some_and(|line| line.starts_with("none"))
-    {
-        return Vec::new();
-    }
-
-    dedup_task_refs(
-        body.lines()
-            .flat_map(task_dependency_refs_from_line)
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
-    let trimmed = line.trim();
-    if trimmed
-        .to_ascii_lowercase()
-        .starts_with("external dependency:")
-    {
-        return collect_task_refs(trimmed);
-    }
-    let without_parens = strip_parenthetical_groups(trimmed);
-    let narrative_cut = without_parens.split(['.', ';']).next().unwrap_or("").trim();
-    collect_task_refs(narrative_cut)
-}
-
-fn strip_parenthetical_groups(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut depth = 0usize;
-    for ch in text.chars() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => result.push(ch),
-            _ => {}
-        }
-    }
-    result
+    let (status, id, title) = parse_shared_task_header(line)?;
+    Some((symphony_task_status(status), id, title))
 }
 
 fn task_field_body(markdown: &str, field: &str, next_field: &str) -> Option<String> {
@@ -1932,26 +1844,6 @@ fn task_field_body(markdown: &str, field: &str, next_field: &str) -> Option<Stri
         }
     }
     collecting.then(|| body.join("\n"))
-}
-
-fn collect_task_refs(text: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        let candidate = &rest[..end];
-        if candidate
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        {
-            refs.push(candidate.to_string());
-        }
-        rest = &rest[end + 1..];
-    }
-    dedup_task_refs(refs)
 }
 
 pub(crate) fn render_issue_title(task: &SymphonyTask) -> String {

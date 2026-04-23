@@ -9,6 +9,7 @@ use crate::claude_exec::{describe_claude_harness, run_claude_with_futility};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
 use crate::completion_artifacts::review_contains_task;
+use crate::task_parser::{parse_task_header as parse_shared_task_header, TaskStatus};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
     git_status_short_filtered, git_stdout, push_branch_with_remote_sync, sync_branch_with_remote,
@@ -571,18 +572,12 @@ fn extract_completed_plan_items(plan_text: &str) -> (String, Vec<CompletedPlanIt
 }
 
 fn is_top_level_plan_task_header(line: &str) -> bool {
-    line.starts_with("- [")
+    line.starts_with("- [") && parse_shared_task_header(line).is_some()
 }
 
 fn completed_plan_task_id(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let rest = trimmed
-        .strip_prefix("- [x]")
-        .or_else(|| trimmed.strip_prefix("- [X]"))?
-        .trim_start();
-    let rest = rest.strip_prefix('`')?;
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
+    let (status, task_id, _) = parse_shared_task_header(line)?;
+    (status == TaskStatus::Done).then_some(task_id)
 }
 
 fn render_completed_plan_review_item(item: &CompletedPlanItem) -> String {

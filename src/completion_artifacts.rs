@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use shlex::split as shell_split;
 
+use crate::task_parser::parse_tasks as parse_shared_tasks;
 use crate::util::atomic_write;
 
 const REVIEW_HEADER: &str = "# REVIEW\n\nAwaiting auto review:\n";
@@ -240,49 +241,19 @@ fn render_host_review_entry(
 }
 
 fn declared_completion_artifacts(task_markdown: &str) -> Vec<String> {
-    let Some(body) = task_field_body_until_any(
-        task_markdown,
-        "Completion artifacts:",
-        &[
-            "Required tests:",
-            "Dependencies:",
-            "Estimated scope:",
-            "Completion signal:",
-        ],
-    ) else {
-        return Vec::new();
-    };
-
-    let first_meaningful = body
-        .lines()
-        .map(strip_list_bullet)
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.to_ascii_lowercase());
-    if first_meaningful
-        .as_deref()
-        .is_some_and(|line| line.starts_with("none"))
-    {
-        return Vec::new();
-    }
-
-    body.lines()
-        .flat_map(artifact_paths_from_line)
-        .collect::<Vec<_>>()
+    parse_shared_tasks(task_markdown)
+        .into_iter()
+        .next()
+        .map(|task| task.completion_artifacts)
+        .unwrap_or_default()
 }
 
 pub(crate) fn verification_plan(task_markdown: &str) -> VerificationPlan {
-    let Some(body) = task_field_body_until_any(
-        task_markdown,
-        "Verification:",
-        &[
-            "Required tests:",
-            "Completion artifacts:",
-            "Dependencies:",
-            "Estimated scope:",
-            "Completion signal:",
-        ],
-    ) else {
+    let Some(body) = parse_shared_tasks(task_markdown)
+        .into_iter()
+        .next()
+        .and_then(|task| task.verification_text)
+    else {
         return VerificationPlan::default();
     };
 
@@ -618,53 +589,6 @@ fn is_env_assignment(token: &str) -> bool {
                 .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
-fn artifact_paths_from_line(line: &str) -> Vec<String> {
-    let trimmed = strip_list_bullet(line).trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let mut paths = Vec::new();
-    let mut rest = trimmed;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        let candidate = rest[..end].trim();
-        if looks_like_repo_relative_path(candidate) {
-            paths.push(candidate.to_string());
-        }
-        rest = &rest[end + 1..];
-    }
-    if !paths.is_empty() {
-        return paths;
-    }
-
-    let candidate = trimmed
-        .split(" -- ")
-        .next()
-        .unwrap_or(trimmed)
-        .split(" — ")
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
-    if looks_like_repo_relative_path(candidate) {
-        paths.push(candidate.to_string());
-    }
-    paths
-}
-
-fn looks_like_repo_relative_path(candidate: &str) -> bool {
-    !candidate.is_empty()
-        && !candidate.starts_with('/')
-        && (candidate.contains('/')
-            || candidate.starts_with('.')
-            || candidate.ends_with(".md")
-            || candidate.ends_with(".json")
-            || candidate.ends_with(".txt"))
-}
-
 fn strip_list_bullet(line: &str) -> &str {
     let trimmed = line.trim_start();
     for bullet in ["- ", "* ", "+ "] {
@@ -673,32 +597,6 @@ fn strip_list_bullet(line: &str) -> &str {
         }
     }
     trimmed
-}
-
-fn task_field_body_until_any(markdown: &str, field: &str, next_fields: &[&str]) -> Option<String> {
-    let mut collecting = false;
-    let mut body = Vec::new();
-    for line in markdown.lines() {
-        let unbulleted = strip_list_bullet(line);
-        if let Some(rest) = unbulleted.strip_prefix(field) {
-            collecting = true;
-            if !rest.trim().is_empty() {
-                body.push(rest.trim().to_string());
-            }
-            continue;
-        }
-        if collecting
-            && next_fields
-                .iter()
-                .any(|next_field| unbulleted.starts_with(next_field))
-        {
-            break;
-        }
-        if collecting {
-            body.push(line.to_string());
-        }
-    }
-    collecting.then(|| body.join("\n"))
 }
 
 #[cfg(test)]

@@ -20,6 +20,10 @@ use crate::completion_artifacts::{
 };
 use crate::linear_tracker::LinearTracker;
 use crate::symphony_command::run_sync;
+use crate::task_parser::{
+    parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks,
+    PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
+};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
     git_status_short_filtered, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
@@ -503,12 +507,6 @@ fn read_loop_plan(repo_root: &Path) -> Result<String> {
         .with_context(|| format!("failed to read {}", plan_path.display()))
 }
 
-fn extract_task_id(task_line: &str) -> Option<String> {
-    let rest = task_line.strip_prefix('`')?;
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoopTaskStatus {
     Pending,
@@ -663,36 +661,25 @@ struct ParallelBlockerDetail {
 }
 
 fn parse_loop_plan(plan: &str) -> LoopPlanSnapshot {
-    let mut tasks = Vec::new();
-    let mut current_header = None::<String>;
-    let mut current_lines = Vec::<String>::new();
-
-    for line in plan.lines() {
-        if parse_task_header(line).is_some() {
-            if let Some(task) = finalize_task(current_header.take(), &current_lines) {
-                tasks.push(task);
-            }
-            current_header = Some(line.to_string());
-            current_lines = vec![line.to_string()];
-            continue;
-        }
-
-        if current_header.is_some() {
-            current_lines.push(line.to_string());
-        }
+    LoopPlanSnapshot {
+        tasks: parse_shared_tasks(plan)
+            .into_iter()
+            .map(finalize_task)
+            .collect(),
     }
-
-    if let Some(task) = finalize_task(current_header, &current_lines) {
-        tasks.push(task);
-    }
-
-    LoopPlanSnapshot { tasks }
 }
 
-fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
-    let header = header?;
-    let (mut status, id, title) = parse_task_header(&header)?;
-    let markdown = lines.join("\n");
+fn finalize_task(task: SharedPlanTask) -> LoopTask {
+    let SharedPlanTask {
+        id,
+        title,
+        status,
+        dependencies,
+        completion_path_target,
+        markdown,
+        ..
+    } = task;
+    let mut status = loop_task_status(status);
     if matches!(
         status,
         LoopTaskStatus::Pending | LoopTaskStatus::Blocked | LoopTaskStatus::Partial
@@ -705,15 +692,24 @@ fn finalize_task(header: Option<String>, lines: &[String]) -> Option<LoopTask> {
             status = LoopTaskStatus::Done;
         }
     }
-    Some(LoopTask {
+    LoopTask {
         id,
         title,
         status,
-        dependencies: parse_task_dependencies(&markdown),
+        dependencies,
         estimated_scope: task_field_line_value(&markdown, "Estimated scope:"),
-        completion_path_target: parse_task_completion_path(&markdown),
+        completion_path_target,
         markdown,
-    })
+    }
+}
+
+fn loop_task_status(status: SharedTaskStatus) -> LoopTaskStatus {
+    match status {
+        SharedTaskStatus::Pending => LoopTaskStatus::Pending,
+        SharedTaskStatus::Blocked => LoopTaskStatus::Blocked,
+        SharedTaskStatus::Partial => LoopTaskStatus::Partial,
+        SharedTaskStatus::Done => LoopTaskStatus::Done,
+    }
 }
 
 fn task_is_non_actionable_placeholder(title: &str, markdown: &str) -> bool {
@@ -746,73 +742,8 @@ fn task_is_deferred_not_shipped_placeholder(title: &str, markdown: &str) -> bool
 }
 
 fn parse_task_header(line: &str) -> Option<(LoopTaskStatus, String, String)> {
-    let trimmed = line.trim_start();
-    let (status, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
-        (LoopTaskStatus::Pending, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("- [!] ") {
-        (LoopTaskStatus::Blocked, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("- [~] ") {
-        (LoopTaskStatus::Partial, rest)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- [x] ")
-        .or_else(|| trimmed.strip_prefix("- [X] "))
-    {
-        (LoopTaskStatus::Done, rest)
-    } else {
-        return None;
-    };
-    let id = extract_task_id(rest)?;
-    let title = rest
-        .trim_start_matches('`')
-        .trim_start_matches(&id)
-        .trim_start_matches('`')
-        .trim()
-        .to_string();
-    Some((status, id, title))
-}
-
-fn parse_task_dependencies(markdown: &str) -> Vec<String> {
-    let Some(body) = task_field_body(markdown, "Dependencies:", "Estimated scope:") else {
-        return Vec::new();
-    };
-
-    let first_meaningful = body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.trim_start_matches('-').trim().to_ascii_lowercase());
-    if first_meaningful
-        .as_deref()
-        .is_some_and(|line| line.starts_with("none"))
-    {
-        return Vec::new();
-    }
-
-    dedup_task_refs(
-        body.lines()
-            .flat_map(task_dependency_refs_from_line)
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn task_dependency_refs_from_line(line: &str) -> Vec<String> {
-    let without_parens = strip_parenthetical_groups(line);
-    let narrative_cut = without_parens.split(['.', ';']).next().unwrap_or("").trim();
-    collect_task_refs(narrative_cut)
-}
-
-fn strip_parenthetical_groups(text: &str) -> String {
-    let mut depth = 0usize;
-    let mut rendered = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => rendered.push(ch),
-            _ => {}
-        }
-    }
-    rendered
+    let (status, id, title) = parse_shared_task_header(line)?;
+    Some((loop_task_status(status), id, title))
 }
 
 fn strip_list_bullet(line: &str) -> &str {
@@ -832,34 +763,6 @@ fn task_field_line_value(markdown: &str, field: &str) -> Option<String> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string())
-    })
-}
-
-fn parse_task_completion_path(markdown: &str) -> Option<String> {
-    markdown.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if let Some(start) = lower.find("completion path:") {
-            let refs = collect_task_refs(line[start + "completion path:".len()..].trim());
-            if let Some(target) = refs.into_iter().next() {
-                return Some(target);
-            }
-        }
-
-        if let Some(start) = lower.find("completion path is") {
-            let refs = collect_task_refs(line[start + "completion path is".len()..].trim());
-            if let Some(target) = refs.into_iter().next() {
-                return Some(target);
-            }
-        }
-
-        if let Some(end) = lower.find("for the completion path") {
-            let refs = collect_task_refs(line[..end].trim());
-            if let Some(target) = refs.into_iter().last() {
-                return Some(target);
-            }
-        }
-
-        None
     })
 }
 
@@ -883,37 +786,6 @@ fn task_field_body(markdown: &str, field: &str, next_field: &str) -> Option<Stri
         }
     }
     collecting.then(|| body.join("\n"))
-}
-
-fn collect_task_refs(text: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('`') else {
-            break;
-        };
-        let candidate = &rest[..end];
-        if candidate
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        {
-            refs.push(candidate.to_string());
-        }
-        rest = &rest[end + 1..];
-    }
-    dedup_task_refs(refs)
-}
-
-fn dedup_task_refs(refs: Vec<String>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut ordered = Vec::new();
-    for task_id in refs {
-        if seen.insert(task_id.clone()) {
-            ordered.push(task_id);
-        }
-    }
-    ordered
 }
 
 #[derive(Clone, Debug)]
