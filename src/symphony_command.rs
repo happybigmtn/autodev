@@ -1571,7 +1571,7 @@ async fn render_workflow(args: SymphonyWorkflowArgs) -> Result<RenderedWorkflow>
         in_progress_state: &args.in_progress_state,
         done_state: &args.done_state,
         blocked_state: args.blocked_state.as_deref(),
-    });
+    })?;
 
     if let Some(parent) = workflow_path.parent() {
         fs::create_dir_all(parent)
@@ -2033,17 +2033,28 @@ struct WorkflowRenderSpec<'a> {
     blocked_state: Option<&'a str>,
 }
 
-fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> String {
+fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> Result<String> {
+    validate_workflow_render_spec(&spec)?;
     let shared_cargo_target_dir = shared_cargo_target_dir(spec.workspace_root);
-    let workspace_root_yaml = shell_safe_path(spec.workspace_root);
-    let shared_cargo_target_dir_yaml = shell_safe_path(&shared_cargo_target_dir);
+    let workspace_root_text = path_text("workspace root", spec.workspace_root)?;
+    let repo_root_text = path_text("repo root", spec.repo_root)?;
+    let shared_cargo_target_dir_text =
+        path_text("shared Cargo target dir", &shared_cargo_target_dir)?;
+    let workspace_root_yaml = yaml_double_quote(&workspace_root_text);
+    let shared_cargo_target_dir_yaml = yaml_double_quote(&shared_cargo_target_dir_text);
+    let base_branch_shell = shell_quote(spec.base_branch);
+    let origin_base_branch_shell = shell_quote(&format!("origin/{}", spec.base_branch));
+    let origin_base_range_shell = shell_quote(&format!("origin/{}..HEAD", spec.base_branch));
+    let model_reasoning_effort = ["model_reasoning_effort=", spec.reasoning_effort].concat();
+    let model_reasoning_effort_shell = shell_quote(&model_reasoning_effort);
+    let model_shell = shell_quote(spec.model);
     let blocked_state_line = spec
         .blocked_state
         .map(|state| format!("- If you hit a true external blocker (missing auth/permissions/secrets), add one precise Linear comment and move the issue to `{state}` before stopping.\n"))
         .unwrap_or_else(|| "- If you hit a true external blocker (missing auth/permissions/secrets), add one precise Linear comment describing the blocker before stopping.\n".to_string());
     let before_run_hook = [
         "set -eu".to_string(),
-        format!("mkdir -p {}", shell_safe_path(&shared_cargo_target_dir)),
+        format!("mkdir -p {}", shell_quote(&shared_cargo_target_dir_text)),
         "if [ -f .git/info/exclude ]; then".to_string(),
         "  if ! grep -qxF '/.cargo-target' .git/info/exclude; then printf '/.cargo-target\\n' >> .git/info/exclude; fi".to_string(),
         "  if ! grep -qxF '/.cargo-target*' .git/info/exclude; then printf '/.cargo-target*\\n' >> .git/info/exclude; fi".to_string(),
@@ -2055,12 +2066,22 @@ fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> String {
         "  fi".to_string(),
         "done".to_string(),
         "ln -s ../.cargo-target .cargo-target".to_string(),
-        format!("git fetch origin {}", spec.base_branch),
-        format!("git checkout {}", spec.base_branch),
-        format!("ahead_commits=$(git rev-list --count origin/{}..HEAD)", spec.base_branch),
+        ["git fetch origin ", &base_branch_shell].concat(),
+        ["git checkout ", &base_branch_shell].concat(),
+        [
+            "ahead_commits=$(git rev-list --count ",
+            &origin_base_range_shell,
+            ")",
+        ]
+        .concat(),
         "should_rebase=1".to_string(),
         "if [ \"$ahead_commits\" -gt 0 ]; then".to_string(),
-        format!("  merge_base=$(git merge-base HEAD origin/{})", spec.base_branch),
+        [
+            "  merge_base=$(git merge-base HEAD ",
+            &origin_base_branch_shell,
+            ")",
+        ]
+        .concat(),
         "  echo \"before_run: found $ahead_commits unpushed local commit(s), restoring them to workspace changes before continuing\"".to_string(),
         "  git reset --mixed \"$merge_base\"".to_string(),
         "  should_rebase=0".to_string(),
@@ -2079,29 +2100,33 @@ fn render_workflow_markdown(spec: WorkflowRenderSpec<'_>) -> String {
         "  should_rebase=0".to_string(),
         "fi".to_string(),
         "if [ \"$should_rebase\" -eq 1 ]; then".to_string(),
-        format!("  git pull --rebase origin {}", spec.base_branch),
+        ["  git pull --rebase origin ", &base_branch_shell].concat(),
         "fi".to_string(),
     ]
     .into_iter()
     .map(|line| format!("    {line}"))
     .collect::<Vec<_>>()
     .join("\n");
-    let codex_command = format!(
-        "env CARGO_TARGET_DIR={} auto quota open codex --config shell_environment_policy.inherit=all --config model_reasoning_effort={} --model {} app-server",
-        shell_quote(&shared_cargo_target_dir.display().to_string()),
-        spec.reasoning_effort,
-        spec.model
-    );
-    format!(
+    let codex_command = [
+        "env CARGO_TARGET_DIR=",
+        &shell_quote(&shared_cargo_target_dir_text),
+        " auto quota open codex --config shell_environment_policy.inherit=all --config ",
+        &model_reasoning_effort_shell,
+        " --model ",
+        &model_shell,
+        " app-server",
+    ]
+    .concat();
+    Ok(format!(
         "---\n\
-tracker:\n  kind: linear\n  api_key: $LINEAR_API_KEY\n  project_slug: \"{project_slug}\"\n  active_states:\n    - {todo_state}\n    - {in_progress_state}\n  terminal_states:\n    - Closed\n    - Cancelled\n    - Canceled\n    - Duplicate\n    - {done_state}\n\
+tracker:\n  kind: linear\n  api_key: $LINEAR_API_KEY\n  project_slug: {project_slug_yaml}\n  active_states:\n    - {todo_state_yaml}\n    - {in_progress_state_yaml}\n  terminal_states:\n    - Closed\n    - Cancelled\n    - Canceled\n    - Duplicate\n    - {done_state_yaml}\n\
 polling:\n  interval_ms: {poll_interval_ms}\n\
 workspace:\n  root: {workspace_root_yaml}\n\
 hooks:\n  after_create: |\n    git clone --depth 1 {remote_url} .\n  before_run: |\n{before_run_hook}\n  timeout_ms: 300000\n\
 agent:\n  max_concurrent_agents: {max_concurrent_agents}\n  max_turns: 20\n\
 codex:\n  command: >-\n    {codex_command}\n  approval_policy: never\n  thread_sandbox: workspace-write\n  turn_sandbox_policy:\n    type: workspaceWrite\n    writableRoots:\n      - {workspace_root_yaml}\n      - {shared_cargo_target_dir_yaml}\n  read_timeout_ms: 60000\n  max_turn_wall_clock_ms: 1800000\n  max_turn_total_tokens: 12000000\n---\n\n\
 You are running an unattended implementation-plan execution session for repository `{repo_label}`.\n\n\
-Repository root inside the workspace clone: `{repo_root}`\n\
+Repository root inside the workspace clone: `{repo_root_text}`\n\
 Integration branch: `{base_branch}`\n\
 Linear project: `{project_slug}`\n\n\
 {{% if attempt %}}\n\
@@ -2200,9 +2225,13 @@ mutation AddComment($issueId: String!, $body: String!) {{\n\
 }}\n\
 ```\n",
         project_slug = spec.project_slug,
+        project_slug_yaml = yaml_double_quote(spec.project_slug),
         todo_state = spec.todo_state,
+        todo_state_yaml = yaml_double_quote(spec.todo_state),
         in_progress_state = spec.in_progress_state,
+        in_progress_state_yaml = yaml_double_quote(spec.in_progress_state),
         done_state = spec.done_state,
+        done_state_yaml = yaml_double_quote(spec.done_state),
         poll_interval_ms = spec.poll_interval_ms,
         remote_url = shell_quote(spec.remote_url),
         base_branch = spec.base_branch,
@@ -2210,19 +2239,93 @@ mutation AddComment($issueId: String!, $body: String!) {{\n\
         max_concurrent_agents = spec.max_concurrent_agents,
         codex_command = codex_command,
         repo_label = spec.repo_label,
-        repo_root = spec.repo_root.display(),
+        repo_root_text = repo_root_text,
         workspace_root_yaml = workspace_root_yaml,
         shared_cargo_target_dir_yaml = shared_cargo_target_dir_yaml,
         blocked_state_line = blocked_state_line,
-    )
-}
-
-fn shell_safe_path(path: &Path) -> String {
-    path.display().to_string()
+    ))
 }
 
 fn shared_cargo_target_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".cargo-target")
+}
+
+fn validate_workflow_render_spec(spec: &WorkflowRenderSpec<'_>) -> Result<()> {
+    validate_single_line_scalar("repo label", spec.repo_label)?;
+    validate_single_line_scalar("project slug", spec.project_slug)?;
+    validate_single_line_scalar("remote URL", spec.remote_url)?;
+    validate_branch_name(spec.base_branch)?;
+    validate_token_scalar("model", spec.model)?;
+    validate_token_scalar("reasoning effort", spec.reasoning_effort)?;
+    validate_single_line_scalar("todo state", spec.todo_state)?;
+    validate_single_line_scalar("in-progress state", spec.in_progress_state)?;
+    validate_single_line_scalar("done state", spec.done_state)?;
+    if let Some(blocked_state) = spec.blocked_state {
+        validate_single_line_scalar("blocked state", blocked_state)?;
+    }
+    path_text("repo root", spec.repo_root)?;
+    path_text("workspace root", spec.workspace_root)?;
+    Ok(())
+}
+
+fn validate_branch_name(branch: &str) -> Result<()> {
+    validate_single_line_scalar("base branch", branch)?;
+    if branch.starts_with('-') || !branch.chars().all(is_safe_branch_char) {
+        bail!("invalid base branch `{branch}`; use only letters, digits, '.', '-', '_', or '/'");
+    }
+    if branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || branch.contains('\\')
+    {
+        bail!(
+            "invalid base branch `{branch}`; use a plain branch name without shell metacharacters or git ref punctuation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_token_scalar(label: &str, value: &str) -> Result<()> {
+    validate_single_line_scalar(label, value)?;
+    if value.starts_with('-') || !value.chars().all(is_safe_token_char) {
+        bail!(
+            "invalid {label} `{value}`; use only letters, digits, '.', '-', '_', '/', ':', or '+'"
+        );
+    }
+    Ok(())
+}
+
+fn validate_single_line_scalar(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("invalid {label}; value must not be empty");
+    }
+    if value
+        .chars()
+        .any(|ch| ch == '\n' || ch == '\r' || ch.is_control())
+    {
+        bail!("invalid {label}; value must be a single line without control characters");
+    }
+    Ok(())
+}
+
+fn path_text(label: &str, path: &Path) -> Result<String> {
+    let text = path.display().to_string();
+    validate_single_line_scalar(label, &text)?;
+    Ok(text)
+}
+
+fn is_safe_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/' | ':' | '+')
+}
+
+fn is_safe_branch_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/')
+}
+
+fn yaml_double_quote(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -3024,31 +3127,26 @@ Awaiting auto review:
 
     #[test]
     fn workflow_render_is_repo_specific() {
-        let markdown = render_workflow_markdown(WorkflowRenderSpec {
-            repo_root: PathBuf::from("/home/r/Coding/autonomy").as_path(),
-            repo_label: "autonomy",
-            project_slug: "autonomy-symphony",
-            remote_url: "git@github.com:example/autonomy.git",
-            base_branch: "trunk",
-            workspace_root: PathBuf::from("/tmp/symphony-workspaces/autonomy").as_path(),
-            poll_interval_ms: 5000,
-            max_concurrent_agents: 1,
-            model: "gpt-5.5",
-            reasoning_effort: "high",
-            todo_state: "Todo",
-            in_progress_state: "In Progress",
-            done_state: "Done",
-            blocked_state: Some("Backlog"),
-        });
+        let repo_root = PathBuf::from("/home/r/Coding/autonomy");
+        let workspace_root = PathBuf::from("/tmp/symphony-workspaces/autonomy");
+        let markdown = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "trunk",
+            "gpt-5.5",
+            "high",
+        ))
+        .expect("workflow should render");
         assert!(markdown.contains("project_slug: \"autonomy-symphony\""));
         assert!(markdown.contains("git clone --depth 1 'git@github.com:example/autonomy.git' ."));
-        assert!(markdown.contains("mkdir -p /tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains("mkdir -p '/tmp/symphony-workspaces/autonomy/.cargo-target'"));
         assert!(markdown.contains("printf '/.cargo-target\\n' >> .git/info/exclude"));
         assert!(markdown.contains("printf '/.cargo-target*\\n' >> .git/info/exclude"));
         assert!(markdown.contains("removing repo-local cargo target path $stale_cargo_target"));
         assert!(markdown.contains("ln -s ../.cargo-target .cargo-target"));
-        assert!(markdown.contains("git fetch origin trunk"));
-        assert!(markdown.contains("git rev-list --count origin/trunk..HEAD"));
+        assert!(markdown.contains("git fetch origin 'trunk'"));
+        assert!(markdown.contains("git rev-list --count 'origin/trunk..HEAD'"));
         assert!(markdown.contains("should_rebase=1"));
         assert!(markdown.contains("git reset --mixed \"$merge_base\""));
         assert!(markdown.contains("unfinished git operation detected"));
@@ -3056,7 +3154,7 @@ Awaiting auto review:
         assert!(markdown.contains("if ! git diff --quiet || ! git diff --cached --quiet; then"));
         assert!(markdown.contains("restoring them to workspace changes before continuing"));
         assert!(markdown.contains("skipping rebase sync to preserve local changes"));
-        assert!(markdown.contains("root: /tmp/symphony-workspaces/autonomy"));
+        assert!(markdown.contains("root: \"/tmp/symphony-workspaces/autonomy\""));
         assert!(markdown.contains("Failure context from the previous attempt"));
         assert!(markdown.contains("Recovery guidance"));
         assert!(markdown.contains("mark the matching task in `IMPLEMENTATION_PLAN.md` as `- [x]`"));
@@ -3092,14 +3190,123 @@ Awaiting auto review:
         assert!(markdown.contains("command: >-"));
         assert!(markdown.contains("turn_sandbox_policy:"));
         assert!(markdown.contains("writableRoots:"));
-        assert!(markdown.contains("      - /tmp/symphony-workspaces/autonomy"));
-        assert!(markdown.contains("      - /tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains("      - \"/tmp/symphony-workspaces/autonomy\""));
+        assert!(markdown.contains("      - \"/tmp/symphony-workspaces/autonomy/.cargo-target\""));
         assert!(markdown.contains("env CARGO_TARGET_DIR="));
-        assert!(markdown.contains("/tmp/symphony-workspaces/autonomy/.cargo-target"));
+        assert!(markdown.contains("'/tmp/symphony-workspaces/autonomy/.cargo-target'"));
         assert!(markdown.contains(
             "call `symphony_land_issue` with `{\"baseBranch\":\"trunk\",\"doneState\":\"Done\"}`"
         ));
         assert!(markdown.contains("If `symphony_land_issue` reports a rebase conflict"));
+    }
+
+    #[test]
+    fn workflow_render_rejects_hostile_branch() {
+        let repo_root = PathBuf::from("/home/r/Coding/autonomy");
+        let workspace_root = PathBuf::from("/tmp/symphony-workspaces/autonomy");
+        let error = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "main; touch /tmp/pwned",
+            "gpt-5.5",
+            "high",
+        ))
+        .expect_err("hostile branch should be rejected");
+
+        assert!(error.to_string().contains("base branch"));
+    }
+
+    #[test]
+    fn workflow_render_rejects_hostile_model_and_effort() {
+        let repo_root = PathBuf::from("/home/r/Coding/autonomy");
+        let workspace_root = PathBuf::from("/tmp/symphony-workspaces/autonomy");
+
+        let model_error = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "trunk",
+            "gpt-5.5 --dangerously-bypass-approvals-and-sandbox",
+            "high",
+        ))
+        .expect_err("hostile model should be rejected");
+        assert!(model_error.to_string().contains("model"));
+
+        let effort_error = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "trunk",
+            "gpt-5.5",
+            "high\nwritableRoots:",
+        ))
+        .expect_err("hostile effort should be rejected");
+        assert!(effort_error.to_string().contains("reasoning effort"));
+
+        let remote_error = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            workspace_root.as_path(),
+            "git@github.com:example/autonomy.git\n  timeout_ms: 1",
+            "trunk",
+            "gpt-5.5",
+            "high",
+        ))
+        .expect_err("hostile remote URL should be rejected");
+        assert!(remote_error.to_string().contains("remote URL"));
+
+        let hostile_workspace_root = PathBuf::from("/tmp/symphony\nhooks:");
+        let path_error = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            hostile_workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "trunk",
+            "gpt-5.5",
+            "high",
+        ))
+        .expect_err("hostile path should be rejected");
+        assert!(path_error.to_string().contains("workspace root"));
+
+        let quoted_workspace_root = PathBuf::from("/tmp/symphony workspaces/auto'quote");
+        let markdown = render_workflow_markdown(test_workflow_spec(
+            repo_root.as_path(),
+            quoted_workspace_root.as_path(),
+            "git@github.com:example/autonomy.git",
+            "trunk",
+            "gpt-5.5",
+            "high",
+        ))
+        .expect("paths with spaces and quotes should render safely");
+        assert!(
+            markdown.contains("mkdir -p '/tmp/symphony workspaces/auto'\"'\"'quote/.cargo-target'")
+        );
+        assert!(markdown.contains("root: \"/tmp/symphony workspaces/auto'quote\""));
+    }
+
+    fn test_workflow_spec<'a>(
+        repo_root: &'a std::path::Path,
+        workspace_root: &'a std::path::Path,
+        remote_url: &'a str,
+        base_branch: &'a str,
+        model: &'a str,
+        reasoning_effort: &'a str,
+    ) -> WorkflowRenderSpec<'a> {
+        WorkflowRenderSpec {
+            repo_root,
+            repo_label: "autonomy",
+            project_slug: "autonomy-symphony",
+            remote_url,
+            base_branch,
+            workspace_root,
+            poll_interval_ms: 5000,
+            max_concurrent_agents: 1,
+            model,
+            reasoning_effort,
+            todo_state: "Todo",
+            in_progress_state: "In Progress",
+            done_state: "Done",
+            blocked_state: Some("Backlog"),
+        }
     }
 
     #[test]
