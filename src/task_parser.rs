@@ -80,7 +80,7 @@ fn finalize_task(lines: &[String]) -> Option<PlanTask> {
     })
 }
 
-fn parse_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
+pub(crate) fn parse_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
     let trimmed = line.trim_start();
     let (status, rest) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
         (TaskStatus::Pending, rest)

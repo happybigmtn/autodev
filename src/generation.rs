@@ -9,6 +9,7 @@ use chrono::{Local, NaiveDate};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state, AutoState};
+use crate::task_parser::{parse_task_header as parse_shared_task_header, TaskStatus};
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
     list_markdown_files, timestamp_slug,
@@ -3471,13 +3472,13 @@ fn finalize_plan_block(
     if lines.is_empty() {
         return Ok(None);
     }
-    let Some((checked, task_id, _title)) = parse_plan_task_header(&lines[0]) else {
+    let Some((status, task_id, _title)) = parse_plan_task_header(&lines[0]) else {
         return Ok(None);
     };
     Ok(Some(PlanTaskBlock {
         section: section.unwrap_or(PlanSection::Priority),
         task_id,
-        checked,
+        checked: matches!(status, TaskStatus::Done),
         markdown: lines.join("\n"),
     }))
 }
@@ -3491,21 +3492,8 @@ fn parse_section_header(line: &str) -> Option<PlanSection> {
     }
 }
 
-fn parse_plan_task_header(line: &str) -> Option<(bool, String, String)> {
-    let trimmed = line.trim_start();
-    let checked = if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [~] ") {
-        false
-    } else if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
-        true
-    } else {
-        return None;
-    };
-    let rest = trimmed[6..].trim_start();
-    let rest = rest.strip_prefix('`')?;
-    let tick = rest.find('`')?;
-    let task_id = rest[..tick].trim().to_string();
-    let title = rest[tick + 1..].trim().to_string();
-    Some((checked, task_id, title))
+fn parse_plan_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
+    parse_shared_task_header(line)
 }
 
 fn spec_topic_slug(source_name: &str) -> String {
@@ -3704,6 +3692,46 @@ Spec: specs/310326-finished.md
         assert!(merged.contains("`VAL-001`"));
         assert!(merged.contains("`SEC-001`"));
         assert!(merged.contains("`OPS-001`"));
+        assert!(!merged.contains("`OLD-001`"));
+    }
+
+    #[test]
+    fn merge_generated_plan_preserves_blocked_tasks() {
+        let generated = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `VAL-001` Validate user query input
+Spec: specs/020426-query-validation.md
+
+## Follow-On Work
+
+## Completed / Already Satisfied
+"#;
+
+        let existing = r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [!] `SEC-001` Blocked auth hardening
+Spec: specs/010426-auth.md
+
+- [X] `OLD-001` Finished uppercase task
+Spec: specs/310326-finished.md
+
+## Follow-On Work
+
+- [!] `OPS-001` Blocked metrics
+Spec: specs/010426-observability.md
+
+## Completed / Already Satisfied
+"#;
+
+        let merged = merge_generated_plan_with_existing_open_tasks(generated, existing).unwrap();
+
+        assert!(merged.contains("`VAL-001`"));
+        assert!(merged.contains("- [!] `SEC-001` Blocked auth hardening"));
+        assert!(merged.contains("- [!] `OPS-001` Blocked metrics"));
         assert!(!merged.contains("`OLD-001`"));
     }
 
