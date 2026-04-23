@@ -1093,6 +1093,9 @@ What it writes:
 What it actually does:
 
 - Resolves the working branch and base branch
+- Runs a mechanical release gate before the Codex ship-prep pass and fails early when installed
+  binary proof, validation receipts, fresh `QA.md`/`HEALTH.md`, release blockers, rollback notes,
+  monitoring notes, or PR/no-PR state are missing or red
 - Reviews the branch diff against the base branch
 - Runs the real validations required by the repo
 - Updates docs, versioning, and changelog surfaces only when warranted by what is actually shipping
@@ -1123,6 +1126,8 @@ When to run it:
 Useful flags:
 
 - `--max-iterations <n>` to allow multiple ship/fix cycles
+- `--bypass-release-gate <reason>` to let the Codex ship-prep pass run despite missing local
+  release evidence; the reason and current gate blockers are recorded in `SHIP.md`
 - `--prompt-file <path>` to override the ship prompt
 - `--branch <name>` to require a specific checked-out branch
 - `--base-branch <name>` to explicitly control diff and PR target

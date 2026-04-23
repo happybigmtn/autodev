@@ -1,8 +1,10 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
@@ -15,7 +17,7 @@ const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
 pub(crate) const DEFAULT_SHIP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, staging, deployment, and local-run rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, `WORKLIST.md`, `LEARNINGS.md`, `QA.md`, `HEALTH.md`, `README.md`, `CHANGELOG.md`, and `VERSION` if they exist.
-0c. Run a monolithic ship-prep pass. You may use helper workflows or GitHub/deploy tools if they are available, but you must satisfy the shipping contract below even if those helpers are missing.
+0c. Run a monolithic ship-prep pass after the mechanical release gate has passed or an operator bypass has been recorded in `SHIP.md`. You may use helper workflows or GitHub/deploy tools if they are available, but you must satisfy the shipping contract below even if those helpers are missing.
 
 1. Your task is to prepare branch `{branch}` to ship against base branch `{base_branch}`.
    - Build a release checklist from the branch diff, the current QA and review state, and the repo's actual release surfaces.
@@ -35,6 +37,7 @@ pub(crate) const DEFAULT_SHIP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 
 3. Maintain `SHIP.md` as the durable release report for this branch:
    - Record the branch, base branch, and the exact validations you ran.
+   - Preserve any mechanical release-gate bypass reason already recorded by `auto ship`.
    - Record what changed for release bookkeeping: docs, changelog, version, or release notes.
    - Record shipping blockers, open follow-ups, and the final ship verdict.
    - Record the rollback path: what gets reverted, disabled, or rolled back first if this ship causes trouble.
@@ -64,12 +67,381 @@ pub(crate) const DEFAULT_SHIP_PROMPT_TEMPLATE: &str = r#"0a. Study `AGENTS.md` f
 
 99999. Important: shipping is a truth-telling workflow, not a ceremony workflow.
 999999. Important: do not rewrite release history, changelog history, or version history casually.
+9999991. Important: an operator bypass is not readiness; keep the bypass reason visible in `SHIP.md` until the missing evidence is replaced.
 9999999. Important: prefer a blocked but honest ship report over a fake green release."#;
 
 fn render_default_ship_prompt(branch: &str, base_branch: &str) -> String {
     DEFAULT_SHIP_PROMPT_TEMPLATE
         .replace("{branch}", branch)
         .replace("{base_branch}", base_branch)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ShipGateReport {
+    blockers: Vec<String>,
+}
+
+impl ShipGateReport {
+    fn is_blocked(&self) -> bool {
+        !self.blockers.is_empty()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VerificationReceipt {
+    #[serde(default)]
+    commands: Vec<VerificationReceiptCommand>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerificationReceiptCommand {
+    command: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    runner_summary: Option<RunnerSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerSummary {
+    #[serde(default)]
+    tests_run: Option<u64>,
+    #[serde(default)]
+    zero_test_detected: Option<bool>,
+}
+
+fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> ShipGateReport {
+    let receipts = load_verification_receipts(repo_root);
+    let mut blockers = Vec::new();
+
+    require_receipt(
+        &receipts,
+        command_is_cargo_fmt,
+        "missing validation receipt: `cargo fmt --check`",
+        "red validation receipt: `cargo fmt --check`",
+        &mut blockers,
+    );
+    require_receipt(
+        &receipts,
+        command_is_cargo_clippy,
+        "missing validation receipt: `cargo clippy --all-targets --all-features -- -D warnings`",
+        "red validation receipt: `cargo clippy --all-targets --all-features -- -D warnings`",
+        &mut blockers,
+    );
+    require_receipt(
+        &receipts,
+        command_is_broad_cargo_test,
+        "missing validation receipt: `cargo test`",
+        "red validation receipt: `cargo test`",
+        &mut blockers,
+    );
+    require_receipt(
+        &receipts,
+        command_is_cargo_install_auto,
+        "missing installed-binary proof: no passing receipt for `cargo install --path . --root ...`",
+        "red installed-binary proof: `cargo install --path . --root ...`",
+        &mut blockers,
+    );
+    require_receipt(
+        &receipts,
+        command_is_auto_version,
+        "missing installed-binary proof: no passing receipt for PATH-resolved `auto --version`",
+        "red installed-binary proof: PATH-resolved `auto --version`",
+        &mut blockers,
+    );
+
+    check_release_report_freshness(repo_root, "QA.md", branch, base_branch, &mut blockers);
+    check_release_report_freshness(repo_root, "HEALTH.md", branch, base_branch, &mut blockers);
+    check_ship_report(repo_root, &mut blockers);
+    check_unresolved_release_blockers(repo_root, &mut blockers);
+
+    ShipGateReport { blockers }
+}
+
+fn require_receipt(
+    receipts: &[VerificationReceiptCommand],
+    matches: fn(&str) -> bool,
+    missing_message: &str,
+    red_message: &str,
+    blockers: &mut Vec<String>,
+) {
+    let matching = receipts
+        .iter()
+        .filter(|receipt| matches(&receipt.command))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        blockers.push(missing_message.to_string());
+    } else if !matching.iter().any(|receipt| receipt_passed(receipt)) {
+        blockers.push(red_message.to_string());
+    }
+}
+
+fn receipt_passed(receipt: &VerificationReceiptCommand) -> bool {
+    let status_passed = receipt.status.as_deref() == Some("passed") || receipt.exit_code == Some(0);
+    let zero_test = receipt
+        .runner_summary
+        .as_ref()
+        .map(|summary| {
+            summary.zero_test_detected == Some(true)
+                || summary.tests_run == Some(0) && command_is_cargo_test_like(&receipt.command)
+        })
+        .unwrap_or(false);
+    status_passed && !zero_test
+}
+
+fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptCommand> {
+    let receipt_root = repo_root.join(".auto/symphony/verification-receipts");
+    let Ok(entries) = fs::read_dir(receipt_root) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<VerificationReceipt>(&text).ok())
+        .flat_map(|receipt| receipt.commands)
+        .collect()
+}
+
+fn normalized_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn command_is_cargo_fmt(command: &str) -> bool {
+    normalized_command(command) == "cargo fmt --check"
+}
+
+fn command_is_cargo_clippy(command: &str) -> bool {
+    normalized_command(command) == "cargo clippy --all-targets --all-features -- -d warnings"
+}
+
+fn command_is_broad_cargo_test(command: &str) -> bool {
+    normalized_command(command) == "cargo test"
+}
+
+fn command_is_cargo_test_like(command: &str) -> bool {
+    normalized_command(command).starts_with("cargo test")
+}
+
+fn command_is_cargo_install_auto(command: &str) -> bool {
+    let command = normalized_command(command);
+    command.contains("cargo install") && command.contains("--path .") && command.contains("--root")
+}
+
+fn command_is_auto_version(command: &str) -> bool {
+    normalized_command(command)
+        .trim_start_matches("command -v auto && ")
+        .ends_with("auto --version")
+}
+
+fn check_release_report_freshness(
+    repo_root: &Path,
+    file_name: &str,
+    branch: &str,
+    base_branch: &str,
+    blockers: &mut Vec<String>,
+) {
+    let path = repo_root.join(file_name);
+    let Ok(content) = fs::read_to_string(&path) else {
+        blockers.push(format!("`{file_name}` is missing"));
+        return;
+    };
+    if !content.contains(branch) || !content.contains(base_branch) {
+        blockers.push(format!(
+            "`{file_name}` is stale: it does not name branch `{branch}` and base branch `{base_branch}`"
+        ));
+    }
+    if report_is_partial_for_release_diff(&content) {
+        blockers.push(format!(
+            "`{file_name}` is stale: it records partial coverage or untested release surfaces"
+        ));
+    }
+    if report_predates_release_diff(repo_root, &path, base_branch) {
+        blockers.push(format!(
+            "`{file_name}` is stale: it predates source, test, workflow, build, or release-doc changes in the branch diff"
+        ));
+    }
+}
+
+fn report_is_partial_for_release_diff(content: &str) -> bool {
+    let normalized = content.to_lowercase();
+    (normalized.contains("partial") || normalized.contains("untested"))
+        && (normalized.contains("release")
+            || normalized.contains("diff")
+            || normalized.contains("ship")
+            || normalized.contains("surface"))
+}
+
+fn report_predates_release_diff(repo_root: &Path, report_path: &Path, base_branch: &str) -> bool {
+    let Ok(report_modified) = report_path.metadata().and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    newest_release_diff_mtime(repo_root, base_branch)
+        .map(|newest| report_modified < newest)
+        .unwrap_or(false)
+}
+
+fn newest_release_diff_mtime(repo_root: &Path, base_branch: &str) -> Option<SystemTime> {
+    let diff = git_stdout(
+        repo_root,
+        ["diff", "--name-only", &format!("{base_branch}...HEAD")],
+    )
+    .or_else(|_| {
+        git_stdout(
+            repo_root,
+            ["diff", "--name-only", &format!("{base_branch}..HEAD")],
+        )
+    })
+    .ok()?;
+    diff.lines()
+        .map(str::trim)
+        .filter(|path| release_relevant_path(path))
+        .filter_map(|path| repo_root.join(path).metadata().ok()?.modified().ok())
+        .max()
+}
+
+fn release_relevant_path(path: &str) -> bool {
+    path.starts_with("src/")
+        || path.starts_with("tests/")
+        || path.starts_with(".github/workflows/")
+        || matches!(
+            path,
+            "Cargo.toml" | "Cargo.lock" | "README.md" | "CHANGELOG.md" | "VERSION" | "AGENTS.md"
+        )
+}
+
+fn check_ship_report(repo_root: &Path, blockers: &mut Vec<String>) {
+    let ship_path = repo_root.join("SHIP.md");
+    let Ok(content) = fs::read_to_string(&ship_path) else {
+        blockers.push("`SHIP.md` is missing rollback notes".to_string());
+        blockers.push("`SHIP.md` is missing monitoring notes".to_string());
+        blockers.push("`SHIP.md` is missing PR URL or explicit no-PR reason".to_string());
+        return;
+    };
+    if !contains_meaningful_note(&content, "rollback") {
+        blockers.push("`SHIP.md` is missing rollback notes".to_string());
+    }
+    if !contains_meaningful_note(&content, "monitoring") {
+        blockers.push("`SHIP.md` is missing monitoring notes".to_string());
+    }
+    let normalized = content.to_lowercase();
+    if !(normalized.contains("http://")
+        || normalized.contains("https://")
+        || normalized.contains("no-pr")
+        || normalized.contains("no pr")
+        || normalized.contains("no pull request"))
+    {
+        blockers.push("`SHIP.md` is missing PR URL or explicit no-PR reason".to_string());
+    }
+}
+
+fn contains_meaningful_note(content: &str, keyword: &str) -> bool {
+    content.lines().any(|line| {
+        let normalized = line.to_lowercase();
+        normalized.contains(keyword)
+            && line
+                .split_once(':')
+                .map(|(_, value)| !value.trim().is_empty())
+                .unwrap_or(true)
+    })
+}
+
+fn check_unresolved_release_blockers(repo_root: &Path, blockers: &mut Vec<String>) {
+    for file_name in ["REVIEW.md", "QA.md", "HEALTH.md", "WORKLIST.md", "SHIP.md"] {
+        let Ok(content) = fs::read_to_string(repo_root.join(file_name)) else {
+            continue;
+        };
+        if let Some(line) = content.lines().find(|line| line_is_release_blocker(line)) {
+            blockers.push(format!(
+                "unresolved release blocker in `{file_name}`: {}",
+                line.trim()
+            ));
+        }
+    }
+}
+
+fn line_is_release_blocker(line: &str) -> bool {
+    let normalized = line.to_lowercase();
+    normalized.contains("not ready")
+        || normalized.contains("red validation")
+        || normalized.contains("validation: red")
+        || normalized.contains("release blocker")
+        || normalized.contains("shipping blocker")
+        || normalized.contains("ship blocker")
+        || normalized.contains("critical blocker")
+        || normalized.contains("unresolved blocker")
+}
+
+fn record_ship_gate_blockers(
+    repo_root: &Path,
+    branch: &str,
+    base_branch: &str,
+    report: &ShipGateReport,
+) -> Result<()> {
+    write_ship_gate_section(
+        repo_root,
+        branch,
+        base_branch,
+        "Blocked before model execution",
+        None,
+        report,
+    )
+}
+
+fn record_ship_gate_bypass(
+    repo_root: &Path,
+    branch: &str,
+    base_branch: &str,
+    reason: &str,
+    report: &ShipGateReport,
+) -> Result<()> {
+    write_ship_gate_section(
+        repo_root,
+        branch,
+        base_branch,
+        "Bypassed before model execution",
+        Some(reason),
+        report,
+    )
+}
+
+fn write_ship_gate_section(
+    repo_root: &Path,
+    branch: &str,
+    base_branch: &str,
+    verdict: &str,
+    bypass_reason: Option<&str>,
+    report: &ShipGateReport,
+) -> Result<()> {
+    let ship_path = repo_root.join("SHIP.md");
+    let mut content = fs::read_to_string(&ship_path).unwrap_or_else(|_| "# SHIP\n".to_string());
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("\n## Mechanical Release Gate\n\n");
+    content.push_str(&format!("- Branch: `{branch}`\n"));
+    content.push_str(&format!("- Base branch: `{base_branch}`\n"));
+    content.push_str(&format!("- Verdict: {verdict}\n"));
+    if let Some(reason) = bypass_reason {
+        content.push_str(&format!("- Operator bypass reason: {reason}\n"));
+    }
+    if report.blockers.is_empty() {
+        content.push_str("- Blockers: none detected by the mechanical gate\n");
+    } else {
+        content.push_str("- Blockers:\n");
+        for blocker in &report.blockers {
+            content.push_str(&format!("  - {blocker}\n"));
+        }
+    }
+    atomic_write(&ship_path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", ship_path.display()))?;
+    Ok(())
 }
 
 pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
@@ -113,6 +485,29 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
     println!("model:       {}", args.model);
     println!("reasoning:   {}", args.reasoning_effort);
     println!("run root:    {}", run_root.display());
+
+    let ship_gate = evaluate_ship_gate(&repo_root, &push_branch, &base_branch);
+    if let Some(reason) = args.bypass_release_gate.as_deref() {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("--bypass-release-gate requires a non-empty reason");
+        }
+        record_ship_gate_bypass(&repo_root, &push_branch, &base_branch, reason, &ship_gate)?;
+        println!("release gate: bypassed; reason recorded in SHIP.md");
+    } else if ship_gate.is_blocked() {
+        record_ship_gate_blockers(&repo_root, &push_branch, &base_branch, &ship_gate)?;
+        bail!(
+            "auto ship release gate failed before model execution:\n{}",
+            ship_gate
+                .blockers
+                .iter()
+                .map(|blocker| format!("- {blocker}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    } else {
+        println!("release gate: passed");
+    }
 
     if let Some(commit) =
         auto_checkpoint_if_needed(&repo_root, push_branch.as_str(), "ship checkpoint")?
@@ -303,9 +698,144 @@ mod tests {
             .expect("git commit failed");
     }
 
+    fn write_release_reports(repo_root: &std::path::Path, branch: &str, base_branch: &str) {
+        fs::write(
+            repo_root.join("QA.md"),
+            format!(
+                "# QA\n\nBranch: `{branch}`\nBase branch: `{base_branch}`\nCommands: `cargo test`\n"
+            ),
+        )
+        .expect("failed to write QA.md");
+        fs::write(
+            repo_root.join("HEALTH.md"),
+            format!(
+                "# HEALTH\n\nBranch: `{branch}`\nBase branch: `{base_branch}`\nObservations: healthy release surface.\n"
+            ),
+        )
+        .expect("failed to write HEALTH.md");
+        fs::write(
+            repo_root.join("SHIP.md"),
+            format!(
+                "# SHIP\n\nBranch: `{branch}`\nBase branch: `{base_branch}`\nRollback: revert the release commit.\nMonitoring: run `auto health` and inspect CI.\nPR: no PR because this is a base-branch release.\n"
+            ),
+        )
+        .expect("failed to write SHIP.md");
+    }
+
+    fn write_receipts(repo_root: &std::path::Path, commands: &[&str]) {
+        let receipt_dir = repo_root.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
+        let commands = commands
+            .iter()
+            .map(|command| format!(r#"{{"command":"{command}","exit_code":0,"status":"passed"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            receipt_dir.join("release.json"),
+            format!(r#"{{"commands":[{commands}]}}"#),
+        )
+        .expect("failed to write receipt");
+    }
+
+    fn write_passing_release_receipts(repo_root: &std::path::Path) {
+        write_receipts(
+            repo_root,
+            &[
+                "cargo fmt --check",
+                "cargo clippy --all-targets --all-features -- -D warnings",
+                "cargo test",
+                "cargo install --path . --root /tmp/autodev-install-proof",
+                "auto --version",
+            ],
+        );
+    }
+
+    #[test]
+    fn ship_gate_fails_without_installed_binary_proof() {
+        let repo = test_dir("missing-installed-proof");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_receipts(
+            &repo,
+            &[
+                "cargo fmt --check",
+                "cargo clippy --all-targets --all-features -- -D warnings",
+                "cargo test",
+            ],
+        );
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(report.is_blocked());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("missing installed-binary proof")));
+        assert!(!report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("QA.md")));
+    }
+
+    #[test]
+    fn ship_gate_reports_stale_qa_or_health() {
+        let repo = test_dir("stale-qa-health");
+        write_passing_release_receipts(&repo);
+        fs::write(
+            repo.join("QA.md"),
+            "# QA\n\nBranch: `old-branch`\nBase branch: `main`\nCommands: `cargo test`\n",
+        )
+        .expect("failed to write QA.md");
+        fs::write(
+            repo.join("HEALTH.md"),
+            "# HEALTH\n\nBranch: `feature/ship`\nBase branch: `main`\nPartial release surface untested.\n",
+        )
+        .expect("failed to write HEALTH.md");
+        fs::write(
+            repo.join("SHIP.md"),
+            "# SHIP\n\nRollback: revert the release commit.\nMonitoring: inspect CI.\nPR: no PR because this is a base-branch release.\n",
+        )
+        .expect("failed to write SHIP.md");
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(report.is_blocked());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("`QA.md` is stale")));
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("`HEALTH.md` is stale")));
+    }
+
+    #[test]
+    fn ship_gate_bypass_records_operator_reason() {
+        let repo = test_dir("bypass-record");
+        let report = ShipGateReport {
+            blockers: vec!["missing validation receipt: `cargo test`".to_string()],
+        };
+
+        record_ship_gate_bypass(
+            &repo,
+            "feature/ship",
+            "main",
+            "release manager accepted live CI evidence",
+            &report,
+        )
+        .expect("failed to record bypass");
+
+        let ship = fs::read_to_string(repo.join("SHIP.md")).expect("failed to read SHIP.md");
+        assert!(ship.contains("Bypassed before model execution"));
+        assert!(ship.contains("Operator bypass reason: release manager accepted live CI evidence"));
+        assert!(ship.contains("missing validation receipt: `cargo test`"));
+    }
+
     #[test]
     fn default_ship_prompt_includes_operational_release_controls() {
         let prompt = render_default_ship_prompt("main", "trunk");
+        assert!(prompt.contains("mechanical release gate"));
+        assert!(prompt.contains("bypass reason"));
         assert!(prompt.contains("rollback path"));
         assert!(prompt.contains("monitoring path"));
         assert!(prompt.contains("accessibility regressions"));

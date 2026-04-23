@@ -1160,6 +1160,10 @@ pub(crate) struct ShipArgs {
     #[arg(long)]
     run_root: Option<PathBuf>,
 
+    /// Bypass the pre-model release gate and record the operator reason in SHIP.md
+    #[arg(long, value_name = "REASON")]
+    bypass_release_gate: Option<String>,
+
     /// Codex executable to invoke
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
