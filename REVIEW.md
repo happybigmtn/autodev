@@ -215,3 +215,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-F02.json`
 - Completion artifacts: `.github/workflows/ci.yml`, `README.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `AD-018`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/release-readiness-gate.md`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-018.json`
+- Completion artifacts: `REVIEW.md`
+- Remaining blockers: missing REVIEW.md handoff

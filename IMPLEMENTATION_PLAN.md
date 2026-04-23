@@ -274,7 +274,7 @@
   Estimated scope: XS
   Completion signal: Release gate policy is decided with explicit blockers and implementation prerequisites.
 
-- [ ] `AD-018` Quality and security checkpoint
+- [x] `AD-018` Quality and security checkpoint
 
   Spec: `specs/230426-quality-pipelines-and-release-lifecycle.md`
   Why now: Audit staging, QA-only dirty-state enforcement, and release gate policy are the next risky cluster after parser, quota, and Symphony work; a checkpoint prevents release or CI work from proceeding on stale assumptions.
