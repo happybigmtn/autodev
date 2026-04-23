@@ -453,4 +453,4 @@
 
 - [x] `SAT-007` `src/completion_artifacts.rs` already requires review handoff, verification receipt presence when executable verification exists, and declared completion artifact existence before task completion is fully evidenced.
 
-- [~] `SAT-008` `src/symphony_command.rs` already requires `--symphony-root` or `AUTODEV_SYMPHONY_ROOT` for foreground Symphony runs and has deterministic parser tests for pending, blocked, partial, and completed task rows.
+- [x] `SAT-008` `src/symphony_command.rs` already requires `--symphony-root` or `AUTODEV_SYMPHONY_ROOT` for foreground Symphony runs and has deterministic parser tests for pending, blocked, partial, and completed task rows.
