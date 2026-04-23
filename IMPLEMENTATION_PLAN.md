@@ -449,7 +449,7 @@
 
 - [x] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
 
-- [~] `SAT-006` `auto parallel status` is already implemented as a status-only action that reports repo, branch, run root, tmux state, host processes, lanes, frontier, and health without launching new work.
+- [x] `SAT-006` `auto parallel status` is already implemented as a status-only action that reports repo, branch, run root, tmux state, host processes, lanes, frontier, and health without launching new work.
 
 - [~] `SAT-007` `src/completion_artifacts.rs` already requires review handoff, verification receipt presence when executable verification exists, and declared completion artifact existence before task completion is fully evidenced.
 
