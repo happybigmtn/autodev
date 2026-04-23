@@ -194,7 +194,7 @@
   Estimated scope: XS
   Completion signal: Receipt schema and zero-test policy are decided before implementation depends on output details.
 
-- [ ] `AD-013` Receipt-backed zero-test detection
+- [x] `AD-013` Receipt-backed zero-test detection
 
   Spec: `specs/230426-verification-receipts-and-completion-evidence.md`
   Why now: Automation can currently accept a receipt for a command that exits zero even when the test runner reports no tests executed; this weakens completion evidence for loop, parallel, Symphony, and review handoff.

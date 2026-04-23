@@ -63,3 +63,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-016.json`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff
+
+## `AD-013`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `scripts/run-task-verification.sh`, `scripts/verification_receipt.py`, `src/completion_artifacts.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-013.json`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff
