@@ -169,6 +169,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         max_turns: args.max_turns,
         parallelism: args.planning_parallelism,
         plan_only: false,
+        snapshot_only: false,
         sync_only: false,
     })
     .await?;

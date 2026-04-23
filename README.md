@@ -268,6 +268,8 @@ Useful flags:
 - `--planning-root <dir>` to point at a non-default corpus
 - `--output-dir <dir>` to control the disposable generation output
 - `--plan-only` to reuse an existing `gen-*` output and only regenerate the plan
+- `--snapshot-only` to write and verify a reviewable `gen-*` snapshot without syncing root specs or
+  the root `IMPLEMENTATION_PLAN.md`; promote it later with `--sync-only --output-dir <gen-dir>`
 - `--model`, `--reasoning-effort`, `--max-turns`, and `--parallelism` to tune the generation pass
 
 Binary provenance:
@@ -379,7 +381,7 @@ When to run it:
 Useful flags:
 
 - Same as `auto gen`: `--planning-root`, `--output-dir`, `--model`, `--reasoning-effort`, `--max-turns`,
-  `--parallelism`, `--plan-only`
+  `--parallelism`, `--plan-only`, `--snapshot-only`
 
 ### `auto bug`
 

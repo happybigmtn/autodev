@@ -499,6 +499,10 @@ pub(crate) struct GenerationArgs {
     #[arg(long)]
     plan_only: bool,
 
+    /// Write a reviewable gen-* snapshot without syncing root specs or the root plan
+    #[arg(long, conflicts_with = "sync_only")]
+    snapshot_only: bool,
+
     /// Skip authoring and only verify/sync an existing gen-* output dir
     #[arg(long)]
     sync_only: bool,

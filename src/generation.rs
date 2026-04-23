@@ -378,6 +378,12 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     let run_started_at = Instant::now();
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    if args.snapshot_only && args.sync_only {
+        bail!(
+            "`{} --snapshot-only` cannot be combined with `--sync-only`; use --sync-only later to promote a reviewed snapshot",
+            mode.command_label()
+        );
+    }
     let mut state = load_state(&repo_root)?;
     let planning_root = args
         .planning_root
@@ -420,6 +426,10 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
+    println!(
+        "snapshot:    {}",
+        if args.snapshot_only { "yes" } else { "no" }
+    );
     println!("sync only:   {}", if args.sync_only { "yes" } else { "no" });
 
     if args.plan_only || args.sync_only {
@@ -566,16 +576,19 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         implementation_plan = verify_generated_implementation_plan(&output_dir)?;
         Some(review)
     };
-    let sync_summary = sync_verified_generation_outputs(SyncVerifiedGenerationOutputs {
-        repo_root: &repo_root,
-        mode,
-        planning_root: &planning_root,
-        output_dir: &output_dir,
-        generated_specs: &generated_specs,
-        implementation_plan: &implementation_plan,
-        state: &mut state,
-        run_started_at,
-    })?;
+    let sync_summary = finalize_verified_generation_outputs(
+        SyncVerifiedGenerationOutputs {
+            repo_root: &repo_root,
+            mode,
+            planning_root: &planning_root,
+            output_dir: &output_dir,
+            generated_specs: &generated_specs,
+            implementation_plan: &implementation_plan,
+            state: &mut state,
+            run_started_at,
+        },
+        args.snapshot_only,
+    )?;
 
     println!("{} complete", mode.command_label());
     println!("repo root:   {}", repo_root.display());
@@ -598,15 +611,20 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("specs:       {}", generated_specs.len());
     println!("plan:        {}", implementation_plan.display());
-    println!(
-        "root specs:  {} appended, {} skipped",
-        sync_summary.root_specs.appended_paths.len(),
-        sync_summary.root_specs.skipped_count
-    );
-    if let Some(root_plan) = sync_summary.root_plan {
-        println!("root plan:   {}", root_plan.display());
+    if let Some(sync_summary) = sync_summary {
+        println!(
+            "root specs:  {} appended, {} skipped",
+            sync_summary.root_specs.appended_paths.len(),
+            sync_summary.root_specs.skipped_count
+        );
+        if let Some(root_plan) = sync_summary.root_plan {
+            println!("root plan:   {}", root_plan.display());
+        } else {
+            println!("root plan:   unchanged");
+        }
     } else {
-        println!("root plan:   unchanged");
+        println!("root specs:  unchanged (snapshot only)");
+        println!("root plan:   unchanged (snapshot only)");
     }
     if let Some(plan_phase) = plan_phase {
         println!("plan prompt: {}", plan_phase.prompt_path.display());
@@ -641,6 +659,24 @@ struct SyncVerifiedGenerationOutputs<'a> {
     run_started_at: Instant,
 }
 
+fn finalize_verified_generation_outputs(
+    input: SyncVerifiedGenerationOutputs<'_>,
+    snapshot_only: bool,
+) -> Result<Option<SyncGeneratedOutputsSummary>> {
+    if snapshot_only {
+        print_stage("save generator state", input.run_started_at);
+        save_generation_state(
+            input.repo_root,
+            input.planning_root,
+            input.output_dir,
+            input.state,
+        )?;
+        return Ok(None);
+    }
+
+    sync_verified_generation_outputs(input).map(Some)
+}
+
 fn sync_verified_generation_outputs(
     input: SyncVerifiedGenerationOutputs<'_>,
 ) -> Result<SyncGeneratedOutputsSummary> {
@@ -667,13 +703,22 @@ fn sync_verified_generation_outputs(
     scrub_root_generated_outputs(repo_root, mode)?;
 
     print_stage("save generator state", run_started_at);
-    state.planning_root = Some(planning_root.to_path_buf());
-    state.latest_output_dir = Some(output_dir.to_path_buf());
-    save_state(repo_root, state)?;
+    save_generation_state(repo_root, planning_root, output_dir, state)?;
     Ok(SyncGeneratedOutputsSummary {
         root_specs,
         root_plan,
     })
+}
+
+fn save_generation_state(
+    repo_root: &Path,
+    planning_root: &Path,
+    output_dir: &Path,
+    state: &mut AutoState,
+) -> Result<()> {
+    state.planning_root = Some(planning_root.to_path_buf());
+    state.latest_output_dir = Some(output_dir.to_path_buf());
+    save_state(repo_root, state)
 }
 
 fn print_stage(stage: &str, run_started_at: Instant) {
@@ -3529,19 +3574,21 @@ mod tests {
     use super::{
         author_phase_uses_claude_model, build_corpus_codex_review_prompt, build_corpus_prompt,
         build_generation_codex_review_prompt, build_implementation_plan_prompt,
-        generated_spec_has_acceptance_criteria, lint_session_resume_wire_contract,
-        lint_signature_policy_consistency, merge_generated_plan_with_existing_open_tasks,
-        normalize_generated_implementation_plan, normalize_generated_spec_markdown,
-        rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_shapes,
-        sanitize_corpus_repo_root_paths, scrub_root_generated_outputs,
-        sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
-        verify_generated_implementation_plan, ActivePlanSurface, CorpusPromptInputs,
-        GeneratedSpecDocument, GenerationMode, SpecSyncSummary, IMPLEMENTATION_PLAN_HEADER,
+        finalize_verified_generation_outputs, generated_spec_has_acceptance_criteria,
+        lint_session_resume_wire_contract, lint_signature_policy_consistency,
+        merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
+        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root,
+        sanitize_corpus_numbered_plan_shapes, sanitize_corpus_repo_root_paths,
+        scrub_root_generated_outputs, sync_generated_specs_to_root_for_date,
+        verify_corpus_execplan, verify_corpus_outputs, verify_generated_implementation_plan,
+        verify_generated_specs, ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument,
+        GenerationMode, SpecSyncSummary, SyncVerifiedGenerationOutputs, IMPLEMENTATION_PLAN_HEADER,
     };
+    use crate::state::{load_state, AutoState};
     use chrono::NaiveDate;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     fn generated_spec(slug: &str, text: &str) -> GeneratedSpecDocument {
         GeneratedSpecDocument {
@@ -4830,6 +4877,89 @@ No external dependencies.
             verify_generated_implementation_plan(&root).expect_err("expected missing spec failure");
 
         assert!(error.to_string().contains("references missing spec"));
+    }
+
+    #[test]
+    fn snapshot_only_generation_does_not_sync_root_outputs() {
+        let repo_root = temp_dir("snapshot-only-root");
+        let planning_root = repo_root.join("genesis");
+        let output_dir = repo_root.join("gen-050426-000000");
+        fs::create_dir_all(&planning_root).unwrap();
+        fs::create_dir_all(repo_root.join("specs")).unwrap();
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(planning_root.join("PLANS.md"), "seed corpus\n").unwrap();
+        fs::write(
+            repo_root.join("specs").join("050426-real.md"),
+            "root spec stays put\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\nroot plan stays put\n",
+        )
+        .unwrap();
+        fs::write(repo_root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        write_real_spec(&output_dir);
+        write_generated_plan(&output_dir, &valid_generated_plan_task());
+
+        let original_root_spec =
+            fs::read_to_string(repo_root.join("specs").join("050426-real.md")).unwrap();
+        let original_root_plan =
+            fs::read_to_string(repo_root.join("IMPLEMENTATION_PLAN.md")).unwrap();
+        let original_genesis = fs::read_to_string(planning_root.join("PLANS.md")).unwrap();
+        let original_source = fs::read_to_string(repo_root.join("src").join("main.rs")).unwrap();
+        let generated_specs = verify_generated_specs(&output_dir).unwrap();
+        let implementation_plan = verify_generated_implementation_plan(&output_dir).unwrap();
+        let mut state = AutoState::default();
+
+        let summary = finalize_verified_generation_outputs(
+            SyncVerifiedGenerationOutputs {
+                repo_root: &repo_root,
+                mode: GenerationMode::Gen,
+                planning_root: &planning_root,
+                output_dir: &output_dir,
+                generated_specs: &generated_specs,
+                implementation_plan: &implementation_plan,
+                state: &mut state,
+                run_started_at: Instant::now(),
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(summary.is_none());
+        assert_eq!(
+            fs::read_to_string(repo_root.join("specs").join("050426-real.md")).unwrap(),
+            original_root_spec
+        );
+        assert_eq!(
+            fs::read_to_string(repo_root.join("IMPLEMENTATION_PLAN.md")).unwrap(),
+            original_root_plan
+        );
+        assert_eq!(
+            fs::read_to_string(planning_root.join("PLANS.md")).unwrap(),
+            original_genesis
+        );
+        assert_eq!(
+            fs::read_to_string(repo_root.join("src").join("main.rs")).unwrap(),
+            original_source
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("IMPLEMENTATION_PLAN.md")).unwrap(),
+            format!(
+                "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\n{}\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+                valid_generated_plan_task()
+            )
+        );
+        let saved_state = load_state(&repo_root).unwrap();
+        assert_eq!(
+            saved_state.planning_root.as_deref(),
+            Some(planning_root.as_path())
+        );
+        assert_eq!(
+            saved_state.latest_output_dir.as_deref(),
+            Some(output_dir.as_path())
+        );
     }
 
     #[test]
