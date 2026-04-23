@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -181,58 +182,195 @@ impl QuotaConfig {
 }
 
 pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Result<()> {
-    fs::create_dir_all(profile_dir)
-        .with_context(|| format!("failed to create {}", profile_dir.display()))?;
+    let staged_profile_dir = staged_profile_dir(profile_dir)?;
+    if staged_profile_dir.exists() {
+        remove_profile_dir(&staged_profile_dir)?;
+    }
+    fs::create_dir_all(&staged_profile_dir)
+        .with_context(|| format!("failed to create {}", staged_profile_dir.display()))?;
 
-    let source = provider.auth_source();
-    match provider {
-        Provider::Codex => {
-            if !source.exists() {
-                bail!(
-                    "codex auth file not found at {}. Log in with `codex` first.",
-                    source.display()
-                );
-            }
-            fs::copy(&source, profile_dir.join("auth.json")).with_context(|| {
-                format!(
-                    "failed to copy {} -> {}",
-                    source.display(),
-                    profile_dir.display()
-                )
-            })?;
-        }
-        Provider::Claude => {
-            if !source.exists() {
-                bail!(
-                    "claude config directory not found at {}. Log in with `claude` first.",
-                    source.display()
-                );
-            }
-            for filename in &[".credentials.json", "credentials.json", "statsig"] {
-                let src = source.join(filename);
-                if src.exists() {
-                    let dst = profile_dir.join(filename);
-                    if src.is_dir() {
-                        copy_dir_recursive(&src, &dst)?;
-                    } else {
-                        fs::copy(&src, &dst).with_context(|| {
-                            format!("failed to copy {} -> {}", src.display(), dst.display())
-                        })?;
-                    }
+    let capture_result = (|| -> Result<()> {
+        let source = provider.auth_source();
+        match provider {
+            Provider::Codex => {
+                if missing_path(&source)? {
+                    bail!(
+                        "codex auth file not found at {}. Log in with `codex` first.",
+                        source.display()
+                    );
                 }
+                copy_credential_file(&source, &staged_profile_dir.join("auth.json"))
             }
-            let home = dirs::home_dir().expect("cannot resolve home directory");
-            let claude_json = home.join(".claude.json");
-            if claude_json.exists() {
-                fs::copy(&claude_json, profile_dir.join(".claude.json"))
-                    .with_context(|| format!("failed to copy {}", claude_json.display()))?;
+            Provider::Claude => {
+                if missing_path(&source)? {
+                    bail!(
+                        "claude config directory not found at {}. Log in with `claude` first.",
+                        source.display()
+                    );
+                }
+                ensure_credential_dir(&source)?;
+                for filename in &[".credentials.json", "credentials.json", "statsig"] {
+                    let src = source.join(filename);
+                    copy_optional_credential_path(&src, &staged_profile_dir.join(filename))?;
+                }
+                let home = dirs::home_dir().expect("cannot resolve home directory");
+                let claude_json = home.join(".claude.json");
+                copy_optional_credential_path(
+                    &claude_json,
+                    &staged_profile_dir.join(".claude.json"),
+                )
             }
         }
+    })();
+
+    if let Err(error) = capture_result {
+        let _ = fs::remove_dir_all(&staged_profile_dir);
+        return Err(error);
+    }
+
+    replace_profile_dir(profile_dir, &staged_profile_dir)
+}
+
+fn staged_profile_dir(profile_dir: &Path) -> Result<PathBuf> {
+    let parent = profile_dir
+        .parent()
+        .with_context(|| format!("{} has no parent directory", profile_dir.display()))?;
+    let name = profile_dir
+        .file_name()
+        .with_context(|| format!("{} has no file name", profile_dir.display()))?
+        .to_string_lossy();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before unix epoch")?
+        .as_nanos();
+    Ok(parent.join(format!(".{name}.capture-{}-{stamp}", std::process::id())))
+}
+
+fn replace_profile_dir(profile_dir: &Path, staged_profile_dir: &Path) -> Result<()> {
+    remove_profile_dir(profile_dir)?;
+    fs::rename(staged_profile_dir, profile_dir).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            profile_dir.display(),
+            staged_profile_dir.display()
+        )
+    })
+}
+
+fn remove_profile_dir(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to replace symlinked profile directory {}",
+            path.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to replace non-directory profile path {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+fn missing_path(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn copy_optional_credential_path(src: &Path, dst: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(src) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", src.display()))
+        }
+    };
+    copy_credential_path_with_metadata(src, dst, &meta)
+}
+
+fn ensure_credential_dir(src: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to copy non-directory credential path {}",
+            src.display()
+        );
     }
     Ok(())
 }
 
+fn copy_credential_path_with_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if meta.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else if meta.is_file() {
+        copy_credential_file(src, dst)
+    } else {
+        bail!(
+            "refusing to copy non-regular credential path {}",
+            src.display()
+        );
+    }
+}
+
+fn copy_credential_file(src: &Path, dst: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "refusing to copy non-regular credential path {}",
+            src.display()
+        );
+    }
+    let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    write_0o600_if_unix(dst, &bytes)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to copy non-directory credential path {}",
+            src.display()
+        );
+    }
     fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
     for entry in
         fs::read_dir(src).with_context(|| format!("failed to read directory {}", src.display()))?
@@ -240,25 +378,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let meta = match fs::symlink_metadata(&src_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            if let Ok(target) = fs::read_link(&src_path) {
-                let _ = std::os::unix::fs::symlink(&target, &dst_path);
-            }
-        } else if meta.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            fs::copy(&src_path, &dst_path).with_context(|| {
-                format!(
-                    "failed to copy {} -> {}",
-                    src_path.display(),
-                    dst_path.display()
-                )
-            })?;
-        }
+        let meta = fs::symlink_metadata(&src_path)
+            .with_context(|| format!("failed to stat {}", src_path.display()))?;
+        copy_credential_path_with_metadata(&src_path, &dst_path, &meta)?;
     }
     Ok(())
 }
@@ -310,6 +432,72 @@ mod tests {
     impl Drop for TempConfigHome {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    struct TempQuotaHome {
+        root: PathBuf,
+        home_previous: Option<OsString>,
+        config_previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempQuotaHome {
+        fn new(label: &str) -> Self {
+            let lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("autodev-{label}-{}-{stamp}", std::process::id()));
+            let home = root.join("home");
+            let config = root.join("config");
+            fs::create_dir_all(&home).expect("failed to create temp home");
+            fs::create_dir_all(&config).expect("failed to create temp config");
+            let home_previous = std::env::var_os("HOME");
+            let config_previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            Self {
+                root,
+                home_previous,
+                config_previous,
+                _lock: lock,
+            }
+        }
+
+        fn home(&self) -> PathBuf {
+            self.root.join("home")
+        }
+
+        fn profile_dir(&self, provider: Provider, name: &str) -> PathBuf {
+            self.root
+                .join("config")
+                .join("quota-router")
+                .join("profiles")
+                .join(format!("{}-{name}", provider.label()))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempQuotaHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.home_previous {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(previous) = &self.config_previous {
                 std::env::set_var("XDG_CONFIG_HOME", previous);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
@@ -387,6 +575,93 @@ mod tests {
         assert_eq!(codex_accounts.len(), 2);
         let claude_accounts = config.accounts_for_provider(Provider::Claude);
         assert_eq!(claude_accounts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_writes_codex_auth_owner_only() {
+        let home = TempQuotaHome::new("quota-config-codex-capture");
+        let codex_dir = home.home().join(".codex");
+        fs::create_dir_all(&codex_dir).expect("failed to create codex auth dir");
+        fs::write(codex_dir.join("auth.json"), br#"{"account":"active"}"#)
+            .expect("failed to write codex auth");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "work");
+        fs::create_dir_all(&profile_dir).expect("failed to create stale profile dir");
+        fs::write(profile_dir.join("stale.json"), br#"{"account":"stale"}"#)
+            .expect("failed to write stale profile file");
+
+        copy_auth_to_profile(Provider::Codex, &profile_dir).expect("codex capture should succeed");
+
+        let entries = fs::read_dir(&profile_dir)
+            .expect("failed to read profile dir")
+            .map(|entry| entry.expect("failed to read profile entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![OsString::from("auth.json")]);
+
+        let profile_auth = profile_dir.join("auth.json");
+        let meta = fs::symlink_metadata(&profile_auth).expect("failed to stat profile auth");
+        assert!(meta.is_file());
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_rejects_symlinked_codex_auth() {
+        let home = TempQuotaHome::new("quota-config-symlink-codex");
+        let codex_dir = home.home().join(".codex");
+        fs::create_dir_all(&codex_dir).expect("failed to create codex auth dir");
+        let real_auth = home.home().join("real-auth.json");
+        fs::write(&real_auth, br#"{"account":"linked"}"#).expect("failed to write real auth");
+        let linked_auth = codex_dir.join("auth.json");
+        std::os::unix::fs::symlink(&real_auth, &linked_auth).expect("failed to symlink auth");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "work");
+        let error = copy_auth_to_profile(Provider::Codex, &profile_dir)
+            .expect_err("symlinked codex auth should be rejected")
+            .to_string();
+
+        assert!(error.contains("symlinked credential path"));
+        assert!(error.contains(&linked_auth.display().to_string()));
+        assert!(!profile_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_prunes_stale_profile_files() {
+        let home = TempQuotaHome::new("quota-config-stale-profile");
+        let claude_dir = home.home().join(".claude");
+        fs::create_dir_all(&claude_dir).expect("failed to create claude config dir");
+        fs::write(
+            claude_dir.join(".credentials.json"),
+            br#"{"account":"active"}"#,
+        )
+        .expect("failed to write claude credentials");
+        fs::write(
+            claude_dir.join("credentials.json"),
+            br#"{"account":"stale-next"}"#,
+        )
+        .expect("failed to write removable claude credentials");
+        fs::write(home.home().join(".claude.json"), br#"{"home":"json"}"#)
+            .expect("failed to write claude home json");
+
+        let profile_dir = home.profile_dir(Provider::Claude, "work");
+        copy_auth_to_profile(Provider::Claude, &profile_dir)
+            .expect("initial claude capture should succeed");
+        assert!(profile_dir.join("credentials.json").exists());
+        assert!(profile_dir.join(".claude.json").exists());
+
+        fs::remove_file(claude_dir.join("credentials.json"))
+            .expect("failed to remove active credentials source");
+        fs::remove_file(home.home().join(".claude.json"))
+            .expect("failed to remove claude home json source");
+
+        copy_auth_to_profile(Provider::Claude, &profile_dir).expect("recapture should succeed");
+
+        assert!(profile_dir.join(".credentials.json").exists());
+        assert!(!profile_dir.join("credentials.json").exists());
+        assert!(!profile_dir.join(".claude.json").exists());
     }
 
     #[cfg(unix)]
