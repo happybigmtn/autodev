@@ -447,7 +447,7 @@
 
 - [x] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
 
-- [~] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
+- [x] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
 
 - [~] `SAT-006` `auto parallel status` is already implemented as a status-only action that reports repo, branch, run root, tmux state, host processes, lanes, frontier, and health without launching new work.
 
