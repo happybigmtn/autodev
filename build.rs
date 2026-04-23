@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rerun-if-changed=.");
     emit_git_rerun_markers();
 
     let git_sha = git_output(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());

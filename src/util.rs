@@ -735,7 +735,7 @@ mod tests {
         atomic_write, auto_checkpoint_if_needed, checkpoint_status, chmod_0o600_if_unix,
         clip_line_for_display, ensure_repo_layout_with, is_checkpoint_excluded_path,
         prune_old_entries, push_branch_with_remote_sync, stage_checkpoint_changes,
-        sync_branch_with_remote, truncate_file_to_max_bytes, write_0o600_if_unix,
+        sync_branch_with_remote, truncate_file_to_max_bytes, write_0o600_if_unix, CLI_LONG_VERSION,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -771,6 +771,35 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git stdout should be utf-8")
+    }
+
+    #[test]
+    fn cli_long_version_exposes_build_provenance_metadata() {
+        let lines: Vec<_> = CLI_LONG_VERSION.lines().collect();
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], env!("CARGO_PKG_VERSION"));
+
+        let commit = lines[1]
+            .strip_prefix("commit: ")
+            .expect("version should label the build commit");
+        assert!(!commit.trim().is_empty());
+
+        let dirty = lines[2]
+            .strip_prefix("dirty: ")
+            .expect("version should label the dirty-state flag");
+        assert!(
+            matches!(dirty, "clean" | "dirty" | "unknown"),
+            "unexpected dirty-state flag: {dirty}"
+        );
+
+        let profile = lines[3]
+            .strip_prefix("profile: ")
+            .expect("version should label the cargo build profile");
+        assert!(
+            matches!(profile, "debug" | "release" | "unknown"),
+            "unexpected build profile: {profile}"
+        );
     }
 
     fn init_remote_and_clones(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
