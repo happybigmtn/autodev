@@ -2,7 +2,7 @@
 
 ## Priority Work
 
-- [ ] `AD-001` Backend invocation inventory and policy gate
+- [x] `AD-001` Backend invocation inventory and policy gate
 
   Spec: `specs/230426-backend-invocation-policy-and-model-routing.md`
   Why now: Backend behavior is spread across direct `Command::new` calls, shared Claude and Codex wrappers, quota-routed Codex paths, Kimi, PI, Symphony, loop, parallel, bug, nemesis, audit, QA, health, ship, steward, and generation; refactoring before inventory risks changing model defaults or dangerous flag semantics accidentally.
