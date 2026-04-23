@@ -6,9 +6,11 @@ use anyhow::{bail, Context, Result};
 
 use crate::claude_exec::{describe_claude_harness, run_claude_exec, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec;
+use crate::completion_artifacts::inspect_task_completion_evidence;
+use crate::task_parser::{parse_task_header, parse_tasks, PlanTask, TaskStatus};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
-    push_branch_with_remote_sync, repo_name, sync_branch_with_remote, timestamp_slug,
+    push_branch_with_remote_sync, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
 };
 use crate::LoopArgs;
 
@@ -309,6 +311,25 @@ pub(crate) async fn run_loop(args: LoopArgs) -> Result<()> {
             }
         }
 
+        if let Some(reconciliation) =
+            reconcile_loop_task_completion_evidence(&repo_root, current_task.as_str())?
+        {
+            if reconciliation.plan_updated {
+                run_git(&repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+                let message = format!(
+                    "{}: {} completion evidence sync",
+                    repo_name(&repo_root),
+                    current_task
+                );
+                run_git(&repo_root, ["commit", "-m", &message])?;
+                println!(
+                    "completion: {} left `[~]` ({})",
+                    reconciliation.task_id,
+                    reconciliation.missing_reasons.join("; ")
+                );
+            }
+        }
+
         if push_branch_with_remote_sync(&repo_root, target_branch.as_str())? {
             println!("remote sync: rebased onto origin/{}", target_branch);
         }
@@ -360,29 +381,127 @@ fn inspect_loop_queue(repo_root: &Path) -> Result<LoopQueueSnapshot> {
 
 fn parse_loop_queue(plan: &str) -> LoopQueueSnapshot {
     let mut queue = LoopQueueSnapshot::default();
-    for line in plan.lines() {
-        let trimmed = line.trim_start();
-        if let Some(task) = trimmed.strip_prefix("- [ ] ") {
-            if let Some(task_id) = extract_task_id(task) {
-                queue.pending_ids.push(task_id);
+    let tasks = parse_tasks(plan);
+    for task in &tasks {
+        match task.status {
+            TaskStatus::Pending => queue.pending_ids.push(task.id.clone()),
+            TaskStatus::Partial => {
+                if !is_completion_path_placeholder(task, &tasks) {
+                    queue.pending_ids.push(task.id.clone());
+                }
             }
-        } else if let Some(task) = trimmed.strip_prefix("- [~] ") {
-            if let Some(task_id) = extract_task_id(task) {
-                queue.pending_ids.push(task_id);
-            }
-        } else if let Some(task) = trimmed.strip_prefix("- [!] ") {
-            if let Some(task_id) = extract_task_id(task) {
-                queue.blocked_ids.push(task_id);
-            }
+            TaskStatus::Blocked => queue.blocked_ids.push(task.id.clone()),
+            TaskStatus::Done => {}
         }
     }
     queue
 }
 
-fn extract_task_id(task_line: &str) -> Option<String> {
-    let rest = task_line.strip_prefix('`')?;
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
+fn is_completion_path_placeholder(task: &PlanTask, tasks: &[PlanTask]) -> bool {
+    if task.status != TaskStatus::Partial {
+        return false;
+    }
+    let Some(target) = task.completion_path_target.as_deref() else {
+        return false;
+    };
+    target != task.id && tasks.iter().any(|candidate| candidate.id == target)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoopCompletionReconciliation {
+    task_id: String,
+    missing_reasons: Vec<String>,
+    plan_updated: bool,
+}
+
+fn reconcile_loop_task_completion_evidence(
+    repo_root: &Path,
+    task_id: &str,
+) -> Result<Option<LoopCompletionReconciliation>> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(None);
+    }
+
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let Some(task) = parse_tasks(&plan)
+        .into_iter()
+        .find(|task| task.id == task_id)
+    else {
+        return Ok(None);
+    };
+    if task.status != TaskStatus::Done {
+        return Ok(None);
+    }
+
+    let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    if evidence.is_fully_evidenced() {
+        return Ok(Some(LoopCompletionReconciliation {
+            task_id: task.id,
+            missing_reasons: Vec::new(),
+            plan_updated: false,
+        }));
+    }
+
+    let missing_reasons = evidence.missing_reasons();
+    let updated = update_loop_task_status_in_plan_text(&plan, &task.id, TaskStatus::Partial);
+    let plan_updated = updated != plan;
+    if plan_updated {
+        atomic_write(&plan_path, updated.as_bytes())
+            .with_context(|| format!("failed to write {}", plan_path.display()))?;
+    }
+
+    Ok(Some(LoopCompletionReconciliation {
+        task_id: task.id,
+        missing_reasons,
+        plan_updated,
+    }))
+}
+
+fn update_loop_task_status_in_plan_text(plan: &str, task_id: &str, status: TaskStatus) -> String {
+    let mut updated = String::new();
+
+    for chunk in plan.split_inclusive('\n') {
+        let line = chunk.trim_end_matches('\n').trim_end_matches('\r');
+        if let Some((_, current_task_id, _)) = parse_task_header(line) {
+            if current_task_id == task_id {
+                updated.push_str(&mark_loop_task_header_status(chunk, status));
+                continue;
+            }
+        }
+        updated.push_str(chunk);
+    }
+
+    updated
+}
+
+fn mark_loop_task_header_status(line: &str, status: TaskStatus) -> String {
+    let newline = if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("- [!] "))
+        .or_else(|| trimmed.strip_prefix("- [~] "))
+        .or_else(|| trimmed.strip_prefix("- [x] "))
+        .or_else(|| trimmed.strip_prefix("- [X] "))
+        .unwrap_or(trimmed);
+    let marker = match status {
+        TaskStatus::Pending => "- [ ]",
+        TaskStatus::Partial => "- [~]",
+        TaskStatus::Blocked => "- [!]",
+        TaskStatus::Done => "- [x]",
+    };
+    format!("{indent}{marker} {rest}{newline}")
 }
 
 fn render_default_loop_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
@@ -675,9 +794,9 @@ mod tests {
 
     use super::{
         build_iteration_prompt, discover_sibling_git_repos, parse_loop_queue,
-        parse_origin_head_branch, pick_loop_branch, render_default_loop_prompt,
-        resolve_reference_repos, summarize_repo_progress, LoopQueueSnapshot, RepoProgress,
-        TrackedRepoState,
+        parse_origin_head_branch, pick_loop_branch, reconcile_loop_task_completion_evidence,
+        render_default_loop_prompt, resolve_reference_repos, summarize_repo_progress,
+        LoopQueueSnapshot, RepoProgress, TrackedRepoState,
     };
 
     #[test]
@@ -819,6 +938,69 @@ mod tests {
                 blocked_ids: vec!["BLOCKED-001".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn parse_loop_queue_skips_partial_completion_path_placeholders() {
+        let queue = parse_loop_queue(
+            r#"
+- [~] `TASK-001` Historical evidence gap. Completion path: `TASK-010`.
+  Dependencies: none
+- [ ] `TASK-010` Real completion path
+  Dependencies: none
+- [ ] `TASK-020` Next task
+  Dependencies: none
+"#,
+        );
+
+        assert_eq!(
+            queue,
+            LoopQueueSnapshot {
+                pending_ids: vec!["TASK-010".to_string(), "TASK-020".to_string()],
+                blocked_ids: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn loop_marks_task_partial_when_completion_evidence_missing() {
+        let root = unique_temp_dir("loop-completion-evidence");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            r#"- [x] `TASK-1` Evidence-backed task
+
+  Verification: `cargo test loop_command::tests::loop_marks_task_partial_when_completion_evidence_missing`
+  Completion artifacts: `docs/proof.md`
+  Dependencies: none
+"#,
+        )
+        .expect("failed to write plan");
+
+        let reconciliation = reconcile_loop_task_completion_evidence(&root, "TASK-1")
+            .expect("reconciliation should succeed")
+            .expect("done task should be reconciled");
+
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md"))
+            .expect("failed to read updated plan");
+        assert!(reconciliation.plan_updated);
+        assert!(reconciliation
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("missing REVIEW.md handoff")));
+        assert!(reconciliation
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("missing verification receipt")));
+        assert!(reconciliation
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("missing completion artifact")));
+        assert!(plan.contains("- [~] `TASK-1` Evidence-backed task"));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp workspace");
     }
 
     #[test]
