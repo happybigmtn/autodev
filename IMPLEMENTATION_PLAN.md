@@ -162,7 +162,7 @@
   Estimated scope: XS
   Completion signal: Review handoff states whether quota credential safety is green, blocked, or partial with concrete residual risks.
 
-- [ ] `AD-011` Harden Symphony workflow scalar rendering
+- [x] `AD-011` Harden Symphony workflow scalar rendering
 
   Spec: `specs/230426-symphony-workflow-and-linear-sync.md`
   Why now: `auto symphony workflow` renders branch, model, reasoning effort, paths, and remote URL into executable workflow text, and branch/model/reasoning strings currently reach shell or YAML command text without full validation or quoting.
