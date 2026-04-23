@@ -31,3 +31,11 @@
 - Validation: verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-006.json` is missing command(s): `rg -n "Doctor|doctor|self-test|preflight" src/main.rs src/*_command.rs README.md`
 - Completion artifacts: `docs/decisions/first-run-preflight.md`
 - Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-006.json` is missing command(s): `rg -n "Doctor|doctor|self-test|preflight" src/main.rs src/*_command.rs README.md`
+
+## `AD-008`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_config.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-008.json`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff

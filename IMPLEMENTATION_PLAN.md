@@ -114,7 +114,7 @@
   Estimated scope: M
   Completion signal: The decided no-model command is implemented, tested, and documented as distinct from model-backed health.
 
-- [ ] `AD-008` Quota profile capture rejects symlinks and stale credentials
+- [x] `AD-008` Quota profile capture rejects symlinks and stale credentials
 
   Spec: `specs/230426-quota-router-and-credential-safety.md`
   Why now: Profile capture currently copies active auth into quota profiles with raw file copies and recursive symlink preservation, which can leak stale or linked credential material between accounts.
