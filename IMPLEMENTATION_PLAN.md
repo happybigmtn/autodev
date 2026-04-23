@@ -130,7 +130,7 @@
   Estimated scope: M
   Completion signal: Capture rejects symlinks, prunes stale profile files, and keeps owner-only config behavior intact.
 
-- [ ] `AD-009` Quota active credential restore covers Claude home JSON
+- [x] `AD-009` Quota active credential restore covers Claude home JSON
 
   Spec: `specs/230426-quota-router-and-credential-safety.md`
   Why now: Quota-routed Claude execution backs up both `~/.claude` and `~/.claude.json`, but the normal provider restore helper only restores the Claude directory, leaving one credential surface inconsistent outside guard-drop cleanup paths.
