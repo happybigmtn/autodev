@@ -66,7 +66,7 @@
   Estimated scope: XS
   Completion signal: Review handoff records the parser checkpoint and names the next permitted parser migration surface.
 
-- [ ] `AD-005` Snapshot-only generation decision
+- [x] `AD-005` Snapshot-only generation decision
 
   Spec: `specs/230426-planning-corpus-and-generation.md`
   Why now: Current generation always syncs verified generated specs and plans back to root after normal authoring, while the generated specs describe snapshot-only behavior as a recommendation and still list the product shape as unresolved.
