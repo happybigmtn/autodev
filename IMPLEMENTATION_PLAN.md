@@ -421,7 +421,7 @@
   Estimated scope: M
   Completion signal: Loop completion behavior matches the shared evidence gate for receipt-backed tasks without adopting parallel lane mechanics.
 
-- [ ] `AD-F06` Mechanical ship gate
+- [x] `AD-F06` Mechanical ship gate
 
   Spec: `specs/230426-quality-pipelines-and-release-lifecycle.md`
   Why now: Once release readiness policy and installed-binary proof exist, `auto ship` can fail before invoking a model when required local evidence is missing or stale.
