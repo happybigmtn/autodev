@@ -876,6 +876,15 @@ mod tests {
 
     #[test]
     fn checkpoint_exclusion_rules_cover_all_generated_paths() {
+        assert_checkpoint_excludes_generated_and_runtime_paths();
+    }
+
+    #[test]
+    fn checkpoint_excludes_generated_and_runtime_paths() {
+        assert_checkpoint_excludes_generated_and_runtime_paths();
+    }
+
+    fn assert_checkpoint_excludes_generated_and_runtime_paths() {
         for excluded in [
             ".auto",
             ".auto/logs/run.log",

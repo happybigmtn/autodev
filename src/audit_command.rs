@@ -834,7 +834,8 @@ fn apply_verdict(
             match apply_patch(repo_root, &patch) {
                 Ok(_) => {
                     let message = format!("audit: {} {}", verdict.verdict, rel_path);
-                    let commit = commit_all(repo_root, branch, &message)?;
+                    let commit =
+                        commit_scoped(repo_root, branch, &message, &[rel_path.to_string()])?;
                     Ok((EntryStatus::Audited, commit))
                 }
                 Err(err) => {
@@ -924,18 +925,50 @@ fn apply_patch(repo_root: &Path, patch: &Path) -> Result<()> {
     Ok(())
 }
 
-fn commit_all(repo_root: &Path, branch: &str, message: &str) -> Result<Option<String>> {
+fn commit_scoped(
+    repo_root: &Path,
+    branch: &str,
+    message: &str,
+    pathspecs: &[String],
+) -> Result<Option<String>> {
     let _ = branch;
-    run_git(repo_root, ["add", "-A"])?;
-    let status = git_stdout(repo_root, ["status", "--porcelain"])?;
+    if pathspecs.is_empty() {
+        bail!("audit commit requires at least one scoped pathspec");
+    }
+
+    let mut add_args = vec!["add", "--"];
+    add_args.extend(pathspecs.iter().map(String::as_str));
+    run_git(repo_root, add_args)?;
+
+    let mut status_args = vec!["status", "--porcelain", "--"];
+    status_args.extend(pathspecs.iter().map(String::as_str));
+    let status = git_stdout(repo_root, status_args)?;
     if status.trim().is_empty() {
         return Ok(None);
     }
-    run_git(repo_root, ["commit", "-m", message])?;
+
+    let mut commit_args = vec!["commit", "-m", message, "--"];
+    commit_args.extend(pathspecs.iter().map(String::as_str));
+    run_git(repo_root, commit_args)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?
         .trim()
         .to_string();
     Ok(Some(commit))
+}
+
+fn repo_relative_pathspec(repo_root: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(repo_root).with_context(|| {
+        format!(
+            "audit commit path {} is outside repo {}",
+            path.display(),
+            repo_root.display()
+        )
+    })?;
+    let pathspec = relative.to_string_lossy().replace('\\', "/");
+    if pathspec.is_empty() {
+        bail!("audit commit path {} resolved to repo root", path.display());
+    }
+    Ok(pathspec)
 }
 
 fn record_worklist_entry(
@@ -967,7 +1000,8 @@ fn record_worklist_entry(
     atomic_write(&worklist_path, current.as_bytes())
         .with_context(|| format!("failed to write {}", worklist_path.display()))?;
     let message = format!("audit: {} {} (worklist)", verdict_tag, rel_path);
-    let commit = commit_all(repo_root, branch, &message)?;
+    let pathspecs = vec![repo_relative_pathspec(repo_root, &worklist_path)?];
+    let commit = commit_scoped(repo_root, branch, &message, &pathspecs)?;
     Ok((EntryStatus::Audited, commit))
 }
 
@@ -1002,7 +1036,8 @@ fn append_retire_candidate(
     atomic_write(&retire_path, current.as_bytes())
         .with_context(|| format!("failed to write {}", retire_path.display()))?;
     let message = format!("audit: RETIRE candidate {}", rel_path);
-    let commit = commit_all(repo_root, branch, &message)?;
+    let pathspecs = vec![repo_relative_pathspec(repo_root, &retire_path)?];
+    let commit = commit_scoped(repo_root, branch, &message, &pathspecs)?;
     Ok((EntryStatus::Audited, commit))
 }
 
@@ -1300,6 +1335,14 @@ mod tests {
         String::from_utf8(output.stdout).expect("git stdout should be utf-8")
     }
 
+    fn last_commit_paths(repo: &Path) -> Vec<String> {
+        run_git_in(repo, ["show", "--format=", "--name-only", "HEAD"])
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     fn init_repo(name: &str) -> TestTempDir {
         let repo = TestTempDir::new(name);
         run_git_in(repo.path(), ["init"]);
@@ -1493,6 +1536,144 @@ mod tests {
             "audit: DRIFT-LARGE README.md (worklist)"
         );
         assert_eq!(run_git_in(repo.path(), ["status", "--short"]), "");
+    }
+
+    #[test]
+    fn commit_audit_outputs_uses_scoped_pathspecs() {
+        let repo = init_repo("audit-scoped-patch");
+        let output_dir = repo.path().join("audit");
+        let file_dir = output_dir.join("files").join("drift-small");
+        fs::create_dir_all(&file_dir).expect("failed to create file dir");
+        fs::create_dir_all(repo.path().join(".auto").join("logs"))
+            .expect("failed to create auto dir");
+        fs::create_dir_all(repo.path().join("bug")).expect("failed to create bug dir");
+        fs::create_dir_all(repo.path().join("nemesis")).expect("failed to create nemesis dir");
+        fs::create_dir_all(repo.path().join("gen-001")).expect("failed to create gen dir");
+        fs::write(
+            repo.path().join(".auto").join("logs").join("run.log"),
+            "runtime\n",
+        )
+        .expect("failed to write auto log");
+        fs::write(repo.path().join("bug").join("BUG.md"), "# bug\n")
+            .expect("failed to write bug artifact");
+        fs::write(repo.path().join("nemesis").join("REPORT.md"), "# nemesis\n")
+            .expect("failed to write nemesis artifact");
+        fs::write(repo.path().join("gen-001").join("SPEC.md"), "# generated\n")
+            .expect("failed to write generated artifact");
+        fs::write(
+            file_dir.join("patch.diff"),
+            "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-# temp
++# audited
+",
+        )
+        .expect("failed to write patch");
+
+        let (status, commit) = apply_verdict(
+            repo.path(),
+            &output_dir,
+            "main",
+            "README.md",
+            &file_dir,
+            &verdict("DRIFT-SMALL", "tighten README"),
+            false,
+        )
+        .expect("patch verdict should commit only the audited file");
+
+        assert_eq!(status, EntryStatus::Audited);
+        assert!(commit.is_some());
+        assert_eq!(last_commit_paths(repo.path()), vec!["README.md"]);
+        let status = run_git_in(repo.path(), ["status", "--short"]);
+        assert!(status.contains("?? .auto/"), "{status}");
+        assert!(status.contains("?? audit/"), "{status}");
+        assert!(status.contains("?? bug/"), "{status}");
+        assert!(status.contains("?? gen-001/"), "{status}");
+        assert!(status.contains("?? nemesis/"), "{status}");
+    }
+
+    #[test]
+    fn audit_commit_excludes_generated_and_runtime_artifacts() {
+        let repo = init_repo("audit-scoped-worklist");
+        let output_dir = repo.path().join("audit");
+        let file_dir = output_dir.join("files").join("drift-large");
+        fs::create_dir_all(&file_dir).expect("failed to create file dir");
+        fs::write(
+            file_dir.join("worklist-entry.md"),
+            "- `README.md` audit DRIFT-LARGE: capture follow-up\n",
+        )
+        .expect("failed to write transient audit output");
+        fs::create_dir_all(repo.path().join(".auto").join("audit"))
+            .expect("failed to create auto dir");
+        fs::create_dir_all(repo.path().join("bug")).expect("failed to create bug dir");
+        fs::create_dir_all(repo.path().join("nemesis")).expect("failed to create nemesis dir");
+        fs::create_dir_all(repo.path().join("gen-001")).expect("failed to create gen dir");
+        fs::create_dir_all(
+            repo.path()
+                .join(".config")
+                .join("quota-router")
+                .join("profiles"),
+        )
+        .expect("failed to create quota profile dir");
+        fs::write(
+            repo.path().join(".auto").join("audit").join("receipt.json"),
+            "{}\n",
+        )
+        .expect("failed to write auto receipt");
+        fs::write(repo.path().join("bug").join("BUG.md"), "# bug\n")
+            .expect("failed to write bug artifact");
+        fs::write(repo.path().join("nemesis").join("REPORT.md"), "# nemesis\n")
+            .expect("failed to write nemesis artifact");
+        fs::write(repo.path().join("gen-001").join("SPEC.md"), "# generated\n")
+            .expect("failed to write generated artifact");
+        fs::write(
+            repo.path()
+                .join(".config")
+                .join("quota-router")
+                .join("profiles")
+                .join("default.json"),
+            "{}\n",
+        )
+        .expect("failed to write quota profile");
+
+        let (status, commit) = apply_verdict(
+            repo.path(),
+            &output_dir,
+            "main",
+            "README.md",
+            &file_dir,
+            &verdict("DRIFT-LARGE", "capture follow-up"),
+            false,
+        )
+        .expect("worklist verdict should commit only durable queue output");
+
+        assert_eq!(status, EntryStatus::Audited);
+        assert!(commit.is_some());
+        assert_eq!(last_commit_paths(repo.path()), vec!["WORKLIST.md"]);
+        let committed = run_git_in(repo.path(), ["show", "--format=", "--name-only", "HEAD"]);
+        for excluded in [
+            ".auto",
+            ".config",
+            "audit/files",
+            "bug",
+            "gen-001",
+            "nemesis",
+        ] {
+            assert!(
+                !committed.contains(excluded),
+                "{excluded} should not be committed:\n{committed}"
+            );
+        }
+        let status = run_git_in(repo.path(), ["status", "--short"]);
+        assert!(status.contains("?? .auto/"), "{status}");
+        assert!(status.contains("?? .config/"), "{status}");
+        assert!(status.contains("?? audit/"), "{status}");
+        assert!(status.contains("?? bug/"), "{status}");
+        assert!(status.contains("?? gen-001/"), "{status}");
+        assert!(status.contains("?? nemesis/"), "{status}");
     }
 
     #[tokio::test]
