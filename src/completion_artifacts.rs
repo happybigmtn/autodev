@@ -120,9 +120,7 @@ pub(crate) fn inspect_task_completion_evidence(
 ) -> TaskCompletionEvidence {
     let review_path = repo_root.join("REVIEW.md");
     let review_text = fs::read_to_string(&review_path).unwrap_or_default();
-    let verification_receipt_path = repo_root
-        .join(".auto/symphony/verification-receipts")
-        .join(format!("{task_id}.json"));
+    let verification_receipt_path = verification_receipt_path(repo_root, task_id);
     let verification = verification_plan(task_markdown);
     let verification_receipt_required = !verification.executable_commands.is_empty();
     let verification_wrapper_present = repo_root.join("scripts/run-task-verification.sh").exists();
@@ -246,6 +244,32 @@ fn declared_completion_artifacts(task_markdown: &str) -> Vec<String> {
         .next()
         .map(|task| task.completion_artifacts)
         .unwrap_or_default()
+}
+
+fn verification_receipt_path(repo_root: &Path, task_id: &str) -> PathBuf {
+    verification_receipt_root(repo_root).join(format!("{task_id}.json"))
+}
+
+fn verification_receipt_root(repo_root: &Path) -> PathBuf {
+    if repo_root.file_name().and_then(|name| name.to_str()) == Some("repo") {
+        if let Some(auto_root) = repo_root
+            .parent()
+            .and_then(|lane_dir| lane_dir.parent())
+            .filter(|lanes_dir| {
+                lanes_dir.file_name().and_then(|name| name.to_str()) == Some("lanes")
+            })
+            .and_then(|lanes_dir| lanes_dir.parent())
+            .filter(|parallel_dir| {
+                parallel_dir.file_name().and_then(|name| name.to_str()) == Some("parallel")
+            })
+            .and_then(|parallel_dir| parallel_dir.parent())
+            .filter(|auto_dir| auto_dir.file_name().and_then(|name| name.to_str()) == Some(".auto"))
+        {
+            return auto_root.join("symphony/verification-receipts");
+        }
+    }
+
+    repo_root.join(".auto/symphony/verification-receipts")
 }
 
 pub(crate) fn verification_plan(task_markdown: &str) -> VerificationPlan {
@@ -665,6 +689,36 @@ Dependencies: none
             "- [ ] `TASK-1` Example\nVerification:\n  - `cargo test -p demo receipt_example`\nCompletion artifacts:\n  - `docs/ops/proof.md`\nDependencies: none\n",
         );
         assert!(evidence.is_fully_evidenced());
+        assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_reads_parallel_lane_receipts() {
+        let base = temp_dir("parallel-lane-receipts");
+        let root = base.join(".auto/parallel/lanes/lane-3/repo");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-LANE`\n",
+        )
+        .expect("failed to write review");
+        fs::create_dir_all(base.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create host receipt dir");
+        fs::write(
+            base.join(".auto/symphony/verification-receipts/TASK-LANE.json"),
+            r#"{"commands":[{"command":"cargo test completion_artifacts::tests::lane_receipt","exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("failed to write host receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-LANE",
+            "- [ ] `TASK-LANE` Example\nVerification:\n  - `cargo test completion_artifacts::tests::lane_receipt`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
         assert!(evidence.missing_reasons().is_empty());
     }
 
