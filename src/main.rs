@@ -1,4 +1,5 @@
 mod audit_command;
+mod backend_policy;
 mod bug_command;
 mod claude_exec;
 mod codex_exec;
