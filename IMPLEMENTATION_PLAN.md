@@ -242,7 +242,7 @@
   Estimated scope: M
   Completion signal: Audit commit tests prove scoped staging and the checkpoint exclusion regression still passes.
 
-- [ ] `AD-016` Report-only QA dirty-state enforcement
+- [x] `AD-016` Report-only QA dirty-state enforcement
 
   Spec: `specs/230426-quality-pipelines-and-release-lifecycle.md`
   Why now: `auto qa-only` is prompt-level report-only, but the runner does not mechanically fail if the model changes files other than `QA.md`.
