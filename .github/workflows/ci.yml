@@ -34,3 +34,17 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Smoke installed auto binary
+        run: |
+          install_root="$RUNNER_TEMP/autodev-install-proof"
+          cargo install --path . --root "$install_root"
+          export PATH="$install_root/bin:$PATH"
+          command -v auto
+          auto --version
+          auto --help
+          auto corpus --help
+          auto gen --help
+          auto parallel --help
+          auto quota --help
+          auto symphony --help

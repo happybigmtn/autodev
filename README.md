@@ -1195,6 +1195,21 @@ Claude, PI, GitHub, Linear, Symphony, Docker, browser automation, tmux, network 
 providers. Missing `codex`, `claude`, `pi`, and `gh` are capability warnings for later workflows,
 not first-run failures.
 
+CI proves the installed binary through the same surface from a temporary install root:
+
+```bash
+install_root="$RUNNER_TEMP/autodev-install-proof"
+cargo install --path . --root "$install_root"
+export PATH="$install_root/bin:$PATH"
+auto --version
+auto --help
+auto corpus --help
+auto gen --help
+auto parallel --help
+auto quota --help
+auto symphony --help
+```
+
 ## Typical Flow
 
 Refresh planning:
