@@ -445,7 +445,7 @@
 
 - [x] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
 
-- [~] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
+- [x] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
 
 - [~] `SAT-005` `src/util.rs` already excludes `.auto`, `.claude/worktrees`, `bug`, `nemesis`, and top-level `gen-*` from checkpoint staging.
 
