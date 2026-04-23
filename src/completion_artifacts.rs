@@ -344,6 +344,14 @@ struct VerificationReceiptCommand {
     exit_code: Option<i32>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    runner_summary: Option<VerificationRunnerSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct VerificationRunnerSummary {
+    #[serde(default)]
+    zero_test_detected: bool,
 }
 
 fn inspect_verification_receipt(
@@ -454,7 +462,43 @@ fn inspect_verification_receipt(
         );
     }
 
+    let mut zero_test = expected_commands
+        .iter()
+        .filter(|command| {
+            receipt
+                .commands
+                .iter()
+                .filter(|entry| verification_receipt_command_matches(entry, command))
+                .any(verification_receipt_reports_zero_tests)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    zero_test.sort();
+    if !zero_test.is_empty() {
+        return (
+            false,
+            Some(format!(
+                "verification receipt `{}` reported zero-test run(s): {}",
+                verification_receipt_path.display(),
+                zero_test
+                    .iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+    }
+
     (true, None)
+}
+
+fn verification_receipt_reports_zero_tests(entry: &VerificationReceiptCommand) -> bool {
+    entry.status.as_deref() == Some("passed")
+        && entry.exit_code == Some(0)
+        && entry
+            .runner_summary
+            .as_ref()
+            .is_some_and(|summary| summary.zero_test_detected)
 }
 
 fn verification_receipt_command_matches(
@@ -898,6 +942,60 @@ Dependencies: none
             .missing_reasons()
             .join("\n")
             .contains("has failed command(s)"));
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_rejects_zero_cargo_tests() {
+        let root = temp_dir("zero-cargo-tests");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-ZERO-CARGO.json"),
+            r#"{"commands":[{"command":"cargo test completion_artifacts::tests::missing_filter","exit_code":0,"status":"passed","runner_summary":{"kind":"cargo-test","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-ZERO-CARGO",
+            "- [ ] `TASK-ZERO-CARGO` Example\nVerification:\n  - `cargo test completion_artifacts::tests::missing_filter`\nDependencies: none\n",
+        );
+
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("reported zero-test run(s)"));
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_rejects_zero_pytest_tests() {
+        let root = temp_dir("zero-pytest-tests");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-ZERO-PYTEST.json"),
+            r#"{"commands":[{"command":"python -m pytest tests/missing.py","argv":["python","-m","pytest","tests/missing.py"],"exit_code":0,"status":"passed","runner_summary":{"kind":"pytest","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-ZERO-PYTEST",
+            "- [ ] `TASK-ZERO-PYTEST` Example\nVerification:\n  - `python -m pytest tests/missing.py`\nDependencies: none\n",
+        );
+
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("reported zero-test run(s)"));
     }
 
     #[test]
