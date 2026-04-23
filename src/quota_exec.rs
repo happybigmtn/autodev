@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::quota_config::{Provider, QuotaConfig};
@@ -64,28 +64,54 @@ fn remove_and_copy_dir(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_file_0o600(src: &Path, dst: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "refusing to copy non-regular credential path {}",
+            src.display()
+        );
+    }
     let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
     write_0o600_if_unix(dst, &bytes)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to copy symlinked credential path {}",
+            src.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to copy non-directory credential path {}",
+            src.display()
+        );
+    }
     fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
     for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let meta = match fs::symlink_metadata(&src_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let meta = fs::symlink_metadata(&src_path)
+            .with_context(|| format!("failed to stat {}", src_path.display()))?;
         if meta.file_type().is_symlink() {
-            // Preserve symlinks as-is; skip if we can't read the target path
-            if let Ok(target) = fs::read_link(&src_path) {
-                let _ = std::os::unix::fs::symlink(&target, &dst_path);
-            }
+            bail!(
+                "refusing to copy symlinked credential path {}",
+                src_path.display()
+            );
         } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        } else if meta.is_file() {
             copy_file_0o600(&src_path, &dst_path).with_context(|| {
                 format!(
                     "failed to copy {} -> {}",
@@ -93,6 +119,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                     dst_path.display()
                 )
             })?;
+        } else {
+            bail!(
+                "refusing to copy non-regular credential path {}",
+                src_path.display()
+            );
         }
     }
     Ok(())
@@ -134,13 +165,27 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
                     continue;
                 }
 
+                let meta = fs::symlink_metadata(&src)
+                    .with_context(|| format!("failed to stat {}", src.display()))?;
+                if meta.file_type().is_symlink() {
+                    bail!(
+                        "refusing to copy symlinked credential path {}",
+                        src.display()
+                    );
+                }
+
                 let dst = target.join(&name);
-                if src.is_dir() {
+                if meta.is_dir() {
                     remove_and_copy_dir(&src, &dst)?;
-                } else {
+                } else if meta.is_file() {
                     copy_file_0o600(&src, &dst).with_context(|| {
                         format!("failed to copy {} -> {}", src.display(), dst.display())
                     })?;
+                } else {
+                    bail!(
+                        "refusing to copy non-regular credential path {}",
+                        src.display()
+                    );
                 }
             }
         }
@@ -161,7 +206,6 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                 copy_file_0o600(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
             }
-            copy_profile_to_active_auth(provider, profile_dir)?;
             vec![(bp, target)]
         }
         Provider::Claude => {
@@ -182,12 +226,13 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
                     .with_context(|| format!("failed to backup {}", claude_json.display()))?;
             }
 
-            copy_profile_to_active_auth(provider, profile_dir)?;
             vec![(bp, target), (claude_json_bp, claude_json)]
         }
     };
 
-    Ok(AuthRestoreGuard::new(pairs))
+    let guard = AuthRestoreGuard::new(pairs);
+    copy_profile_to_active_auth(provider, profile_dir)?;
+    Ok(guard)
 }
 
 fn acquire_provider_lock(provider: Provider) -> Result<fd_lock::RwLock<fs::File>> {
@@ -379,6 +424,13 @@ fn restore_credentials(provider: Provider) -> Result<()> {
                 remove_and_copy_dir(&bp, &target)?;
                 fs::remove_dir_all(&bp)?;
             }
+            let claude_json_bp = backup_dir.join("claude.json");
+            let home = dirs::home_dir().expect("cannot resolve home directory");
+            let claude_json = home.join(".claude.json");
+            if claude_json_bp.exists() {
+                copy_file_0o600(&claude_json_bp, &claude_json)?;
+                fs::remove_file(&claude_json_bp)?;
+            }
         }
     }
     Ok(())
@@ -485,7 +537,7 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quota_output_has_agent_progress, swap_credentials};
+    use super::{quota_output_has_agent_progress, restore_credentials, swap_credentials};
     use crate::quota_config::Provider;
 
     #[cfg(unix)]
@@ -541,12 +593,16 @@ mod tests {
             self.root.join("home")
         }
 
-        fn profile_dir(&self, name: &str) -> PathBuf {
+        fn profile_dir(&self, provider: Provider, name: &str) -> PathBuf {
             self.root
                 .join("config")
                 .join("quota-router")
                 .join("profiles")
-                .join(format!("codex-{name}"))
+                .join(format!("{}-{name}", provider.label()))
+        }
+
+        fn backup_dir(&self) -> PathBuf {
+            self.root.join("config").join("quota-router").join("backup")
         }
     }
 
@@ -600,7 +656,7 @@ mod tests {
         fs::write(&active_auth, br#"{"account":"active"}"#).expect("failed to write active auth");
         set_mode(&active_auth, 0o644);
 
-        let profile_dir = home.profile_dir("work");
+        let profile_dir = home.profile_dir(Provider::Codex, "work");
         fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
         let profile_auth = profile_dir.join("auth.json");
         fs::write(&profile_auth, br#"{"account":"profile"}"#)
@@ -640,5 +696,126 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(restored_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_credentials_restores_claude_json_backup() {
+        let home = TempQuotaHome::new("quota-exec-restore-claude-json");
+        let active_claude = home.home().join(".claude");
+        fs::create_dir_all(&active_claude).expect("failed to create active claude dir");
+        fs::write(
+            active_claude.join("credentials.json"),
+            br#"{"account":"swapped-dir"}"#,
+        )
+        .expect("failed to write swapped claude credentials");
+        fs::write(
+            home.home().join(".claude.json"),
+            br#"{"account":"swapped-json"}"#,
+        )
+        .expect("failed to write swapped claude json");
+
+        let backup_dir = home.backup_dir();
+        let backup_claude = backup_dir.join("claude");
+        fs::create_dir_all(&backup_claude).expect("failed to create claude backup dir");
+        fs::write(
+            backup_claude.join("credentials.json"),
+            br#"{"account":"original-dir"}"#,
+        )
+        .expect("failed to write claude backup credentials");
+        fs::write(
+            backup_dir.join("claude.json"),
+            br#"{"account":"original-json"}"#,
+        )
+        .expect("failed to write claude json backup");
+
+        restore_credentials(Provider::Claude).expect("restore should succeed");
+
+        let restored_dir = fs::read(active_claude.join("credentials.json"))
+            .expect("failed to read restored claude credentials");
+        assert_eq!(restored_dir, br#"{"account":"original-dir"}"#);
+        let restored_json = fs::read(home.home().join(".claude.json"))
+            .expect("failed to read restored claude json");
+        assert_eq!(restored_json, br#"{"account":"original-json"}"#);
+        assert!(!backup_claude.exists());
+        assert!(!backup_dir.join("claude.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_credentials_restores_claude_json_on_drop() {
+        let home = TempQuotaHome::new("quota-exec-drop-claude-json");
+        let active_claude = home.home().join(".claude");
+        fs::create_dir_all(&active_claude).expect("failed to create active claude dir");
+        fs::write(
+            active_claude.join("credentials.json"),
+            br#"{"account":"original-dir"}"#,
+        )
+        .expect("failed to write active claude credentials");
+        fs::write(
+            home.home().join(".claude.json"),
+            br#"{"account":"original-json"}"#,
+        )
+        .expect("failed to write active claude json");
+
+        let profile_dir = home.profile_dir(Provider::Claude, "work");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        fs::write(
+            profile_dir.join("credentials.json"),
+            br#"{"account":"profile-dir"}"#,
+        )
+        .expect("failed to write profile claude credentials");
+        fs::write(
+            profile_dir.join(".claude.json"),
+            br#"{"account":"profile-json"}"#,
+        )
+        .expect("failed to write profile claude json");
+
+        let guard = swap_credentials(Provider::Claude, &profile_dir)
+            .expect("credential swap should succeed");
+
+        let swapped_json =
+            fs::read(home.home().join(".claude.json")).expect("failed to read swapped json");
+        assert_eq!(swapped_json, br#"{"account":"profile-json"}"#);
+
+        drop(guard);
+
+        let restored_dir = fs::read(active_claude.join("credentials.json"))
+            .expect("failed to read restored claude credentials");
+        assert_eq!(restored_dir, br#"{"account":"original-dir"}"#);
+        let restored_json = fs::read(home.home().join(".claude.json"))
+            .expect("failed to read restored claude json");
+        assert_eq!(restored_json, br#"{"account":"original-json"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_credentials_rejects_symlinked_claude_profile_paths() {
+        let home = TempQuotaHome::new("quota-exec-symlink-claude");
+        let active_claude = home.home().join(".claude");
+        fs::create_dir_all(&active_claude).expect("failed to create active claude dir");
+        fs::write(
+            active_claude.join("credentials.json"),
+            br#"{"account":"original-dir"}"#,
+        )
+        .expect("failed to write active claude credentials");
+
+        let profile_dir = home.profile_dir(Provider::Claude, "work");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        let real_profile = profile_dir.join("real-credentials.json");
+        fs::write(&real_profile, br#"{"account":"profile"}"#)
+            .expect("failed to write real profile credentials");
+        std::os::unix::fs::symlink(&real_profile, profile_dir.join("credentials.json"))
+            .expect("failed to create profile symlink");
+
+        let error = match swap_credentials(Provider::Claude, &profile_dir) {
+            Ok(_) => panic!("symlinked claude profile path should be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("symlinked credential path"));
+        let active = fs::read(active_claude.join("credentials.json"))
+            .expect("failed to read restored active claude credentials");
+        assert_eq!(active, br#"{"account":"original-dir"}"#);
     }
 }
