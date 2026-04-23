@@ -98,7 +98,7 @@
   Estimated scope: XS
   Completion signal: First-run command shape is decided without relabeling model-backed `auto health` as a no-model path.
 
-- [ ] `AD-007` No-model first-run command
+- [x] `AD-007` No-model first-run command
 
   Spec: `specs/230426-first-run-ci-and-installed-binary-proof.md`
   Why now: Once the command shape is decided, the repo needs a zero-friction local success path that reports missing external tools clearly instead of requiring model credentials or live services.
