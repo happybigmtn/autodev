@@ -943,6 +943,8 @@ Useful flags:
 Purpose:
 
 - Replace `auto corpus` + `auto gen` for repos that already have an active planning surface
+- Prefer this over a fresh corpus/gen cycle when the repo already has durable queue/spec artifacts
+  and needs reconciliation against live code
 - Run a two-pass Codex stewardship flow: first write drift / hinge / retire / hazard artifacts,
   then optionally review and apply bounded plan/spec promotions
 
@@ -979,6 +981,8 @@ Defaults:
 Purpose:
 
 - Audit tracked files one by one against an operator-authored doctrine
+- Prefer this over `auto bug` or `auto nemesis` when the review standard is a specific
+  repo-authored doctrine rather than open-ended defect discovery
 - Keep clean files untouched, patch bounded drift or slop, and escalate larger retire/refactor
   calls with a durable artifact trail
 
@@ -1013,6 +1017,8 @@ Defaults:
 Purpose:
 
 - Bridge `IMPLEMENTATION_PLAN.md` into a Linear project and launch the local Symphony runtime
+- Prefer this over `auto loop` or `auto parallel` when Linear is the coordination surface for the
+  implementation queue
 - Keep the repo's plan, rendered workflow, and Linear issue state aligned instead of drifting
   apart
 
