@@ -29,6 +29,7 @@ mod state;
 mod steward_command;
 mod super_command;
 mod symphony_command;
+mod task_parser;
 mod util;
 
 use std::path::PathBuf;
