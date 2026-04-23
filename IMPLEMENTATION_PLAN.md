@@ -226,7 +226,7 @@
   Estimated scope: XS
   Completion signal: Review handoff records local green proof or specific blockers for workflow rendering and receipt evidence.
 
-- [ ] `AD-015` Audit commits use scoped pathspecs
+- [x] `AD-015` Audit commits use scoped pathspecs
 
   Spec: `specs/230426-checkpoint-security-and-artifact-policy.md`
   Why now: `auto audit` can apply fixes or append planning entries and then stage broadly through `commit_all`, which conflicts with the repo's generated artifact and credential safety posture.
