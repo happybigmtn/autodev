@@ -443,7 +443,7 @@
 
 - [~] `SAT-002` `build.rs` already embeds git SHA, dirty state, and build profile, and `src/util.rs` exposes that metadata through `CLI_LONG_VERSION`.
 
-- [~] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
+- [x] `SAT-003` `.github/workflows/ci.yml` already runs formatting, clippy, and an unfiltered Rust test step.
 
 - [~] `SAT-004` `src/main.rs` currently exposes 17 top-level command variants: `Corpus`, `Gen`, `Super`, `Reverse`, `Bug`, `Loop`, `Parallel`, `Qa`, `QaOnly`, `Health`, `Review`, `Steward`, `Audit`, `Ship`, `Nemesis`, `Quota`, and `Symphony`.
 
