@@ -258,7 +258,7 @@
   Estimated scope: S
   Completion signal: QA-only dirty-state tests pass and the command fails loudly on non-report modifications.
 
-- [ ] `AD-017` Release readiness gate decision
+- [x] `AD-017` Release readiness gate decision
 
   Spec: `specs/230426-quality-pipelines-and-release-lifecycle.md`
   Why now: Release readiness touches installed-binary proof, QA/health freshness, review state, blockers, rollback, monitoring, PR state, and validation evidence; implementing a mechanical gate before those inputs are defined would bake in unverified product policy.
