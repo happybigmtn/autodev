@@ -373,7 +373,7 @@
   Estimated scope: S
   Completion signal: CI contains installed-binary proof and README names the same commands.
 
-- [ ] `AD-F03` Backend policy metadata model
+- [x] `AD-F03` Backend policy metadata model
 
   Spec: `specs/230426-backend-invocation-policy-and-model-routing.md`
   Why now: After the invocation inventory is reviewed, code can start expressing backend policy as data instead of scattered argv construction.
