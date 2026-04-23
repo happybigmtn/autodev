@@ -151,3 +151,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-007.json`
 - Completion artifacts: `README.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `AD-F05`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/loop_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-F05.json`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff

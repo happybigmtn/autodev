@@ -405,7 +405,7 @@
   Estimated scope: M
   Completion signal: Shared parser adapters back the major executor parsers while existing targeted parser and evidence tests remain green.
 
-- [ ] `AD-F05` Loop completion evidence convergence
+- [x] `AD-F05` Loop completion evidence convergence
 
   Spec: `specs/230426-parallel-loop-and-lane-recovery.md`
   Why now: `auto parallel` has stronger completion evidence enforcement than `auto loop`; loop should stop treating prompt-level completion as enough when a task declares executable verification and artifacts.
