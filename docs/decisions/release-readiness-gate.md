@@ -72,3 +72,12 @@ Blockers must be written plainly to `SHIP.md` with owner, scope, next action, an
 The follow-on ship-gate implementation should reuse the existing receipt reader instead of parsing ad hoc logs. It should keep the current prompt-based ship workflow for release-note generation, but only after deterministic local evidence passes or a blocker is recorded.
 
 CI can add installed-binary proof later by running `cargo install --path . --root ~/.local`, putting `~/.local/bin` on `PATH`, and running `auto --version`; this decision does not change `.github/workflows/ci.yml`.
+
+## AD-018 Checkpoint
+
+The quality and security checkpoint found the release lifecycle ready for follow-on CI installed-binary proof and mechanical ship-gate implementation.
+
+- Audit staging proof: `cargo test audit_command::tests::commit_audit_outputs_uses_scoped_pathspecs` passed through `scripts/run-task-verification.sh AD-018`, proving audit commits use scoped pathspecs instead of broad staging for the covered path.
+- QA-only dirty-state proof: `cargo test qa_only_command::tests::qa_only_rejects_non_report_file_changes` passed through `scripts/run-task-verification.sh AD-018`, proving report-only QA rejects non-`QA.md` file changes for the covered path.
+- Release gate status: this accepted decision remains the current release readiness policy. Installed-binary proof and pre-model `auto ship` enforcement are intentionally follow-on implementation work, not part of this checkpoint.
+- Blockers: none found in the local AD-018 proof set. The parallel host still owns the canonical `REVIEW.md` queue handoff for this checkpoint.
