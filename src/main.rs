@@ -1307,7 +1307,28 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, SymphonySubcommand};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn top_level_command_surface_matches_live_enum() {
+        let expected = [
+            "corpus", "gen", "super", "reverse", "bug", "loop", "parallel", "qa", "qa-only",
+            "health", "doctor", "review", "steward", "audit", "ship", "nemesis", "quota",
+            "symphony",
+        ];
+        let cli_command = Cli::command();
+        let actual = cli_command
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+
+        for command in expected {
+            let help = Cli::try_parse_from(["auto", command, "--help"]);
+            assert!(help.is_err(), "expected help output for auto {command}");
+        }
+    }
 
     #[test]
     fn symphony_run_does_not_sync_by_default() {
