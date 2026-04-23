@@ -357,7 +357,7 @@
   Estimated scope: M
   Completion signal: Snapshot-only mode is implemented, documented, and proven not to mutate root planning surfaces.
 
-- [ ] `AD-F02` CI installed-binary proof
+- [x] `AD-F02` CI installed-binary proof
 
   Spec: `specs/230426-first-run-ci-and-installed-binary-proof.md`
   Why now: CI currently validates source with fmt, clippy, and tests, but it does not prove the installable `auto` binary exposes version and help behavior from PATH.
