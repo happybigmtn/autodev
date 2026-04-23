@@ -178,7 +178,7 @@
   Estimated scope: M
   Completion signal: Hostile scalar render tests fail before the fix, pass after the fix, and existing deterministic workflow tests remain green.
 
-- [ ] `AD-012` Verification receipt output policy decision
+- [x] `AD-012` Verification receipt output policy decision
 
   Spec: `specs/230426-verification-receipts-and-completion-evidence.md`
   Why now: Receipt inspection can reject missing, failed, corrupted, or incomplete receipts, but zero-test detection needs runner output or structured proof details that receipts do not currently store.

@@ -15,3 +15,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-001.json`
 - Completion artifacts: `docs/decisions/backend-invocation-policy.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `AD-012`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/verification-receipt-policy.md`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/AD-012.json`
+- Completion artifacts: `docs/decisions/verification-receipt-policy.md`
+- Remaining blockers: missing REVIEW.md handoff
