@@ -1427,20 +1427,20 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     }
 
     let lanes_root = run_root.join("lanes");
-    if !lanes_root.exists() {
+    let mut lanes = if !lanes_root.exists() {
         println!("lanes:       none ({})", lanes_root.display());
-        return Ok(());
-    }
-
-    let mut lanes = fs::read_dir(&lanes_root)
-        .with_context(|| format!("failed to read {}", lanes_root.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            parse_lane_index(&name).map(|index| (index, entry.path()))
-        })
-        .collect::<Vec<_>>();
+        Vec::new()
+    } else {
+        fs::read_dir(&lanes_root)
+            .with_context(|| format!("failed to read {}", lanes_root.display()))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                parse_lane_index(&name).map(|index| (index, entry.path()))
+            })
+            .collect::<Vec<_>>()
+    };
     lanes.sort_by_key(|(index, _)| *index);
 
     let preflight_warnings = preflight_warning_names(&run_root);
@@ -1521,9 +1521,16 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
 }
 
 fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
+    let current_pid = std::process::id();
     command_stdout(Path::new("."), ["pgrep", "-af", "auto parallel"])
         .unwrap_or_default()
         .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                != Some(current_pid)
+        })
         .filter(|line| {
             line.split_once(' ')
                 .map(|(_, command)| {
