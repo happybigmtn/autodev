@@ -9,7 +9,7 @@ Keep `auto ship` the single-entry release command: it takes the branch from "imp
 ### Verified facts (code)
 
 - `src/main.rs:89` declares `Ship`.
-- `src/main.rs:1031-1090` `ShipArgs` (approximate range): default model `gpt-5.4`, default reasoning effort `high`, optional `--base-branch`, optional `--branch`, Codex binary `codex`.
+- `src/main.rs:1031-1090` `ShipArgs` (approximate range): default model `gpt-5.5`, default reasoning effort `high`, optional `--base-branch`, optional `--branch`, Codex binary `codex`.
 - Default target is the repo's resolved base branch (`--base-branch` > `origin/HEAD` > `main` / `master` / `trunk`), per `corpus/ASSESSMENT.md` §"ship_command.rs" and `README.md:52-53`.
 - Ship uses `util::sync_branch_with_remote` before work and `util::push_branch_with_remote_sync` before push (`corpus/SPEC.md` item 5).
 - `auto ship` is the only mutating quality command documented as producing the `SHIP.md` report with rollback and monitoring sections (`corpus/SPEC.md` §"Artifact shapes"; `ship_command.rs` prompt includes the text "rollback path" per corpus test-gaps table).
@@ -18,7 +18,7 @@ Keep `auto ship` the single-entry release command: it takes the branch from "imp
 
 ### Verified facts (docs)
 
-- `README.md:52-53`: "auto ship runs on the currently checked-out branch by default with `gpt-5.4` and `high`, targeting the repo's resolved base branch."
+- `README.md:52-53`: "auto ship runs on the currently checked-out branch by default with `gpt-5.5` and `high`, targeting the repo's resolved base branch."
 - `README.md:56-58`: mutating commands including `ship` rebase onto `origin/<branch>` both before work and before push.
 
 ### Recommendations (corpus)
@@ -34,7 +34,7 @@ Keep `auto ship` the single-entry release command: it takes the branch from "imp
 ## Acceptance Criteria
 
 - `auto ship` resolves the base branch in the order `--base-branch` flag → `origin/HEAD` symbolic-ref → first present of `main` / `master` / `trunk`; if none resolve, the command exits non-zero with a clear error.
-- `auto ship` uses `gpt-5.4` with `high` reasoning effort by default; both are overridable by CLI flags.
+- `auto ship` uses `gpt-5.5` with `high` reasoning effort by default; both are overridable by CLI flags.
 - `auto ship` calls `util::sync_branch_with_remote` before the Codex ship-prep pass and `util::push_branch_with_remote_sync` before the push.
 - `auto ship` writes a single `SHIP.md` file containing at minimum: rollback path, monitoring path, and a rollout-posture section; the file is overwritten on repeat runs.
 - `auto ship` appends new items to `WORKLIST.md` and `LEARNINGS.md` only when the ship-prep pass identifies them.

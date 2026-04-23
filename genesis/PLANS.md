@@ -1,66 +1,58 @@
-# PLANS — autodev corpus
+# PLANS - generated corpus index
 
-This file is an **index** of the generated ExecPlans under `genesis/plans/`. It is not itself an ExecPlan authoring standard.
+This file indexes the generated `genesis/plans/` ExecPlans. It is not the root implementation queue and it is not a replacement for root planning docs.
 
-## Active planning surface
+## Active Planning Surface
 
-The repository root has no `PLANS.md`, no `plans/` directory, no `CLAUDE.md`, and an empty `IMPLEMENTATION_PLAN.md` skeleton. The only active control doc is `AGENTS.md`. Therefore the generated corpus under `genesis/` is the active planning surface for this pass.
+No root `PLANS.md` file exists in this repository today, and no root `plans/` directory exists. The active control surface remains `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and `specs/`. The generated `genesis/` corpus is subordinate to those root docs. Its numbered plans are recommendations and ready-to-run slices, not automatic queue authority until promoted into the root implementation plan.
 
-When `auto gen` is run next, `genesis/plans/*.md` will be promoted into the root `IMPLEMENTATION_PLAN.md` queue. Root-level ExecPlans do not exist yet, so the generated plans here are not subordinate to a root corpus — they are the intended seed for it.
+If a root `PLANS.md` standard is later added, future generated numbered plans should explicitly conform to it.
 
-## Numbered plan set
+## Sequencing Principles
 
-| # | Title | Shape | Dependencies | Gate? |
+The chosen order prioritizes trust and recovery before expansion:
+
+1. Reconcile the planning truth surface so operators stop executing stale work.
+2. Fix credential and generated workflow safety risks.
+3. Gate after security fixes before changing execution contracts.
+4. Harden verification evidence and shared task parsing.
+5. Gate again before changing first-run and CI surfaces.
+6. Improve first-run DX and release proof.
+7. Leave lifecycle research as a decision gate rather than silently changing product direction.
+
+The obvious alternative would be to start with modular refactors. That was rejected because current risks are behavioral and operator-facing: credential restore, shell/YAML rendering, false verification proof, and stale planning truth. Current `cargo test` is green, but it does not cover the higher-risk credential restore and workflow-rendering gaps.
+
+## Plan Index
+
+| Plan | Title | Type | Depends on | Why now |
 |---|---|---|---|---|
-| 001 | Master plan & sequencing | Index / decision record | — | — |
-| 002 | README command inventory sync | Mechanical / small | — | — |
-| 003 | Retire `codex_exec.rs` tmux dead code | Mechanical / small | 002 | — |
-| 004 | `auto audit` verdict-application test harness | Implementation / medium | — | — |
-| 005 | **Checkpoint — Truth pass complete** | Decision gate | 002, 003, 004 | Yes |
-| 006 | Quota credential permissions + log scrubbing | Implementation / medium (security) | 005 | — |
-| 007 | Shared utilities: branch, reference-repo, prompt-log | Refactor / medium | 005 | — |
-| 008 | LlmBackend trait consolidation (research) | Research / bounded | 007 | — |
-| 009 | **Checkpoint — Consolidation complete** | Decision gate | 006, 007, 008 | Yes |
-| 010 | GitHub Actions CI bootstrap | Implementation / small | 009 | — |
-| 011 | End-to-end smoke tests for `qa`, `health`, `ship` | Implementation / medium | 010 | — |
-| 012 | Command-lifecycle reconciliation (research) | Research / bounded | 009 | — |
+| 001 | Master Plan | Coordination | none | Orients the whole corpus and keeps later slices focused |
+| 002 | Root Planning Truth Reconciliation | Implementation | 001 | Prevents stale root docs from steering execution |
+| 003 | Quota Credential Restore And Profile Hardening | Implementation | 001 | Fixes the highest-severity credential risk and preserves quota usage error-surfacing coverage |
+| 004 | Symphony Workflow Rendering Hardening | Implementation | 001 | Hardens generated executable shell/YAML before more Symphony use |
+| 005 | Security Checkpoint Gate | Checkpoint | 002, 003, 004 | Stops later execution-contract work until the security baseline is proved |
+| 006 | Verification Command And Receipt Hardening | Implementation | 005 | Closes known false-proof worklist items |
+| 007 | Shared Task Parser And Blocked-Task Preservation | Implementation | 005 | Aligns generation, loop, parallel, review, and Symphony on one task contract |
+| 008 | Backend Invocation Policy Research | Research gate | 005 | Designs a shared execution policy before refactoring live runners |
+| 009 | Execution Contract Checkpoint Gate | Checkpoint | 006, 007, 008 | Confirms evidence and parser changes before DX/CI changes |
+| 010 | First-Run Doctor And Hermetic Smoke Tests | Implementation | 009 | Gives operators a no-model success path and contributors integration proof |
+| 011 | CI Fidelity And Installed-Binary Proof | Implementation | 009, 010 | Aligns CI with real operator commands and installed CLI expectations |
+| 012 | Release Readiness And Command Lifecycle Decision Gate | Checkpoint/research | 010, 011 | Decides whether current lifecycle is ready for release and whether `steward` changes product direction |
 
-All numbered plans under `genesis/plans/` are full ExecPlans, not task stubs. They are self-contained for a novice with only the current working tree and the plan file.
+## Phase Boundaries
 
-## Sequencing rationale
+Phase 1: Plans 002-004.
 
-**Phase 1 — Truth pass (002-005).** Close the doc-vs-code gap so operators and future planning passes work against an honest inventory. These are small, high-signal, and unblock everything else by eliminating the README-drift noise that otherwise contaminates every subsequent conversation. Remove the dead tmux scaffolding in `codex_exec.rs` at the same time — it is in the same drift category.
+Goal: root truth and security. This phase should end with Plan 005.
 
-Plan 004 (audit tests) belongs in Phase 1 because `auto audit` is the newest command with the weakest coverage, and any further feature work on it without tests risks silent behavior drift.
+Phase 2: Plans 006-008.
 
-Plan 005 is a decision gate: nothing in Phase 2 starts until Phase 1 is validated against `cargo test` and `cargo clippy -D warnings`.
+Goal: execution evidence and shared contracts. This phase should end with Plan 009.
 
-**Phase 2 — Consolidation (006-009).** The concrete security gap (plaintext credentials) and the structural debt (duplicated helpers) are both near-at-hand wins that do not require architectural changes. Plan 008 is research-only because a `LlmBackend` trait is a taste-call that should be validated against two commands (`bug` and `nemesis`) before committing. Plan 009 is a decision gate.
+Phase 3: Plans 010-011.
 
-**Phase 3 — Foundation (010-012).** CI first (010), then the integration tests it will enforce (011). Plan 012 is research-only because the "when do I use `steward` vs. `corpus + gen`" question is a product-lens decision the operator should weigh in on before code changes.
+Goal: first-run confidence and CI fidelity. This phase should end with Plan 012.
 
-## Why this slice order is preferable
+## Promotion Guidance
 
-**Alternative A — Tackle the 7853-LOC `parallel_command.rs` first.** Rejected. `parallel` is the most-used command; restructuring it before cleaning up the surrounding documentation, the duplicated helpers it shares with other commands, and the test scaffolding would destabilize the working path.
-
-**Alternative B — Ship a new command (`auto doctor`, `auto preflight`) first.** Rejected. The repo already added two commands on 2026-04-21 without README updates; adding another compounds drift. The design goal says "this repo should stay small."
-
-**Alternative C — Write the security fix first, before the truth pass.** Tempting, and would be correct if production secrets were at risk. The quota credential storage is a developer-machine concern; the README-drift issue affects every first-run experience. Truth pass first is cheaper and unblocks the corpus itself.
-
-**Alternative D — Skip research plans and implement everything.** Rejected. `LlmBackend` consolidation (008) and command-lifecycle reconciliation (012) both have non-mechanical decision surfaces. Implementing without a scoped research step risks writing the wrong abstraction.
-
-## Not doing (carried forward from Genesis Report)
-
-These are explicitly out of scope for the corpus this index covers. Any of them may become in-scope later via a separate corpus pass.
-
-- Rewrite or workspace-split the crate.
-- Introduce a new command.
-- Refactor `parallel_command.rs` or `generation.rs` beyond extracting shared helpers.
-- Build a web UI or JSON API front end.
-- Add cross-repo refactoring features beyond what `--reference-repo` already does.
-- Replace `anyhow` with a typed error scheme.
-- Encrypt quota credentials at rest (keep it on the backlog, out of this pass).
-
-## Living-document reminder
-
-Every file under `genesis/plans/` must be maintained as a living document. The ExecPlan standard is declared inline in each plan file, matching the conventional header that a root `PLANS.md` would carry if one existed. If a root `PLANS.md` is added later, plans under `genesis/plans/` should be re-reconciled against it.
+To promote a `genesis/plans/` plan into active work, copy its chosen slice into `IMPLEMENTATION_PLAN.md` using the root plan's existing task style, then keep the `genesis/` plan as supporting detail. Do not execute every generated plan automatically.

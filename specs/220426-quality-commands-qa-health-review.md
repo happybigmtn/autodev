@@ -9,10 +9,10 @@ Lock the four quality-surface commands so each produces a well-defined durable r
 ### Verified facts (code)
 
 - `src/main.rs:67-73` declares `Qa`, `QaOnly`, `Health`, `Review`.
-- `src/main.rs:927-960` `QaArgs`: default model `gpt-5.4`, default reasoning effort `high`, default tier `QaTier::Standard`, default Codex binary `codex`, default `max_iterations = 1`.
+- `src/main.rs:927-960` `QaArgs`: default model `gpt-5.5`, default reasoning effort `high`, default tier `QaTier::Standard`, default Codex binary `codex`, default `max_iterations = 1`.
 - `src/main.rs:962-991` `QaOnlyArgs`: same defaults as `QaArgs`, no iteration count (report-only by nature).
-- `src/main.rs:993-1014` `HealthArgs`: default model `gpt-5.4`, default reasoning effort `high`.
-- `src/main.rs:720-800+` `ReviewArgs`: default model `gpt-5.4`, default reasoning effort `high`.
+- `src/main.rs:993-1014` `HealthArgs`: default model `gpt-5.5`, default reasoning effort `high`.
+- `src/main.rs:720-800+` `ReviewArgs`: default model `gpt-5.5`, default reasoning effort `high`.
 - `auto qa` and `auto review` call `util::sync_branch_with_remote` before work and `util::push_branch_with_remote_sync` before push (`src/qa_command.rs:124-190`, `src/review_command.rs:203-270,395-415`).
 - `auto qa-only` and `auto health` are report-only wrappers today: they validate an optional branch override, write prompt logs, invoke Codex, and do not call `sync_branch_with_remote` or push (`src/qa_only_command.rs:59-128`, `src/health_command.rs:40-109`).
 - Artifact contract (per `corpus/SPEC.md` §"Artifact shapes"):
@@ -40,7 +40,7 @@ Lock the four quality-surface commands so each produces a well-defined durable r
 
 ## Acceptance Criteria
 
-- `auto qa` and `auto qa-only` default to model `gpt-5.4`, reasoning effort `high`, tier `standard`.
+- `auto qa` and `auto qa-only` default to model `gpt-5.5`, reasoning effort `high`, tier `standard`.
 - `auto qa` default `max-iterations` is `1`; a higher value runs the fix cycle that many times before stopping.
 - `auto qa` may write code changes; `auto qa-only` must not modify tracked files outside `.auto/qa-only/` and `QA.md`.
 - Both commands overwrite `QA.md` on each run; prior content is not preserved in that file (operators diff via git history).

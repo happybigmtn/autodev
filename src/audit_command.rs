@@ -44,11 +44,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 use tokio::time;
 
-use crate::codex_stream::capture_pi_output;
+use crate::codex_exec::MAX_CODEX_MODEL_CONTEXT_WINDOW;
+use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
@@ -197,7 +198,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     fs::create_dir_all(output_dir.join("files"))
         .with_context(|| format!("failed to create {}", output_dir.join("files").display()))?;
 
-    if args.use_kimi_cli && !args.dry_run {
+    if args.use_kimi_cli && is_kimi_model(&args.model) && !args.dry_run {
         let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
         preflight_kimi_cli(&kimi_bin, &args.model)
             .with_context(|| "kimi-cli preflight failed; aborting auto audit".to_string())?;
@@ -1049,11 +1050,101 @@ fn write_progress_snapshot(
 }
 
 async fn run_auditor(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
-    if args.use_kimi_cli {
+    if args.use_kimi_cli && is_kimi_model(&args.model) {
         run_auditor_kimi(repo_root, prompt, args).await
+    } else if is_kimi_model(&args.model) {
+        bail!("auto audit Kimi models currently require --use-kimi-cli");
     } else {
-        bail!("auto audit currently requires --use-kimi-cli");
+        run_auditor_codex(repo_root, prompt, args).await
     }
+}
+
+fn is_kimi_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
+}
+
+async fn run_auditor_codex(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
+    let mut command = TokioCommand::new(&args.codex_bin);
+    command
+        .arg("exec")
+        .arg("--json")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("--skip-git-repo-check")
+        .arg("--cd")
+        .arg(repo_root)
+        .arg("-m")
+        .arg(&args.model)
+        .arg("-c")
+        .arg(format!(
+            "model_reasoning_effort=\"{}\"",
+            args.reasoning_effort
+        ))
+        .arg("-c")
+        .arg(format!(
+            "model_context_window={MAX_CODEX_MODEL_CONTEXT_WINDOW}"
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(repo_root);
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch Codex at {} from {}",
+            args.codex_bin.display(),
+            repo_root.display()
+        )
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Codex stdin should be piped for auto audit")?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .context("failed to write auto audit prompt to Codex")?;
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("Codex stdout should be piped for auto audit")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Codex stderr should be piped for auto audit")?;
+    let stdout_task = tokio::spawn(async move { capture_codex_output(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+    let wait_result = time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
+    let timed_out = wait_result.is_err();
+    if timed_out {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let stdout = stdout_task
+        .await
+        .context("Codex stdout capture task panicked")??;
+    let stderr_text = stderr_task
+        .await
+        .context("Codex stderr capture task panicked")??;
+    if timed_out {
+        bail!("Codex audit pass timed out after {}s", AUDITOR_TIMEOUT_SECS);
+    }
+    let status = wait_result
+        .expect("timeout already handled")
+        .context("failed waiting for Codex")?;
+    if !status.success() {
+        bail!(
+            "Codex audit failed: {}",
+            if !stderr_text.trim().is_empty() {
+                stderr_text.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            }
+        );
+    }
+    Ok(stdout)
 }
 
 async fn run_auditor_kimi(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
@@ -1405,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_audit_requires_use_kimi_cli() {
+    async fn run_audit_kimi_models_require_use_kimi_cli() {
         let repo_root = TestTempDir::new("run-audit-requires-kimi");
         let args = AuditArgs {
             doctrine_prompt: PathBuf::from("audit/DOCTRINE.md"),
@@ -1420,7 +1511,7 @@ mod tests {
             branch: None,
             model: "k2.6".to_string(),
             reasoning_effort: "high".to_string(),
-            escalation_model: "gpt-5.4".to_string(),
+            escalation_model: "gpt-5.5".to_string(),
             escalation_effort: "high".to_string(),
             codex_bin: PathBuf::from("codex"),
             kimi_bin: PathBuf::from("kimi-cli"),
@@ -1430,11 +1521,11 @@ mod tests {
 
         let err = run_auditor(repo_root.path(), "prompt", &args)
             .await
-            .expect_err("run_auditor should reject --no-use-kimi-cli");
+            .expect_err("run_auditor should reject Kimi without --use-kimi-cli");
 
         assert_eq!(
             err.to_string(),
-            "auto audit currently requires --use-kimi-cli"
+            "auto audit Kimi models currently require --use-kimi-cli"
         );
     }
 }

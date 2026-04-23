@@ -9,9 +9,9 @@ Keep `auto audit` a deterministic file-by-file check against an operator-authore
 ### Verified facts (code)
 
 - `src/main.rs:81-87` doc-comments `Audit` as "File-by-file audit of a mature codebase against an operator-authored doctrine. Produces per-file verdicts (CLEAN / DRIFT / SLOP / RETIRE / REFACTOR), applies safe fixes atomically, batches large work into WORKLIST.md, and resumes cleanly from partial runs via a manifest."
-- `src/main.rs:850-912` `AuditArgs` defaults: `model = "k2.6"`, `reasoning_effort = "high"`, `escalation_model = "gpt-5.4"`, `escalation_effort = "high"`, `codex_bin = "codex"`, `kimi_bin = "kimi-cli"`, `pi_bin = "pi"`, `use_kimi_cli = true`.
+- `src/main.rs:850-912` `AuditArgs` defaults: `model = "gpt-5.5"`, `reasoning_effort = "high"`, `escalation_model = "gpt-5.5"`, `escalation_effort = "high"`, `codex_bin = "codex"`, `kimi_bin = "kimi-cli"`, `pi_bin = "pi"`, `use_kimi_cli = true`.
 - `AuditResumeMode` variants (`src/main.rs:914-925`): `Resume` (default), `Fresh`, `OnlyDrifted`.
-- `audit_command.rs:1050` bails with "auto audit currently requires --use-kimi-cli" when `use_kimi_cli` is false.
+- `audit_command.rs` runs Codex by default and only requires `--use-kimi-cli` when an explicit Kimi model is selected.
 - `FileVerdict` struct at `audit_command.rs:131` fields: `verdict: String`, `patch_diff: Option<String>`, `worklist_entry: Option<String>`, `retire_reason: Option<String>`.
 - Verdict variants in the auditor doctrine (`audit_command.rs:9` or similar const list): `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, `REFACTOR`.
 - `touched_paths` and `escalate` fields exist on the parsed verdict JSON but are not currently consumed downstream (`corpus/ASSESSMENT.md` §"Half-built" and §"Tech debt inventory": "`FileVerdict::touched_paths` and `FileVerdict::escalate` are parsed but never consumed").
@@ -39,7 +39,7 @@ Keep `auto audit` a deterministic file-by-file check against an operator-authore
 ## Acceptance Criteria
 
 - `auto audit` requires a readable `audit/DOCTRINE.md` in the repo root; missing or empty doctrine yields a clear non-zero exit.
-- `auto audit` defaults to Kimi (`k2.6` at `high`) via `kimi-cli --yolo`; explicit `--no-use-kimi-cli` requires the operator to set up the PI fallback or the command exits non-zero with the "currently requires --use-kimi-cli" message.
+- `auto audit` defaults to Codex `gpt-5.5` at `high`; explicit Kimi model selections route through `kimi-cli --yolo` unless the operator opts into the legacy PI path.
 - `auto audit --resume` (default) reads `audit/MANIFEST.json` and re-audits only files where `content_hash` or `doctrine_hash` has drifted since the previous run.
 - `auto audit --resume-mode fresh` (or equivalent flag name) archives the current manifest and starts a fresh full pass.
 - `auto audit --resume-mode only-drifted` re-audits only files with drifted hashes and skips all files never audited.
@@ -52,15 +52,15 @@ Keep `auto audit` a deterministic file-by-file check against an operator-authore
 - `SLOP` verdicts emit a worklist entry describing the slop and never auto-patch.
 - `FileVerdict::touched_paths` and `FileVerdict::escalate` are either (a) consumed by the apply pipeline (future) or (b) explicitly marked as reserved-for-future so test coverage does not depend on them yet.
 - Manifest reconciliation test: after an intentional doctrine edit, `auto audit --resume` re-audits every file whose per-file doctrine hash has drifted.
-- Test harness covers: manifest load/save, hash computation, verdict application for `CLEAN` / `DRIFT-SMALL` / `REFACTOR`, glob matching, and the `--use-kimi-cli` bail.
+- Test harness covers: manifest load/save, hash computation, verdict application for `CLEAN` / `DRIFT-SMALL` / `REFACTOR`, glob matching, and the explicit Kimi-without-`--use-kimi-cli` bail.
 
 ## Verification
 
 - `cargo test -p autodev audit_command` passes existing glob/sha256 tests and the new verdict-application / manifest-reconcile / escalation tests specified by `corpus/plans/004-audit-verdict-test-harness.md`.
-- Fixture repo with `audit/DOCTRINE.md` + a single file whose doctrine requires a specific import ordering; run `auto audit` with a stubbed Kimi CLI that produces a pre-recorded `DRIFT-SMALL` verdict + patch; assert the patch is applied and the manifest updated.
+- Fixture repo with `audit/DOCTRINE.md` + a single file whose doctrine requires a specific import ordering; run `auto audit` with a stubbed model response that produces a pre-recorded `DRIFT-SMALL` verdict + patch; assert the patch is applied and the manifest updated.
 - Re-run `auto audit --resume` on the same repo without doctrine or code changes; assert no files are re-audited.
 - Edit `audit/DOCTRINE.md`; re-run `auto audit --resume`; assert all files are re-audited (or the ones whose per-file doctrine hash now differs).
-- Negative test: run `auto audit --no-use-kimi-cli` without PI fallback; assert the documented exit message and non-zero exit.
+- Negative test: run `auto audit --model k2.6 --no-use-kimi-cli` without PI fallback support; assert the documented exit message and non-zero exit.
 
 ## Open Questions
 

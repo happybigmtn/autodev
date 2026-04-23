@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::claude_exec::{describe_claude_harness, run_claude_with_futility};
-use crate::codex_exec::run_codex_exec;
+use crate::codex_exec::run_codex_exec_max_context;
 use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
 use crate::completion_artifacts::review_contains_task;
 use crate::util::{
@@ -341,7 +341,7 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
             )
             .await?
         } else {
-            run_codex_exec(
+            run_codex_exec_max_context(
                 &repo_root,
                 &full_prompt,
                 &args.model,

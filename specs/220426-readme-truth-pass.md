@@ -2,7 +2,7 @@
 
 ## Objective
 
-Close the #1 operator-visible gap: the README currently claims "thirteen commands" and documents only those thirteen, while `src/main.rs:52-96` has sixteen. `steward`, `audit`, and `symphony` are invisible to any operator who reads the README alone. Default-model claims for `auto bug` and `auto nemesis` are also stale (README says MiniMax/PI defaults; code says Kimi-first with Codex finalizers). A focused truth-pass updates the inventory bullet list, the detailed command guide, and the per-command default-model lines so that the README matches `auto --help` and code constants. Depth changes (detailed rewrites, new sections) are out of scope for this pass.
+Close the #1 operator-visible gap: the README must match `auto --help` and current code constants. The command inventory includes `steward`, `audit`, and `symphony`, and default-model claims for `auto bug`, `auto nemesis`, and `auto audit` must reflect Codex `gpt-5.5` `high` defaults.
 
 ## Evidence Status
 
@@ -11,8 +11,7 @@ Close the #1 operator-visible gap: the README currently claims "thirteen command
 - `README.md:11` asserts "`auto` owns thirteen commands" — verified to contradict the 16-variant `Command` enum at `src/main.rs:52-96`.
 - `README.md:13-25` bulleted inventory lists: `corpus`, `gen`, `reverse`, `bug`, `nemesis`, `quota`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, `ship`. Missing: `steward`, `audit`, `symphony`.
 - `README.md:536` mentions `auto symphony` in prose inside the `auto loop` description but not in the inventory.
-- `README.md:39`: "`auto bug` runs MiniMax finder, Kimi skeptic/reviewer, and a final `gpt-5.4` `high` implementation pass by default." Code defaults (`src/main.rs:514-520`) set `--finder-model = "k2.6"` (Kimi). Commit `639d953` (title: "bug + nemesis: kimi-cli primary, fix-on-verify, Codex finalizer") intentionally switched the finder primary.
-- `README.md:54-55`: "`auto nemesis` runs a PI audit pair by default, then a `gpt-5.4` `high` implementation pass." Code defaults now set audit/synthesis/fixer to Kimi `k2.6` and finalizer to Codex `gpt-5.4` (`src/main.rs:1065-1116`, `src/nemesis.rs:637-710`).
+- `README.md` default model lines for `auto bug`, `auto nemesis`, and `auto audit` must show Codex `gpt-5.5` `high` defaults.
 - README detailed guide section (`README.md:84-918`) has no subsection for `auto steward`, `auto audit`, or `auto symphony` (detailed guide only covers the thirteen advertised commands).
 - `auto symphony` and `auto audit` and `auto steward` have doc-comments on their `Command` variants in `src/main.rs:74-95`, so `auto --help` already describes them correctly; only the README is stale.
 
@@ -40,8 +39,8 @@ Close the #1 operator-visible gap: the README currently claims "thirteen command
 - `README.md:11` no longer says "thirteen commands"; the count matches the real surface (sixteen).
 - The top-level inventory bullet list in `README.md:13-25` adds `auto steward`, `auto audit`, and `auto symphony` (in a sensible order, for example placed near lifecycle neighbors).
 - The same inventory list includes a one-line "what is this" purpose next to each of the sixteen entries, derived from the `Command` variant doc-comment in `src/main.rs:52-96`.
-- `README.md:39` default-model line for `auto bug` reflects code reality: "Kimi `k2.6` finder, Kimi skeptic/reviewer, Kimi fixer (by default), and a final `gpt-5.4` `high` Codex finalizer pass."
-- `README.md:54-55` default-model line for `auto nemesis` reflects code reality: Kimi `k2.6` audit, synthesis, and fixer by default, followed by a Codex `gpt-5.4` `high` finalizer when implementation runs.
+- `README.md` default-model line for `auto bug` reflects code reality: Codex `gpt-5.5` `high` across finder, skeptic, reviewer, fixer, and finalizer.
+- `README.md` default-model line for `auto nemesis` reflects code reality: Codex `gpt-5.5` `high` across audit, synthesis, fixer, and finalizer.
 - The detailed command guide gains three subsections: `### auto steward`, `### auto audit`, `### auto symphony`. Each subsection covers purpose, inputs, outputs (artifact file list), default models / flags, and when to prefer this command over its siblings.
 - For each of the three new subsections, the artifact list matches the real artifact set:
   - `auto steward`: `DRIFT.md`, `HINGES.md`, `RETIRE.md`, `HAZARDS.md`, `STEWARDSHIP-REPORT.md`, `PROMOTIONS.md`.

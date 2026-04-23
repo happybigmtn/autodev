@@ -1,132 +1,127 @@
-# Plan 001 — Master plan and sequencing
+# Master Plan For Operator Trust
 
-This ExecPlan is a living document. Update every section as reality moves. If a root `PLANS.md` is added to the repository root later, reconcile this plan against it.
+This ExecPlan is a living document. The sections Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective must be updated as work proceeds. No root `PLANS.md` exists in this repository today; if one is added later, maintain this plan in accordance with root `PLANS.md`.
 
 ## Purpose / Big Picture
 
-Make `autodev` honest about itself in its docs, safer for its operators in its quota subsystem, cleaner in its internal structure, and enforceable via CI. The operator gains a tool whose README matches the binary, whose credential handling matches the security posture expected of a local CLI, and whose test and CI scaffolding actually runs. An external observer can see it working by comparing README command inventory to `auto --help`, by inspecting `ls -l ~/.config/quota-router/profiles/*/auth.json` and seeing `0o600`, and by watching a green GitHub Actions run on the next push.
+This master plan coordinates the generated corpus. A user gains a clear, sequenced path from current repo reality to a safer `auto` CLI: reconciled planning truth, fixed credential handling, hardened workflow rendering, stronger verification evidence, shared task parsing, and better first-run proof.
 
-This plan is the index for Plans 002 through 012. It does no implementation work itself; it asserts sequencing and dependency order, declares decision gates, and records what the bundle must achieve before the next corpus pass.
+The work is visible when root planning docs stop contradicting code, quota credential swaps restore exactly, Symphony workflows quote hostile inputs safely, verification receipts reject false proof, and operators can run a no-model smoke path before trusting live agents.
 
 ## Requirements Trace
 
-- **R1.** The generated corpus under `genesis/` is the active planning surface for this pass and takes precedence over any ad-hoc plan file elsewhere in the tree until a root `PLANS.md` or `plans/` is created. Contract: `genesis/PLANS.md` and `genesis/plans/NNN-*.md` are the canonical list; `IMPLEMENTATION_PLAN.md` at the repository root remains empty until `auto gen` promotes plans into it.
-- **R2.** Plans in this corpus execute in the declared Phase 1 → Phase 2 → Phase 3 sequence. Each phase ends with a checkpoint plan (005, 009) that blocks the next phase until its acceptance is met.
-- **R3.** No plan in this corpus introduces a new CLI command, a new artifact file shape, or a rewrite of `parallel_command.rs` / `generation.rs` / `bug_command.rs` beyond extracting shared helpers.
-- **R4.** Every numbered plan under `genesis/plans/` is self-contained. A novice with only the current working tree and the single plan file can execute it without reading other plans.
+- R1: Keep `genesis/` subordinate to active root planning docs until work is promoted.
+- R2: Fix credential restore/copy safety before broader execution refactors.
+- R3: Harden generated executable text before expanding Symphony usage.
+- R4: Make verification evidence explicit and risk-classed.
+- R5: Converge duplicated task parsing.
+- R6: Add first-run and CI proof after safety gates pass.
 
 ## Scope Boundaries
 
-- **Not changing** in this plan: source files under `src/`, configuration under `.auto/`, the existing README or AGENTS.md, anything under `specs/` or `bug/` or `nemesis/`.
-- **Not changing** via this corpus at all: the `Symphony` or `Steward` feature sets (their reconciliation is researched in Plan 012 and implementation is deferred).
-- **Deferred** to a future corpus pass: encryption at rest for quota credentials, full refactor of `parallel_command.rs`, command retirement.
+This plan does not directly edit Rust code, root docs, CI, or provider credentials. It coordinates the numbered plans and defines phase gates. It does not add commands, change defaults, or decide encryption-at-rest.
 
 ## Progress
 
-- [x] 2026-04-21 — Corpus authored. `ASSESSMENT.md`, `SPEC.md`, `DESIGN.md`, `PLANS.md`, `GENESIS-REPORT.md`, `plans/001-master-plan.md` through `plans/012-*.md` written.
-- [ ] Phase 1 (Plans 002, 003, 004) complete.
-- [ ] Plan 005 checkpoint passed.
-- [ ] Phase 2 (Plans 006, 007, 008) complete.
-- [ ] Plan 009 checkpoint passed.
-- [ ] Phase 3 (Plans 010, 011, 012) complete.
+- [x] 2026-04-23: Current repo review completed across code, docs, tests, CI, git history, and archived corpus.
+- [x] 2026-04-23: Plan sequence selected with checkpoint gates after security and execution-contract phases.
+- [ ] 2026-04-23: Promote selected slices into root `IMPLEMENTATION_PLAN.md` before execution.
 
 ## Surprises & Discoveries
 
-- 2026-04-21 — The repo has sixteen commands, not thirteen. Three (`steward`, `audit`, `symphony`) are undocumented in the README.
-- 2026-04-21 — `src/codex_exec.rs` carries ~400 lines of dead tmux scaffolding fronted by `#![allow(dead_code)]`.
-- 2026-04-21 — Quota credentials are stored in plaintext under `~/.config/quota-router/` with no `chmod` call anywhere in the subsystem.
+The archived previous corpus is materially stale. Several high-priority old findings, including CI absence and older command inventory drift, have been addressed. Current `cargo test` is green, but urgent issues remain in credential restore, planning drift, Symphony rendering, and verification proof.
 
 ## Decision Log
 
-- **2026-04-21 — Active planning surface = `genesis/`.** Mechanical. Repo has no root `PLANS.md`, no root `plans/`, no `CLAUDE.md`. `AGENTS.md` does not designate an alternate surface.
-- **2026-04-21 — Agent-instruction file convention = `AGENTS.md`.** Mechanical. File already exists; this is a Codex-first repo based on its validation commands.
-- **2026-04-21 — Docs truth-pass before security fix.** Taste. Both matter; docs affect every first-run operator, security affects only quota users. Operator may reorder by running Plan 006 before Plans 002-004 if the quota risk is more pressing in their threat model.
-- **2026-04-21 — `LlmBackend` trait and command-lifecycle reconciliation are research-only.** Taste / User Challenge. Two callers do not universally justify an abstraction; command retirement is a product decision.
-- **2026-04-21 — Phase-boundary checkpoints (Plans 005, 009) are mandatory.** Mechanical. The corpus explicitly requests decision gates at meaningful phase boundaries.
+- Mechanical: No root `PLANS.md` or root `plans/` exists, so generated ExecPlans are subordinate corpus artifacts.
+- Taste: Planning truth reconciliation comes before security implementation so later work is tracked in the correct root queue.
+- Mechanical: Security checkpoint Plan 005 blocks execution-contract work until credential and workflow risks are addressed.
+- User Challenge: Dangerous-mode defaults and encryption-at-rest remain operator decisions rather than silent changes.
 
 ## Outcomes & Retrospective
 
-None yet. To be filled as each phase completes.
+Not implemented yet. The intended outcome is a promoted, evidence-backed subset of this corpus in the root plan, followed by phase-by-phase execution. Update this section after each checkpoint.
 
 ## Context and Orientation
 
-Relevant files and starting points for a novice operator picking up this corpus:
+Relevant files:
 
-- `README.md` at the repository root — current tool-facing prose. Known stale.
-- `AGENTS.md` at the repository root — authoritative build / validate / essentials block.
-- `src/main.rs` — command enum and dispatch. Lines 52-96 enumerate all sixteen commands.
-- `src/util.rs` — shared git, checkpoint, and atomic-write helpers. Starting point for Plan 007 extractions.
-- `src/codex_exec.rs` — contains dead tmux scaffolding (Plan 003 target).
-- `src/audit_command.rs` — `auto audit` implementation (Plan 004 target).
-- `src/quota_config.rs`, `src/quota_state.rs`, `src/quota_usage.rs`, `src/quota_status.rs` — quota subsystem (Plan 006 target).
-- `genesis/ASSESSMENT.md` — full review findings with file:line citations.
-- `genesis/SPEC.md` — behavioral contract and current-state truth table.
-- `genesis/DESIGN.md` — CLI surface and artifact design.
-- `genesis/PLANS.md` — index of numbered plans with dependency order.
-- `genesis/GENESIS-REPORT.md` — refresh summary and decision audit trail.
-
-The repo builds with `cargo build`. Validate with `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings`. There is no pre-existing CI; introducing it is Plan 010's scope.
+- `AGENTS.md` documents build and validation commands.
+- `src/main.rs` defines the public CLI surface and defaults.
+- `src/generation.rs` writes and verifies `genesis/` and `gen-*` planning artifacts.
+- `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and `specs/` are active root planning materials.
+- `src/quota_exec.rs`, `src/quota_config.rs`, and `src/quota_usage.rs` own quota-account behavior.
+- `src/symphony_command.rs` renders Symphony workflow text.
+- `src/completion_artifacts.rs` interprets verification evidence.
+- `src/parallel_command.rs`, `src/loop_command.rs`, and `src/review_command.rs` execute or review task queues.
 
 ## Plan of Work
 
-The master plan expresses the bundle as three phases with two decision gates:
-
-- **Phase 1 (Plans 002 → 003 → 004) — Truth pass.** Small, high-signal, unblock everything else. README inventory, dead-code removal, audit-command test harness.
-- **Plan 005 — Phase 1 gate.** Assert: `cargo test`, `cargo clippy -D warnings`, and `auto --help` match README inventory before Phase 2 begins.
-- **Phase 2 (Plans 006 → 007 → 008) — Consolidation.** Security hardening on quota, shared-utility extraction, LlmBackend research.
-- **Plan 009 — Phase 2 gate.** Assert: credential files are `0o600`, duplication metrics have dropped, and a backend-trait decision is recorded.
-- **Phase 3 (Plans 010 → 011 → 012) — Foundation.** CI, integration smoke tests, command-lifecycle research.
+First reconcile planning truth. Then fix credential and generated workflow security issues. Add a security gate. Then harden verification receipts, shared task parsing, and backend policy design. Add an execution-contract gate. Finally improve first-run DX, CI, and release readiness.
 
 ## Implementation Units
 
-This plan is an index; it produces no code. It produces this document and the twelve sibling files under `genesis/plans/`.
+Unit 1 - Promote the chosen plan subset:
 
-**Unit 1 — Corpus authorship.**
-- Goal: author `ASSESSMENT.md`, `SPEC.md`, `DESIGN.md`, `PLANS.md`, `GENESIS-REPORT.md`, and `plans/001-master-plan.md` through `plans/012-*.md` inside `genesis/`.
-- Requirements advanced: R1, R4.
-- Dependencies: none.
-- Files to create: `genesis/ASSESSMENT.md`, `genesis/SPEC.md`, `genesis/DESIGN.md`, `genesis/PLANS.md`, `genesis/GENESIS-REPORT.md`, `genesis/plans/001-master-plan.md` through `012-command-lifecycle-reconciliation-research.md`.
+- Goal: Copy the selected next work into the active root plan.
+- Requirements advanced: R1.
+- Dependencies: this corpus.
+- Files to create or modify: `IMPLEMENTATION_PLAN.md`.
 - Tests to add or modify: none.
-- Approach: read repo source and control docs; write a corpus that treats code as truth and docs as claims.
-- Test expectation: none — this is the planning corpus itself; no code behavior changes.
+- Approach: add only the chosen near-term slice rows, preserving existing root plan style.
+- Specific test scenarios: `rg -n "Quota Credential Restore|Symphony Workflow Rendering|Verification Command" IMPLEMENTATION_PLAN.md` should find promoted work when those slices are selected.
+
+Unit 2 - Execute phase gates:
+
+- Goal: Stop later phases until the previous phase has evidence.
+- Requirements advanced: R2, R3, R4, R5, R6.
+- Dependencies: Plans 005, 009, and 012.
+- Files to create or modify: gate plans and root status docs.
+- Tests to add or modify: none for this coordination unit.
+- Approach: update root status only after targeted commands pass.
+- Specific test scenarios: each checkpoint plan lists its own acceptance commands.
+
+Unit 3 - Maintain the corpus:
+
+- Goal: Keep generated plans aligned with actual execution.
+- Requirements advanced: R1.
+- Dependencies: all plans.
+- Files to create or modify: `genesis/GENESIS-REPORT.md`, this plan, and affected numbered plans.
+- Tests to add or modify: Test expectation: none -- this is a documentation maintenance unit, not code behavior.
+- Approach: update Progress and Outcomes sections as execution proceeds.
+- Specific test scenarios: `rg -n "None yet" genesis/plans` should shrink as plans move from proposed to executed.
 
 ## Concrete Steps
 
-1. From the repository root, confirm the corpus is in place:
-   ```
-   ls genesis/
-   ls genesis/plans/
-   ```
-2. Open `genesis/GENESIS-REPORT.md` and read the Decision audit trail section end to end.
-3. Proceed to Plan 002. After each plan completes, return to this plan and update the Progress section.
+From the repository root:
+
+    rg -n "Root Planning Truth|Quota Credential|Symphony Workflow" genesis/plans
+    sed -n '1,220p' genesis/PLANS.md
+    sed -n '1,220p' IMPLEMENTATION_PLAN.md
+
+Expected observation: `genesis/PLANS.md` indexes the full sequence, while root `IMPLEMENTATION_PLAN.md` remains the active queue until explicitly updated.
 
 ## Validation and Acceptance
 
-Acceptance for this plan:
+Acceptance for this master plan is documentation-level:
 
-- `genesis/` contains `ASSESSMENT.md`, `SPEC.md`, `DESIGN.md`, `PLANS.md`, `GENESIS-REPORT.md`, and `plans/001-master-plan.md` through `plans/012-command-lifecycle-reconciliation-research.md`.
-- Each plan under `genesis/plans/` includes every section listed in the corpus ExecPlan requirements (Purpose / Big Picture, Requirements Trace, Scope Boundaries, Progress, Surprises & Discoveries, Decision Log, Outcomes & Retrospective, Context and Orientation, Plan of Work, Implementation Units, Concrete Steps, Validation and Acceptance, Idempotence and Recovery, Artifacts and Notes, Interfaces and Dependencies).
-- No plan file contains absolute repository-root paths in prose.
-
-Observable verification:
-```
-find genesis -name '*.md' -type f | sort
-grep -c '^## ' genesis/plans/001-master-plan.md
-```
-The second command should print at least 15.
+- the generated corpus contains plans 001 through 012;
+- the index states that root docs remain active;
+- checkpoint plans exist after meaningful phase boundaries;
+- no generated markdown contains the absolute repository-root path.
 
 ## Idempotence and Recovery
 
-Rerunning this plan means re-authoring the corpus. If the corpus already exists and is correct, re-execution is a no-op. If a plan file is accidentally deleted, recover via `git checkout -- genesis/plans/NNN-*.md` from the commit that last contained it. If the entire corpus needs to be rebuilt, `auto corpus` is the reproducer; the operator may choose to rerun it or to hand-edit.
+Rerun the corpus review safely by archiving current `genesis/` first if using `auto corpus`. If a generated plan is partially promoted, compare root `IMPLEMENTATION_PLAN.md` with this file and only keep the selected slices. Do not mass-copy every generated plan into active work without operator choice.
 
 ## Artifacts and Notes
 
-- Corpus files enumerated in the Validation section.
-- Commit: `0b59aec` was HEAD at corpus-authoring time.
-- Tool versions observed: Rust 2021 edition, `clap` 4, `tokio` with `full` features, `reqwest` 0.12, `chrono` 0.4.
+Evidence captured in this corpus:
+
+- targeted review reran the previously reported quota usage failure and full `cargo test`; both passed;
+- no root `PLANS.md` or root `plans/` directory exists;
+- previous corpus snapshot is historical and stale in several areas.
 
 ## Interfaces and Dependencies
 
-- **Depends on:** nothing. Pure authoring.
-- **Used by:** Plans 002 through 012.
-- **External:** none. No agent CLI, no network call, no build.
+This plan depends on markdown docs only. It coordinates the interfaces owned by later plans: quota credentials, Symphony workflow rendering, completion artifacts, task parsing, backend execution, first-run smoke tests, and CI.

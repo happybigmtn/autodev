@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 
-use crate::codex_exec::run_codex_exec;
+use crate::codex_exec::run_codex_exec_max_context;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state, AutoState};
 use crate::util::{
@@ -866,12 +866,13 @@ async fn run_logged_codex_review(
     println!("phase:       {phase_slug}");
     println!("model:       {model}");
     println!("effort:      {reasoning_effort}");
+    println!("context:     max");
     println!("codex bin:   {}", codex_bin.display());
     println!("prompt log:  {}", prompt_path.display());
     println!("stderr log:  {}", stderr_log_path.display());
     println!("report path: {}", report_path.display());
 
-    let status = run_codex_exec(
+    let status = run_codex_exec_max_context(
         repo_root,
         prompt,
         model,
@@ -975,12 +976,13 @@ async fn run_logged_codex_author_phase(
     println!("phase:       {phase_slug}");
     println!("model:       {model}");
     println!("effort:      {reasoning_effort}");
+    println!("context:     max");
     println!("codex bin:   {}", codex_bin.display());
     println!("prompt log:  {}", prompt_path.display());
     println!("stdout log:  {}", stdout_log_path.display());
     println!("stderr log:  {}", stderr_log_path.display());
 
-    let status = run_codex_exec(
+    let status = run_codex_exec_max_context(
         repo_root,
         prompt,
         model,
@@ -1834,9 +1836,9 @@ fn build_corpus_codex_review_prompt(
     format!(
         r#"{skill_boundary}
 
-You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `auto corpus`.
+You are the mandatory GPT-5.5 xhigh Codex outside-voice review step for `auto corpus`.
 
-Claude Opus 4.7 xhigh has already produced the initial planning corpus under `{planning_root}` for the repository at `{repo_root}`. Your job is to conduct an independent review and validation pass, then amend the generated corpus in place when the documents fall short.
+A GPT-5.5 xhigh Codex authoring pass has already produced the initial planning corpus under `{planning_root}` for the repository at `{repo_root}`. Your job is to conduct an independent review and validation pass, then amend the generated corpus in place when the documents fall short.
 
 Edit boundary:
 - You may read the repository at `{repo_root}` and the generated corpus at `{planning_root}`.
@@ -1850,8 +1852,8 @@ Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
-- Treat a `User Challenge` as any point where both the Opus output and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in `GENESIS-REPORT.md`, `ASSESSMENT.md`, or `{report_path}`.
-- Treat Codex-vs-Opus disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend the corpus only when the repository evidence supports the change.
+- Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in `GENESIS-REPORT.md`, `ASSESSMENT.md`, or `{report_path}`.
+- Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend the corpus only when the repository evidence supports the change.
 
 CEO review pass:
 - Re-test the premise, product direction, opportunity cost, and "Not Doing" list against the actual code.
@@ -1918,9 +1920,9 @@ fn build_generation_codex_review_prompt(
     format!(
         r#"{skill_boundary}
 
-You are the mandatory GPT-5.4 xhigh Codex outside-voice review step for `{command_label}`.
+You are the mandatory GPT-5.5 xhigh Codex outside-voice review step for `{command_label}`.
 
-Claude Opus 4.7 xhigh has already produced initial generated specs and an implementation plan in `{output_dir}` for the repository at `{repo_root}`.
+A GPT-5.5 xhigh Codex authoring pass has already produced initial generated specs and an implementation plan in `{output_dir}` for the repository at `{repo_root}`.
 
 {mode_clause}
 
@@ -1934,8 +1936,8 @@ Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
-- Treat a `User Challenge` as any point where both the Opus output and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in the generated docs or `{report_path}`.
-- Treat Codex-vs-Opus disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend generated docs only when repository evidence supports the change.
+- Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in the generated docs or `{report_path}`.
+- Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend generated docs only when repository evidence supports the change.
 
 CEO review pass:
 - Check whether the generated specs and plan preserve the right product/system direction, scope boundaries, non-goals, alternatives, and hidden assumptions.
@@ -3906,7 +3908,7 @@ Spec: `specs/050426-deterministic-transcripts.md`
             &ActivePlanSurface::default(),
         );
 
-        assert!(corpus_prompt.contains("GPT-5.4 xhigh Codex outside-voice review"));
+        assert!(corpus_prompt.contains("GPT-5.5 xhigh Codex outside-voice review"));
         assert!(corpus_prompt.contains("Do NOT read or execute any SKILL.md files"));
         assert!(
             corpus_prompt.contains("You may edit only markdown files under `/tmp/repo/genesis`")
@@ -4008,9 +4010,9 @@ Spec: `specs/050426-deterministic-transcripts.md`
 
     #[test]
     fn generation_author_backend_uses_codex_for_non_claude_models() {
-        assert!(author_phase_uses_claude_model("claude-opus-4-7"));
+        assert!(author_phase_uses_claude_model("claude-sonnet-4-6"));
         assert!(author_phase_uses_claude_model("sonnet"));
-        assert!(!author_phase_uses_claude_model("gpt-5.4"));
+        assert!(!author_phase_uses_claude_model("gpt-5.5"));
         assert!(!author_phase_uses_claude_model("o3"));
     }
 

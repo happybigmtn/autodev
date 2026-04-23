@@ -1,6 +1,6 @@
 //! `auto steward` — stewardship replacement for corpus+gen on mid-flight repos.
 //!
-//! Both passes run through Codex (gpt-5.4 by default). The first pass reads
+//! Both passes run through Codex (gpt-5.5 by default). The first pass reads
 //! the repo + planning surface and writes audit artifacts; the second pass is
 //! an independent Codex review that verifies the first pass's GHOST / ORPHAN
 //! rows against the live tree and applies approved active plan/spec
@@ -545,7 +545,7 @@ fn build_finalizer_prompt(
          Commit any edits with message `steward: finalizer applied`."
     };
     format!(
-        r#"You are the finalizer for an `auto steward` pass. Both passes run under Codex gpt-5.4 by default; you are the second, independent look.
+        r#"You are the finalizer for an `auto steward` pass. Both passes run under Codex gpt-5.5 by default; you are the second, independent look.
 
 The first pass produced five artifacts. Verify they hold in the live tree and apply the approved IMPLEMENTATION_PLAN.md / WORKLIST.md / LEARNINGS.md edits.
 
@@ -642,9 +642,9 @@ mod tests {
             report_only: false,
             dry_run,
             branch: None,
-            model: "gpt-5.4".to_string(),
+            model: "gpt-5.5".to_string(),
             reasoning_effort: "high".to_string(),
-            finalizer_model: "gpt-5.4".to_string(),
+            finalizer_model: "gpt-5.5".to_string(),
             finalizer_effort: "high".to_string(),
             codex_bin: repo.join("missing-codex"),
             skip_finalizer: false,

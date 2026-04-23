@@ -1,120 +1,154 @@
-# SPEC — autodev
+# SPEC - autodev as an operator-trust CLI
 
-## What this is
+## Product Summary
 
-`autodev` is a single Rust binary named `auto` that wraps a fleet of coding-agent CLIs (`claude`, `codex`, `pi`, `kimi-cli`) in an opinionated repo-root planning and execution lifecycle. The operator runs `auto <command>` from inside a Git working tree; `auto` resolves the repo root, invokes one or more agent CLIs, consumes their streamed output, and writes durable artifacts back into the repo (`specs/`, `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `QA.md`, `HEALTH.md`, `SHIP.md`) or into disposable staging (`genesis/`, `gen-<timestamp>/`, `bug/`, `nemesis/`, `.auto/`).
+`autodev` builds the `auto` command, a repo-root CLI for planning, generating, executing, reviewing, and shipping agent-driven engineering work. It is a local operator tool, not a hosted service. Its main job is to convert a real working tree into actionable planning artifacts, run model-backed workers against that tree, and preserve enough evidence that a human can trust what happened.
 
-The tool assumes one operator per repo per run, a reachable `origin`, and the expectation that commits will be pushed to the branch the operator is on. Most mutating commands rebase onto `origin/<branch>` before work and before push.
+Near-term product direction: stabilize the current command lifecycle before expanding the surface. The product should become an evidence-first operator console for existing commands: planning truth, credential safety, verification receipts, backend policy, and first-run confidence.
 
-## Command surface (current truth)
+## Users And Jobs
 
-`main.rs:52-96` enumerates sixteen top-level commands. Treating this as the real surface:
+Primary operator job: "I need to move a real repo forward with agent help without losing track of source truth, credentials, worktree state, or verification evidence."
 
-| Command | Module | Role | State |
-|---|---|---|---|
-| `corpus` | `corpus.rs`, driven by a Claude invocation in the caller | Build a disposable planning corpus under `genesis/` from repo reality | Stable |
-| `gen` | `generation.rs` | Turn the corpus into durable specs and a plan | Stable |
-| `reverse` | `generation.rs` (shared pipeline) | Reverse-engineer specs from code without touching the plan | Stable |
-| `bug` | `bug_command.rs` | Chunked finder → skeptic → reviewer → fixer pipeline | Stable |
-| `nemesis` | `nemesis.rs` | Draft audit → synthesis → implementation, feedback into root plan | Stable |
-| `loop` | `loop_command.rs` | Single-worker implementation of the next `- [ ]` task | Stable |
-| `parallel` | `parallel_command.rs` | Multi-lane tmux-backed implementation executor | Stable but large |
-| `qa` | `qa_command.rs` | Runtime QA pass, may fix bounded issues | Stable |
-| `qa-only` | `qa_only_command.rs` | Report-only QA (no fixes) | Stable |
-| `health` | `health_command.rs` | Repo-wide quality/verification snapshot, no fixes | Stable |
-| `review` | `review_command.rs` | Review completed work, archive or worklist-append | Stable |
-| `steward` | `steward_command.rs` | Two-pass reconciliation for mid-flight repos; alternative to `corpus + gen` | **New (2026-04-21), undocumented in README** |
-| `audit` | `audit_command.rs` | File-by-file audit against operator-authored `audit/DOCTRINE.md` | **New (2026-04-21), undocumented in README** |
-| `ship` | `ship_command.rs` | Release-prep + docs/version sync + PR creation/refresh | Stable |
-| `quota` | `quota_*.rs` | Multi-account routing for Claude/Codex | Stable, security gap |
-| `symphony` | `symphony_command.rs` | Linear.app sync + orchestration runtime | **Undocumented in README command list** |
+Contributor job: "I need to change `auto` safely, understand which command owns which behavior, and run tests that prove I did not break the lifecycle."
 
-"State" column judges whether code and docs agree and whether the command has meaningful test coverage. Stability does not mean bug-free.
+Reviewer job: "I need generated plans, receipts, and logs that let me distinguish implemented code from model prose."
 
-## Behavioral contract for the lifecycle (what operators rely on)
+## Current System Behaviors Grounded In Code
 
-The following behaviors are exercised in the source and confirmed in code review. They form the implicit contract `autodev` is asking operators to trust.
+Planning:
 
-1. **Binary provenance.** `auto --version` prints package version plus embedded git SHA, dirty/clean flag, and build profile (driven by `build.rs`).
-2. **Repo-root auto-resolution.** Every command calls `util::git_repo_root` and operates relative to the resolved root.
-3. **Checkpoint safety on mutating runs.** Before launching a long agent invocation, commands call `util::auto_checkpoint_if_needed` to commit dirty tracked/untracked state with a machine-readable message, honoring `CHECKPOINT_EXCLUDE_RULES` (`.auto/`, `bug/`, `nemesis/`, `gen-*`).
-4. **Atomic file writes.** Spec, plan, report, and state artifacts go through `util::atomic_write`, which writes to `<name>.tmp-<pid>-<nanos>` and renames, cleaning up the temp on failure.
-5. **Rebase-before-work and rebase-before-push** for `loop`, `qa`, `review`, `ship`, `bug`, `nemesis`, `parallel`, and `audit`. `util::sync_branch_with_remote` performs `git pull --rebase --autostash origin <branch>` when the remote branch exists.
-6. **Archive-then-wipe for disposable output.** `nemesis.rs::prepare_output_dir` archives the previous `nemesis/` into `.auto/fresh-input/nemesis-previous-<timestamp>/` before wiping. `auto corpus` does the same for `genesis/`.
-7. **Futility detection on agent streams.** `codex_stream.rs` tracks consecutive empty tool results (`CLAUDE_FUTILITY_THRESHOLD = 8`, `CLAUDE_FUTILITY_THRESHOLD_REVIEW = 16`); reaching the threshold kills the agent and returns exit code 137 (`FUTILITY_EXIT_MARKER`).
-8. **Quota routing on exhaustion.** `quota_exec.rs` sequentially tries configured accounts, detects exhaustion via `quota_patterns.rs` (rate limit, quota exceeded, 429, overloaded), and rotates. Weekly floor is `10%`, session floor is `25%` (`quota_selector.rs:8-10`).
-9. **Task queue protocol.** `IMPLEMENTATION_PLAN.md` uses `- [ ]` for pending, `- [!]` for blocked (skipped by `loop`), `- [x]` for completed. Parsing is identical across `loop_command`, `parallel_command`, `review_command`, `generation`.
-10. **Verification receipts for parallel host reconciliation.** `parallel_command.rs` requires `.auto/symphony/verification-receipts/<task_id>.json` (shape validated by `completion_artifacts.rs`) to mark executable-`Verification:` tasks complete; prose handoff alone leaves the task `[~]`.
+- `auto corpus` writes a planning corpus under `genesis/`, can accept idea/focus/reference repo inputs, runs an author phase, optionally runs Codex review, sanitizes absolute repo-root paths, and verifies required corpus shape.
+- `auto gen` and `auto reverse` load the corpus, emit `gen-*` snapshots, generate specs and an implementation plan, and synchronize selected output back to root docs.
+- `src/corpus.rs` defines the corpus loader shape. Numbered plans are expected under `genesis/plans/`.
 
-## Artifact shapes (user-visible file formats)
+Execution:
 
-These are the persistent surfaces operators see and sometimes hand-edit:
+- `auto loop` picks sequential plan work, syncs/checkpoints/pushes the primary branch, and runs a model worker.
+- `auto parallel` parses plan tasks, assigns lanes, runs tmux-backed workers, lands lane commits, writes review handoffs, and can sync with Linear.
+- `auto symphony` renders and runs Linear/Symphony workflows.
 
-- **`specs/<ddmmyy>-<topic-slug>[-<counter>].md`** — durable specs. Required sections per `auto gen` contract: `## Objective`, `## Acceptance Criteria`, `## Verification`, `## Evidence Status`, `## Open Questions`.
-- **`IMPLEMENTATION_PLAN.md`** — plan queue with `- [ ]` / `- [!]` / `- [x]` task markers and per-task metadata (spec reference, evidence, owned surfaces, scope, acceptance, verification, dependencies, estimated scope, completion signal).
-- **`REVIEW.md`** — completion handoffs for `auto review` to pick up.
-- **`ARCHIVED.md`** — cleared review items.
-- **`WORKLIST.md`** — issues that survived review, or that `auto audit` surfaces for manual follow-up.
-- **`LEARNINGS.md`** — durable institutional knowledge surfaced during review/qa/ship.
-- **`QA.md`** — branch-level runtime QA evidence and verdict.
-- **`HEALTH.md`** — repo-wide health snapshot with 0-10 score and per-lane sub-scores.
-- **`SHIP.md`** — release-prep report with rollback path, monitoring path, rollout posture.
-- **`COMPLETED.md`** — completed work that has not yet flowed through `auto review`.
-- **`genesis/{ASSESSMENT,SPEC,PLANS,GENESIS-REPORT,DESIGN,FOCUS,IDEA}.md` and `genesis/plans/*.md`** — disposable planning corpus.
-- **`bug/BUG_REPORT.md`, `bug/verified-findings.json`, `bug/implementation-results.json`** — bug-pipeline outputs.
-- **`nemesis/nemesis-audit.md`, `nemesis/IMPLEMENTATION_PLAN.md`, `nemesis/implementation-results.{json,md}`** — nemesis outputs.
-- **`audit/MANIFEST.json`, `audit/files/<hash-prefix>/{verdict.json,patch.diff,response.log,prompt.md}`** — per-file audit manifest and artifacts.
-- **`.auto/state.json`, `.auto/logs/`, `.auto/loop/`, `.auto/parallel/`, `.auto/qa/`, `.auto/health/`, `.auto/ship/`, `.auto/review/`, `.auto/fresh-input/`, `.auto/queue-runs/`, `.auto/symphony/`** — runtime state and logs.
+Quality and review:
 
-## Models (current defaults, verified in source)
+- `auto review`, `auto qa`, `auto qa-only`, `auto health`, and `auto ship` are model-backed operator commands around review, QA, status, and release control.
+- `auto audit`, `auto bug`, and `auto nemesis` generate findings and remediation work through specialized prompts and parsers.
 
-The README names specific defaults. Code review reveals some drift:
+Quota and backend execution:
 
-| Command / phase | README claim | Source reality |
-|---|---|---|
-| `corpus`, `gen`, `reverse` | `claude-opus-4-7` with `xhigh` | Matches (`claude_exec.rs`, model resolution tables) |
-| `loop` | `gpt-5.4` with `xhigh` | Matches (`loop_command.rs` defaults) |
-| `qa`, `qa-only`, `health`, `review`, `ship` | `gpt-5.4` with `high` (standard tier for QA) | Matches |
-| `nemesis` draft | PI with `minimax/MiniMax-M2.7-highspeed` and `high` | Matches, but `--kimi` and `--minimax` flags exist |
-| `nemesis` synthesis | PI with `kimi-coding/k2p6` and `high` | Matches |
-| `nemesis` implementer | Codex `gpt-5.4` with `high` | Matches |
-| `bug` finder | "MiniMax `minimax/MiniMax-M2.7-highspeed`" (README:341) | **Drift** — commit `639d953` made Kimi primary; code defaults now favor `kimi-coding/k2p6` |
-| `bug` skeptic / reviewer | Kimi `kimi-coding/k2p6` with `high` | Matches |
-| `bug` implementer | `gpt-5.4` with `high` | Matches |
-| `audit` auditor | (not in README) | Kimi via `kimi-cli --yolo`; no PI fallback path, bails without `--use-kimi-cli` |
-| `parallel` | `gpt-5.4` with `xhigh`, five workers | Matches |
+- `auto quota` manages provider accounts, usage selection, and credential swapping for Codex and Claude.
+- Codex and Claude wrappers exist, but several command modules also build direct spawn paths.
 
-These should be treated as **recommended defaults** subject to future change. Any plan or spec written against exact model strings must be rewrittable when defaults move again.
+State and generated artifacts:
 
-## Runtime dependencies (verified against code and README)
+- `.auto/` stores runtime state, logs, receipts, and snapshots.
+- `bug/` and `nemesis/` store generated outputs for their respective commands.
+- `genesis/` is a planning corpus.
+- `gen-*` directories are generated plan/spec outputs.
 
-- `git` — always required; `util.rs::git_repo_root` calls `git rev-parse --show-toplevel` at startup.
-- `claude` — required for `corpus`, `gen`, `reverse`; also used inside `parallel` / `review` / `loop` branches.
-- `codex` — required for `nemesis`, `loop`, `qa`, `qa-only`, `health`, `review`, `ship`, `bug` (unless using PI for a phase).
-- `pi` — required for `bug` PI phases and default `nemesis` audit passes.
-- `kimi-cli` — required for the `audit` command (see `audit_command.rs:1023`) and for bug/nemesis Kimi phases.
-- `gh` — optional; used by `ship` to create or refresh PRs.
-- `tmux` — required for `parallel` (invoked by `parallel_command.rs` to host lane windows).
+## Verified Technical Details
 
-Absence of any required tool produces an `anyhow::Error` at the point of invocation; there is no single preflight command. `AGENTS.md` lists the essentials.
+The following values are verified from current code or checked-in configuration, not invented requirements:
 
-## Scope this repo intends to own
+- Package version: `0.2.0` from `Cargo.toml`.
+- Rust edition: `2021` from `Cargo.toml`.
+- Binary name: `auto` from `Cargo.toml`.
+- Dependency tags in `Cargo.toml`: `anyhow = "1"`, `chrono = "0.4"`, `clap = "4"`, `console = "0.15"`, `dirs = "6"`, `fd-lock = "4"`, `regex = "1"`, `reqwest = "0.12"`, `serde = "1"`, `serde_json = "1"`, `shlex = "1.3"`, `tokio = "1"`, `base64 = "0.22"`, `sha2 = "0.10"`, `toml = "0.8"`.
+- Corpus default model and review model in current `src/main.rs`: `gpt-5.5` with `xhigh` reasoning.
+- Bug, nemesis, audit, loop, parallel, QA, review, ship, steward, and Symphony defaults currently favor Codex `gpt-5.5` paths unless explicit Claude/Kimi/PI options are selected.
+- Codex max context helper: `MAX_CODEX_MODEL_CONTEXT_WINDOW = 1_000_000` in `src/codex_exec.rs`.
+- Quota selector floors: weekly floor `10` percent and session floor `25` percent in `src/quota_selector.rs`.
+- Quota exhaustion cooldown: `1` hour in `src/quota_state.rs`.
+- Claude token refresh endpoint and client id are hardcoded in `src/quota_usage.rs`; treat those as verified implementation details, not a recommendation to expose them in docs.
+- Claude refresh buffer: `300` seconds in `src/quota_usage.rs`.
+- Codex CLI refresh timeout: `20` seconds in `src/quota_usage.rs`.
+- Parallel poll/cleanup timing constants are defined in `src/parallel_command.rs`; keep future docs tied to those constants rather than retyping values casually.
+- CI currently runs format check, clippy with warnings denied, and tests from `.github/workflows/ci.yml`.
 
-The design-goal paragraph in the README defines the scope in its own words: "if a feature does not directly improve `corpus`, `gen`, `reverse`, `bug`, `nemesis`, `quota`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, or `ship`, it probably does not belong here." The code has since added `steward`, `audit`, and `symphony`, which either belong in an updated scope statement or deserve an explicit justification.
+The exact resolved dependency versions are in `Cargo.lock`; this corpus does not restate the full lockfile as requirements.
 
-Pragmatic read of current scope:
+## Recommended Requirements
 
-- **In scope.** Planning (`corpus`, `gen`, `reverse`, `steward`), implementation (`loop`, `parallel`), quality (`qa`, `qa-only`, `health`, `review`, `audit`), release (`ship`), audit (`bug`, `nemesis`), account management (`quota`), orchestration backbone (`symphony`).
-- **Out of scope.** Language servers, IDE plugins, per-file formatting, non-agent code generation, cross-repo refactoring engines, anything a monorepo tool would handle.
+R1. Planning truth must be singular. Root `IMPLEMENTATION_PLAN.md` plus `specs/` remain the active planning surface unless the repo adds a root `PLANS.md` or explicit instruction to promote another control plane. `genesis/` remains generated corpus input for planning.
 
-## Near-term direction (what we want the next corpus pass to reflect)
+R2. Credential swapping must be transactional. Every provider auth file or directory backed up during quota execution must be restored or removed on all success and failure paths.
 
-1. **Docs match code.** README inventory, per-command guide, and `--help` text agree on the sixteen commands and their current defaults.
-2. **Security hygiene on quota.** Credential files are chmod-restricted; error messages do not print refresh-token bodies.
-3. **Dead code removed.** `codex_exec.rs` loses its ~400 lines of tmux scaffolding or the scaffolding ships as a used feature.
-4. **CI enforces validate.** `cargo test`, `cargo clippy -D warnings`, and `cargo fmt --check` run on push.
-5. **Audit command gains tests.** Verdict-application, manifest reconciliation, and escalation are covered by tests before any further feature expansion of `audit`.
-6. **Shared utilities consolidated.** Branch resolution, reference-repo discovery, and prompt logging live in one place and are re-used.
-7. **Command-lifecycle narrative clear.** An operator reading the README can tell when to use `steward` vs. `corpus + gen`, when to use `audit` vs. `nemesis`, and when `symphony` is the right front end.
+R3. Credential profile storage must be owner-only and symlink-safe. Profile capture must reject or dereference symlinks intentionally, prune stale files, and create sensitive files with restricted permissions on Unix.
 
-Each of these is a `genesis/plans/NNN-*.md` target. Order and dependency are in `genesis/PLANS.md`.
+R4. Generated executable workflow text must validate and quote every shell/YAML scalar. Branch, model, reasoning, path, and remote values must not be interpolated raw.
+
+R5. Verification evidence must be risk-classed. Safe local tests, shell interpreters, network/external tools, and destructive commands should not be treated as the same proof type.
+
+R6. Task parsing should converge. Generation, loop, parallel, review, completion artifacts, and Symphony should share one model for status, dependencies, verification commands, spec refs, and completion artifacts.
+
+R7. Backend policy should be explicit. Dangerous bypass flags may remain available, but they should be controlled through one policy layer and visible in command help or logs.
+
+R8. First-run operator experience should include a local, no-model success path that proves the binary, repo layout, required tools for the selected command, and safe dry-run behavior.
+
+## Non-Goals
+
+- No web UI or TUI in this phase.
+- No new provider backend in this phase.
+- No rewrite into a workspace, daemon, or plugin architecture.
+- No silent default change that makes existing operator workflows fail without migration text.
+- No encryption-at-rest commitment yet. File permissions and symlink safety are immediate requirements; encryption is a separate user challenge because it introduces key management.
+- No attempt to make `genesis/` the active root queue.
+
+## System Interfaces
+
+CLI interface: `src/main.rs`.
+
+Planning corpus interface: `genesis/ASSESSMENT.md`, `genesis/SPEC.md`, `genesis/PLANS.md`, `genesis/GENESIS-REPORT.md`, `genesis/DESIGN.md`, and numbered plans under `genesis/plans/`.
+
+Active repo planning interface: `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and `specs/`.
+
+Provider execution interface: `src/codex_exec.rs`, `src/claude_exec.rs`, `src/pi_backend.rs`, `src/kimi_backend.rs`, plus direct command-specific spawn paths that should be audited.
+
+Credential interface: `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_state.rs`, `src/quota_usage.rs`, and provider home-directory auth files.
+
+Workflow rendering interface: `src/symphony_command.rs` and `src/linear_tracker.rs`.
+
+Verification interface: `src/completion_artifacts.rs`, `scripts/run-task-verification.sh` if present, `auto parallel` handoff logic, and loop/review prompt contracts.
+
+## Data Flow
+
+1. A human starts from a repo root and runs planning (`auto corpus`, then `auto gen`) or execution (`auto loop`, `auto parallel`, `auto symphony`).
+2. The command reads root instructions, current docs, specs, and source.
+3. The command may call provider CLIs through direct or shared wrappers.
+4. It writes logs, prompts, receipts, generated artifacts, and sometimes commits.
+5. Review and landing commands parse those artifacts to decide whether tasks are done, partial, blocked, or stale.
+
+The safest future architecture keeps these contracts explicit and shared. The highest-risk current drift is that several commands do similar parsing and proof evaluation differently.
+
+## Observability Requirements
+
+Every mutating command should emit:
+
+- command name, model/backend, reasoning effort, and whether dangerous mode is active;
+- repo branch and dirty-state summary before mutation;
+- output directory or log path before model invocation;
+- verification receipt path when executable proof is claimed;
+- credential provider/account label when quota routing is active, without secrets;
+- recovery instructions when an archive, checkpoint, or backup is created.
+
+Logs should pass through one redaction layer before persistence.
+
+## Validation Strategy
+
+Near-term validation should prioritize targeted unit and integration tests:
+
+- quota restore and profile capture regression tests;
+- Symphony hostile scalar golden tests;
+- completion-artifact false-proof fixtures;
+- shared task parser fixtures for `[ ]`, `[~]`, `[!]`, `[x]`, dependencies, spec refs, verification, and artifacts;
+- fake-model CLI smoke tests for command wiring;
+- installed-binary proof after source changes that affect user invocation.
+
+Full `cargo test`, clippy, and CI remain release gates, but targeted tests should fail before and pass after each vertical slice.
+
+## Open Questions
+
+- Should `genesis/` be tracked long-term or treated as disposable generated state? Current code treats it as generated corpus, but it is currently tracked.
+- Should dangerous backend bypass remain the default for all agent commands, or should commands require an explicit trust profile?
+- Should `steward` eventually replace `corpus + gen` for mid-flight repos, or remain a separate reconciliation command?
+- Should quota credentials be encrypted at rest, or is owner-only file permission sufficient for this local developer tool?
+- Should the repo add a new `auto doctor` command or extend `auto health` for command-specific preflight?

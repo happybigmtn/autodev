@@ -8,6 +8,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
+use crate::codex_exec::MAX_CODEX_MODEL_CONTEXT_WINDOW;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
@@ -19,7 +20,7 @@ use crate::util::{
     git_stdout, opencode_agent_dir, push_branch_with_remote_sync, repo_name, run_git,
     sync_branch_with_remote, timestamp_slug,
 };
-use crate::NemesisArgs;
+use crate::{HardeningProfile, NemesisArgs};
 
 const DEFAULT_NEMESIS_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific build, validation, and staging rules.
 0b. Study `specs/*`, `IMPLEMENTATION_PLAN.md`, and any security- or audit-related docs already present.
@@ -149,9 +150,9 @@ Requirements:
 - Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
 "#;
 
-const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.4";
+const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.5";
 #[allow(dead_code)]
-const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "k2.6";
+const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "gpt-5.5";
 const EMPTY_PLAN: &str = "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n";
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
@@ -276,6 +277,35 @@ impl NemesisBackend {
     }
 }
 
+fn apply_nemesis_profile(
+    profile: HardeningProfile,
+    auditor: &mut PhaseConfig,
+    reviewer: &mut PhaseConfig,
+    fixer: &mut PhaseConfig,
+    finalizer: &mut PhaseConfig,
+) {
+    match profile {
+        HardeningProfile::Balanced => {}
+        HardeningProfile::Fast => {
+            set_default_effort(auditor, "medium");
+            set_default_effort(reviewer, "medium");
+            set_default_effort(fixer, "high");
+            set_default_effort(finalizer, "high");
+        }
+        HardeningProfile::MaxQuality => {
+            for config in [auditor, reviewer, fixer, finalizer] {
+                set_default_effort(config, "xhigh");
+            }
+        }
+    }
+}
+
+fn set_default_effort(config: &mut PhaseConfig, effort: &str) {
+    if config.model == DEFAULT_CODEX_NEMESIS_MODEL && config.effort == "high" {
+        config.effort = effort.to_string();
+    }
+}
+
 pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
@@ -300,29 +330,42 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         .output_dir
         .clone()
         .unwrap_or_else(|| repo_root.join("nemesis"));
-    let auditor = PhaseConfig {
+    let mut auditor = PhaseConfig {
         model: resolve_auditor_model(&args),
         effort: args.reasoning_effort.clone(),
     };
-    let reviewer = PhaseConfig {
+    let mut reviewer = PhaseConfig {
         model: args.reviewer_model.clone(),
         effort: args.reviewer_effort.clone(),
     };
-    let fixer = PhaseConfig {
+    let mut fixer = PhaseConfig {
         model: args.fixer_model.clone(),
         effort: args.fixer_effort.clone(),
     };
-    let finalizer = PhaseConfig {
+    let mut finalizer = PhaseConfig {
         model: args.finalizer_model.clone(),
         effort: args.finalizer_effort.clone(),
     };
-    ensure_kimi_phase_config("auto nemesis audit pass", &auditor)?;
-    ensure_kimi_phase_config("auto nemesis synthesis pass", &reviewer)?;
+    apply_nemesis_profile(
+        args.profile,
+        &mut auditor,
+        &mut reviewer,
+        &mut fixer,
+        &mut finalizer,
+    );
+    ensure_nemesis_phase_config("auto nemesis audit pass", &auditor)?;
+    ensure_nemesis_phase_config("auto nemesis synthesis pass", &reviewer)?;
     ensure_nemesis_fixer_config(&fixer)?;
     ensure_nemesis_finalizer_config(&finalizer)?;
+    let kimi_preflight_model = [&auditor, &reviewer, &fixer]
+        .iter()
+        .find(|config| is_kimi_model(&config.model))
+        .map(|config| config.model.as_str());
     if args.use_kimi_cli {
-        let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
-        preflight_kimi_cli(&kimi_bin, &auditor.model)?;
+        if let Some(model) = kimi_preflight_model {
+            let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
+            preflight_kimi_cli(&kimi_bin, model)?;
+        }
     }
     let audit_backend = select_backend(
         &auditor.model,
@@ -348,8 +391,15 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         &args.kimi_bin,
         args.use_kimi_cli,
     );
-    validate_nemesis_backend_binaries(&audit_backend, &review_backend, args.report_only, &args)?;
-    let previous_snapshot = maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run)?;
+    validate_nemesis_backend_binaries(
+        &audit_backend,
+        &review_backend,
+        &fix_backend,
+        args.report_only,
+        &args,
+    )?;
+    let previous_snapshot =
+        maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run, args.resume)?;
 
     let prompt_template = match &args.prompt_file {
         Some(path) => fs::read_to_string(path)
@@ -402,6 +452,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     println!("auto nemesis");
     println!("repo root:   {}", repo_root.display());
     println!("output dir:  {}", output_dir.display());
+    println!("profile:     {:?}", args.profile);
     println!(
         "auditor:     {} ({})",
         audit_backend.model(),
@@ -422,6 +473,9 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
     if let Some(previous) = &previous_snapshot {
         println!("prior input: {}", previous.display());
     }
+    if args.resume {
+        println!("resume:      reusing valid nemesis artifacts when present");
+    }
     if args.dry_run {
         println!("mode:        dry-run");
         return Ok(());
@@ -438,46 +492,59 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         println!("mode:        report-only");
     }
 
-    print_phase_header("auditor", &audit_backend);
-    let audit_response =
-        run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend, &args.codex_bin)
-            .await
-            .map_err(|err| {
-                annotate_output_recovery(
-                    err,
-                    &output_dir,
-                    previous_snapshot.as_deref(),
-                    "Nemesis audit pass failed",
-                )
-            })?;
     let audit_response_path = repo_root
         .join(".auto")
         .join("logs")
         .join(format!("nemesis-{}-audit-response.log", timestamp_slug()));
-    if !audit_response.trim().is_empty() {
-        atomic_write(&audit_response_path, audit_response.as_bytes())
-            .with_context(|| format!("failed to write {}", audit_response_path.display()))?;
-    }
-
-    print_phase_header("reviewer", &review_backend);
-    let review_response =
-        run_nemesis_backend(&repo_root, &review_prompt, &review_backend, &args.codex_bin)
-            .await
-            .map_err(|err| {
-                annotate_output_recovery(
-                    err,
-                    &output_dir,
-                    previous_snapshot.as_deref(),
-                    "Nemesis synthesis pass failed",
-                )
-            })?;
     let review_response_path = repo_root
         .join(".auto")
         .join("logs")
         .join(format!("nemesis-{}-review-response.log", timestamp_slug()));
-    if !review_response.trim().is_empty() {
-        atomic_write(&review_response_path, review_response.as_bytes())
-            .with_context(|| format!("failed to write {}", review_response_path.display()))?;
+
+    let final_outputs_reusable = args.resume && verify_nemesis_outputs(&output_dir).is_ok();
+    if final_outputs_reusable {
+        println!("resume:      reusing verified final audit and plan");
+    } else {
+        let draft_outputs_reusable =
+            args.resume && draft_nemesis_outputs_valid(&draft_audit_path, &draft_plan_path).is_ok();
+        if draft_outputs_reusable {
+            println!("resume:      reusing draft audit and plan");
+        } else {
+            print_phase_header("auditor", &audit_backend);
+            let audit_response =
+                run_nemesis_backend(&repo_root, &audit_prompt, &audit_backend, &args.codex_bin)
+                    .await
+                    .map_err(|err| {
+                        annotate_output_recovery(
+                            err,
+                            &output_dir,
+                            previous_snapshot.as_deref(),
+                            "Nemesis audit pass failed",
+                        )
+                    })?;
+            if !audit_response.trim().is_empty() {
+                atomic_write(&audit_response_path, audit_response.as_bytes()).with_context(
+                    || format!("failed to write {}", audit_response_path.display()),
+                )?;
+            }
+        }
+
+        print_phase_header("reviewer", &review_backend);
+        let review_response =
+            run_nemesis_backend(&repo_root, &review_prompt, &review_backend, &args.codex_bin)
+                .await
+                .map_err(|err| {
+                    annotate_output_recovery(
+                        err,
+                        &output_dir,
+                        previous_snapshot.as_deref(),
+                        "Nemesis synthesis pass failed",
+                    )
+                })?;
+        if !review_response.trim().is_empty() {
+            atomic_write(&review_response_path, review_response.as_bytes())
+                .with_context(|| format!("failed to write {}", review_response_path.display()))?;
+        }
     }
 
     let VerifiedNemesisOutputs {
@@ -505,10 +572,20 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             println!("status:      no unchecked Nemesis tasks; skipping implementer");
             implementation_summary =
                 format!("skipped (no unchecked tasks in {})", plan_path.display());
+        } else if args.resume
+            && verify_nemesis_implementation_results_once(
+                &implementation_results_json_path,
+                &implementation_results_md_path,
+                &plan_path,
+            )
+            .is_ok()
+        {
+            println!("resume:      reusing implementation results");
+            implementation_summary = implementation_results_json_path.display().to_string();
+            implementation_results = Some(implementation_results_json_path.clone());
         } else {
-            // Route the implementer through the selected backend (Kimi-cli by
-            // default). Codex stays as the finalizer that reviews the landed
-            // diff after this phase.
+            // Route the implementer through the selected backend. Codex stays
+            // as the finalizer that reviews the landed diff after this phase.
             let stderr_log = output_dir.join("implementer.stderr.log");
             let response = run_nemesis_backend(
                 &repo_root,
@@ -536,10 +613,11 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
             .await?;
             implementation_summary = implementation_path.display().to_string();
             implementation_results = Some(implementation_path);
-
-            // Codex finalizer: independent review of the diff Kimi just
-            // produced. Fails loudly if it finds regressions; audit record
-            // is written to `nemesis/final-review.md`.
+        }
+        if implementation_results.is_some() {
+            // Codex finalizer: independent review of the diff just produced.
+            // Fails loudly if it finds regressions; audit record is written to
+            // `nemesis/final-review.md`.
             let finalizer_backend = NemesisBackend::Codex {
                 model: finalizer.model.clone(),
                 reasoning_effort: finalizer.effort.clone(),
@@ -558,18 +636,23 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
                 .join(format!("nemesis-{}-finalizer-prompt.md", timestamp_slug()));
             atomic_write(&finalizer_prompt_path, finalizer_prompt.as_bytes())
                 .with_context(|| format!("failed to write {}", finalizer_prompt_path.display()))?;
-            print_phase_header("finalizer", &finalizer_backend);
-            let finalizer_response = run_nemesis_backend(
-                &repo_root,
-                &finalizer_prompt,
-                &finalizer_backend,
-                &args.codex_bin,
-            )
-            .await?;
             let finalizer_response_path = output_dir.join("final-review.md");
-            atomic_write(&finalizer_response_path, finalizer_response.as_bytes()).with_context(
-                || format!("failed to write {}", finalizer_response_path.display()),
-            )?;
+            if args.resume && nonempty_file(&finalizer_response_path) {
+                println!("resume:      reusing finalizer review");
+            } else {
+                print_phase_header("finalizer", &finalizer_backend);
+                let finalizer_response = run_nemesis_backend(
+                    &repo_root,
+                    &finalizer_prompt,
+                    &finalizer_backend,
+                    &args.codex_bin,
+                )
+                .await?;
+                atomic_write(&finalizer_response_path, finalizer_response.as_bytes())
+                    .with_context(|| {
+                        format!("failed to write {}", finalizer_response_path.display())
+                    })?;
+            }
             println!(
                 "finalizer:   wrote review to {}",
                 finalizer_response_path.display()
@@ -664,20 +747,16 @@ fn is_kimi_model(model: &str) -> bool {
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
 
-fn ensure_kimi_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
-    if !is_kimi_model(&config.model) && PiProvider::detect(&config.model).is_none() {
-        bail!(
-            "{label} must use a Kimi model (e.g. `k2.6`); got `{}`",
-            config.model
-        );
+fn ensure_nemesis_phase_config(label: &str, config: &PhaseConfig) -> Result<()> {
+    if config.model.trim().is_empty() {
+        bail!("{label} model is required");
     }
     Ok(())
 }
 
-/// The fixer phase used to be hard-pinned to Codex because the Kimi wrapper
-/// ran through legacy PI. Now Kimi drives remediation (via `kimi-cli --yolo`)
-/// and Codex becomes the finalizer/reviewer. Accept either family here; the
-/// finalizer phase has its own Codex-only gate.
+/// Accept any concrete model for remediation. The finalizer phase has its own
+/// Codex-only gate so implementation can use Codex by default or an explicit
+/// Kimi/PI opt-in.
 fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
     if config.model.trim().is_empty() {
         bail!("auto nemesis fixer model is required");
@@ -685,12 +764,12 @@ fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
     Ok(())
 }
 
-/// Finalizer MUST be Codex — we want an independent reviewer after Kimi's
-/// remediation lands.
+/// Finalizer MUST be Codex so the last pass is independent of any optional
+/// Kimi/PI implementation backend.
 fn ensure_nemesis_finalizer_config(config: &PhaseConfig) -> Result<()> {
     if is_kimi_model(&config.model) || PiProvider::detect(&config.model).is_some() {
         bail!(
-            "auto nemesis finalizer must use a Codex model (e.g. `gpt-5.4`); got `{}`",
+            "auto nemesis finalizer must use a Codex model (e.g. `gpt-5.5`); got `{}`",
             config.model
         );
     }
@@ -706,7 +785,7 @@ fn resolve_auditor_model(args: &NemesisArgs) -> String {
     if args.minimax {
         return "minimax".to_string();
     }
-    // `--kimi` is now the default; setting it is a no-op beyond log clarity.
+    // Explicit legacy opt-in for the Kimi audit model remains available.
     if args.kimi {
         return "k2.6".to_string();
     }
@@ -716,13 +795,15 @@ fn resolve_auditor_model(args: &NemesisArgs) -> String {
 fn validate_nemesis_backend_binaries(
     audit_backend: &NemesisBackend,
     review_backend: &NemesisBackend,
+    fix_backend: &NemesisBackend,
     report_only: bool,
     args: &NemesisArgs,
 ) -> Result<()> {
     validate_backend_binary("Nemesis audit backend", audit_backend)?;
     validate_backend_binary("Nemesis synthesis backend", review_backend)?;
     if !report_only {
-        ensure_executable_available("Nemesis implementation backend", &args.codex_bin)?;
+        validate_backend_binary("Nemesis implementation backend", fix_backend)?;
+        ensure_executable_available("Nemesis finalizer backend", &args.codex_bin)?;
     }
     Ok(())
 }
@@ -770,8 +851,14 @@ fn maybe_prepare_output_dir(
     repo_root: &Path,
     output_dir: &Path,
     dry_run: bool,
+    resume: bool,
 ) -> Result<Option<PathBuf>> {
     if dry_run {
+        return Ok(None);
+    }
+    if resume {
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("failed to create {}", output_dir.display()))?;
         return Ok(None);
     }
     prepare_output_dir(repo_root, output_dir)
@@ -833,7 +920,7 @@ fn build_implementation_prompt(
         .replace("{branch}", branch)
 }
 
-/// Codex finalizer prompt. Reads the Kimi-produced spec + plan + implementation
+/// Codex finalizer prompt. Reads the produced spec + plan + implementation
 /// results and produces an independent review of the landed diff. Fails the
 /// audit if the reviewer finds regressions, missing test coverage, or a fix
 /// that claims `status: fixed` without touching the cited files.
@@ -847,9 +934,9 @@ fn build_finalizer_prompt(
     format!(
         r#"You are the Codex finalizer for an `auto nemesis` run.
 
-Kimi 2.6 has just produced the audit, synthesis, and implementation passes. Your
-job is to give the landed diff an independent code review and decide whether the
-run is safe to ship as-is.
+The audit, synthesis, and implementation passes have just produced the landed
+diff. Your job is to give that diff an independent code review and decide
+whether the run is safe to ship as-is.
 
 ## Inputs
 
@@ -870,8 +957,8 @@ run is safe to ship as-is.
    truthful against the code.
 3. Flag any fix that claims `touched_files: []` but the codebase still contains
    the documented failure mode.
-4. Look for the usual Kimi failure modes: over-wide refactors, speculative
-   cleanup, silent suppression of warnings, hard-coded test fixtures.
+4. Look for usual agent failure modes: over-wide refactors, speculative cleanup,
+   silent suppression of warnings, hard-coded test fixtures.
 
 ## Deliverables
 
@@ -894,11 +981,11 @@ PASS | CONCERNS | FAIL
 ```
 
 If you find `FAIL`-severity issues, fix them in place with a minimal diff and
-record them under `## Regressions observed`. Do not rewrite passing Kimi work.
+record them under `## Regressions observed`. Do not rewrite passing work.
 Do not touch `nemesis/` artifacts other than `nemesis/final-review.md`.
 
 Stay on branch `{branch}`. Commit any remediation with the message
-`codex-finalizer: address Kimi regressions`.
+`codex-finalizer: address nemesis regressions`.
 "#,
         audit = audit_path.display(),
         plan = plan_path.display(),
@@ -1132,6 +1219,10 @@ async fn run_codex(
         .arg(model)
         .arg("-c")
         .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
+        .arg("-c")
+        .arg(format!(
+            "model_context_window={MAX_CODEX_MODEL_CONTEXT_WINDOW}"
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1336,6 +1427,27 @@ fn verify_nemesis_outputs(output_dir: &Path) -> Result<VerifiedNemesisOutputs> {
         spec_path,
         plan_path,
     })
+}
+
+fn draft_nemesis_outputs_valid(draft_audit_path: &Path, draft_plan_path: &Path) -> Result<()> {
+    if !draft_audit_path.exists() || !draft_plan_path.exists() {
+        bail!("draft Nemesis outputs are incomplete");
+    }
+    let audit = fs::read_to_string(draft_audit_path)
+        .with_context(|| format!("failed to read {}", draft_audit_path.display()))?;
+    let plan = fs::read_to_string(draft_plan_path)
+        .with_context(|| format!("failed to read {}", draft_plan_path.display()))?;
+    if !audit.starts_with("# Specification:") {
+        bail!("draft Nemesis audit must start with `# Specification:`");
+    }
+    if !plan.contains("# IMPLEMENTATION_PLAN") {
+        bail!("draft Nemesis plan must contain `# IMPLEMENTATION_PLAN`");
+    }
+    Ok(())
+}
+
+fn nonempty_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 async fn verify_nemesis_implementation_results(
@@ -2240,7 +2352,7 @@ mod tests {
     use super::{
         annotate_output_recovery, append_new_open_tasks, build_implementation_prompt,
         build_nemesis_results_repair_prompt, commit_nemesis_outputs_if_needed,
-        ensure_kimi_phase_config, ensure_nemesis_finalizer_config, ensure_nemesis_fixer_config,
+        ensure_nemesis_finalizer_config, ensure_nemesis_fixer_config, ensure_nemesis_phase_config,
         load_nemesis_fix_results, maybe_prepare_output_dir, next_nemesis_spec_destination,
         prepare_output_dir, resolve_auditor_model, select_backend, unchecked_nemesis_task_ids,
         verify_nemesis_outputs, PhaseConfig, DEFAULT_NEMESIS_AUDIT_MODEL,
@@ -2411,6 +2523,8 @@ Spec: specs/020426-nemesis-audit.md
         NemesisArgs {
             prompt_file: None,
             output_dir: None,
+            resume: false,
+            profile: crate::HardeningProfile::Balanced,
             model: model.to_string(),
             reasoning_effort: "high".to_string(),
             reviewer_model: "kimi".to_string(),
@@ -2420,9 +2534,9 @@ Spec: specs/020426-nemesis-audit.md
             report_only: false,
             branch: None,
             dry_run: true,
-            fixer_model: "gpt-5.4".to_string(),
+            fixer_model: "gpt-5.5".to_string(),
             fixer_effort: "high".to_string(),
-            finalizer_model: "gpt-5.4".to_string(),
+            finalizer_model: "gpt-5.5".to_string(),
             finalizer_effort: "high".to_string(),
             audit_passes: 1,
             codex_bin: PathBuf::from("codex"),
@@ -2535,12 +2649,21 @@ Spec: specs/020426-nemesis-audit.md
     }
 
     #[test]
-    fn nemesis_phase_rejects_non_pi_models() {
+    fn nemesis_phase_accepts_codex_default_models() {
         let config = PhaseConfig {
-            model: "gpt-5.4".to_string(),
+            model: "gpt-5.5".to_string(),
             effort: "high".to_string(),
         };
-        assert!(ensure_kimi_phase_config("nemesis", &config).is_err());
+        assert!(ensure_nemesis_phase_config("nemesis", &config).is_ok());
+    }
+
+    #[test]
+    fn nemesis_phase_rejects_empty_models() {
+        let config = PhaseConfig {
+            model: "   ".to_string(),
+            effort: "high".to_string(),
+        };
+        assert!(ensure_nemesis_phase_config("nemesis", &config).is_err());
     }
 
     #[test]
@@ -2686,7 +2809,7 @@ Spec: specs/020426-nemesis-audit.md
         };
         assert!(
             ensure_nemesis_fixer_config(&config).is_ok(),
-            "Kimi is the default fixer since auto bug + nemesis moved to kimi-cli"
+            "explicit Kimi fixer opt-ins should continue to work"
         );
     }
 
@@ -2749,8 +2872,8 @@ Spec: specs/020426-nemesis-audit.md
         let original = output_dir.join("nemesis-audit.md");
         fs::write(&original, "# keep me\n").expect("failed to seed old output");
 
-        let archived =
-            maybe_prepare_output_dir(&repo, &output_dir, true).expect("dry-run should succeed");
+        let archived = maybe_prepare_output_dir(&repo, &output_dir, true, false)
+            .expect("dry-run should succeed");
         assert!(archived.is_none());
         assert!(
             original.exists(),

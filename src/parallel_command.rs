@@ -1953,6 +1953,7 @@ async fn run_serial_loop(
                 "auto parallel",
                 &worker_env.extra_env,
                 None,
+                None,
             )
             .await?
         };
@@ -3535,7 +3536,7 @@ async fn refresh_parallel_plan(
                     repo_root: Some(repo_root.to_path_buf()),
                     project_slug: None,
                     todo_state: "Todo".to_string(),
-                    planner_model: "gpt-5.4".to_string(),
+                    planner_model: "gpt-5.5".to_string(),
                     planner_reasoning_effort: "high".to_string(),
                     codex_bin: PathBuf::from("codex"),
                     no_ai_planner: true,
@@ -4940,6 +4941,7 @@ fn spawn_parallel_lane_attempt(
                 &context_label,
                 &extra_env,
                 Some(&worker_pid_path),
+                None,
             )
             .await
         };

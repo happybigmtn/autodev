@@ -8,10 +8,11 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns sixteen commands:
+`auto` owns seventeen commands:
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
+- `auto super` runs the all-in-one production-grade workflow: corpus, gen, gates, then parallel.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
 - `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
 - `auto loop` runs the implementation loop on the repo's primary branch.
@@ -39,23 +40,26 @@ need to pass directories in the normal case.
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs Kimi `k2.6` finder, skeptic, fixer, and reviewer with a final `gpt-5.4`
-  `high` Codex finalizer by default
-- `auto loop` runs on the repo's primary branch by default with `gpt-5.4` and `xhigh`
+- `auto bug` runs `gpt-5.5` `high` finder, skeptic, fixer, reviewer, and finalizer
+  passes by default
+- `auto loop` runs on the repo's primary branch by default with `gpt-5.5` and `high`
 - `auto parallel` runs on the repo's primary branch by default with five workers; outside tmux it
   launches a detached `<repo>-parallel` tmux session automatically
+- `auto super` runs corpus and generation with `gpt-5.5` `xhigh`, runs additional
+  production-readiness and execution-gate reviews, then launches `auto parallel` with
+  `gpt-5.5` `high` workers unless `--no-execute` is supplied
 - `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
   state, worker PIDs, and latest lane log lines
-- `auto qa` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and the
+- `auto qa` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and the
   `standard` tier
-- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.4`, `high`, and
+- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and
   the `standard` tier
-- `auto health` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
-- `auto review` runs on the currently checked-out branch by default with `gpt-5.4` and `high`
-- `auto ship` runs on the currently checked-out branch by default with `gpt-5.4` and `high`,
+- `auto health` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
+- `auto review` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
+- `auto ship` runs on the currently checked-out branch by default with `gpt-5.5` and `high`,
   targeting the repo's resolved base branch
-- `auto nemesis` runs Kimi `k2.6` audit, synthesis, and fixer passes plus a Codex `gpt-5.4`
-  `high` finalizer unless `--report-only` is used
+- `auto nemesis` runs `gpt-5.5` `high` audit, synthesis, fixer, and finalizer
+  passes by default unless `--report-only` is used
 - All mutating branch commands (`auto loop`, `auto qa`, `auto review`, `auto ship`, `auto bug`,
   and `auto nemesis`) now rebase onto `origin/<branch>` when that remote branch exists before
   starting work and again before pushing, so remote fast-forwards do not kill long runs at the end
@@ -73,6 +77,10 @@ The commands form one opinionated lifecycle:
 6. `auto review` reviews completed work and archives only what really clears.
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
+
+`auto super` is the high-agency composition of steps 1-3 for production-grade work: it runs
+`auto corpus`, adds production-readiness review artifacts, runs `auto gen`, gates the generated
+root queue, and launches `auto parallel`.
 
 The other nine commands are side lanes:
 
@@ -120,7 +128,8 @@ What it actually does:
 
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
-- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Gives the authoring and independent review passes the maximum Codex model context window
 - Reviews the repo as the primary truth source
 - Determines the active planning surface from the repo's own instructions and
   control docs instead of assuming root-level primacy from filenames alone
@@ -204,7 +213,8 @@ What it writes:
 What it actually does:
 
 - Generates fresh specs from the planning corpus
-- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Gives the authoring and independent review passes the maximum Codex model context window
 - Uses the planning corpus for intended future direction, but treats the live codebase as
   authoritative for current-state facts such as commands, counts, metric names, filenames, and
   behavior claims
@@ -261,6 +271,67 @@ Binary provenance:
 - `auto --version` prints the package version plus embedded git commit, dirty/clean status, and
   build profile so operators can confirm which binary they are actually running
 
+### `auto super`
+
+Purpose:
+
+- Run the all-in-one "make this repo production-grade" workflow
+- Keep `auto corpus` and `auto gen` as the control primitives
+- Add production-readiness review gates before allowing parallel implementation
+
+What it reads:
+
+- The live repository
+- Existing planning docs and root queue files
+- `genesis/` after the corpus stage creates it
+- generated `gen-*` outputs after the generation stage creates them
+- any explicit `--reference-repo <dir>` inputs
+
+What it writes:
+
+- `genesis/` via the normal `auto corpus` control path
+- root `specs/*.md` and root `IMPLEMENTATION_PLAN.md` via the normal `auto gen` control path
+- `.auto/super/<run-id>/manifest.json`
+- `.auto/super/<run-id>/PRODUCTION-READINESS.md`
+- `.auto/super/<run-id>/RISK-REGISTER.md`
+- `.auto/super/<run-id>/QUALITY-GATES.md`
+- `.auto/super/<run-id>/SYSTEM-MAP.md`
+- `.auto/super/<run-id>/SUPER-REPORT.md`
+- `.auto/super/<run-id>/EXECUTION-GATE.md`
+- `.auto/super/<run-id>/DETERMINISTIC-GATE.json`
+- `.auto/super/<run-id>/parallel/` when execution launches
+
+What it actually does:
+
+- Builds a production-grade focus brief from the positional prompt and optional `--focus`
+- Runs `auto corpus` with GPT-5.5 `xhigh` and max Codex context
+- Runs a super corpus review board across CEO/Product, Principal Engineer, Security,
+  Reliability/Ops, QA/Test Architect, DX/Operator, and Release Manager perspectives
+- Lets that review amend `genesis/` before generation starts
+- Runs `auto gen` with GPT-5.5 `xhigh` and max Codex context
+- Runs an execution-gate review that may amend root specs and `IMPLEMENTATION_PLAN.md`
+- Requires `EXECUTION-GATE.md` to say exactly `Verdict: GO`
+- Runs a deterministic Rust gate that rejects empty queues, missing task fields, oversized task
+  scope, vague ownership, placeholders, and broad or malformed verification commands
+- Launches `auto parallel` only after both the model gate and deterministic gate pass
+
+When to run it:
+
+- When the goal is broad production readiness rather than a narrow planning refresh
+- When you want one command to generate the corpus, produce the execution queue, validate it, and
+  start tmux-backed implementation
+- When the repo needs a release-blocker campaign rather than a loose backlog
+
+Useful flags:
+
+- `auto super "make this repo production grade"` supplies the main steering prompt
+- `--no-execute` stops after corpus, generation, and gates without launching workers
+- `--skip-super-review` keeps only the normal corpus/gen review controls and deterministic gate
+- `--threads <n>` controls parallel worker lanes
+- `--max-iterations <n>` limits successful parallel lands
+- `--worker-model` and `--worker-reasoning-effort` tune implementation workers separately from
+  planning
+
 ### `auto reverse`
 
 Purpose:
@@ -285,7 +356,7 @@ What it does not write:
 What it actually does:
 
 - Produces specs grounded in current behavior
-- Runs Claude `claude-opus-4-7` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
 - Uses the same stronger spec format as `auto gen`
 - Surfaces assumptions and spec/code conflicts instead of silently reconciling them
 - Writes the results into the root `specs/` snapshot directory and replaces same-day same-topic
@@ -314,7 +385,7 @@ Purpose:
 
 What it reads:
 
-- The tracked repository files, chunked by top-level scope
+- The tracked repository files, chunked by scope, rough token size, and static risk hints
 - Existing `bug/` artifacts when `--resume` is used
 
 What it writes:
@@ -322,14 +393,14 @@ What it writes:
 - `bug/BUG_REPORT.md`
 - `bug/verified-findings.json`
 - `bug/implementation-results.json`
+- `bug/pre-index.md`
 - per-chunk prompts, raw model outputs, JSON verdicts, and markdown summaries
 
 What it actually does:
 
-- Splits the repo into manageable chunks
-- Runs a finder pass to maximize plausible bug recall
-- Runs a skeptic pass to eliminate weak or speculative findings
-- Runs a verification review pass to decide what is concrete enough to fix
+- Builds a cheap static pre-index of risky files before invoking a model
+- Splits the repo into manageable chunks using file count, rough token size, and static risk hints
+- Runs finder, skeptic, and verification review chunk pipelines concurrently up to `--read-parallelism`
 - Runs a final repo-wide implementation pass over the surviving findings unless `--report-only` is
   set
 - Pushes truthful implementation fixes back to the current branch
@@ -344,11 +415,18 @@ What it actually does:
 
 Default model layout:
 
-- finder: Kimi `k2.6` with `high`
-- skeptic: Kimi `k2.6` with `high`
-- reviewer: Kimi `k2.6` with `high`
-- fixer: Kimi `k2.6` with `high`
-- finalizer: Codex `gpt-5.4` with `high`
+- finder: Codex `gpt-5.5` with `high`
+- skeptic: Codex `gpt-5.5` with `high`
+- reviewer: Codex `gpt-5.5` with `high`
+- fixer: Codex `gpt-5.5` with `high`
+- finalizer: Codex `gpt-5.5` with `high`
+- all Codex bug phases request the maximum model context window
+
+Profiles:
+
+- `--profile balanced` keeps the default `gpt-5.5 high` layout.
+- `--profile fast` lowers read-only discovery/review effort to `medium` unless explicitly overridden.
+- `--profile max-quality` raises default Codex efforts to `xhigh` unless explicitly overridden.
 
 Safety behavior:
 
@@ -371,6 +449,8 @@ Useful flags:
 
 - `--chunk-size <n>` to change chunk size
 - `--max-chunks <n>` to cap the run
+- `--read-parallelism <n>` to tune concurrent read-only chunk pipelines
+- `--profile <fast|balanced|max-quality>` to choose an execution preset
 - `--resume` to continue in-place instead of starting over
 - `--report-only` to stop after the verification/reporting phases
 - `--allow-dirty` to intentionally layer implementation on top of an already-dirty tree
@@ -402,10 +482,10 @@ What it writes:
 
 What it actually does:
 
-- Archives the previous `nemesis/` folder under `.auto/fresh-input/`
+- Archives the previous `nemesis/` folder under `.auto/fresh-input/`, unless `--resume` is used
 - Runs a draft audit pass to maximize evidence-backed recall
 - Runs a synthesis pass to tighten or discard weak claims
-- Runs a final `gpt-5.4` `high` implementation pass against the synthesized Nemesis plan by
+- Runs a final `gpt-5.5` `high` implementation pass against the synthesized Nemesis plan by
   default
 - Treats the Nemesis plan as the execution contract for bounded hardening work
 - Writes implementation results under `nemesis/`
@@ -413,6 +493,8 @@ What it actually does:
 - Commits and pushes truthful Nemesis hardening increments plus trailing Nemesis outputs
 - Rebases onto `origin/<branch>` before implementation and before each push when that remote
   branch exists, so long Nemesis runs do not die on a non-fast-forward at the end
+- `--resume` reuses valid draft, final, implementation, and finalizer artifacts and continues from the
+  first missing or invalid phase
 
 Important rule:
 
@@ -421,9 +503,12 @@ Important rule:
 
 Backend selection:
 
-- Draft auditor default: PI with `minimax/MiniMax-M2.7-highspeed` and `high`
-- Final reviewer default: PI with `kimi-coding/k2p6` and `high`
-- Final implementer default: Codex `gpt-5.4` with `high`
+- Draft auditor default: Codex `gpt-5.5` with `high`
+- Final reviewer default: Codex `gpt-5.5` with `high`
+- Final implementer default: Codex `gpt-5.5` with `high`
+- Finalizer default: Codex `gpt-5.5` with `high`
+- all Codex Nemesis phases request the maximum model context window
+- `--profile fast|balanced|max-quality` applies the same effort presets as `auto bug`
 - `--kimi` switches the draft pass to the current Kimi coding model
 - `--minimax` switches the draft pass to MiniMax
 - `--model kimi` and `--model minimax` do the same through the generic model flag
@@ -579,7 +664,7 @@ Purpose:
 
 What it actually does:
 
-- Defaults to five workers with `gpt-5.4` and `xhigh`
+- Defaults to five workers with `gpt-5.5` and `high`
 - Requires a clean repo before launch
 - When run outside tmux, starts a detached `<repo>-parallel` tmux session running the same command
   and prints the `tmux attach` command
@@ -882,8 +967,8 @@ What it produces:
 Defaults:
 
 - Output directory defaults to `<repo>/steward`
-- The first steward pass defaults to Codex `gpt-5.4` with `high`
-- The finalizer pass defaults to Codex `gpt-5.4` with `high`
+- The first steward pass defaults to Codex `gpt-5.5` with `high`
+- The finalizer pass defaults to Codex `gpt-5.5` with `high`
 - It uses the current checked-out branch unless you pass `--branch`
 - It runs through `codex` unless you override `--codex-bin`
 - `--skip-finalizer` leaves the six stewardship deliverables in place without the review/apply
@@ -919,8 +1004,8 @@ Defaults:
 - Doctrine prompt defaults to `audit/DOCTRINE.md`
 - Output directory defaults to `<repo>/audit`
 - Resume mode defaults to `resume`
-- The primary auditor defaults to Kimi `k2.6` with `high` via `kimi-cli`
-- Escalations default to Codex `gpt-5.4` with `high`
+- The primary auditor defaults to Codex `gpt-5.5` with `high`
+- Escalations default to Codex `gpt-5.5` with `high`
 - Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
 
 ### `auto symphony`
@@ -955,10 +1040,10 @@ Subcommands:
 
 Defaults:
 
-- `sync` defaults `--todo-state` to `Todo`, planner model to `gpt-5.4`, planner effort to
+- `sync` defaults `--todo-state` to `Todo`, planner model to `gpt-5.5`, planner effort to
   `high`, and planner binary to `codex`
 - `workflow` defaults to `.auto/symphony/WORKFLOW.md`, `max_concurrent_agents = 1`,
-  `poll_interval_ms = 5000`, model `gpt-5.4`, effort `high`, `In Progress`, and `Done`
+  `poll_interval_ms = 5000`, model `gpt-5.5`, effort `high`, `In Progress`, and `Done`
 - `run` reuses the workflow defaults, can `--sync-first` before launch, and writes logs under
   `.auto/symphony/logs/` unless you override `--logs-root`
 
@@ -1057,12 +1142,11 @@ workflow.
 ## Runtime Requirements
 
 - Git repository with a valid `origin`
-- `claude` on `PATH` for `auto corpus`, `auto gen`, and `auto reverse`
-- `codex` on `PATH` for `auto nemesis`, `auto loop`, `auto qa`, `auto qa-only`, `auto health`,
-  `auto review`, and `auto ship`
+- `codex` on `PATH` for `auto corpus`, `auto gen`, `auto reverse`, `auto bug`,
+  `auto nemesis`, `auto audit`, `auto loop`, `auto parallel`, `auto qa`, `auto qa-only`,
+  `auto health`, `auto review`, and `auto ship`
 - `codex` and `claude` logged in locally if you want `auto quota` to capture and rotate accounts
-- `codex` on `PATH` for any `auto bug` phase using a non-PI model
-- `pi` on `PATH` for `auto bug` MiniMax/Kimi passes and both default `auto nemesis` audit passes
+- `kimi-cli` or `pi` on `PATH` only when you explicitly select Kimi/PI legacy models
 - `gh` on `PATH` if you want `auto ship` to create or refresh pull requests
 
 Recommended environment:
@@ -1091,6 +1175,18 @@ Refresh planning:
 ```bash
 auto corpus
 auto gen
+```
+
+Run the all-in-one production-grade campaign and launch parallel workers after gates pass:
+
+```bash
+auto super "make this repo production grade"
+```
+
+Run the same campaign but stop before execution:
+
+```bash
+auto super "make this repo production grade" --no-execute
 ```
 
 Seed planning from a product idea:
@@ -1136,6 +1232,7 @@ Preview chunking or run report-only:
 ```bash
 auto bug --dry-run
 auto bug --report-only
+auto bug --profile max-quality --read-parallelism 8
 ```
 
 Use PI instead:

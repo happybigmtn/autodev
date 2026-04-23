@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -9,8 +10,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Semaphore;
 use tokio::time::{self, Duration};
 
+use crate::codex_exec::MAX_CODEX_MODEL_CONTEXT_WINDOW;
 use crate::codex_stream::{capture_codex_output, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
@@ -22,9 +25,9 @@ use crate::util::{
     git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
     sync_branch_with_remote, timestamp_slug, truncate_file_to_max_bytes,
 };
-use crate::BugArgs;
+use crate::{BugArgs, HardeningProfile};
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
@@ -39,6 +42,15 @@ struct RepoChunk {
     id: String,
     scope_label: String,
     files: Vec<String>,
+    risk_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FileCandidate {
+    path: String,
+    estimated_tokens: usize,
+    risk_score: usize,
+    risk_notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +197,37 @@ impl LlmBackend {
     }
 }
 
+fn apply_bug_profile(
+    profile: HardeningProfile,
+    finder: &mut PhaseConfig,
+    skeptic: &mut PhaseConfig,
+    reviewer: &mut PhaseConfig,
+    fixer: &mut PhaseConfig,
+    finalizer: &mut PhaseConfig,
+) {
+    match profile {
+        HardeningProfile::Balanced => {}
+        HardeningProfile::Fast => {
+            set_default_effort(finder, "medium");
+            set_default_effort(skeptic, "medium");
+            set_default_effort(reviewer, "medium");
+            set_default_effort(fixer, "high");
+            set_default_effort(finalizer, "high");
+        }
+        HardeningProfile::MaxQuality => {
+            for config in [finder, skeptic, reviewer, fixer, finalizer] {
+                set_default_effort(config, "xhigh");
+            }
+        }
+    }
+}
+
+fn set_default_effort(config: &mut PhaseConfig, effort: &str) {
+    if config.model == DEFAULT_CODEX_MODEL && config.effort == DEFAULT_CODEX_REASONING_EFFORT {
+        config.effort = effort.to_string();
+    }
+}
+
 pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
@@ -211,54 +254,54 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     if chunks.is_empty() {
         bail!("auto bug found no tracked repo files eligible for audit");
     }
+    if !args.dry_run {
+        write_bug_pre_index(&output_dir, &chunks)?;
+    }
 
     let stderr_log_path = output_dir.join("bug.stderr.log");
-    let finder = PhaseConfig {
+    let mut finder = PhaseConfig {
         model: args.finder_model.clone(),
         effort: args.finder_effort.clone(),
     };
-    let skeptic = PhaseConfig {
+    let mut skeptic = PhaseConfig {
         model: args.skeptic_model.clone(),
         effort: args.skeptic_effort.clone(),
     };
-    let fixer = PhaseConfig {
+    let mut fixer = PhaseConfig {
         model: args.fixer_model.clone(),
         effort: args.fixer_effort.clone(),
     };
-    let reviewer = PhaseConfig {
+    let mut reviewer = PhaseConfig {
         model: args.reviewer_model.clone(),
         effort: args.reviewer_effort.clone(),
     };
-    let finalizer = PhaseConfig {
+    let mut finalizer = PhaseConfig {
         model: args.finalizer_model.clone(),
         effort: args.finalizer_effort.clone(),
     };
+    apply_bug_profile(
+        args.profile,
+        &mut finder,
+        &mut skeptic,
+        &mut reviewer,
+        &mut fixer,
+        &mut finalizer,
+    );
     ensure_code_writer_config("auto bug final review pass", &finalizer)?;
+    let kimi_preflight_model = [&finder, &skeptic, &reviewer, &fixer]
+        .iter()
+        .find(|config| is_kimi_model(&config.model))
+        .map(|config| config.model.as_str());
     if args.use_kimi_cli {
-        let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
-        preflight_kimi_cli(&kimi_bin, &finder.model).with_context(|| {
-            format!(
-                "kimi-cli preflight failed. Pipeline aborted before touching {} \
-                 chunks; no work was wasted.",
-                chunks.len()
-            )
-        })?;
-    }
-    // Every pre-finalizer phase must route through Kimi. The finalizer stays
-    // Codex; everything else must be the Kimi remediation path (either via
-    // `kimi-cli` or the legacy PI Kimi route when `--no-use-kimi-cli` is set).
-    for (label, config) in [
-        ("finder", &finder),
-        ("skeptic", &skeptic),
-        ("reviewer", &reviewer),
-        ("fixer", &fixer),
-    ] {
-        if !is_kimi_model(&config.model) {
-            bail!(
-                "auto bug {label} phase must use a Kimi model (e.g. `k2.6`); got `{}`. \
-                 Run with `--{label}-model k2.6` or pass an explicit Kimi alias.",
-                config.model
-            );
+        if let Some(model) = kimi_preflight_model {
+            let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
+            preflight_kimi_cli(&kimi_bin, model).with_context(|| {
+                format!(
+                    "kimi-cli preflight failed. Pipeline aborted before touching {} \
+                     chunks; no work was wasted.",
+                    chunks.len()
+                )
+            })?;
         }
     }
 
@@ -266,6 +309,8 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     println!("repo root:   {}", repo_root.display());
     println!("output dir:  {}", output_dir.display());
     println!("chunks:      {}", chunks.len());
+    println!("profile:     {:?}", args.profile);
+    println!("read lanes:  {}", args.read_parallelism.max(1));
     println!(
         "finder:      {} ({})",
         display_phase_model(&finder),
@@ -342,82 +387,32 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
         println!("remote sync: rebased onto origin/{}", current_branch);
     }
 
-    let mut outcomes = Vec::new();
+    let outcomes = run_read_only_chunk_pipelines(
+        &repo_root,
+        &output_dir,
+        chunks,
+        &finder,
+        &skeptic,
+        &reviewer,
+        &args,
+    )
+    .await?;
     let mut per_chunk_fixes: Vec<FixResult> = Vec::new();
-    for chunk in chunks {
+    for outcome in &outcomes {
+        let chunk = &outcome.chunk;
         let chunk_dir = output_dir.join("chunks").join(&chunk.id);
-        fs::create_dir_all(&chunk_dir)
-            .with_context(|| format!("failed to create {}", chunk_dir.display()))?;
-        write_chunk_manifest(&chunk_dir, &chunk)?;
-
-        let findings = load_or_run_finder_phase(
-            &repo_root,
-            &chunk,
-            &chunk_dir,
-            &finder,
-            &args,
-            &stderr_log_path,
-        )
-        .await?;
-
-        let (disproved_count, accepted) = if findings.is_empty() {
-            let accepted_path = chunk_dir.join("accepted-findings.json");
-            if !accepted_path.exists() {
-                atomic_write(&accepted_path, b"[]")?;
-            }
-            (0, Vec::new())
-        } else {
-            load_or_run_skeptic_phase(
-                &repo_root,
-                &chunk,
-                &chunk_dir,
-                &skeptic,
-                &findings,
-                &args,
-                &stderr_log_path,
-            )
-            .await?
-        };
-
-        let reviews = if accepted.is_empty() {
-            Vec::new()
-        } else {
-            load_or_run_review_phase(
-                &repo_root,
-                &chunk,
-                &chunk_dir,
-                &reviewer,
-                &accepted,
-                &args,
-                &stderr_log_path,
-            )
-            .await?
-        };
-        let verified = derive_verified_findings(&accepted, &reviews)?;
-
-        println!(
-            "summary:     {} reported | {} accepted | {} verified | {} disproved",
-            findings.len(),
-            accepted.len(),
-            verified.len(),
-            disproved_count
-        );
-        if !reviews.is_empty() {
-            println!("review:      {} item(s)", reviews.len());
-        }
-
         // Fix-on-verify: as soon as this chunk's findings survive the skeptic
-        // and reviewer, run the Kimi implementer against them and commit the
+        // and reviewer, run the configured implementer against them and commit the
         // diff. Keeps remediation atomic per chunk so resume can skip over
         // landed work without re-prompting the fixer.
-        let chunk_fixes = if args.report_only || verified.is_empty() {
+        let chunk_fixes = if args.report_only || outcome.verified.is_empty() {
             Vec::new()
         } else {
             let results = load_or_run_fix_phase_for_chunk(
                 &repo_root,
-                &chunk,
+                chunk,
                 &chunk_dir,
-                &verified,
+                &outcome.verified,
                 &fixer,
                 current_branch.as_str(),
                 &args,
@@ -439,15 +434,6 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
             results
         };
         per_chunk_fixes.extend(chunk_fixes.clone());
-
-        outcomes.push(ChunkOutcome {
-            chunk,
-            findings,
-            disproved_count,
-            accepted,
-            verified,
-            reviews,
-        });
     }
 
     let all_verified = outcomes
@@ -573,6 +559,133 @@ pub(crate) async fn run_bug(args: BugArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_read_only_chunk_pipelines(
+    repo_root: &Path,
+    output_dir: &Path,
+    chunks: Vec<RepoChunk>,
+    finder: &PhaseConfig,
+    skeptic: &PhaseConfig,
+    reviewer: &PhaseConfig,
+    args: &BugArgs,
+) -> Result<Vec<ChunkOutcome>> {
+    let lanes = args.read_parallelism.max(1);
+    let semaphore = Arc::new(Semaphore::new(lanes));
+    let mut handles = Vec::new();
+    for chunk in chunks {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("bug chunk semaphore closed")?;
+        let repo_root = repo_root.to_path_buf();
+        let output_dir = output_dir.to_path_buf();
+        let finder = finder.clone();
+        let skeptic = skeptic.clone();
+        let reviewer = reviewer.clone();
+        let args = args.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            run_read_only_chunk_pipeline(
+                &repo_root,
+                &output_dir,
+                chunk,
+                &finder,
+                &skeptic,
+                &reviewer,
+                &args,
+            )
+            .await
+        }));
+    }
+
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(
+            handle
+                .await
+                .context("bug read-only chunk task panicked")??,
+        );
+    }
+    outcomes.sort_by_key(|outcome| outcome.chunk.ordinal);
+    Ok(outcomes)
+}
+
+async fn run_read_only_chunk_pipeline(
+    repo_root: &Path,
+    output_dir: &Path,
+    chunk: RepoChunk,
+    finder: &PhaseConfig,
+    skeptic: &PhaseConfig,
+    reviewer: &PhaseConfig,
+    args: &BugArgs,
+) -> Result<ChunkOutcome> {
+    let chunk_dir = output_dir.join("chunks").join(&chunk.id);
+    fs::create_dir_all(&chunk_dir)
+        .with_context(|| format!("failed to create {}", chunk_dir.display()))?;
+    write_chunk_manifest(&chunk_dir, &chunk)?;
+    let stderr_log_path = chunk_dir.join("read-only.stderr.log");
+
+    let findings = load_or_run_finder_phase(
+        repo_root,
+        &chunk,
+        &chunk_dir,
+        finder,
+        args,
+        &stderr_log_path,
+    )
+    .await?;
+    let (disproved_count, accepted) = if findings.is_empty() {
+        let accepted_path = chunk_dir.join("accepted-findings.json");
+        if !accepted_path.exists() {
+            atomic_write(&accepted_path, b"[]")?;
+        }
+        (0, Vec::new())
+    } else {
+        load_or_run_skeptic_phase(
+            repo_root,
+            &chunk,
+            &chunk_dir,
+            skeptic,
+            &findings,
+            args,
+            &stderr_log_path,
+        )
+        .await?
+    };
+    let reviews = if accepted.is_empty() {
+        Vec::new()
+    } else {
+        load_or_run_review_phase(
+            repo_root,
+            &chunk,
+            &chunk_dir,
+            reviewer,
+            &accepted,
+            args,
+            &stderr_log_path,
+        )
+        .await?
+    };
+    let verified = derive_verified_findings(&accepted, &reviews)?;
+
+    println!(
+        "summary:     {} | {} reported | {} accepted | {} verified | {} disproved",
+        chunk.id,
+        findings.len(),
+        accepted.len(),
+        verified.len(),
+        disproved_count
+    );
+    Ok(ChunkOutcome {
+        chunk,
+        findings,
+        disproved_count,
+        accepted,
+        verified,
+        reviews,
+    })
 }
 
 async fn run_finder_phase(
@@ -801,7 +914,7 @@ async fn load_or_run_skeptic_phase(
 }
 
 /// Per-chunk fix-on-verify. Writes the chunk's verified findings to a local
-/// JSON file, runs the Kimi implementer against them, and records the results
+/// JSON file, runs the configured implementer against them, and records the results
 /// inside the chunk directory so `--resume` can skip already-landed chunks.
 #[allow(clippy::too_many_arguments)]
 async fn run_fix_phase_for_chunk(
@@ -1286,9 +1399,10 @@ fn ensure_code_writer_config(label: &str, config: &PhaseConfig) -> Result<()> {
             config.model
         );
     }
-    if config.effort.trim().to_ascii_lowercase() != DEFAULT_CODEX_REASONING_EFFORT {
+    let effort = config.effort.trim().to_ascii_lowercase();
+    if effort != DEFAULT_CODEX_REASONING_EFFORT && effort != "xhigh" {
         bail!(
-            "{label} must use `{}` reasoning; got `{}`",
+            "{label} must use `{}` or `xhigh` reasoning; got `{}`",
             DEFAULT_CODEX_REASONING_EFFORT,
             config.effort
         );
@@ -1341,6 +1455,10 @@ async fn run_backend_prompt(
                 .arg(model)
                 .arg("-c")
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
+                .arg("-c")
+                .arg(format!(
+                    "model_context_window={MAX_CODEX_MODEL_CONTEXT_WINDOW}"
+                ))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1696,35 +1814,124 @@ fn collect_repo_chunks(
     }
 
     let tracked = git_stdout(repo_root, ["ls-files"])?;
-    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    let mut grouped = BTreeMap::<String, Vec<FileCandidate>>::new();
     for line in tracked.lines() {
         let path = line.trim();
         if path.is_empty() || !should_audit_path(path) {
             continue;
         }
         let scope = top_level_scope(path);
-        grouped.entry(scope).or_default().push(path.to_string());
+        let candidate = build_file_candidate(repo_root, path);
+        grouped.entry(scope).or_default().push(candidate);
     }
 
     let mut chunks = Vec::new();
     let mut ordinal = 1usize;
-    for (scope, mut files) in grouped {
-        files.sort();
-        for slice in files.chunks(chunk_size) {
-            let id = format!("chunk-{:03}-{}", ordinal, slugify(&scope));
-            chunks.push(RepoChunk {
-                ordinal,
-                id,
-                scope_label: scope.clone(),
-                files: slice.to_vec(),
-            });
-            ordinal += 1;
+    let token_budget = chunk_size.saturating_mul(700).max(700);
+    for (scope, mut candidates) in grouped {
+        candidates.sort_by(|a, b| {
+            b.risk_score
+                .cmp(&a.risk_score)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let mut current = Vec::<FileCandidate>::new();
+        let mut current_tokens = 0usize;
+        for candidate in candidates {
+            let would_exceed_files = current.len() >= chunk_size;
+            let would_exceed_tokens =
+                !current.is_empty() && current_tokens + candidate.estimated_tokens > token_budget;
+            if would_exceed_files || would_exceed_tokens {
+                push_repo_chunk(&mut chunks, &scope, &mut ordinal, current)?;
+                if max_chunks.is_some_and(|limit| chunks.len() >= limit) {
+                    return Ok(chunks);
+                }
+                current = Vec::new();
+                current_tokens = 0;
+            }
+            current_tokens += candidate.estimated_tokens;
+            current.push(candidate);
+        }
+        if !current.is_empty() {
+            push_repo_chunk(&mut chunks, &scope, &mut ordinal, current)?;
             if max_chunks.is_some_and(|limit| chunks.len() >= limit) {
                 return Ok(chunks);
             }
         }
     }
     Ok(chunks)
+}
+
+fn push_repo_chunk(
+    chunks: &mut Vec<RepoChunk>,
+    scope: &str,
+    ordinal: &mut usize,
+    candidates: Vec<FileCandidate>,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let id = format!("chunk-{:03}-{}", *ordinal, slugify(scope));
+    let mut files = Vec::new();
+    let mut risk_notes = Vec::new();
+    for candidate in candidates {
+        files.push(candidate.path.clone());
+        for note in candidate.risk_notes {
+            risk_notes.push(format!("{}: {note}", candidate.path));
+        }
+    }
+    chunks.push(RepoChunk {
+        ordinal: *ordinal,
+        id,
+        scope_label: scope.to_string(),
+        files,
+        risk_notes,
+    });
+    *ordinal += 1;
+    Ok(())
+}
+
+fn build_file_candidate(repo_root: &Path, path: &str) -> FileCandidate {
+    let full_path = repo_root.join(path);
+    let bytes = fs::read(&full_path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let estimated_tokens = (text.len() / 4).max(1);
+    let risk_notes = risk_notes_for_file(path, &text);
+    FileCandidate {
+        path: path.to_string(),
+        estimated_tokens,
+        risk_score: risk_notes.len(),
+        risk_notes,
+    }
+}
+
+fn risk_notes_for_file(path: &str, text: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let lower_path = path.to_ascii_lowercase();
+    if lower_path.contains("auth") || lower_path.contains("token") || lower_path.contains("secret")
+    {
+        notes.push("auth/credential surface".to_string());
+    }
+    let patterns = [
+        ("unwrap(", "panic-prone unwrap"),
+        ("expect(", "panic-prone expect"),
+        ("unsafe ", "unsafe block"),
+        ("Command::new", "process execution"),
+        ("std::process", "process execution"),
+        ("fs::write", "filesystem write"),
+        ("remove_dir_all", "destructive filesystem operation"),
+        ("DELETE ", "destructive database/query operation"),
+        ("UPDATE ", "state mutation query"),
+        ("TODO", "unfinished TODO"),
+        ("FIXME", "unfinished FIXME"),
+    ];
+    for (needle, label) in patterns {
+        if text.contains(needle) {
+            notes.push(label.to_string());
+        }
+    }
+    notes.sort();
+    notes.dedup();
+    notes
 }
 
 fn top_level_scope(path: &str) -> String {
@@ -1785,10 +1992,46 @@ fn write_chunk_manifest(chunk_dir: &Path, chunk: &RepoChunk) -> Result<()> {
     for file in &chunk.files {
         manifest.push_str(&format!("- `{file}`\n"));
     }
+    if !chunk.risk_notes.is_empty() {
+        manifest.push_str("\n## Static Risk Hints\n\n");
+        for note in &chunk.risk_notes {
+            manifest.push_str(&format!("- {note}\n"));
+        }
+    }
     atomic_write(&chunk_dir.join("manifest.md"), manifest.as_bytes())
 }
 
+fn write_bug_pre_index(output_dir: &Path, chunks: &[RepoChunk]) -> Result<()> {
+    let mut markdown = String::new();
+    markdown.push_str("# Bug Pre-Index\n\n");
+    markdown.push_str("Cheap static hints generated before model audit. These are prioritization hints, not findings.\n\n");
+    for chunk in chunks {
+        if chunk.risk_notes.is_empty() {
+            continue;
+        }
+        markdown.push_str(&format!("## `{}`\n\n", chunk.id));
+        for note in &chunk.risk_notes {
+            markdown.push_str(&format!("- {note}\n"));
+        }
+        markdown.push('\n');
+    }
+    if !markdown.contains("## `") {
+        markdown.push_str("No static risk hints found.\n");
+    }
+    atomic_write(&output_dir.join("pre-index.md"), markdown.as_bytes())
+}
+
 fn build_finder_prompt(chunk: &RepoChunk, findings_json: &Path, findings_md: &Path) -> String {
+    let risk_hints = if chunk.risk_notes.is_empty() {
+        "No static risk hints were found for this chunk. Still perform a full audit.".to_string()
+    } else {
+        chunk
+            .risk_notes
+            .iter()
+            .map(|note| format!("- {note}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
         r#"You are the finder pass in a multi-pass bug pipeline.
 
@@ -1796,6 +2039,9 @@ Audit repo chunk `{chunk_id}` with primary scope `{scope}`.
 
 Primary files in this chunk:
 {files}
+
+Static risk hints from the cheap pre-index:
+{risk_hints}
 
 Rules:
 - Treat the live codebase as truth.
@@ -1826,6 +2072,7 @@ Each JSON item must use exactly this schema:
 
 Requirements:
 - Maximize recall, but every finding must name a concrete failure mode and at least one falsification check.
+- Every finding must include direct code evidence and either a reproduction path, violated invariant, or exact validation command.
 - Prefer findings with a believable reproduction path, violated invariant, and plausible root-cause region over vague smell reports.
 - Cover correctness, state consistency, security, performance, and runtime behavior when the code supports them.
 - Use bug IDs with prefix `BUG-{ordinal:03}-`.
@@ -1837,6 +2084,7 @@ Requirements:
         chunk_id = chunk.id,
         scope = chunk.scope_label,
         files = render_prompt_files(&chunk.files),
+        risk_hints = risk_hints,
         findings_json = findings_json.display(),
         findings_md = findings_md.display(),
         ordinal = chunk.ordinal,
@@ -2149,8 +2397,23 @@ fn validate_findings(chunk: &RepoChunk, findings: &[BugFinding]) -> Result<()> {
                 finding.bug_id
             );
         }
+        if finding.evidence.is_empty() || !finding_has_grounded_evidence(chunk, finding) {
+            bail!(
+                "finder output for {} must include direct repo-grounded evidence",
+                finding.bug_id
+            );
+        }
     }
     Ok(())
+}
+
+fn finding_has_grounded_evidence(chunk: &RepoChunk, finding: &BugFinding) -> bool {
+    let mut haystack = finding.evidence.join("\n");
+    haystack.push('\n');
+    haystack.push_str(&finding.location);
+    chunk.files.iter().any(|file| {
+        haystack.contains(file) || haystack.contains(file.split('/').next().unwrap_or(file))
+    })
 }
 
 fn validate_accepted_findings(findings: &[BugFinding], accepted: &[AcceptedFinding]) -> Result<()> {
@@ -2278,6 +2541,7 @@ fn derive_verified_findings(
             .get(finding.bug_id.as_str())
             .with_context(|| format!("review output missing verdict for {}", finding.bug_id))?;
         match review.verdict.trim().to_ascii_lowercase().as_str() {
+            "verified" if review.confidence.trim().eq_ignore_ascii_case("low") => {}
             "verified" => verified.push(finding.clone()),
             "discarded" => {}
             other => bail!("invalid review verdict `{other}` for {}", finding.bug_id),
@@ -3277,6 +3541,7 @@ mod tests {
             id: format!("chunk-{ordinal:03}-test"),
             scope_label: "test".to_string(),
             files: vec!["src/lib.rs".to_string()],
+            risk_notes: Vec::new(),
         }
     }
 
@@ -3290,7 +3555,7 @@ mod tests {
             description: "desc".to_string(),
             why_plausible: "why".to_string(),
             falsification_checks: vec!["check".to_string()],
-            evidence: vec!["evidence".to_string()],
+            evidence: vec!["src/lib.rs:1 evidence".to_string()],
         }
     }
 
@@ -3320,7 +3585,7 @@ mod tests {
     #[test]
     fn bug_pipeline_minimax_alias_defaults_to_m27_highspeed() {
         assert_eq!(
-            PiProvider::Minimax.resolve_model("minimax", "gpt-5.4"),
+            PiProvider::Minimax.resolve_model("minimax", "gpt-5.5"),
             "minimax/MiniMax-M2.7-highspeed"
         );
     }
@@ -3430,7 +3695,7 @@ mod tests {
             description: "desc".to_string(),
             why_plausible: "why".to_string(),
             falsification_checks: vec!["check".to_string()],
-            evidence: vec!["evidence".to_string()],
+            evidence: vec!["path:1 evidence".to_string()],
         }];
         let accepted = vec![AcceptedFinding {
             bug_id: "BUG-999-01".to_string(),

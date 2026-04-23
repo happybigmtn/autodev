@@ -27,6 +27,7 @@ mod review_command;
 mod ship_command;
 mod state;
 mod steward_command;
+mod super_command;
 mod symphony_command;
 mod util;
 
@@ -55,6 +56,8 @@ enum Command {
     Corpus(CorpusArgs),
     /// Generate specs and a new implementation plan from genesis/
     Gen(GenerationArgs),
+    /// Run the all-in-one production-grade workflow: corpus, gen, gates, then parallel
+    Super(SuperArgs),
     /// Reverse-engineer specs from code reality using genesis/ as supporting context
     Reverse(GenerationArgs),
     /// Run a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline
@@ -71,7 +74,7 @@ enum Command {
     Health(HealthArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
-    /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.4)
+    /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.5)
     /// pipeline: reconciles plan claims against the live code, surfaces
     /// hinge items, and applies approved IMPLEMENTATION_PLAN.md /
     /// WORKLIST.md / LEARNINGS.md updates in-place. Replaces `auto corpus`
@@ -132,7 +135,7 @@ struct SymphonySyncArgs {
     todo_state: String,
 
     /// Codex model used for sync planning analysis
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     planner_model: String,
 
     /// Codex reasoning effort used for sync planning analysis
@@ -179,7 +182,7 @@ struct SymphonyWorkflowArgs {
     poll_interval_ms: u64,
 
     /// Model passed to Codex app-server through quota routing
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
@@ -230,7 +233,7 @@ struct SymphonyRunArgs {
     poll_interval_ms: u64,
 
     /// Model passed to Codex app-server through quota routing
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
@@ -246,7 +249,7 @@ struct SymphonyRunArgs {
     todo_state: String,
 
     /// Codex model used for sync planning analysis when --sync-first is set
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     planner_model: String,
 
     /// Codex reasoning effort used for sync planning analysis when --sync-first is set
@@ -379,6 +382,13 @@ impl QaTier {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum HardeningProfile {
+    Fast,
+    Balanced,
+    MaxQuality,
+}
+
 #[derive(Args, Clone)]
 pub(crate) struct CorpusArgs {
     /// Planning corpus root. Defaults to <repo>/genesis
@@ -398,7 +408,7 @@ pub(crate) struct CorpusArgs {
     reference_repos: Vec<PathBuf>,
 
     /// Model used for corpus authoring
-    #[arg(long, default_value = "claude-opus-4-7")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort used for corpus authoring
@@ -406,7 +416,7 @@ pub(crate) struct CorpusArgs {
     reasoning_effort: String,
 
     /// Model used for the independent Codex review pass after corpus authoring
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     codex_review_model: String,
 
     /// Reasoning effort used for the independent Codex review pass
@@ -425,7 +435,7 @@ pub(crate) struct CorpusArgs {
     #[arg(long)]
     verify_only: bool,
 
-    /// Maximum Claude turns
+    /// Maximum Claude turns when an explicit Claude authoring model is selected
     #[arg(long, default_value_t = 200)]
     max_turns: usize,
 
@@ -449,7 +459,7 @@ pub(crate) struct GenerationArgs {
     output_dir: Option<PathBuf>,
 
     /// Model used for spec and plan authoring
-    #[arg(long, default_value = "claude-opus-4-7")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort used for spec and plan authoring
@@ -457,7 +467,7 @@ pub(crate) struct GenerationArgs {
     reasoning_effort: String,
 
     /// Model used for the independent Codex review pass after generation
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     codex_review_model: String,
 
     /// Reasoning effort used for the independent Codex review pass
@@ -472,7 +482,7 @@ pub(crate) struct GenerationArgs {
     #[arg(long)]
     skip_codex_review: bool,
 
-    /// Maximum Claude turns
+    /// Maximum Claude turns when an explicit Claude authoring model is selected
     #[arg(long, default_value_t = 200)]
     max_turns: usize,
 
@@ -490,6 +500,88 @@ pub(crate) struct GenerationArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct SuperArgs {
+    /// Single high-level instruction for the production-grade workflow
+    prompt: Option<String>,
+
+    /// Planning corpus root. Defaults to <repo>/genesis
+    #[arg(long)]
+    planning_root: Option<PathBuf>,
+
+    /// Generated output directory. Defaults to <repo>/gen-<timestamp>
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Seed corpus generation with product direction
+    #[arg(long)]
+    idea: Option<String>,
+
+    /// Additional focus text to combine with the positional prompt
+    #[arg(long)]
+    focus: Option<String>,
+
+    /// Additional repository roots that all planning phases may inspect as reference material
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
+    /// Model used for corpus, generation, and super review gates
+    #[arg(long, default_value = "gpt-5.5")]
+    model: String,
+
+    /// Reasoning effort used for corpus, generation, and super review gates
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Codex executable used for Codex-backed phases
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Maximum Claude turns if an explicit Claude authoring model is selected
+    #[arg(long, default_value_t = 200)]
+    max_turns: usize,
+
+    /// Maximum parallel subagents to encourage during corpus and generation
+    #[arg(long, default_value_t = 8)]
+    planning_parallelism: usize,
+
+    /// Maximum concurrent `auto parallel` worker lanes
+    #[arg(
+        long = "threads",
+        visible_alias = "max-concurrent-workers",
+        default_value_t = 5
+    )]
+    max_concurrent_workers: usize,
+
+    /// Stop `auto parallel` after this many successful lands. Default is unlimited.
+    #[arg(long)]
+    max_iterations: Option<usize>,
+
+    /// Model used by implementation workers after the gates pass
+    #[arg(long, default_value = "gpt-5.5")]
+    worker_model: String,
+
+    /// Reasoning effort used by implementation workers after the gates pass
+    #[arg(long, default_value = "high")]
+    worker_reasoning_effort: String,
+
+    /// Branch that `auto parallel` is allowed to run on. Defaults to the repo's primary branch.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Skip launching `auto parallel` after the production-grade gates pass
+    #[arg(long)]
+    no_execute: bool,
+
+    /// Skip the additional super-only model review gates, leaving corpus/gen controls in place
+    #[arg(long)]
+    skip_super_review: bool,
+
+    /// Preview the planned super workflow without invoking models or launching workers
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct BugArgs {
     /// Output directory for bug pipeline artifacts. Defaults to <repo>/bug
     #[arg(long)]
@@ -499,6 +591,10 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     resume: bool,
 
+    /// Execution preset. Explicit model/effort flags still win over the preset.
+    #[arg(long, value_enum, default_value_t = HardeningProfile::Balanced)]
+    profile: HardeningProfile,
+
     /// Maximum files per audit chunk
     #[arg(long, default_value_t = 24)]
     chunk_size: usize,
@@ -506,6 +602,10 @@ pub(crate) struct BugArgs {
     /// Optional cap on how many chunks to process
     #[arg(long)]
     max_chunks: Option<usize>,
+
+    /// Maximum concurrent read-only chunk pipelines before serial implementation begins
+    #[arg(long, default_value_t = 4)]
+    read_parallelism: usize,
 
     /// Stop after the verification review and summary generation
     #[arg(long)]
@@ -519,8 +619,8 @@ pub(crate) struct BugArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Model for the initial finder pass (Kimi k2.6 by default)
-    #[arg(long, default_value = "k2.6")]
+    /// Model for the initial finder pass
+    #[arg(long, default_value = "gpt-5.5")]
     finder_model: String,
 
     /// Effort / variant for the initial finder pass
@@ -528,7 +628,7 @@ pub(crate) struct BugArgs {
     finder_effort: String,
 
     /// Model for the adversarial skeptic pass
-    #[arg(long, default_value = "k2.6")]
+    #[arg(long, default_value = "gpt-5.5")]
     skeptic_model: String,
 
     /// Effort / variant for the skeptic pass
@@ -536,7 +636,7 @@ pub(crate) struct BugArgs {
     skeptic_effort: String,
 
     /// Model for the implementation pass after review verification
-    #[arg(long, default_value = "k2.6")]
+    #[arg(long, default_value = "gpt-5.5")]
     fixer_model: String,
 
     /// Effort / variant for the implementation pass after review verification
@@ -544,15 +644,15 @@ pub(crate) struct BugArgs {
     fixer_effort: String,
 
     /// Model for the verification review pass
-    #[arg(long, default_value = "k2.6")]
+    #[arg(long, default_value = "gpt-5.5")]
     reviewer_model: String,
 
     /// Effort / variant for the verification review pass
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
 
-    /// Model for the final Codex review pass. This stays pinned to gpt-5.4.
-    #[arg(long, default_value = "gpt-5.4")]
+    /// Model for the final Codex review pass. This stays pinned to gpt-5.5.
+    #[arg(long, default_value = "gpt-5.5")]
     finalizer_model: String,
 
     /// Effort / variant for the final Codex review pass. This stays pinned to high.
@@ -563,18 +663,15 @@ pub(crate) struct BugArgs {
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Legacy PI executable. Retained only as a fallback — by default auto bug now
-    /// routes Kimi phases through `kimi-cli --yolo`. Set `--no-use-kimi-cli` to
-    /// go back through `pi`.
+    /// Legacy PI executable. Retained for explicit Kimi/PI opt-ins.
     #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
     pi_bin: PathBuf,
 
-    /// kimi-cli executable (used when `--use-kimi-cli` is on, which is the default)
+    /// kimi-cli executable used for explicit Kimi model opt-ins.
     #[arg(long, default_value = "kimi-cli")]
     kimi_bin: PathBuf,
 
-    /// Route Kimi phases through `kimi-cli --yolo` instead of the legacy `pi` binary.
-    /// Enabled by default. Pass `--no-use-kimi-cli` to opt back into PI.
+    /// Route explicit Kimi phases through `kimi-cli --yolo` instead of the legacy `pi` binary.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_kimi_cli: bool,
 }
@@ -590,11 +687,11 @@ pub(crate) struct LoopArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the implementation worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Branch that the loop is allowed to run on. Defaults to the repo's primary branch.
@@ -661,11 +758,11 @@ pub(crate) struct ParallelArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the implementation worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex worker
-    #[arg(long, default_value = "xhigh")]
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Branch that the parallel executor is allowed to run on. Defaults to the repo's primary branch.
@@ -736,7 +833,7 @@ pub(crate) struct ReviewArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the review worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex review worker
@@ -807,7 +904,7 @@ pub(crate) struct StewardArgs {
 
     /// Codex model for the first steward pass — writes drift + hinge + retire +
     /// hazard artifacts and promotes active plan/spec work.
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Codex reasoning effort for the first steward pass.
@@ -816,7 +913,7 @@ pub(crate) struct StewardArgs {
 
     /// Codex model for the finalizer pass — reviews the first pass's proposed
     /// edits against the live tree and applies the ones that hold.
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     finalizer_model: String,
 
     /// Codex finalizer reasoning effort.
@@ -884,9 +981,8 @@ pub(crate) struct AuditArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Auditor model. Kimi by default (high-volume read-heavy pass; Codex
-    /// handles escalations).
-    #[arg(long, default_value = "k2.6")]
+    /// Auditor model.
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Auditor reasoning effort / thinking.
@@ -895,26 +991,26 @@ pub(crate) struct AuditArgs {
 
     /// Escalation model for DRIFT-LARGE / REFACTOR verdicts that write
     /// worklist entries. Codex gives a second-opinion on high-impact calls.
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     escalation_model: String,
 
     /// Escalation reasoning effort.
     #[arg(long, default_value = "high")]
     escalation_effort: String,
 
-    /// Codex executable (used for escalations + fallback).
+    /// Codex executable used for audit and escalation passes.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// kimi-cli executable (used for the primary auditor pass).
+    /// kimi-cli executable used for explicit Kimi model opt-ins.
     #[arg(long, default_value = "kimi-cli")]
     kimi_bin: PathBuf,
 
-    /// Legacy PI binary, only used when `--no-use-kimi-cli` is set.
+    /// Legacy PI binary retained for compatibility.
     #[arg(long = "pi-bin", default_value = "pi")]
     pi_bin: PathBuf,
 
-    /// Route the auditor through `kimi-cli --yolo`. Default on.
+    /// Route explicit Kimi audit models through `kimi-cli --yolo`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_kimi_cli: bool,
 }
@@ -943,7 +1039,7 @@ pub(crate) struct QaArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the QA worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex QA worker
@@ -974,7 +1070,7 @@ pub(crate) struct QaOnlyArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the QA report worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex QA report worker
@@ -1005,7 +1101,7 @@ pub(crate) struct HealthArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the health worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex health worker
@@ -1036,7 +1132,7 @@ pub(crate) struct ShipArgs {
     prompt_file: Option<PathBuf>,
 
     /// Model to use for the ship worker
-    #[arg(long, default_value = "gpt-5.4")]
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort to pass through to the Codex ship worker
@@ -1070,23 +1166,31 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// Model for the initial Nemesis audit pass (Kimi k2.6 by default).
-    #[arg(long, default_value = "k2.6")]
+    /// Reuse valid nemesis artifacts and continue from the first missing or invalid phase
+    #[arg(long)]
+    resume: bool,
+
+    /// Execution preset. Explicit model/effort flags still win over the preset.
+    #[arg(long, value_enum, default_value_t = HardeningProfile::Balanced)]
+    profile: HardeningProfile,
+
+    /// Model for the initial Nemesis audit pass.
+    #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
     /// Reasoning effort / variant for the initial Nemesis audit pass
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
-    /// Model for the Nemesis synthesis pass (Kimi k2.6 by default).
-    #[arg(long, default_value = "k2.6")]
+    /// Model for the Nemesis synthesis pass.
+    #[arg(long, default_value = "gpt-5.5")]
     reviewer_model: String,
 
     /// Reasoning effort / variant for the final Nemesis synthesis pass
     #[arg(long, default_value = "high")]
     reviewer_effort: String,
 
-    /// Legacy opt-in. Kimi is the default; pass `--kimi` only to make the default explicit in logs.
+    /// Legacy opt-in for the Kimi audit model.
     #[arg(long, conflicts_with = "minimax")]
     kimi: bool,
 
@@ -1107,16 +1211,16 @@ pub(crate) struct NemesisArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Model to use for the Nemesis implementation / fixer pass. Kimi by default.
-    #[arg(long, default_value = "k2.6")]
+    /// Model to use for the Nemesis implementation / fixer pass.
+    #[arg(long, default_value = "gpt-5.5")]
     fixer_model: String,
 
     /// Reasoning effort / variant for the Nemesis implementation pass
     #[arg(long, default_value = "high")]
     fixer_effort: String,
 
-    /// Model used by the final Codex review-of-Kimi-diff pass. Stays on gpt-5.4.
-    #[arg(long, default_value = "gpt-5.4")]
+    /// Model used by the final Codex review pass. Stays on gpt-5.5.
+    #[arg(long, default_value = "gpt-5.5")]
     finalizer_model: String,
 
     /// Reasoning effort / variant for the Codex finalizer pass
@@ -1132,16 +1236,15 @@ pub(crate) struct NemesisArgs {
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Legacy PI executable. Retained only as a fallback; set `--no-use-kimi-cli`
-    /// to route Kimi phases through `pi` again.
+    /// Legacy PI executable. Retained for explicit Kimi/PI opt-ins.
     #[arg(long = "pi-bin", visible_alias = "opencode-bin", default_value = "pi")]
     pi_bin: PathBuf,
 
-    /// kimi-cli executable (used when `--use-kimi-cli` is on, which is the default)
+    /// kimi-cli executable used for explicit Kimi model opt-ins.
     #[arg(long, default_value = "kimi-cli")]
     kimi_bin: PathBuf,
 
-    /// Route Kimi phases through `kimi-cli --yolo`. Default on.
+    /// Route explicit Kimi phases through `kimi-cli --yolo`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_kimi_cli: bool,
 }
@@ -1151,6 +1254,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Corpus(args) => generation::run_corpus(args).await,
         Command::Gen(args) => generation::run_gen(args).await,
+        Command::Super(args) => super_command::run_super(args).await,
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,

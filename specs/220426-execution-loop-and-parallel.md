@@ -9,7 +9,7 @@ Pin down the plan-queue burn-down contract used by `auto loop` (single-worker, o
 ### Verified facts (code)
 
 - `src/main.rs:63` declares `Loop`; `src/main.rs:65` declares `Parallel`.
-- `LoopArgs` defaults (per `src/main.rs:575-660`): model `gpt-5.4`, reasoning effort `xhigh`, Codex binary `codex`, unlimited iterations by default.
+- `LoopArgs` defaults (per `src/main.rs:575-660`): model `gpt-5.5`, reasoning effort `high`, Codex binary `codex`, unlimited iterations by default.
 - `ParallelArgs` defaults include five workers (`--max-concurrent-workers`, default 5) per `README.md:42` and `corpus/SPEC.md` table.
 - Task queue markers parsed identically across `loop_command.rs`, `parallel_command.rs`, `review_command.rs`, `generation.rs` (per `corpus/SPEC.md` §"Task queue protocol"):
   - `- [ ]` pending and runnable,

@@ -9,8 +9,8 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 ### Verified facts (code)
 
 - `src/main.rs:95` declares `Symphony`; `SymphonySubcommand` at `src/main.rs:111-118` covers `Sync`, `Workflow`, `Run`.
-- `SymphonySyncArgs` (`src/main.rs:121-149`): `--repo-root`, `--project-slug`, `--todo-state` (default `"Todo"`), `--planner-model` (default `"gpt-5.4"`), `--planner-reasoning-effort` (default `"high"`), `--codex-bin` (default `"codex"`), `--no-ai-planner`.
-- `SymphonyWorkflowArgs` (`src/main.rs:151-200+`): `--repo-root`, `--project-slug`, `--output`, `--workspace-root`, `--base-branch`, `--max-concurrent-agents` (default `1`), `--poll-interval-ms` (default `5_000`), `--model` (default `"gpt-5.4"`), `--reasoning-effort` (default `"high"`), `--in-progress-state` (default `"In Progress"`), `--done-state` (default `"Done"`), `--blocked-state` (optional).
+- `SymphonySyncArgs` (`src/main.rs:121-149`): `--repo-root`, `--project-slug`, `--todo-state` (default `"Todo"`), `--planner-model` (default `"gpt-5.5"`), `--planner-reasoning-effort` (default `"high"`), `--codex-bin` (default `"codex"`), `--no-ai-planner`.
+- `SymphonyWorkflowArgs` (`src/main.rs:151-200+`): `--repo-root`, `--project-slug`, `--output`, `--workspace-root`, `--base-branch`, `--max-concurrent-agents` (default `1`), `--poll-interval-ms` (default `5_000`), `--model` (default `"gpt-5.5"`), `--reasoning-effort` (default `"high"`), `--in-progress-state` (default `"In Progress"`), `--done-state` (default `"Done"`), `--blocked-state` (optional).
 - `SymphonyRunArgs` (`src/main.rs:201-286`) includes `--symphony-root` with no hardcoded default; `auto symphony run` resolves an explicit path first, then `AUTODEV_SYMPHONY_ROOT`, and fails with an actionable error when both are unset (`src/symphony_command.rs:1672-1682`).
 - `symphony_command.rs` is ~3,062 LOC (corpus ASSESSMENT). Tests ~18 covering GraphQL query construction and state parsing.
 - Host-side `auto parallel` GraphQL tracker queries live in `src/linear_tracker.rs`:
@@ -58,7 +58,7 @@ Keep `auto symphony` the operator's bridge between `IMPLEMENTATION_PLAN.md` and 
 - `auto symphony --help` lists the three subcommands: `sync`, `workflow`, `run`.
 - `auto symphony sync` reads the repo's `IMPLEMENTATION_PLAN.md`, computes drift against a Linear project, and updates or creates issues to reflect plan state using `UPDATE_ISSUE_STATE_MUTATION` and the project-fetch queries.
 - `auto symphony sync --no-ai-planner` runs without invoking Codex (planner bypass) and uses deterministic dependency parsing only.
-- `auto symphony sync` defaults: `--todo-state = "Todo"`, `--planner-model = "gpt-5.4"`, `--planner-reasoning-effort = "high"`, `--codex-bin = "codex"`.
+- `auto symphony sync` defaults: `--todo-state = "Todo"`, `--planner-model = "gpt-5.5"`, `--planner-reasoning-effort = "high"`, `--codex-bin = "codex"`.
 - `auto symphony workflow` renders a `WORKFLOW.md` file (to `--output` or a default path) containing `workspace_root`, `poll_interval_ms`, `model`, `reasoning_effort`, `in_progress_state`, `done_state`, `blocked_state` fields; defaults match `SymphonyWorkflowArgs`.
 - `auto symphony run` launches the Symphony runtime in the foreground, loading the rendered workflow; exits with the runtime's exit code.
 - Drift detection marks a Linear issue `terminal` when its state is one of the configured terminal states (`Done`, archived) and the plan row is still `- [ ]`.

@@ -11,6 +11,8 @@ use crate::quota_config::Provider;
 use crate::quota_exec;
 use crate::util::{atomic_write, timestamp_slug};
 
+pub(crate) const MAX_CODEX_MODEL_CONTEXT_WINDOW: i64 = 1_000_000;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_exec(
     repo_root: &Path,
@@ -33,6 +35,34 @@ pub(crate) async fn run_codex_exec(
         context_label,
         &[],
         None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_exec_max_context(
+    repo_root: &Path,
+    full_prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+    stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
+    context_label: &str,
+) -> Result<std::process::ExitStatus> {
+    run_codex_exec_with_env(
+        repo_root,
+        full_prompt,
+        model,
+        reasoning_effort,
+        codex_bin,
+        stderr_log_path,
+        stdout_log_path,
+        context_label,
+        &[],
+        None,
+        Some(MAX_CODEX_MODEL_CONTEXT_WINDOW),
     )
     .await
 }
@@ -49,6 +79,7 @@ pub(crate) async fn run_codex_exec_with_env(
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
+    model_context_window: Option<i64>,
 ) -> Result<std::process::ExitStatus> {
     let (status, stderr_text) = if quota_exec::is_quota_available(Provider::Codex) {
         let repo_root = repo_root.to_owned();
@@ -79,6 +110,7 @@ pub(crate) async fn run_codex_exec_with_env(
                     &context_label,
                     &extra_env,
                     worker_pid_path,
+                    model_context_window,
                 )
                 .await
             }
@@ -96,6 +128,7 @@ pub(crate) async fn run_codex_exec_with_env(
             context_label,
             extra_env,
             worker_pid_path,
+            model_context_window,
         )
         .await?
     };
@@ -114,6 +147,7 @@ async fn spawn_codex(
     context_label: &str,
     extra_env: &[(String, String)],
     worker_pid_path: Option<&Path>,
+    model_context_window: Option<i64>,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut command = TokioCommand::new(codex_bin);
     command
@@ -126,7 +160,13 @@ async fn spawn_codex(
         .arg("-m")
         .arg(model)
         .arg("-c")
-        .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
+        .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+    if let Some(model_context_window) = model_context_window {
+        command
+            .arg("-c")
+            .arg(format!("model_context_window={model_context_window}"));
+    }
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -8,8 +8,8 @@ Guarantee that `auto steward` stays an honest, two-pass reconciliation for repos
 
 ### Verified facts (code)
 
-- `src/main.rs:74-80` doc-comment declares `steward` as "two-pass Codex (gpt-5.4) pipeline" that "replaces `auto corpus` and `auto gen` for repos that already have an active planning surface; greenfield repos should keep using those."
-- `src/main.rs:87` (see `StewardArgs` block near line 800+) default model is `gpt-5.4`, effort `high`; a `--skip-finalizer` flag exists.
+- `src/main.rs:74-80` doc-comment declares `steward` as "two-pass Codex (gpt-5.5) pipeline" that "replaces `auto corpus` and `auto gen` for repos that already have an active planning surface; greenfield repos should keep using those."
+- `src/main.rs:87` (see `StewardArgs` block near line 800+) default model is `gpt-5.5`, effort `high`; a `--skip-finalizer` flag exists.
 - `src/steward_command.rs:21-28` declares the deliverable set: `DRIFT.md`, `HINGES.md`, `RETIRE.md`, `HAZARDS.md`, `STEWARDSHIP-REPORT.md`, `PROMOTIONS.md`.
 - Tests in `src/steward_command.rs`: 7 tests covering prompt content, planning-surface detection, and report-only mode (per corpus ASSESSMENT coverage table).
 - README does not list `steward` in the inventory at `README.md:11-25` or the detailed command guide.
@@ -31,8 +31,8 @@ Guarantee that `auto steward` stays an honest, two-pass reconciliation for repos
 - `auto steward` writes all six deliverables when the pipeline completes: `DRIFT.md`, `HINGES.md`, `RETIRE.md`, `HAZARDS.md`, `STEWARDSHIP-REPORT.md`, `PROMOTIONS.md`.
 - `auto steward --skip-finalizer` writes the six deliverables but does not modify `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, or `LEARNINGS.md`.
 - Without `--skip-finalizer`, the command applies approved edits directly to `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, and/or `LEARNINGS.md` as called for by the first-pass deliverables.
-- The first-pass Codex invocation uses `gpt-5.4` with `high` effort by default; CLI flags may override.
-- The second-pass Codex invocation also uses `gpt-5.4` with `high` effort by default.
+- The first-pass Codex invocation uses `gpt-5.5` with `high` effort by default; CLI flags may override.
+- The second-pass Codex invocation also uses `gpt-5.5` with `high` effort by default.
 - Before the finalizer writes, the command creates a git checkpoint when the worktree has tracked dirty state outside `.auto/`, `bug/`, `nemesis/`, and `gen-*`.
 - All deliverable writes go through `util::atomic_write` (no partial-write artifacts visible on failure).
 - The command exits non-zero if `codex` is not on `PATH`, naming the missing dependency.

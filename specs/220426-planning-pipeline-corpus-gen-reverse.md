@@ -1,15 +1,15 @@
-# Specification: Planning pipeline — `auto corpus`, `auto gen`, `auto reverse`
+# Specification: Planning pipeline — `auto corpus`, `auto gen`, `auto super`, `auto reverse`
 
 ## Objective
 
-Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `genesis/` corpus from repo reality; `auto gen` turns that corpus into durable `specs/` plus `IMPLEMENTATION_PLAN.md`; `auto reverse` documents current behavior from code without rewriting the root plan queue. All three commands must remain archive-safe, must emit required spec sections, and must keep their per-command artifact contracts aligned with what `loop`, `parallel`, `review`, and `steward` already parse.
+Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `genesis/` corpus from repo reality; `auto gen` turns that corpus into durable `specs/` plus `IMPLEMENTATION_PLAN.md`; `auto super` composes corpus + gen + production-grade gates + `auto parallel`; `auto reverse` documents current behavior from code without rewriting the root plan queue. These commands must remain archive-safe, must emit required spec sections, and must keep their per-command artifact contracts aligned with what `loop`, `parallel`, `review`, and `steward` already parse.
 
 ## Evidence Status
 
 ### Verified facts (code)
 
 - `src/main.rs:54-59` declares `Corpus`, `Gen`, and `Reverse`. `Gen` and `Reverse` share the `GenerationArgs` type (`src/main.rs:57,59`).
-- `src/main.rs:401-405` sets `corpus` defaults to `claude-opus-4-7` with effort `xhigh`. `src/main.rs:409-413` sets `gen` / `reverse` planner defaults to the same (`gpt-5.4` variant also available via CLI flags; see args block).
+- `src/main.rs` sets `corpus`, `gen`, and `reverse` authoring defaults to Codex `gpt-5.5` with effort `xhigh`. The independent Codex review pass also defaults to `gpt-5.5` with effort `xhigh`, and both Codex authoring/review paths request the maximum model context window.
 - `src/corpus.rs:10-23` defines `PlanningCorpus` with explicit output paths: `assessment_path`, `design_path`, `focus_path`, `idea_path`, `report_path`, `plans_index_path`, `spec_path`, `specs_index_path`, `spec_documents`, `primary_plans`, `support_documents`.
 - Plan-level constants in `src/generation.rs:108-116` declare `# IMPLEMENTATION_PLAN` plus `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`; `src/generation.rs:1752-1768` is the prompt contract requiring generated specs to include `## Objective`, `## Evidence Status`, `## Acceptance Criteria`, `## Verification`, and `## Open Questions`.
 - Spec filename pattern is `ddmmyy-<topic-slug>[-<counter>].md` (`src/generation.rs:1754` path formatter).
@@ -17,9 +17,11 @@ Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `ge
 - `auto reverse` does not rewrite the root `IMPLEMENTATION_PLAN.md`; gen does. Corpus claim: "Reverse treats the codebase as truth, specs as documentation-only" (`corpus/SPEC.md` row for `reverse`).
 - `auto corpus` archives the previous `genesis/` snapshot into `.auto/fresh-input/` before wiping (behavior confirmed in `corpus/SPEC.md` §"Archive-then-wipe" and runs via `generation.rs` layout).
 - `auto corpus` supports `--focus "..."` (writes `genesis/FOCUS.md`) and `--idea "..."` (writes `genesis/IDEA.md`, also seeds a pre-corpus office-hours shaping pass). Described at `README.md:102-128,142-150`.
-- Stage-by-stage observability to stdout is documented at `README.md:138-141`: binary provenance, repo root, prompt log path, Claude phase markers, Claude PID, cwd, elapsed timings.
+- Stage-by-stage observability to stdout is documented in the README: binary provenance, repo root, prompt log path, Codex phase markers, cwd, elapsed timings.
 - `genesis/` artifacts emitted when present: `ASSESSMENT.md`, `SPEC.md`, `PLANS.md`, `GENESIS-REPORT.md`, `DESIGN.md` (only for repos with meaningful UI surfaces), `FOCUS.md` / `IDEA.md` (only when flags used), `plans/*.md` (`README.md:102-112`).
 - Specs under `specs/` survive across runs; plan queue is replaced each `auto gen` run, with still-open tasks from the prior plan appended back (`corpus/DESIGN.md` §"Artifacts as information system" + `README.md:238`).
+- `src/main.rs` declares `Super` as the all-in-one production-grade workflow. `src/super_command.rs` runs the existing `auto corpus` and `auto gen` control paths, adds super-only model review gates, writes `.auto/super/<run-id>/` artifacts, then launches `auto parallel` unless `--no-execute` is supplied.
+- `auto super` defaults planning/review phases to Codex `gpt-5.5` with `xhigh` and implementation workers to Codex `gpt-5.5` with `high`.
 
 ### Recommendations (intended direction from corpus)
 
@@ -37,15 +39,19 @@ Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `ge
 - `auto corpus` moves any pre-existing `genesis/` tree into `.auto/fresh-input/genesis-<timestamp>/` before writing new files; the new `genesis/` does not merge with the archived snapshot.
 - `auto corpus --focus "<str>"` writes `genesis/FOCUS.md` and uses it as biasing context without skipping the full-repo sweep.
 - `auto corpus --idea "<str>"` writes `genesis/IDEA.md` and runs a pre-corpus shaping pass that produces the office-hours-style brief documented in `README.md:142-150`.
-- `auto corpus` prints stage markers to stdout: binary provenance line, repo root, prompt log path, claude phase start/finish markers with PID, and per-phase elapsed timings.
+- `auto corpus` prints stage markers to stdout: binary provenance line, repo root, prompt log path, Codex phase start/finish markers, and per-phase elapsed timings.
 - `auto gen` writes one or more markdown files under `specs/` with filename shape `ddmmyy-<slug>[-N].md` and each file begins with `# Specification:` and includes `## Objective`, `## Acceptance Criteria`, `## Verification`.
 - `auto gen` produces or updates `IMPLEMENTATION_PLAN.md` with the three required top-level sections declared in `src/generation.rs:108-116`.
 - `auto gen` preserves still-open (`- [ ]`, `- [!]`) tasks from the previous plan by re-appending them to the new plan rather than silently dropping them.
 - `auto gen` does not re-append tasks that were already completed (`- [x]`).
+- `auto super` runs `auto corpus`, a production-readiness corpus review, `auto gen`, a model execution-gate review, and a deterministic execution gate before launching parallel implementation.
+- `auto super` writes `.auto/super/<run-id>/manifest.json`, `PRODUCTION-READINESS.md`, `RISK-REGISTER.md`, `QUALITY-GATES.md`, `SYSTEM-MAP.md`, `SUPER-REPORT.md`, `EXECUTION-GATE.md`, and `DETERMINISTIC-GATE.json`.
+- `auto super` refuses to launch `auto parallel` unless `EXECUTION-GATE.md` contains `Verdict: GO` and the deterministic gate finds at least one unchecked executable task with required fields, concrete ownership, accepted scope, and non-broad verification.
+- `auto super --no-execute` performs corpus, gen, and gates but skips the `auto parallel` launch.
 - `auto reverse` writes under `specs/` with the same filename shape and required sections as `auto gen` but does not overwrite, replace, or append to the root `IMPLEMENTATION_PLAN.md`.
 - Every spec produced by `auto gen` / `auto reverse` includes `## Evidence Status` and `## Open Questions` (current behavior of the required-section check).
 - Each run writes a prompt log under `.auto/logs/<command>-<timestamp>-prompt.md`.
-- When invoked in a repo with no reachable `claude` binary on `PATH`, the command exits non-zero with a message that names `claude` as the missing dependency.
+- When invoked in a repo with no reachable `codex` binary on `PATH`, the default command exits non-zero with a message that names `codex` as the missing dependency. Claude is only required for explicit Claude authoring model overrides.
 - `SpecSyncSummary::skipped_count` reports specs that matched an existing file with the same stem in the same day bucket; the skipped specs are not re-written.
 
 ## Verification
@@ -53,6 +59,8 @@ Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `ge
 - Run `auto corpus` against a fixture repo with a pre-existing `genesis/`; confirm the old snapshot lands in `.auto/fresh-input/`.
 - Run `auto corpus --focus "hardening"`; assert `genesis/FOCUS.md` exists with the normalized brief.
 - Run `auto gen` twice back-to-back; assert still-open tasks survive and completed tasks do not re-appear.
+- Run `auto super "make this repo production grade" --dry-run`; assert it prints the corpus -> super corpus review -> gen -> execution gate -> parallel stage sequence.
+- Unit tests in `src/super_command.rs` cover the production focus builder and deterministic gate rejection of package-wide `cargo test` verification.
 - Run `auto reverse`; assert `IMPLEMENTATION_PLAN.md` modification time is unchanged and new `specs/*.md` files exist.
 - Unit tests in `src/generation.rs` (43 tests per the Gathered-evidence report) cover markdown extraction, task-block parsing, and dated-slug collision.
 - Grep the resulting spec files for `## Objective` / `## Acceptance Criteria` / `## Verification` / `## Evidence Status` / `## Open Questions`; all five must be present.

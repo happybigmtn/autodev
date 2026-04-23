@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn minimax_alias_defaults_to_m27_highspeed() {
         assert_eq!(
-            PiProvider::Minimax.resolve_model("minimax", "gpt-5.4"),
+            PiProvider::Minimax.resolve_model("minimax", "gpt-5.5"),
             "minimax/MiniMax-M2.7-highspeed"
         );
     }
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn kimi_alias_defaults_to_k2p6() {
         assert_eq!(
-            PiProvider::Kimi.resolve_model("kimi", "gpt-5.4"),
+            PiProvider::Kimi.resolve_model("kimi", "gpt-5.5"),
             "kimi-coding/k2p6"
         );
     }
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn kimi_k25_aliases_still_resolve_to_legacy_k2p5() {
         assert_eq!(
-            PiProvider::Kimi.resolve_model("kimi-k2.5", "gpt-5.4"),
+            PiProvider::Kimi.resolve_model("kimi-k2.5", "gpt-5.5"),
             "kimi-coding/k2p5"
         );
     }
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn kimi_k26_preview_aliases_resolve_to_k2p6() {
         assert_eq!(
-            PiProvider::Kimi.resolve_model("kimi-k2.6-code-preview", "gpt-5.4"),
+            PiProvider::Kimi.resolve_model("kimi-k2.6-code-preview", "gpt-5.5"),
             "kimi-coding/k2p6"
         );
     }

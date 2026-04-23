@@ -3,7 +3,7 @@
 ## `TASK-001`
 - Source: auto parallel host handoff synthesized after lane landing.
 - Files: `README.md`
-- Review result: passed after reconciling a stale README default-model claim. The detailed `auto bug` model layout now matches the live CLI defaults: Kimi `k2.6` finder/skeptic/reviewer/fixer plus Codex `gpt-5.4` finalizer.
+- Review result: passed after reconciling a stale README default-model claim. The detailed `auto bug` model layout now matches the live CLI defaults: Codex `gpt-5.5` `high` across finder/skeptic/reviewer/fixer/finalizer.
 - Validation: receipt-backed proof in `.auto/symphony/verification-receipts/TASK-001.json` for `grep -n "thirteen\|sixteen" README.md`, `grep -n "Kimi.*finder\|Codex finalizer" README.md`, and `grep -n "auto steward\|auto audit\|auto symphony" README.md`.
 - Completion artifacts: `README.md`
 - Remaining blockers: none.
