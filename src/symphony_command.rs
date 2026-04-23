@@ -2687,13 +2687,17 @@ mod tests {
   Dependencies: `P-018`
 
 - [x] `P-020` Done task
+
+- [X] `P-021` Uppercase done task
 "#;
         let tasks = parse_tasks(plan);
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         assert_eq!(tasks[0].id, "P-018");
+        assert_eq!(tasks[0].status, TaskStatus::Pending);
         assert_eq!(tasks[0].dependencies, vec!["P-017B"]);
         assert_eq!(tasks[1].status, TaskStatus::Blocked);
         assert_eq!(tasks[2].status, TaskStatus::Done);
+        assert_eq!(tasks[3].status, TaskStatus::Done);
     }
 
     #[test]
