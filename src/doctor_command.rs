@@ -1,0 +1,459 @@
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{anyhow, Context, Result};
+use clap::Args;
+
+use crate::util::git_repo_root;
+
+const REQUIRED_LAYOUT: &[&str] = &["Cargo.toml", "src/main.rs", "README.md", "AGENTS.md"];
+const HELP_SURFACES: &[&[&str]] = &[
+    &["--help"],
+    &["corpus", "--help"],
+    &["gen", "--help"],
+    &["parallel", "--help"],
+    &["quota", "--help"],
+    &["symphony", "--help"],
+];
+const OPTIONAL_TOOLS: &[OptionalTool] = &[
+    OptionalTool {
+        name: "codex",
+        workflows: "model-backed health, qa, review, generation, loop, and parallel flows",
+    },
+    OptionalTool {
+        name: "claude",
+        workflows: "Claude-backed corpus and generation flows",
+    },
+    OptionalTool {
+        name: "pi",
+        workflows: "quota-aware account multiplexing and legacy PI-selected flows",
+    },
+    OptionalTool {
+        name: "gh",
+        workflows: "GitHub-facing ship and review flows",
+    },
+];
+
+#[derive(Args, Clone)]
+pub(crate) struct DoctorArgs {}
+
+pub(crate) async fn run_doctor(_args: DoctorArgs) -> Result<()> {
+    let current_exe = env::current_exe().context("failed to resolve current auto executable")?;
+    let report = build_doctor_report(&current_exe);
+    print_doctor_report(&report);
+    if report.required_failed() {
+        return Err(anyhow!("doctor failed"));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DoctorReport {
+    required: Vec<RequiredCheck>,
+    capabilities: Vec<CapabilityCheck>,
+}
+
+impl DoctorReport {
+    fn required_failed(&self) -> bool {
+        self.required.iter().any(|check| !check.passed)
+    }
+}
+
+#[derive(Debug)]
+struct RequiredCheck {
+    name: String,
+    passed: bool,
+    detail: String,
+    action: Option<String>,
+}
+
+#[derive(Debug)]
+struct CapabilityCheck {
+    tool: &'static str,
+    found: Option<PathBuf>,
+    workflows: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct OptionalTool {
+    name: &'static str,
+    workflows: &'static str,
+}
+
+#[derive(Debug)]
+struct CommandProbe {
+    success: bool,
+    stdout: String,
+    stderr: String,
+    launch_error: Option<String>,
+}
+
+fn build_doctor_report(current_exe: &Path) -> DoctorReport {
+    let mut report = DoctorReport {
+        required: Vec::new(),
+        capabilities: build_optional_tool_checks(find_on_path),
+    };
+
+    match git_repo_root() {
+        Ok(repo_root) => {
+            report.required.push(RequiredCheck {
+                name: "repo root".to_string(),
+                passed: true,
+                detail: format!("found {}", repo_root.display()),
+                action: None,
+            });
+            report.required.extend(check_required_layout(&repo_root));
+            report
+                .required
+                .push(check_cargo_manifest(&repo_root.join("Cargo.toml")));
+        }
+        Err(err) => report.required.push(RequiredCheck {
+            name: "repo root".to_string(),
+            passed: false,
+            detail: err.to_string(),
+            action: Some("rerun from inside the repository checkout".to_string()),
+        }),
+    }
+
+    report.required.push(check_version_probe(&run_auto_probe(
+        current_exe,
+        &["--version"],
+    )));
+    report.required.extend(check_help_surfaces_with(|args| {
+        run_auto_probe(current_exe, args)
+    }));
+
+    report
+}
+
+fn check_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
+    let missing: Vec<&str> = REQUIRED_LAYOUT
+        .iter()
+        .copied()
+        .filter(|relative| !repo_root.join(relative).is_file())
+        .collect();
+
+    if missing.is_empty() {
+        vec![RequiredCheck {
+            name: "repo layout".to_string(),
+            passed: true,
+            detail: format!("found {}", REQUIRED_LAYOUT.join(", ")),
+            action: None,
+        }]
+    } else {
+        vec![RequiredCheck {
+            name: "repo layout".to_string(),
+            passed: false,
+            detail: format!("missing {}", missing.join(", ")),
+            action: Some("restore the checkout or rerun from the repository root".to_string()),
+        }]
+    }
+}
+
+fn check_cargo_manifest(path: &Path) -> RequiredCheck {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => {
+            return RequiredCheck {
+                name: "Cargo.toml manifest".to_string(),
+                passed: false,
+                detail: format!("failed to read {}: {err}", path.display()),
+                action: Some("restore Cargo.toml before rerunning doctor".to_string()),
+            };
+        }
+    };
+
+    let manifest: toml::Value = match toml::from_str(&text) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return RequiredCheck {
+                name: "Cargo.toml manifest".to_string(),
+                passed: false,
+                detail: format!("failed to parse {}: {err}", path.display()),
+                action: Some("fix Cargo.toml before rerunning doctor".to_string()),
+            };
+        }
+    };
+
+    let package_name = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str);
+    let has_auto_bin = manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|bins| {
+            bins.iter().any(|bin| {
+                bin.get("name").and_then(toml::Value::as_str) == Some("auto")
+                    && bin.get("path").and_then(toml::Value::as_str) == Some("src/main.rs")
+            })
+        });
+
+    if package_name == Some("autodev") && has_auto_bin {
+        RequiredCheck {
+            name: "Cargo.toml manifest".to_string(),
+            passed: true,
+            detail: "package autodev declares binary auto at src/main.rs".to_string(),
+            action: None,
+        }
+    } else {
+        RequiredCheck {
+            name: "Cargo.toml manifest".to_string(),
+            passed: false,
+            detail: "expected package autodev and [[bin]] auto -> src/main.rs".to_string(),
+            action: Some("restore the autodev package and auto binary declarations".to_string()),
+        }
+    }
+}
+
+fn check_version_probe(probe: &CommandProbe) -> RequiredCheck {
+    if let Some(error) = &probe.launch_error {
+        return RequiredCheck {
+            name: "binary provenance".to_string(),
+            passed: false,
+            detail: format!("failed to run auto --version: {error}"),
+            action: Some("run cargo build or cargo install --path . --root ~/.local".to_string()),
+        };
+    }
+
+    let output = format!("{}\n{}", probe.stdout, probe.stderr);
+    let has_package_version = output.contains(env!("CARGO_PKG_VERSION"));
+    let has_metadata =
+        output.contains("commit:") && output.contains("dirty:") && output.contains("profile:");
+
+    if probe.success && has_package_version && has_metadata {
+        RequiredCheck {
+            name: "binary provenance".to_string(),
+            passed: true,
+            detail: first_nonempty_line(&probe.stdout)
+                .unwrap_or("auto --version ok")
+                .to_string(),
+            action: None,
+        }
+    } else {
+        RequiredCheck {
+            name: "binary provenance".to_string(),
+            passed: false,
+            detail: format!(
+                "auto --version did not expose package version plus commit/dirty/profile metadata: {}",
+                compact_probe_output(probe)
+            ),
+            action: Some("rebuild with cargo build or reinstall with cargo install --path . --root ~/.local".to_string()),
+        }
+    }
+}
+
+fn check_help_surfaces_with(mut run: impl FnMut(&[&str]) -> CommandProbe) -> Vec<RequiredCheck> {
+    HELP_SURFACES
+        .iter()
+        .map(|args| {
+            let probe = run(args);
+            let display = format_auto_args(args);
+            if let Some(error) = &probe.launch_error {
+                return RequiredCheck {
+                    name: format!("help surface `{display}`"),
+                    passed: false,
+                    detail: format!("failed to run {display}: {error}"),
+                    action: Some("run cargo build or reinstall the auto binary".to_string()),
+                };
+            }
+
+            if probe.success && probe.stdout.contains("Usage:") {
+                RequiredCheck {
+                    name: format!("help surface `{display}`"),
+                    passed: true,
+                    detail: "help parsed".to_string(),
+                    action: None,
+                }
+            } else {
+                RequiredCheck {
+                    name: format!("help surface `{display}`"),
+                    passed: false,
+                    detail: format!(
+                        "help output was not parseable: {}",
+                        compact_probe_output(&probe)
+                    ),
+                    action: Some("run cargo test doctor_command_is_parseable".to_string()),
+                }
+            }
+        })
+        .collect()
+}
+
+fn build_optional_tool_checks(
+    mut find: impl FnMut(&str) -> Option<PathBuf>,
+) -> Vec<CapabilityCheck> {
+    OPTIONAL_TOOLS
+        .iter()
+        .map(|tool| CapabilityCheck {
+            tool: tool.name,
+            found: find(tool.name),
+            workflows: tool.workflows,
+        })
+        .collect()
+}
+
+fn run_auto_probe(current_exe: &Path, args: &[&str]) -> CommandProbe {
+    match Command::new(current_exe).args(args).output() {
+        Ok(output) => CommandProbe {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            launch_error: None,
+        },
+        Err(err) => CommandProbe {
+            success: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            launch_error: Some(err.to_string()),
+        },
+    }
+}
+
+fn find_on_path(tool: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!("required:");
+    for check in &report.required {
+        let status = if check.passed { "ok" } else { "fail" };
+        println!("- [{status}] {}: {}", check.name, check.detail);
+        if let Some(action) = &check.action {
+            println!("  next: {action}");
+        }
+    }
+
+    println!();
+    println!("capabilities:");
+    for check in &report.capabilities {
+        match &check.found {
+            Some(path) => println!(
+                "- [ok] {}: found at {}; enables {}",
+                check.tool,
+                path.display(),
+                check.workflows
+            ),
+            None => println!(
+                "- [warn] {}: not found on PATH; unavailable until installed/authenticated: {}",
+                check.tool, check.workflows
+            ),
+        }
+    }
+
+    println!();
+    println!("model/network:");
+    println!("- [ok] no model providers, network APIs, Linear, GitHub, Symphony, Docker, browser automation, or tmux sessions were invoked");
+
+    println!();
+    println!("next steps:");
+    if report.required_failed() {
+        println!("- fix the failed required checks above, then rerun auto doctor");
+        println!("doctor failed");
+    } else {
+        println!("- run cargo test for local regression proof");
+        println!(
+            "- run model-backed commands such as auto health only after credentials are configured"
+        );
+        println!("doctor ok");
+    }
+}
+
+fn compact_probe_output(probe: &CommandProbe) -> String {
+    let mut output = format!("{} {}", probe.stdout.trim(), probe.stderr.trim())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if output.len() > 240 {
+        output.truncate(240);
+        output.push_str("...");
+    }
+    if output.is_empty() {
+        format!("exit success={}", probe.success)
+    } else {
+        output
+    }
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| !line.trim().is_empty())
+}
+
+fn format_auto_args(args: &[&str]) -> String {
+    if args == ["--help"].as_slice() {
+        "auto --help".to_string()
+    } else {
+        format!("auto {}", args.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{
+        build_optional_tool_checks, check_help_surfaces_with, format_auto_args, CommandProbe,
+        HELP_SURFACES,
+    };
+
+    #[test]
+    fn doctor_reports_missing_optional_tools_without_panicking() {
+        let checks = build_optional_tool_checks(|_| None);
+
+        assert_eq!(checks.len(), 4);
+        assert!(checks.iter().all(|check| check.found.is_none()));
+        assert!(checks.iter().any(|check| check.tool == "codex"));
+        assert!(checks.iter().any(|check| check.tool == "claude"));
+        assert!(checks.iter().any(|check| check.tool == "pi"));
+        assert!(checks.iter().any(|check| check.tool == "gh"));
+    }
+
+    #[test]
+    fn doctor_reports_found_optional_tools_as_capabilities() {
+        let checks = build_optional_tool_checks(|tool| {
+            (tool == "codex").then(|| PathBuf::from("/usr/local/bin/codex"))
+        });
+
+        let codex = checks
+            .iter()
+            .find(|check| check.tool == "codex")
+            .expect("codex check");
+        assert_eq!(codex.found, Some(PathBuf::from("/usr/local/bin/codex")));
+        assert!(checks
+            .iter()
+            .filter(|check| check.tool != "codex")
+            .all(|check| check.found.is_none()));
+    }
+
+    #[test]
+    fn doctor_checks_expected_help_surfaces() {
+        let mut observed = Vec::new();
+        let checks = check_help_surfaces_with(|args| {
+            observed.push(format_auto_args(args));
+            CommandProbe {
+                success: true,
+                stdout: "Usage: auto <COMMAND>\n".to_string(),
+                stderr: String::new(),
+                launch_error: None,
+            }
+        });
+
+        assert_eq!(
+            observed,
+            vec![
+                "auto --help",
+                "auto corpus --help",
+                "auto gen --help",
+                "auto parallel --help",
+                "auto quota --help",
+                "auto symphony --help",
+            ]
+        );
+        assert_eq!(checks.len(), HELP_SURFACES.len());
+        assert!(checks.iter().all(|check| check.passed));
+    }
+}

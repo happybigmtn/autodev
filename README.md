@@ -8,7 +8,7 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns seventeen commands:
+`auto` owns eighteen commands:
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
@@ -20,6 +20,7 @@ The local CLI command is `auto`.
 - `auto qa` runs a runtime QA and ship-readiness pass on the current branch.
 - `auto qa-only` runs a report-only runtime QA pass on the current branch.
 - `auto health` runs a repo-wide quality and verification health report.
+- `auto doctor` runs a no-model first-run preflight for local layout, binary metadata, and help surfaces.
 - `auto review` reviews completed work on the current branch.
 - `auto steward` runs a stewardship pass for a mid-flight repo.
 - `auto audit` runs a file-by-file audit against an operator-authored doctrine.
@@ -55,6 +56,8 @@ need to pass directories in the normal case.
 - `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and
   the `standard` tier
 - `auto health` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
+- `auto doctor` is read-only and no-model; missing `codex`, `claude`, `pi`, and `gh` are reported
+  as capability warnings rather than baseline first-run failures
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
 - `auto ship` runs on the currently checked-out branch by default with `gpt-5.5` and `high`,
   targeting the repo's resolved base branch
@@ -73,7 +76,7 @@ The commands form one opinionated lifecycle:
 2. `auto gen` turns that understanding into durable specs and an execution queue.
 3. `auto loop` burns down the execution queue one truthful task at a time.
 4. `auto qa` runs runtime checks and hardens the branch with direct evidence.
-5. `auto health` captures the repo-wide verification state.
+5. `auto health` captures the model-backed repo-wide verification state.
 6. `auto review` reviews completed work and archives only what really clears.
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
@@ -82,8 +85,9 @@ The commands form one opinionated lifecycle:
 `auto corpus`, adds production-readiness review artifacts, runs `auto gen`, gates the generated
 root queue, and launches `auto parallel`.
 
-The other nine commands are side lanes:
+The other ten commands are side lanes:
 
+- `auto doctor` proves the first-run local checkout and binary surface without model credentials.
 - `auto reverse` documents current behavior from code reality.
 - `auto bug` runs a bug-finding and implementation pipeline.
 - `auto steward` reconciles an active planning surface against the live repo and updates it in place.
@@ -1173,6 +1177,21 @@ That installs the CLI as:
 ```bash
 ~/.local/bin/auto
 ```
+
+First success path:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+auto --version
+auto doctor
+```
+
+`auto doctor` checks the repo layout, `Cargo.toml` binary declaration, embedded version metadata,
+and parseable help for `auto --help`, `auto corpus --help`, `auto gen --help`,
+`auto parallel --help`, `auto quota --help`, and `auto symphony --help`. It does not call Codex,
+Claude, PI, GitHub, Linear, Symphony, Docker, browser automation, tmux, network endpoints, or model
+providers. Missing `codex`, `claude`, `pi`, and `gh` are capability warnings for later workflows,
+not first-run failures.
 
 ## Typical Flow
 

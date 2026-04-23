@@ -6,6 +6,7 @@ mod codex_exec;
 mod codex_stream;
 mod completion_artifacts;
 mod corpus;
+mod doctor_command;
 mod generation;
 mod health_command;
 mod kimi_backend;
@@ -74,6 +75,8 @@ enum Command {
     QaOnly(QaOnlyArgs),
     /// Run a repo-wide quality and verification health report
     Health(HealthArgs),
+    /// Run a no-model first-run preflight for local layout, binary metadata, and help surfaces
+    Doctor(doctor_command::DoctorArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
     /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.5)
@@ -1264,6 +1267,7 @@ async fn main() -> Result<()> {
         Command::Qa(args) => qa_command::run_qa(args).await,
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
         Command::Health(args) => health_command::run_health(args).await,
+        Command::Doctor(args) => doctor_command::run_doctor(args).await,
         Command::Review(args) => review_command::run_review(args).await,
         Command::Steward(args) => steward_command::run_steward(args).await,
         Command::Audit(args) => audit_command::run_audit(args).await,
@@ -1333,6 +1337,20 @@ mod tests {
             panic!("expected review command");
         };
         assert!(args.include_siblings);
+    }
+
+    #[test]
+    fn doctor_command_is_parseable() {
+        let cli = Cli::try_parse_from(["auto", "doctor"]).expect("cli parse");
+        let Command::Doctor(_) = cli.command else {
+            panic!("expected doctor command");
+        };
+
+        let help = match Cli::try_parse_from(["auto", "doctor", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected help output"),
+        };
+        assert!(help.contains("Usage: auto doctor"));
     }
 
     #[test]
