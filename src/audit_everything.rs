@@ -337,7 +337,9 @@ fn load_or_create_run(
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
         let mut manifest: EverythingManifest = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-        reconcile_file_inventory(&worktree_root, &report_root, &mut manifest).ok();
+        if manifest.files.is_empty() || !matches!(manifest.context.status, StageStatus::Complete) {
+            reconcile_file_inventory(&worktree_root, &report_root, &mut manifest).ok();
+        }
         return Ok((manifest, paths));
     }
 
