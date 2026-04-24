@@ -25,6 +25,7 @@ use crate::{AuditArgs, AuditEverythingPhase};
 
 const PROFESSIONAL_AUDIT_DIR: &str = ".auto/audit-everything";
 const LATEST_RUN_FILE: &str = "latest-run";
+const PAUSE_REQUEST_FILE: &str = "PAUSE";
 const MAX_FILE_PROMPT_BYTES: usize = 220_000;
 const LEGACY_LARGE_FILE_OMISSION_MARKER: &str = "[file omitted from prompt because";
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["trunk", "main", "master"];
@@ -173,12 +174,14 @@ enum StageStatus {
     Skipped,
 }
 
+#[derive(Clone)]
 struct RunPaths {
     host_root: PathBuf,
     manifest_path: PathBuf,
     latest_path: PathBuf,
     worktree_root: PathBuf,
     report_root: PathBuf,
+    pause_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -227,8 +230,20 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
     println!("reports:     {}", paths.report_root.display());
     println!("phase:       {:?}", args.everything_phase);
 
+    if matches!(args.everything_phase, AuditEverythingPhase::Pause) {
+        request_pause(&paths, &manifest)?;
+        print_status(&paths, &manifest);
+        return Ok(());
+    }
+
+    if matches!(args.everything_phase, AuditEverythingPhase::Unpause) {
+        clear_pause(&paths, &manifest)?;
+        print_status(&paths, &manifest);
+        return Ok(());
+    }
+
     if matches!(args.everything_phase, AuditEverythingPhase::Status) {
-        print_status(&manifest);
+        print_status(&paths, &manifest);
         return Ok(());
     }
 
@@ -247,6 +262,11 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
             } else {
                 run_remediation_plan_phase(&paths, &mut manifest)?;
                 run_remediation_phase(&args, &paths, &mut manifest).await?;
+                if pause_requested(&paths) {
+                    println!("professional audit paused before final review");
+                    print_status(&paths, &manifest);
+                    return Ok(());
+                }
                 run_final_review_phase(&args, &paths, &mut manifest).await?;
                 if args.no_everything_merge {
                     mark_merge_skipped(&paths, &mut manifest, "--no-everything-merge")?;
@@ -285,10 +305,12 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
         AuditEverythingPhase::Merge => {
             attempt_merge(&repo_root, &paths, &mut manifest)?;
         }
-        AuditEverythingPhase::Status => unreachable!("handled above"),
+        AuditEverythingPhase::Pause
+        | AuditEverythingPhase::Unpause
+        | AuditEverythingPhase::Status => unreachable!("handled above"),
     }
 
-    print_status(&manifest);
+    print_status(&paths, &manifest);
     Ok(())
 }
 
@@ -335,6 +357,7 @@ fn load_or_create_run(
         latest_path,
         worktree_root: worktree_root.clone(),
         report_root: report_root.clone(),
+        pause_path: host_root.join(PAUSE_REQUEST_FILE),
     };
 
     if manifest_path.exists() {
@@ -381,6 +404,36 @@ fn load_or_create_run(
         .with_context(|| format!("failed to write {}", paths.latest_path.display()))?;
     write_manifest(&paths, &manifest)?;
     Ok((manifest, paths))
+}
+
+fn request_pause(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    let body = format!(
+        "pause requested at {}\nrun: {}\n",
+        timestamp_slug(),
+        manifest.run_id
+    );
+    atomic_write(&paths.pause_path, body.as_bytes())
+        .with_context(|| format!("failed to write {}", paths.pause_path.display()))?;
+    write_run_status_if_possible(paths, manifest)?;
+    println!("pause requested: {}", paths.pause_path.display());
+    println!("active remediation lanes will drain; no new lanes will be dispatched");
+    Ok(())
+}
+
+fn clear_pause(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    if paths.pause_path.exists() {
+        fs::remove_file(&paths.pause_path)
+            .with_context(|| format!("failed to remove {}", paths.pause_path.display()))?;
+        println!("pause cleared: {}", paths.pause_path.display());
+    } else {
+        println!("pause was not active: {}", paths.pause_path.display());
+    }
+    write_run_status_if_possible(paths, manifest)?;
+    Ok(())
+}
+
+fn pause_requested(paths: &RunPaths) -> bool {
+    paths.pause_path.exists()
 }
 
 fn ensure_worktree(
@@ -646,7 +699,17 @@ async fn run_remediation_lanes(
     let mut failures = Vec::new();
 
     loop {
-        while active.len() < workers {
+        let paused = pause_requested(paths);
+        if paused && active.is_empty() {
+            println!(
+                "professional audit pause request observed at {}; scheduler is idle",
+                paths.pause_path.display()
+            );
+            persist_remediation_progress(paths, manifest)?;
+            return Ok(());
+        }
+
+        while !paused && active.len() < workers {
             let cycle_breaker_allowed =
                 active.is_empty() || active.iter().all(|id| active_cycle_breakers.contains(id));
             let Some(choice) =
@@ -682,13 +745,7 @@ async fn run_remediation_lanes(
             write_manifest(paths, manifest)?;
 
             let mut task = manifest.remediation_tasks[index].clone();
-            let paths_clone = RunPaths {
-                host_root: paths.host_root.clone(),
-                manifest_path: paths.manifest_path.clone(),
-                latest_path: paths.latest_path.clone(),
-                worktree_root: paths.worktree_root.clone(),
-                report_root: paths.report_root.clone(),
-            };
+            let paths_clone = paths.clone();
             let config_clone = config.clone();
             if !choice.unmet_dependencies.is_empty() {
                 active_cycle_breakers.insert(task_id.clone());
@@ -737,7 +794,7 @@ async fn run_remediation_lanes(
                 "{}: {error}",
                 manifest.remediation_tasks[task_index].id
             ));
-            write_manifest(paths, manifest)?;
+            persist_remediation_progress(paths, manifest)?;
             continue;
         }
 
@@ -753,7 +810,7 @@ async fn run_remediation_lanes(
                 {
                     group.remediation_status = StageStatus::Complete;
                 }
-                write_manifest(paths, manifest)?;
+                persist_remediation_progress(paths, manifest)?;
             }
             Err(err) => {
                 let error = format!("{err:#}");
@@ -763,13 +820,12 @@ async fn run_remediation_lanes(
                     "{}: {error}",
                     manifest.remediation_tasks[task_index].id
                 ));
-                write_manifest(paths, manifest)?;
+                persist_remediation_progress(paths, manifest)?;
             }
         }
     }
 
-    write_remediation_plan_files(paths, manifest)?;
-    commit_worktree_changes(paths, manifest)?;
+    persist_remediation_progress(paths, manifest)?;
     if !failures.is_empty() {
         for failure in &failures {
             eprintln!("remediation failure: {failure}");
@@ -784,6 +840,12 @@ async fn run_remediation_lanes(
         );
     }
     Ok(())
+}
+
+fn persist_remediation_progress(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    write_remediation_plan_files(paths, manifest)?;
+    write_manifest(paths, manifest)?;
+    commit_worktree_changes(paths, manifest)
 }
 
 async fn run_final_review_phase(
@@ -1601,13 +1663,7 @@ fn spawn_group_worker(
     phase: GroupPhase,
     config: &PhaseConfig,
 ) {
-    let paths_clone = RunPaths {
-        host_root: paths.host_root.clone(),
-        manifest_path: paths.manifest_path.clone(),
-        latest_path: paths.latest_path.clone(),
-        worktree_root: paths.worktree_root.clone(),
-        report_root: paths.report_root.clone(),
-    };
+    let paths_clone = paths.clone();
     let config_clone = config.clone();
     join_set.spawn(
         async move { run_one_group_phase(&paths_clone, &group, phase, &config_clone).await },
@@ -1638,13 +1694,7 @@ fn spawn_file_worker(
     context: &str,
     config: &PhaseConfig,
 ) {
-    let paths_clone = RunPaths {
-        host_root: paths.host_root.clone(),
-        manifest_path: paths.manifest_path.clone(),
-        latest_path: paths.latest_path.clone(),
-        worktree_root: paths.worktree_root.clone(),
-        report_root: paths.report_root.clone(),
-    };
+    let paths_clone = paths.clone();
     let context_clone = context.to_string();
     let config_clone = config.clone();
     join_set.spawn(async move {
@@ -2620,7 +2670,7 @@ fn first_verdict_line(text: &str) -> Option<String> {
         .map(|line| line.trim().to_string())
 }
 
-fn print_status(manifest: &EverythingManifest) {
+fn print_status(paths: &RunPaths, manifest: &EverythingManifest) {
     let files_done = manifest
         .files
         .iter()
@@ -2651,13 +2701,172 @@ fn print_status(manifest: &EverythingManifest) {
         "remed tasks: {remediation_tasks_done}/{}",
         manifest.remediation_tasks.len()
     );
+    println!(
+        "paused:      {}",
+        if pause_requested(paths) { "yes" } else { "no" }
+    );
+    println!("pause file:  {}", paths.pause_path.display());
+    println!("status doc:  {}", run_status_markdown_path(paths).display());
+    println!(
+        "remed plan:  {}",
+        remediation_plan_markdown_path(paths).display()
+    );
     println!("final review:{:?}", manifest.final_review.status);
     println!("merge:       {:?}", manifest.merge.status);
 }
 
 fn write_manifest(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
     atomic_write(&paths.manifest_path, &serde_json::to_vec_pretty(manifest)?)
-        .with_context(|| format!("failed to write {}", paths.manifest_path.display()))
+        .with_context(|| format!("failed to write {}", paths.manifest_path.display()))?;
+    write_run_status_if_possible(paths, manifest)
+}
+
+fn write_run_status_if_possible(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    if !paths.worktree_root.join(".git").exists() && !paths.report_root.exists() {
+        return Ok(());
+    }
+    write_run_status_markdown(paths, manifest)
+}
+
+fn run_status_markdown_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("RUN-STATUS.md")
+}
+
+fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    let files_done = manifest
+        .files
+        .iter()
+        .filter(|file| matches!(file.status, StageStatus::Complete))
+        .count();
+    let synthesis_done = manifest
+        .groups
+        .iter()
+        .filter(|group| matches!(group.synthesis_status, StageStatus::Complete))
+        .count();
+    let remediation_done = manifest
+        .groups
+        .iter()
+        .filter(|group| matches!(group.remediation_status, StageStatus::Complete))
+        .count();
+    let task_count = |status| {
+        manifest
+            .remediation_tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .count()
+    };
+    let mut body = String::new();
+    body.push_str("# Auto Audit Run Status\n\n");
+    body.push_str(&format!("Run: `{}`  \n", manifest.run_id));
+    body.push_str(&format!("Repository: `{}`  \n", manifest.repo_root));
+    body.push_str(&format!("Audit branch: `{}`  \n", manifest.audit_branch));
+    body.push_str(&format!("Primary branch: `{}`  \n", manifest.branch));
+    body.push_str(&format!("Status captured: `{}`\n\n", timestamp_slug()));
+    body.push_str("## Current State\n\n");
+    body.push_str(&format!(
+        "- Context engineering: {:?}\n",
+        manifest.context.status
+    ));
+    body.push_str(&format!(
+        "- File pass: {files_done} / {} complete\n",
+        manifest.files.len()
+    ));
+    body.push_str(&format!(
+        "- Synthesis: {synthesis_done} / {} complete\n",
+        manifest.groups.len()
+    ));
+    body.push_str(&format!(
+        "- Remediation groups: {remediation_done} / {} complete\n",
+        manifest.groups.len()
+    ));
+    body.push_str(&format!(
+        "- Remediation plan: {:?}\n",
+        manifest.remediation_plan.status
+    ));
+    if let Some(note) = manifest.remediation_plan.note.as_deref() {
+        body.push_str(&format!("- Remediation plan note: {}\n", one_line(note)));
+    }
+    body.push_str(&format!(
+        "- Remediation tasks: {} complete, {} running, {} pending, {} failed, {} skipped\n",
+        task_count(StageStatus::Complete),
+        task_count(StageStatus::Running),
+        task_count(StageStatus::Pending),
+        task_count(StageStatus::Failed),
+        task_count(StageStatus::Skipped)
+    ));
+    body.push_str(&format!(
+        "- Pause requested: {}\n",
+        if pause_requested(paths) { "yes" } else { "no" }
+    ));
+    body.push_str(&format!(
+        "- Final review: {:?}\n",
+        manifest.final_review.status
+    ));
+    body.push_str(&format!("- Merge: {:?}\n\n", manifest.merge.status));
+    body.push_str("## Important Paths\n\n");
+    body.push_str(&format!(
+        "- Manifest: `{}`\n",
+        paths.manifest_path.display()
+    ));
+    body.push_str(&format!("- Pause file: `{}`\n", paths.pause_path.display()));
+    body.push_str(&format!(
+        "- Audit worktree: `{}`\n",
+        paths.worktree_root.display()
+    ));
+    body.push_str(&format!(
+        "- Audit reports: `{}`\n",
+        paths.report_root.display()
+    ));
+    body.push_str(&format!(
+        "- Remediation plan: `{}`\n",
+        remediation_plan_markdown_path(paths).display()
+    ));
+    body.push_str(&format!(
+        "- Remediation plan JSON: `{}`\n\n",
+        remediation_plan_json_path(paths).display()
+    ));
+    body.push_str("## Remediation Tasks\n\n");
+    append_status_tasks(&mut body, "Running", manifest, StageStatus::Running);
+    append_status_tasks(&mut body, "Failed", manifest, StageStatus::Failed);
+    append_status_tasks(&mut body, "Pending", manifest, StageStatus::Pending);
+    append_status_tasks(&mut body, "Complete", manifest, StageStatus::Complete);
+    append_status_tasks(&mut body, "Skipped", manifest, StageStatus::Skipped);
+
+    atomic_write(&run_status_markdown_path(paths), body.as_bytes()).with_context(|| {
+        format!(
+            "failed to write {}",
+            run_status_markdown_path(paths).display()
+        )
+    })
+}
+
+fn append_status_tasks(
+    body: &mut String,
+    heading: &str,
+    manifest: &EverythingManifest,
+    status: StageStatus,
+) {
+    let tasks = manifest
+        .remediation_tasks
+        .iter()
+        .filter(|task| task.status == status)
+        .collect::<Vec<_>>();
+    if tasks.is_empty() {
+        return;
+    }
+    body.push_str(&format!("### {heading}\n\n"));
+    for task in tasks {
+        body.push_str(&format!("- `{}` `{}`", task.id, task.group));
+        if let Some(note) = task.note.as_deref().filter(|note| !note.trim().is_empty()) {
+            body.push_str(&format!(" - {}", one_line(note)));
+        }
+        body.push('\n');
+    }
+    body.push('\n');
+}
+
+fn one_line(text: &str) -> String {
+    text.trim().replace('\n', " ")
 }
 
 fn resolve_primary_branch(
@@ -3057,6 +3266,7 @@ mod tests {
             latest_path: dir.join("latest"),
             worktree_root: dir.clone(),
             report_root,
+            pause_path: dir.join(PAUSE_REQUEST_FILE),
         };
 
         build_initial_group_reports(&paths, &manifest).expect("failed to build group reports");
@@ -3078,6 +3288,7 @@ mod tests {
             latest_path: PathBuf::from("/tmp/run/latest"),
             worktree_root: PathBuf::from("/tmp/run/worktree"),
             report_root: PathBuf::from("/tmp/run/worktree/audit/everything/test-run"),
+            pause_path: PathBuf::from("/tmp/run/PAUSE"),
         };
         let group = GroupState {
             name: "src".to_string(),
@@ -3103,6 +3314,7 @@ mod tests {
             latest_path: PathBuf::from("/tmp/run/latest"),
             worktree_root: PathBuf::from("/tmp/run/worktree"),
             report_root: PathBuf::from("/tmp/run/worktree/audit/everything/test-run"),
+            pause_path: PathBuf::from("/tmp/run/PAUSE"),
         };
         let task = RemediationTaskState {
             id: "AUD-REM-001".to_string(),
@@ -3224,6 +3436,53 @@ mod tests {
         active.insert("AUD-REM-099".to_string());
         assert!(next_remediation_scheduler_choice(&manifest, &active, false).is_none());
         assert!(next_remediation_scheduler_choice(&manifest, &active, true).is_some());
+    }
+
+    #[test]
+    fn run_status_markdown_records_pause_paths_and_task_counts() {
+        let dir =
+            std::env::temp_dir().join(format!("auto-audit-run-status-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("worktree/audit/everything/test-run");
+        fs::create_dir_all(&report_root).expect("failed to create report root");
+        let paths = RunPaths {
+            host_root: dir.clone(),
+            manifest_path: dir.join("MANIFEST.json"),
+            latest_path: dir.join("latest-run"),
+            worktree_root: dir.join("worktree"),
+            report_root,
+            pause_path: dir.join(PAUSE_REQUEST_FILE),
+        };
+        fs::write(&paths.pause_path, "pause requested\n").expect("failed to write pause file");
+        let mut manifest = manifest_with_groups(vec![
+            group_for_test("crates/core", &["crates/core/src/lib.rs"]),
+            group_for_test("docs", &["docs/architecture.md"]),
+        ]);
+        manifest.files = vec![FileState {
+            path: "crates/core/src/lib.rs".to_string(),
+            group: "crates/core".to_string(),
+            content_hash: "hash".to_string(),
+            artifact_dir: "artifact".to_string(),
+            status: StageStatus::Complete,
+        }];
+        manifest.remediation_tasks = vec![
+            task_for_test("AUD-REM-001", "crates/core", &[]),
+            task_for_test("AUD-REM-002", "docs", &["AUD-REM-001"]),
+        ];
+        manifest.remediation_tasks[0].status = StageStatus::Complete;
+        manifest.remediation_tasks[0].note = Some("landed 2 changed file(s)".to_string());
+        manifest.remediation_tasks[1].status = StageStatus::Running;
+
+        write_run_status_markdown(&paths, &manifest).expect("failed to write run status");
+        let status = fs::read_to_string(run_status_markdown_path(&paths))
+            .expect("failed to read run status");
+
+        assert!(status.contains("Pause requested: yes"));
+        assert!(status.contains("1 complete, 1 running, 0 pending, 0 failed, 0 skipped"));
+        assert!(status.contains("`AUD-REM-002` `docs`"));
+        assert!(status.contains("REMEDIATION-PLAN.md"));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 
     fn manifest_with_groups(groups: Vec<GroupState>) -> EverythingManifest {

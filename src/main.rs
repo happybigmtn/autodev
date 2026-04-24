@@ -1108,6 +1108,11 @@ pub(crate) enum AuditEverythingPhase {
     FinalReview,
     /// Attempt to merge the professional audit branch back to the primary branch.
     Merge,
+    /// Request a graceful pause for the run. Active remediation lanes drain;
+    /// no new lanes are dispatched while the request exists.
+    Pause,
+    /// Clear a professional audit pause request so the next run can resume.
+    Unpause,
     /// Print current professional audit status.
     Status,
 }
