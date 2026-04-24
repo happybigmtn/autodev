@@ -38,7 +38,7 @@ jobs:
       - name: Smoke installed auto binary
         run: |
           install_root="$RUNNER_TEMP/autodev-install-proof"
-          cargo install --path . --root "$install_root"
+          cargo install --path . --locked --root "$install_root"
           export PATH="$install_root/bin:$PATH"
           command -v auto
           auto --version

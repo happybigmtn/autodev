@@ -339,3 +339,43 @@
 - Validation: `rg -n "cargo fmt --check|cargo clippy --all-targets --all-features -- -D warnings|cargo test|cargo install --path" .github/workflows/ci.yml`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 - Completion artifacts: none.
 - Remaining blockers: none.
+
+## `SAT-002`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `build.rs`, `src/util.rs`
+- Review result: passed. Build provenance is wired through `build.rs` into `CLI_LONG_VERSION`, and `auto --version` exposes package version, commit, dirty-state flag, and build profile. No correctness, boundary, security, or performance regression was found in the narrow provenance surface.
+- Validation: `cargo test util::tests::cli_long_version_exposes_build_provenance_metadata`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: none.
+- Remaining blockers: none.
+
+## `AD-F02`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `.github/workflows/ci.yml`, `README.md`
+- Review result: passed after fixing a [Required] CI-fidelity issue. The installed-binary smoke now uses `cargo install --path . --locked --root ...`, so CI and the README prove the operator binary against the same lockfile-backed dependency graph as clippy and tests instead of a freshly resolved graph.
+- Validation: `.auto/symphony/verification-receipts/AD-F02.json` exists; `actionlint .github/workflows/ci.yml`; locked temporary install smoke covering `command -v auto`, `auto --version`, and help for `auto`, `auto corpus`, `auto gen`, `auto parallel`, `auto quota`, and `auto symphony`; `cargo test doctor_command::tests::doctor_checks_expected_help_surfaces`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; and `cargo test`.
+- Completion artifacts: `.github/workflows/ci.yml`, `README.md`
+- Remaining blockers: none.
+
+## `AD-018`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/release-readiness-gate.md`
+- Review result: passed after reconciling stale release-readiness prose with the now-landed CI installed-binary proof. The decision still keeps deterministic pre-model `auto ship` enforcement as follow-on work, while current CI proof is documented as present and lockfile-backed. The existing receipt contains one older failed unquoted `rg` attempt alongside later passing proof; that receipt ambiguity is tracked in `WORKLIST.md`.
+- Validation: `.auto/symphony/verification-receipts/AD-018.json` exists; `cargo test audit_command::tests::commit_audit_outputs_uses_scoped_pathspecs`; `cargo test qa_only_command::tests::qa_only_rejects_non_report_file_changes`; `rg -n "installed-binary proof|locked|ship-gate|receipt|QA.md|HEALTH.md|SHIP.md" docs/decisions/release-readiness-gate.md`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; and `cargo test`.
+- Completion artifacts: `docs/decisions/release-readiness-gate.md`, `REVIEW.md`
+- Remaining blockers: none.
+
+## `SAT-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/main.rs`
+- Review result: passed. The top-level command-surface test matches the live `Command` enum and verifies every listed subcommand produces help, without changing runtime command behavior.
+- Validation: `.auto/symphony/verification-receipts/SAT-004.json` exists; `cargo test tests::top_level_command_surface_matches_live_enum`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; and `cargo test`.
+- Completion artifacts: none.
+- Remaining blockers: none.
+
+## `SAT-005`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/util.rs`
+- Review result: passed. Checkpoint status and staging now prove tracked generated/runtime paths under `.auto/`, `.claude/worktrees/`, `bug/`, `nemesis/`, and `gen-*` stay excluded, while normal changed files remain stageable.
+- Validation: `.auto/symphony/verification-receipts/SAT-005.json` exists; `cargo test util::tests::checkpoint`; `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; and `cargo test`.
+- Completion artifacts: none.
+- Remaining blockers: none.

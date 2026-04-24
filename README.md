@@ -1176,7 +1176,7 @@ Recommended environment:
 Build and install locally:
 
 ```bash
-cargo install --path . --root ~/.local
+cargo install --path . --locked --root ~/.local
 ```
 
 That installs the CLI as:
@@ -1204,7 +1204,7 @@ CI proves the installed binary through the same surface from a temporary install
 
 ```bash
 install_root="$RUNNER_TEMP/autodev-install-proof"
-cargo install --path . --root "$install_root"
+cargo install --path . --locked --root "$install_root"
 export PATH="$install_root/bin:$PATH"
 auto --version
 auto --help

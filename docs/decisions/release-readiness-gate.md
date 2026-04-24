@@ -9,7 +9,7 @@ Task: `AD-017`
 - `auto ship` is the release command operators already run. Its prompt maintains `SHIP.md`, records validation, rollback, monitoring, blockers, PR state, and post-push evidence, but the current Rust command does not mechanically reject missing release evidence before invoking Codex.
 - `scripts/run-task-verification.sh` and `scripts/verification_receipt.py` already provide receipt-backed proof for exact executable verification commands, and `src/completion_artifacts.rs` treats missing, failed, incomplete, or zero-test receipts as incomplete task evidence.
 - `auto qa` and `auto qa-only` maintain `QA.md`; `auto health` maintains `HEALTH.md`. Those reports are useful release inputs only when they are fresh for the branch being shipped and backed by concrete commands or runtime observations.
-- `.github/workflows/ci.yml` currently runs formatting, clippy, and tests. It does not install `auto` or prove the installed binary that an operator would run.
+- `.github/workflows/ci.yml` runs formatting, clippy, tests, and a locked temporary install smoke for the `auto` binary an operator would run.
 
 ## Decision
 
@@ -25,7 +25,7 @@ Release readiness requires passing verification receipts for every executable co
 - Static analysis: `cargo clippy --all-targets --all-features -- -D warnings` when clippy is available.
 - Tests: `cargo test` or the repo's stronger declared test command.
 - Smoke or runtime checks named by `AGENTS.md`, `README.md`, `QA.md`, `HEALTH.md`, or the current release diff.
-- Installed-binary proof: `cargo install --path . --root ~/.local`, followed by a PATH-resolved `auto --version` smoke that proves the installed binary can start and reports build provenance.
+- Installed-binary proof: `cargo install --path . --locked --root ~/.local`, followed by a PATH-resolved `auto --version` smoke that proves the installed binary can start and reports build provenance.
 
 Executable proof must be recorded through `scripts/run-task-verification.sh` when the wrapper exists. A command that exits zero but records a zero-test receipt is not release evidence.
 
@@ -71,13 +71,13 @@ Blockers must be written plainly to `SHIP.md` with owner, scope, next action, an
 
 The follow-on ship-gate implementation should reuse the existing receipt reader instead of parsing ad hoc logs. It should keep the current prompt-based ship workflow for release-note generation, but only after deterministic local evidence passes or a blocker is recorded.
 
-CI can add installed-binary proof later by running `cargo install --path . --root ~/.local`, putting `~/.local/bin` on `PATH`, and running `auto --version`; this decision does not change `.github/workflows/ci.yml`.
+CI now carries the installed-binary smoke with a temporary install root. Release gating should reuse the same locked install shape, put that root on `PATH`, and run `auto --version`.
 
 ## AD-018 Checkpoint
 
-The quality and security checkpoint found the release lifecycle ready for follow-on CI installed-binary proof and mechanical ship-gate implementation.
+The quality and security checkpoint found the release lifecycle ready for follow-on mechanical ship-gate implementation. CI installed-binary proof is already present and should stay lockfile-backed.
 
 - Audit staging proof: `cargo test audit_command::tests::commit_audit_outputs_uses_scoped_pathspecs` passed through `scripts/run-task-verification.sh AD-018`, proving audit commits use scoped pathspecs instead of broad staging for the covered path.
 - QA-only dirty-state proof: `cargo test qa_only_command::tests::qa_only_rejects_non_report_file_changes` passed through `scripts/run-task-verification.sh AD-018`, proving report-only QA rejects non-`QA.md` file changes for the covered path.
-- Release gate status: this accepted decision remains the current release readiness policy. Installed-binary proof and pre-model `auto ship` enforcement are intentionally follow-on implementation work, not part of this checkpoint.
+- Release gate status: this accepted decision remains the current release readiness policy. Deterministic pre-model `auto ship` enforcement is intentionally follow-on implementation work, not part of this checkpoint.
 - Blockers: none found in the local AD-018 proof set. The parallel host still owns the canonical `REVIEW.md` queue handoff for this checkpoint.
