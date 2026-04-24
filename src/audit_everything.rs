@@ -193,6 +193,11 @@ struct RemediationLaneResult {
     error: Option<String>,
 }
 
+struct RemediationSchedulerChoice {
+    index: usize,
+    unmet_dependencies: Vec<String>,
+}
+
 pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
     if args.everything_threads == 0 {
         bail!("--everything-threads must be greater than 0");
@@ -641,9 +646,10 @@ async fn run_remediation_lanes(
 
     loop {
         while active.len() < workers {
-            let Some(index) = next_ready_remediation_task_index(manifest, &active) else {
+            let Some(choice) = next_remediation_scheduler_choice(manifest, &active) else {
                 break;
             };
+            let index = choice.index;
             match try_harvest_existing_remediation_lane(paths, manifest, index) {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -659,7 +665,15 @@ async fn run_remediation_lanes(
             }
             let task_id = manifest.remediation_tasks[index].id.clone();
             manifest.remediation_tasks[index].status = StageStatus::Running;
-            manifest.remediation_tasks[index].note = Some("lane dispatched".to_string());
+            manifest.remediation_tasks[index].note =
+                Some(if choice.unmet_dependencies.is_empty() {
+                    "lane dispatched".to_string()
+                } else {
+                    format!(
+                        "dependency cycle breaker: lane dispatched despite unmet dependencies: {}",
+                        choice.unmet_dependencies.join(", ")
+                    )
+                });
             write_manifest(paths, manifest)?;
 
             let mut task = manifest.remediation_tasks[index].clone();
@@ -1130,32 +1144,98 @@ fn reset_interrupted_remediation_tasks(
     Ok(())
 }
 
+#[cfg(test)]
 fn next_ready_remediation_task_index(
     manifest: &EverythingManifest,
     active: &BTreeSet<String>,
 ) -> Option<usize> {
-    let complete = manifest
+    next_ready_remediation_task_index_with_complete(
+        manifest,
+        active,
+        &complete_remediation_task_ids(manifest),
+    )
+}
+
+fn next_remediation_scheduler_choice(
+    manifest: &EverythingManifest,
+    active: &BTreeSet<String>,
+) -> Option<RemediationSchedulerChoice> {
+    let complete = complete_remediation_task_ids(manifest);
+    if let Some(index) =
+        next_ready_remediation_task_index_with_complete(manifest, active, &complete)
+    {
+        return Some(RemediationSchedulerChoice {
+            index,
+            unmet_dependencies: Vec::new(),
+        });
+    }
+    if !active.is_empty() {
+        return None;
+    }
+    manifest
         .remediation_tasks
         .iter()
-        .filter(|task| matches!(task.status, StageStatus::Complete | StageStatus::Skipped))
-        .map(|task| task.id.as_str())
-        .collect::<BTreeSet<_>>();
+        .enumerate()
+        .filter(|(_, task)| is_schedulable_remediation_task(task, active))
+        .map(|(index, task)| (index, unmet_remediation_dependencies(task, &complete)))
+        .min_by(|(left_index, left_unmet), (right_index, right_unmet)| {
+            left_unmet
+                .len()
+                .cmp(&right_unmet.len())
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, unmet_dependencies)| RemediationSchedulerChoice {
+            index,
+            unmet_dependencies,
+        })
+}
+
+fn next_ready_remediation_task_index_with_complete(
+    manifest: &EverythingManifest,
+    active: &BTreeSet<String>,
+    complete: &BTreeSet<&str>,
+) -> Option<usize> {
     manifest
         .remediation_tasks
         .iter()
         .enumerate()
         .find(|(_, task)| {
-            !active.contains(&task.id)
-                && !matches!(
-                    task.status,
-                    StageStatus::Complete | StageStatus::Skipped | StageStatus::Running
-                )
+            is_schedulable_remediation_task(task, active)
                 && task
                     .dependencies
                     .iter()
                     .all(|dependency| complete.contains(dependency.as_str()))
         })
         .map(|(index, _)| index)
+}
+
+fn complete_remediation_task_ids(manifest: &EverythingManifest) -> BTreeSet<&str> {
+    let complete = manifest
+        .remediation_tasks
+        .iter()
+        .filter(|task| matches!(task.status, StageStatus::Complete | StageStatus::Skipped))
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    complete
+}
+
+fn is_schedulable_remediation_task(task: &RemediationTaskState, active: &BTreeSet<String>) -> bool {
+    !active.contains(&task.id)
+        && !matches!(
+            task.status,
+            StageStatus::Complete | StageStatus::Skipped | StageStatus::Running
+        )
+}
+
+fn unmet_remediation_dependencies(
+    task: &RemediationTaskState,
+    complete: &BTreeSet<&str>,
+) -> Vec<String> {
+    task.dependencies
+        .iter()
+        .filter(|dependency| !complete.contains(dependency.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn first_blocked_remediation_task(manifest: &EverythingManifest) -> Option<&RemediationTaskState> {
@@ -3112,6 +3192,27 @@ mod tests {
             next_ready_remediation_task_index(&manifest, &BTreeSet::new()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn remediation_scheduler_breaks_dependency_cycle_only_when_idle() {
+        let mut manifest = manifest_with_groups(vec![
+            group_for_test("crates/core", &["crates/core/src/lib.rs"]),
+            group_for_test("docs", &["docs/architecture.md"]),
+        ]);
+        manifest.remediation_tasks = vec![
+            task_for_test("AUD-REM-001", "crates/core", &["AUD-REM-002"]),
+            task_for_test("AUD-REM-002", "docs", &["AUD-REM-001"]),
+        ];
+
+        let choice = next_remediation_scheduler_choice(&manifest, &BTreeSet::new())
+            .expect("idle scheduler should break dependency cycles");
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.unmet_dependencies, vec!["AUD-REM-002"]);
+
+        let mut active = BTreeSet::new();
+        active.insert("AUD-REM-099".to_string());
+        assert!(next_remediation_scheduler_choice(&manifest, &active).is_none());
     }
 
     fn manifest_with_groups(groups: Vec<GroupState>) -> EverythingManifest {
