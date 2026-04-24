@@ -936,24 +936,33 @@ fn commit_scoped(
         bail!("audit commit requires at least one scoped pathspec");
     }
 
+    let literal_pathspecs = pathspecs
+        .iter()
+        .map(|pathspec| literal_git_pathspec(pathspec))
+        .collect::<Vec<_>>();
+
     let mut add_args = vec!["add", "--"];
-    add_args.extend(pathspecs.iter().map(String::as_str));
+    add_args.extend(literal_pathspecs.iter().map(String::as_str));
     run_git(repo_root, add_args)?;
 
     let mut status_args = vec!["status", "--porcelain", "--"];
-    status_args.extend(pathspecs.iter().map(String::as_str));
+    status_args.extend(literal_pathspecs.iter().map(String::as_str));
     let status = git_stdout(repo_root, status_args)?;
     if status.trim().is_empty() {
         return Ok(None);
     }
 
     let mut commit_args = vec!["commit", "-m", message, "--"];
-    commit_args.extend(pathspecs.iter().map(String::as_str));
+    commit_args.extend(literal_pathspecs.iter().map(String::as_str));
     run_git(repo_root, commit_args)?;
     let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?
         .trim()
         .to_string();
     Ok(Some(commit))
+}
+
+fn literal_git_pathspec(pathspec: &str) -> String {
+    format!(":(literal){pathspec}")
 }
 
 fn repo_relative_pathspec(repo_root: &Path, path: &Path) -> Result<String> {
@@ -1283,8 +1292,8 @@ mod tests {
     use crate::{AuditArgs, AuditResumeMode};
 
     use super::{
-        apply_verdict, glob_match, plan_audit_queue, run_auditor, sha256_hex, EntryStatus,
-        FileVerdict, Manifest, ManifestEntry,
+        apply_verdict, commit_scoped, glob_match, plan_audit_queue, run_auditor, sha256_hex,
+        EntryStatus, FileVerdict, Manifest, ManifestEntry,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1593,6 +1602,34 @@ diff --git a/README.md b/README.md
         assert!(status.contains("?? bug/"), "{status}");
         assert!(status.contains("?? gen-001/"), "{status}");
         assert!(status.contains("?? nemesis/"), "{status}");
+    }
+
+    #[test]
+    fn commit_scoped_treats_repo_paths_as_literals() {
+        let repo = init_repo("audit-literal-pathspec");
+        let magic_path = ":(glob)*";
+        fs::write(repo.path().join(magic_path), "before\n").expect("failed to write magic file");
+        fs::write(repo.path().join("other.md"), "before\n").expect("failed to write other file");
+        run_git_in(repo.path(), ["add", "."]);
+        run_git_in(repo.path(), ["commit", "-m", "add magic path"]);
+
+        fs::write(repo.path().join(magic_path), "after\n").expect("failed to edit magic file");
+        fs::write(repo.path().join("other.md"), "after\n").expect("failed to edit other file");
+
+        let commit = commit_scoped(
+            repo.path(),
+            "main",
+            "audit: literal pathspec",
+            &[magic_path.to_string()],
+        )
+        .expect("literal pathspec commit should succeed");
+
+        assert!(commit.is_some());
+        assert_eq!(last_commit_paths(repo.path()), vec![magic_path]);
+        assert_eq!(
+            run_git_in(repo.path(), ["status", "--short", "--", "other.md"]).trim(),
+            "M other.md"
+        );
     }
 
     #[test]

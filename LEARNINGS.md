@@ -11,3 +11,4 @@
 - CLI default-behavior claims need parser-level tests, not only helper-function tests. A sibling-discovery helper can pass while the exposed command still defaults to not calling it.
 - Dirty-state guards should consume Git porcelain `-z` output, not human `--short` status. Quoted paths can otherwise fingerprint as missing and hide mutations to pre-existing dirty files.
 - Credential restore guards need absence metadata as well as backup paths. If no original auth file existed, a successful swap must remove the temporary active file during restore instead of leaving the selected profile behind.
+- Any helper that accepts repo paths and forwards them to Git as pathspecs should force literal pathspec semantics. Machine-derived tracked filenames can still look like Git magic such as `:(glob)*`, and scoped commits must not let that widen the staged or committed surface.

@@ -259,3 +259,43 @@
 - Validation: `rg -n '^### .*auto (steward|audit|symphony)' README.md`, `rg -n 'DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md' README.md`, `rg -n 'audit/DOCTRINE.md' README.md`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - Completion artifacts: `README.md`
 - Remaining blockers: none.
+
+## `AD-005`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/snapshot-only-generation.md`
+- Review result: passed as a documentation decision. The decision record truthfully scopes snapshot-only generation as an accepted product contract, and the current generation code is consistent with its root-sync boundaries.
+- Validation: receipt-backed proof in `.auto/symphony/verification-receipts/AD-005.json` for `cargo test`, `rg -n "snapshot-only|no-sync|sync-only|plan-only|root specs|IMPLEMENTATION_PLAN.md" docs/decisions/snapshot-only-generation.md`, and `rg -n "sync_verified_generation_outputs|sync_only|plan_only" src/generation.rs`.
+- Completion artifacts: `docs/decisions/snapshot-only-generation.md`
+- Remaining blockers: none.
+
+## `AD-015`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/audit_command.rs`, `src/util.rs`
+- Review result: passed after fixing a required trust-boundary issue: audit commit scopes now convert repo paths to literal Git pathspecs before `git add`, `git status`, and `git commit`, so pathspec-magic-shaped filenames cannot widen the committed surface.
+- Validation: `cargo test audit_command::tests::`; receipt-backed prior proof in `.auto/symphony/verification-receipts/AD-015.json` for `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, `cargo test audit_command::tests::audit_commit_excludes_generated_and_runtime_artifacts`, `cargo test audit_command::tests::commit_audit_outputs_uses_scoped_pathspecs`, and `cargo test util::tests::checkpoint_excludes_generated_and_runtime_paths`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-F04`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/completion_artifacts.rs`, `src/parallel_command.rs`, `src/review_command.rs`, `src/symphony_command.rs`, `src/task_parser.rs`
+- Review result: passed. The shared task parser migration preserves dependency parsing, partial completion-path placeholders, completed-plan harvesting, and narrative verification handling across the executor adapters.
+- Validation: receipt-backed proof in `.auto/symphony/verification-receipts/AD-F04.json` for the cited parser and completion-artifact regression tests.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-007`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`, `src/doctor_command.rs`, `src/main.rs`
+- Review result: passed. The no-model `auto doctor` command is wired into the CLI, probes required local surfaces through the current executable, and reports missing external tools as capability warnings rather than first-run failures.
+- Validation: receipt-backed proof in `.auto/symphony/verification-receipts/AD-007.json` for `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, `cargo test`, and the three doctor command regressions.
+- Completion artifacts: `README.md`
+- Remaining blockers: none.
+
+## `AD-F05`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/loop_command.rs`
+- Review result: passed. `auto loop` now reuses the shared task parser, skips partial completion-path placeholders, and demotes done tasks back to partial when required completion evidence is missing before the loop pushes.
+- Validation: receipt-backed proof in `.auto/symphony/verification-receipts/AD-F05.json` for `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and the cited completion-evidence / loop-queue regressions.
+- Completion artifacts: none
+- Remaining blockers: none.
