@@ -29,9 +29,10 @@ const PROFESSIONAL_AUDIT_DIR: &str = ".auto/audit-everything";
 const LATEST_RUN_FILE: &str = "latest-run";
 const MAX_FILE_PROMPT_BYTES: usize = 220_000;
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["trunk", "main", "master"];
-const DEFAULT_EXCLUDE_PREFIXES: [&str; 9] = [
+const DEFAULT_EXCLUDE_PREFIXES: [&str; 10] = [
     ".git/",
     ".auto/",
+    ".claude/worktrees/",
     "target/",
     "node_modules/",
     "dist/",
@@ -2026,8 +2027,12 @@ fn reconcile_file_inventory(
     let groups = classify_groups(worktree_root, &tracked);
     let mut files = Vec::new();
     for path in tracked {
-        let content = fs::read(worktree_root.join(&path))
-            .with_context(|| format!("failed to read {}", worktree_root.join(&path).display()))?;
+        let absolute_path = worktree_root.join(&path);
+        if !absolute_path.is_file() {
+            continue;
+        }
+        let content = fs::read(&absolute_path)
+            .with_context(|| format!("failed to read {}", absolute_path.display()))?;
         let hash = sha256_hex(&content);
         let artifact_dir = report_root
             .join("files")
@@ -2656,6 +2661,8 @@ mod tests {
     #[test]
     fn excluded_path_skips_generated_and_runtime_state() {
         assert!(excluded_path(".auto/audit/log"));
+        assert!(excluded_path(".claude/worktrees/agent-a123"));
+        assert!(excluded_path(".claude/worktrees/agent-a123/README.md"));
         assert!(excluded_path("target/debug/app"));
         assert!(excluded_path("gen-20260424/spec.md"));
         assert!(!excluded_path("crates/bitino-house/src/lib.rs"));
