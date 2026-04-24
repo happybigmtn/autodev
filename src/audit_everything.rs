@@ -10,12 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::codex_exec::run_codex_exec_max_context;
@@ -500,27 +498,22 @@ async fn run_first_pass_phase(
         pending.len(),
         workers
     );
-    let semaphore = Arc::new(Semaphore::new(workers));
     let mut join_set = JoinSet::new();
-    for file in pending {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let paths_clone = RunPaths {
-            host_root: paths.host_root.clone(),
-            manifest_path: paths.manifest_path.clone(),
-            latest_path: paths.latest_path.clone(),
-            worktree_root: paths.worktree_root.clone(),
-            report_root: paths.report_root.clone(),
-        };
-        let context_clone = context.clone();
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            let _permit = permit;
-            run_one_file_analysis(&paths_clone, &file, &context_clone, &config_clone).await
-        });
+    let mut pending_iter = pending.into_iter();
+    let mut active = 0usize;
+    for _ in 0..workers {
+        if let Some(file) = pending_iter.next() {
+            spawn_file_worker(&mut join_set, paths, file, &context, &config);
+            active += 1;
+        }
     }
 
     let mut failures = Vec::new();
-    while let Some(result) = join_set.join_next().await {
+    while active > 0 {
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        active -= 1;
         match result {
             Ok(Ok(path)) => {
                 if let Some(file) = manifest.files.iter_mut().find(|file| file.path == path) {
@@ -530,6 +523,10 @@ async fn run_first_pass_phase(
             }
             Ok(Err(err)) => failures.push(format!("{err:#}")),
             Err(err) => failures.push(format!("worker task panicked: {err}")),
+        }
+        if let Some(file) = pending_iter.next() {
+            spawn_file_worker(&mut join_set, paths, file, &context, &config);
+            active += 1;
         }
     }
     if !failures.is_empty() {
@@ -1389,26 +1386,22 @@ async fn run_group_workers(
     phase: GroupPhase,
     manifest: &mut EverythingManifest,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(workers));
     let mut join_set = JoinSet::new();
-    for group in pending {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let paths_clone = RunPaths {
-            host_root: paths.host_root.clone(),
-            manifest_path: paths.manifest_path.clone(),
-            latest_path: paths.latest_path.clone(),
-            worktree_root: paths.worktree_root.clone(),
-            report_root: paths.report_root.clone(),
-        };
-        let config_clone = config.clone();
-        join_set.spawn(async move {
-            let _permit = permit;
-            run_one_group_phase(&paths_clone, &group, phase, &config_clone).await
-        });
+    let mut pending_iter = pending.into_iter();
+    let mut active = 0usize;
+    for _ in 0..workers {
+        if let Some(group) = pending_iter.next() {
+            spawn_group_worker(&mut join_set, paths, group, phase, &config);
+            active += 1;
+        }
     }
 
     let mut failures = Vec::new();
-    while let Some(result) = join_set.join_next().await {
+    while active > 0 {
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        active -= 1;
         match result {
             Ok(Ok(slug)) => {
                 if let Some(group) = manifest.groups.iter_mut().find(|group| group.slug == slug) {
@@ -1419,6 +1412,10 @@ async fn run_group_workers(
             Ok(Err(err)) => failures.push(format!("{err:#}")),
             Err(err) => failures.push(format!("group worker task panicked: {err}")),
         }
+        if let Some(group) = pending_iter.next() {
+            spawn_group_worker(&mut join_set, paths, group, phase, &config);
+            active += 1;
+        }
     }
     if !failures.is_empty() {
         for failure in &failures {
@@ -1428,6 +1425,26 @@ async fn run_group_workers(
     }
     write_manifest(paths, manifest)?;
     Ok(())
+}
+
+fn spawn_group_worker(
+    join_set: &mut JoinSet<Result<String>>,
+    paths: &RunPaths,
+    group: GroupState,
+    phase: GroupPhase,
+    config: &PhaseConfig,
+) {
+    let paths_clone = RunPaths {
+        host_root: paths.host_root.clone(),
+        manifest_path: paths.manifest_path.clone(),
+        latest_path: paths.latest_path.clone(),
+        worktree_root: paths.worktree_root.clone(),
+        report_root: paths.report_root.clone(),
+    };
+    let config_clone = config.clone();
+    join_set.spawn(
+        async move { run_one_group_phase(&paths_clone, &group, phase, &config_clone).await },
+    );
 }
 
 async fn run_one_file_analysis(
@@ -1445,6 +1462,27 @@ async fn run_one_file_analysis(
     run_codex_phase_for_artifact(paths, &artifact_dir, "first-pass", &prompt, config).await?;
     require_nonempty_file(&artifact_dir.join("analysis.md"))?;
     Ok(file.path.clone())
+}
+
+fn spawn_file_worker(
+    join_set: &mut JoinSet<Result<String>>,
+    paths: &RunPaths,
+    file: FileState,
+    context: &str,
+    config: &PhaseConfig,
+) {
+    let paths_clone = RunPaths {
+        host_root: paths.host_root.clone(),
+        manifest_path: paths.manifest_path.clone(),
+        latest_path: paths.latest_path.clone(),
+        worktree_root: paths.worktree_root.clone(),
+        report_root: paths.report_root.clone(),
+    };
+    let context_clone = context.to_string();
+    let config_clone = config.clone();
+    join_set.spawn(async move {
+        run_one_file_analysis(&paths_clone, &file, &context_clone, &config_clone).await
+    });
 }
 
 async fn run_one_group_phase(
@@ -2039,13 +2077,15 @@ fn reconcile_file_inventory(
             .join(short_hash(&hash))
             .display()
             .to_string();
-        let status = existing_status
-            .get(&path)
-            .copied()
-            .filter(|status| {
-                artifact_complete(Path::new(&artifact_dir)) || *status != StageStatus::Complete
-            })
-            .unwrap_or(StageStatus::Pending);
+        let status = if artifact_complete(Path::new(&artifact_dir)) {
+            StageStatus::Complete
+        } else {
+            existing_status
+                .get(&path)
+                .copied()
+                .filter(|status| !matches!(status, StageStatus::Complete))
+                .unwrap_or(StageStatus::Pending)
+        };
         files.push(FileState {
             group: groups
                 .get(&path)
