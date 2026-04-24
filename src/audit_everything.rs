@@ -26,6 +26,7 @@ use crate::{AuditArgs, AuditEverythingPhase};
 const PROFESSIONAL_AUDIT_DIR: &str = ".auto/audit-everything";
 const LATEST_RUN_FILE: &str = "latest-run";
 const MAX_FILE_PROMPT_BYTES: usize = 220_000;
+const LEGACY_LARGE_FILE_OMISSION_MARKER: &str = "[file omitted from prompt because";
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["trunk", "main", "master"];
 const DEFAULT_EXCLUDE_PREFIXES: [&str; 10] = [
     ".git/",
@@ -1853,6 +1854,7 @@ Hard boundaries:
 - The only architectural context you may use is the injected context below.
 - Write outputs only in the artifact directory.
 - Apply only the selected gstack lenses below for this file's surface. Do not invoke tools in this first pass. Do not discuss unrelated lenses.
+- If the target file content below says it is omitted because the file is large, you must read the entire target file from its path in ordered chunks before writing artifacts. Do not sample. Do not rely on metadata only. If you cannot inspect every line, fail this file instead of writing artifacts.
 
 Injected context:
 {context}
@@ -1876,11 +1878,12 @@ Write these files:
 - Important public types/functions/modules/configuration it owns.
 - How it appears to fit the architecture.
 - Whether it is the best version of itself it could be.
+- A coverage note stating whether the full file content was provided inline or reviewed from disk in chunks.
 - If not 10/10, list expansions, deletions, revisions, clarifications, tests, code refactors, documentation moves, or retirement steps that would make it an idiomatic 10/10 work product.
 - Cross-file questions or likely relationships surfaced by this file, without resolving them from other source files in this pass.
 
 `analysis.json` must be valid JSON with:
-`path`, `group`, `score_out_of_10`, `summary`, `best_version_assessment`, `recommended_actions`, `cross_file_questions`, `confidence`.
+`path`, `group`, `score_out_of_10`, `summary`, `best_version_assessment`, `recommended_actions`, `cross_file_questions`, `coverage`, `confidence`.
 
 Target file content:
 ```text
@@ -2271,13 +2274,15 @@ fn build_initial_group_reports(paths: &RunPaths, manifest: &EverythingManifest) 
 
 fn prompt_file_body(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if bytes.len() > MAX_FILE_PROMPT_BYTES {
-        return Ok(format!(
-            "[file omitted from prompt because it is {} bytes; inspect metadata and path only]",
-            bytes.len()
-        ));
-    }
+    let byte_len = bytes.len();
     match String::from_utf8(bytes) {
+        Ok(text) if byte_len > MAX_FILE_PROMPT_BYTES => {
+            let line_count = text.lines().count();
+            Ok(format!(
+                "[large UTF-8 file omitted from inline prompt because it is {byte_len} bytes and {line_count} lines. Mandatory full-file review: inspect `{}` directly inside the worktree before writing artifacts. Read the entire file in ordered chunks no larger than 250 lines, from line 1 through line {line_count}, using `sed -n '<start>,<end>p'`, `nl -ba`, or an equivalent command. Do not sample. Do not rely on metadata only. In `analysis.md`, include a Coverage note that states this was a large-file chunked review and names the line count. In `analysis.json`, set `coverage` to a concise statement confirming full-file chunked inspection. If you cannot inspect every line, fail instead of writing artifacts.]",
+                path.display()
+            ))
+        }
         Ok(text) => Ok(text),
         Err(err) => Ok(format!(
             "[binary or non-UTF8 file omitted from prompt: {} valid bytes before error]",
@@ -2287,7 +2292,14 @@ fn prompt_file_body(path: &Path) -> Result<String> {
 }
 
 fn artifact_complete(artifact_dir: &Path) -> bool {
-    artifact_dir.join("analysis.md").exists() && artifact_dir.join("analysis.json").exists()
+    artifact_dir.join("analysis.md").exists()
+        && artifact_dir.join("analysis.json").exists()
+        && !artifact_has_legacy_large_file_prompt(artifact_dir)
+}
+
+fn artifact_has_legacy_large_file_prompt(artifact_dir: &Path) -> bool {
+    fs::read_to_string(artifact_dir.join("first-pass-prompt.md"))
+        .is_ok_and(|prompt| prompt.contains(LEGACY_LARGE_FILE_OMISSION_MARKER))
 }
 
 fn file_artifact_dir(report_root: &Path, path: &str, content_hash: &str) -> PathBuf {
@@ -2780,6 +2792,47 @@ mod tests {
             file_artifact_slug("crates/a/generated.d.ts", &content_hash),
             file_artifact_slug("crates/b/generated.d.ts", &content_hash)
         );
+    }
+
+    #[test]
+    fn large_utf8_file_prompt_requires_full_chunked_review() {
+        let dir =
+            std::env::temp_dir().join(format!("auto-audit-large-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("large.rs");
+        let mut body = String::new();
+        for index in 0..20_000 {
+            body.push_str(&format!("fn line_{index}() {{}}\n"));
+        }
+        fs::write(&path, body).expect("failed to write large file");
+
+        let prompt_body = prompt_file_body(&path).expect("failed to build prompt file body");
+        assert!(prompt_body.contains("large UTF-8 file omitted from inline prompt"));
+        assert!(prompt_body.contains("Mandatory full-file review"));
+        assert!(prompt_body.contains("Read the entire file in ordered chunks"));
+        assert!(!prompt_body.contains("metadata and path only"));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn legacy_large_file_prompt_invalidates_artifact_completion() {
+        let dir =
+            std::env::temp_dir().join(format!("auto-audit-legacy-artifact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(dir.join("analysis.md"), "# src/lib.rs\n").expect("failed to write analysis.md");
+        fs::write(dir.join("analysis.json"), "{}\n").expect("failed to write analysis.json");
+        fs::write(
+            dir.join("first-pass-prompt.md"),
+            "[file omitted from prompt because it is 300000 bytes; inspect metadata and path only]",
+        )
+        .expect("failed to write first-pass prompt");
+
+        assert!(!artifact_complete(&dir));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 
     #[test]
