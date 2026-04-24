@@ -7,12 +7,15 @@ use crate::quota_config::Provider;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QuotaVerdict {
     Exhausted,
+    Unavailable,
     OtherError,
     Ok,
 }
 
 static CODEX_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+static CODEX_UNAVAILABLE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
 static CLAUDE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+static CLAUDE_UNAVAILABLE_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
 
 fn codex_patterns() -> &'static [Regex] {
     CODEX_PATTERNS.get_or_init(|| {
@@ -28,6 +31,22 @@ fn codex_patterns() -> &'static [Regex] {
             r"(?i)capacity.*limit",
             r"(?i)billing.*limit",
             r"429",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).expect("invalid regex pattern"))
+        .collect()
+    })
+}
+
+fn codex_unavailable_patterns() -> &'static [Regex] {
+    CODEX_UNAVAILABLE_PATTERNS.get_or_init(|| {
+        [
+            r"(?i)401 Unauthorized",
+            r"(?i)Missing bearer or basic authentication",
+            r"(?i)failed to connect to websocket: HTTP error: 401 Unauthorized",
+            r"(?i)invalid.?api.?key",
+            r"(?i)authentication failed",
+            r"(?i)unauthorized",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("invalid regex pattern"))
@@ -54,19 +73,40 @@ fn claude_patterns() -> &'static [Regex] {
     })
 }
 
+fn claude_unavailable_patterns() -> &'static [Regex] {
+    CLAUDE_UNAVAILABLE_PATTERNS.get_or_init(|| {
+        [
+            r"(?i)401 Unauthorized",
+            r"(?i)authentication failed",
+            r"(?i)invalid.?api.?key",
+            r"(?i)invalid.?auth",
+            r"(?i)unauthorized",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).expect("invalid regex pattern"))
+        .collect()
+    })
+}
+
 /// Scan stderr text for quota-exhaustion signals.
 pub(crate) fn check_stderr(provider: Provider, stderr: &str) -> QuotaVerdict {
     if stderr.trim().is_empty() {
         return QuotaVerdict::Ok;
     }
 
-    let patterns = match provider {
-        Provider::Codex => codex_patterns(),
-        Provider::Claude => claude_patterns(),
+    let (unavailable_patterns, exhausted_patterns) = match provider {
+        Provider::Codex => (codex_unavailable_patterns(), codex_patterns()),
+        Provider::Claude => (claude_unavailable_patterns(), claude_patterns()),
     };
 
     for line in stderr.lines() {
-        for pattern in patterns {
+        for pattern in unavailable_patterns {
+            if pattern.is_match(line) {
+                return QuotaVerdict::Unavailable;
+            }
+        }
+
+        for pattern in exhausted_patterns {
             if pattern.is_match(line) {
                 return QuotaVerdict::Exhausted;
             }
@@ -105,6 +145,24 @@ mod tests {
         assert_eq!(
             check_stderr(Provider::Codex, stderr),
             QuotaVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn detects_codex_unauthorized_as_unavailable() {
+        let stderr = "ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses";
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::Unavailable
+        );
+    }
+
+    #[test]
+    fn detects_codex_missing_bearer_as_unavailable() {
+        let stderr = "error: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses";
+        assert_eq!(
+            check_stderr(Provider::Codex, stderr),
+            QuotaVerdict::Unavailable
         );
     }
 

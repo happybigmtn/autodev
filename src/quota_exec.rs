@@ -390,7 +390,9 @@ where
                 restore_and_update_state(provider, &account_name, &mut guard, |state, now| {
                     state.mark_used(&account_name, now);
                     match verdict {
-                        QuotaVerdict::Exhausted => state.mark_exhausted(&account_name, now),
+                        QuotaVerdict::Exhausted | QuotaVerdict::Unavailable => {
+                            state.mark_exhausted(&account_name, now)
+                        }
                         QuotaVerdict::Ok | QuotaVerdict::OtherError => {
                             if status.success() {
                                 state.mark_success(&account_name, now);
@@ -408,6 +410,13 @@ where
                         };
                         eprintln!(
                             "[quota-router] account '{account_name}' quota exhausted{progress_note}, \
+                             trying next..."
+                        );
+                        continue;
+                    }
+                    QuotaVerdict::Unavailable => {
+                        eprintln!(
+                            "[quota-router] account '{account_name}' auth/availability failed, \
                              trying next..."
                         );
                         continue;
