@@ -1018,6 +1018,36 @@ Defaults:
 - Escalations default to Codex `gpt-5.5` with `high`
 - Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
 
+#### `auto audit --everything`
+
+Purpose:
+
+- Run a professional whole-codebase audit with one fresh Codex loop per tracked file
+- Start with context engineering: a dedicated worktree, revised `AGENTS.md`, revised
+  `ARCHITECTURE.md`, and injected `doctrine/` content when present
+- Produce comprehensive markdown reports split by logical crate/module group, then revise those
+  reports based on cross-file relationships before attempting bounded crate-by-crate remediation
+
+What it does:
+
+- Creates a resumable run under `.auto/audit-everything/<run-id>`
+- Creates an audit worktree on `auto-audit/<repo>-<run-id>` from the primary branch
+- Writes human reports under `audit/everything/<run-id>` in the audit worktree
+- Runs first-pass per-file analysis with Codex `gpt-5.5` `low`
+- Runs synthesis and remediation with Codex `gpt-5.5` `high`
+- Runs final review with Codex `gpt-5.5` `xhigh`
+- Attempts a fast-forward merge back to the resolved primary branch only after final review writes
+  `Verdict: GO`, unless `--no-everything-merge` is set
+
+Useful controls:
+
+- `--everything-phase init-context|first-pass|synthesize|remediate|final-review|merge|status|all`
+- `--everything-run-id <id>` to resume a specific run
+- `--everything-threads <n>` for read-only parallel phases, capped at 15
+- `--remediation-threads <n>` for crate remediation, defaulting to 1 for safer landing
+- `--report-only` to stop before remediation
+- `--branch trunk|main` when the primary branch cannot be inferred
+
 ### `auto symphony`
 
 Purpose:

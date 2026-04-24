@@ -1,4 +1,5 @@
 mod audit_command;
+mod audit_everything;
 mod backend_policy;
 mod bug_command;
 mod claude_exec;
@@ -941,6 +942,71 @@ pub(crate) struct StewardArgs {
 
 #[derive(Args, Clone)]
 pub(crate) struct AuditArgs {
+    /// Run the professional whole-repo audit pipeline: context engineering,
+    /// per-file analysis, cross-file synthesis, crate remediation, final review,
+    /// and optional primary-branch merge.
+    #[arg(long)]
+    everything: bool,
+
+    /// Professional audit phase to run. Used only with --everything.
+    #[arg(long, value_enum, default_value_t = AuditEverythingPhase::All)]
+    everything_phase: AuditEverythingPhase,
+
+    /// Resume an existing professional audit run. Defaults to the latest run
+    /// recorded under .auto/audit-everything.
+    #[arg(long)]
+    everything_run_id: Option<String>,
+
+    /// Root directory for professional audit runtime state.
+    #[arg(long)]
+    everything_run_root: Option<PathBuf>,
+
+    /// Maximum concurrent Codex workers for read-only professional audit phases.
+    #[arg(long, default_value_t = 15)]
+    everything_threads: usize,
+
+    /// Maximum concurrent Codex workers for remediation phases. Defaults to
+    /// serial crate-by-crate repair to keep merge conflicts tractable.
+    #[arg(long, default_value_t = 1)]
+    remediation_threads: usize,
+
+    /// Model for professional audit first-pass file analysis.
+    #[arg(long, default_value = "gpt-5.5")]
+    first_pass_model: String,
+
+    /// Reasoning effort for professional audit first-pass file analysis.
+    #[arg(long, default_value = "low")]
+    first_pass_effort: String,
+
+    /// Model for professional audit cross-file synthesis.
+    #[arg(long, default_value = "gpt-5.5")]
+    synthesis_model: String,
+
+    /// Reasoning effort for professional audit cross-file synthesis.
+    #[arg(long, default_value = "high")]
+    synthesis_effort: String,
+
+    /// Model for professional audit crate-by-crate remediation.
+    #[arg(long, default_value = "gpt-5.5")]
+    remediation_model: String,
+
+    /// Reasoning effort for professional audit crate-by-crate remediation.
+    #[arg(long, default_value = "high")]
+    remediation_effort: String,
+
+    /// Model for professional audit final review.
+    #[arg(long, default_value = "gpt-5.5")]
+    final_review_model: String,
+
+    /// Reasoning effort for professional audit final review.
+    #[arg(long, default_value = "xhigh")]
+    final_review_effort: String,
+
+    /// Do not attempt to merge the professional audit branch back into the
+    /// primary branch after final review, even if the final review is GO.
+    #[arg(long)]
+    no_everything_merge: bool,
+
     /// Operator-authored doctrine markdown. This is the judgment framework
     /// the auditor applies. The command stays agnostic — whatever you put
     /// here is what "clean" means for this repo. Required; will NOT be
@@ -1022,6 +1088,26 @@ pub(crate) struct AuditArgs {
     /// Route explicit Kimi audit models through `kimi-cli --yolo`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_kimi_cli: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum AuditEverythingPhase {
+    /// Run all professional audit phases in order.
+    All,
+    /// Create/reuse worktree and generate AGENTS.md / ARCHITECTURE.md context.
+    InitContext,
+    /// Run one clean Codex iteration per tracked file.
+    FirstPass,
+    /// Build and revise crate/module markdown reports from per-file analysis.
+    Synthesize,
+    /// Apply crate-by-crate code/doc/test revisions and keep reports updated.
+    Remediate,
+    /// Run the final xhigh review over reports and diff.
+    FinalReview,
+    /// Attempt to merge the professional audit branch back to the primary branch.
+    Merge,
+    /// Print current professional audit status.
+    Status,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

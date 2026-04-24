@@ -139,6 +139,10 @@ struct FileVerdict {
 }
 
 pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
+    if args.everything {
+        return crate::audit_everything::run_audit_everything(args).await;
+    }
+
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?
@@ -1717,6 +1721,21 @@ diff --git a/README.md b/README.md
     async fn run_audit_kimi_models_require_use_kimi_cli() {
         let repo_root = TestTempDir::new("run-audit-requires-kimi");
         let args = AuditArgs {
+            everything: false,
+            everything_phase: crate::AuditEverythingPhase::All,
+            everything_run_id: None,
+            everything_run_root: None,
+            everything_threads: 15,
+            remediation_threads: 1,
+            first_pass_model: "gpt-5.5".to_string(),
+            first_pass_effort: "low".to_string(),
+            synthesis_model: "gpt-5.5".to_string(),
+            synthesis_effort: "high".to_string(),
+            remediation_model: "gpt-5.5".to_string(),
+            remediation_effort: "high".to_string(),
+            final_review_model: "gpt-5.5".to_string(),
+            final_review_effort: "xhigh".to_string(),
+            no_everything_merge: false,
             doctrine_prompt: PathBuf::from("audit/DOCTRINE.md"),
             rubric_prompt: None,
             include_paths: Vec::new(),
