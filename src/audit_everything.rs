@@ -584,7 +584,7 @@ async fn run_remediation_phase(
     paths: &RunPaths,
     manifest: &mut EverythingManifest,
 ) -> Result<()> {
-    reset_interrupted_remediation_tasks(manifest);
+    reset_interrupted_remediation_tasks(paths, manifest)?;
     let pending_count = manifest
         .remediation_tasks
         .iter()
@@ -844,6 +844,17 @@ fn commit_worktree_changes(paths: &RunPaths, manifest: &EverythingManifest) -> R
         return Ok(());
     }
     run_git(&paths.worktree_root, ["add", "--", "."])?;
+    let generated_file_artifacts = format!("audit/everything/{}/files", manifest.run_id);
+    let _ = run_git(
+        &paths.worktree_root,
+        [
+            "rm",
+            "-r",
+            "--cached",
+            "--ignore-unmatch",
+            &generated_file_artifacts,
+        ],
+    );
     let staged = command_status(
         &paths.worktree_root,
         ["diff", "--cached", "--quiet", "--exit-code"],
@@ -1084,13 +1095,24 @@ fn write_remediation_plan_files(paths: &RunPaths, manifest: &EverythingManifest)
     })
 }
 
-fn reset_interrupted_remediation_tasks(manifest: &mut EverythingManifest) {
+fn reset_interrupted_remediation_tasks(
+    _paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+) -> Result<()> {
     for task in &mut manifest.remediation_tasks {
         if matches!(task.status, StageStatus::Running) {
+            let lane_root = PathBuf::from(&task.lane_root);
+            if lane_root.exists() {
+                fs::remove_dir_all(&lane_root).with_context(|| {
+                    format!("failed to remove interrupted {}", lane_root.display())
+                })?;
+            }
             task.status = StageStatus::Pending;
+            task.base_commit = None;
             task.note = Some("reset from interrupted lane".to_string());
         }
     }
+    Ok(())
 }
 
 fn next_ready_remediation_task_index(
@@ -2127,6 +2149,9 @@ fn enumerate_tracked_files(repo_root: &Path) -> Result<Vec<String>> {
 }
 
 fn excluded_path(path: &str) -> bool {
+    if path.starts_with("audit/everything/") {
+        return true;
+    }
     DEFAULT_EXCLUDE_PREFIXES.iter().any(|prefix| {
         if prefix.ends_with('/') {
             path.starts_with(prefix)
@@ -2785,6 +2810,12 @@ mod tests {
         assert!(excluded_path(".auto/audit/log"));
         assert!(excluded_path(".claude/worktrees/agent-a123"));
         assert!(excluded_path(".claude/worktrees/agent-a123/README.md"));
+        assert!(excluded_path(
+            "audit/everything/20260424-115535/reports/src.md"
+        ));
+        assert!(excluded_path(
+            "audit/everything/20260424-115535/files/hash/analysis.md"
+        ));
         assert!(excluded_path("target/debug/app"));
         assert!(excluded_path("gen-20260424/spec.md"));
         assert!(!excluded_path("crates/bitino-house/src/lib.rs"));
