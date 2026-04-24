@@ -13,39 +13,54 @@ use crate::util::write_0o600_if_unix;
 
 /// Guard that restores original auth files on drop.
 struct AuthRestoreGuard {
-    pairs: Vec<(PathBuf, PathBuf)>,
+    entries: Vec<AuthBackupEntry>,
     active: bool,
 }
 
+struct AuthBackupEntry {
+    backup: PathBuf,
+    target: PathBuf,
+    had_original: bool,
+}
+
 impl AuthRestoreGuard {
-    fn new(pairs: Vec<(PathBuf, PathBuf)>) -> Self {
+    fn new(entries: Vec<AuthBackupEntry>) -> Self {
         Self {
-            pairs,
+            entries,
             active: true,
         }
     }
 
-    fn disarm(&mut self) {
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        restore_auth_backups(&self.entries)?;
         self.active = false;
+        Ok(())
     }
 }
 
 impl Drop for AuthRestoreGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        for (backup, target) in &self.pairs {
-            if backup.exists() {
-                if backup.is_dir() {
-                    let _ = remove_and_copy_dir(backup, target);
-                } else {
-                    let _ = copy_file_0o600(backup, target);
-                }
-                let _ = remove_path(backup);
+        let _ = self.restore();
+    }
+}
+
+fn restore_auth_backups(entries: &[AuthBackupEntry]) -> Result<()> {
+    for entry in entries {
+        if entry.backup.exists() {
+            if entry.backup.is_dir() {
+                remove_and_copy_dir(&entry.backup, &entry.target)?;
+            } else {
+                copy_file_0o600(&entry.backup, &entry.target)?;
             }
+            remove_path(&entry.backup)?;
+        } else if !entry.had_original && entry.target.exists() {
+            remove_path(&entry.target)?;
         }
     }
+    Ok(())
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -79,6 +94,10 @@ fn copy_file_0o600(src: &Path, dst: &Path) -> Result<()> {
         );
     }
     let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     write_0o600_if_unix(dst, &bytes)
 }
 
@@ -199,18 +218,24 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
     let backup_dir = QuotaConfig::config_dir().join("backup");
     fs::create_dir_all(&backup_dir).context("failed to create backup directory")?;
 
-    let pairs = match provider {
+    let entries = match provider {
         Provider::Codex => {
             let bp = backup_dir.join("codex-auth.json");
-            if target.exists() {
+            let had_original = target.exists();
+            if had_original {
                 copy_file_0o600(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
             }
-            vec![(bp, target)]
+            vec![AuthBackupEntry {
+                backup: bp,
+                target,
+                had_original,
+            }]
         }
         Provider::Claude => {
             let bp = backup_dir.join("claude");
-            if target.exists() {
+            let had_original = target.exists();
+            if had_original {
                 let _ = remove_path(&bp);
                 copy_dir_recursive(&target, &bp)
                     .with_context(|| format!("failed to backup {}", target.display()))?;
@@ -221,16 +246,28 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
             let claude_json = home.join(".claude.json");
 
             // Backup ~/.claude.json separately (lives in home, not in ~/.claude)
-            if claude_json.exists() {
+            let had_claude_json = claude_json.exists();
+            if had_claude_json {
                 copy_file_0o600(&claude_json, &claude_json_bp)
                     .with_context(|| format!("failed to backup {}", claude_json.display()))?;
             }
 
-            vec![(bp, target), (claude_json_bp, claude_json)]
+            vec![
+                AuthBackupEntry {
+                    backup: bp,
+                    target,
+                    had_original,
+                },
+                AuthBackupEntry {
+                    backup: claude_json_bp,
+                    target: claude_json,
+                    had_original: had_claude_json,
+                },
+            ]
         }
     };
 
-    let guard = AuthRestoreGuard::new(pairs);
+    let guard = AuthRestoreGuard::new(entries);
     copy_profile_to_active_auth(provider, profile_dir)?;
     Ok(guard)
 }
@@ -306,8 +343,7 @@ fn restore_and_update_state(
         anyhow::anyhow!("failed to acquire {provider} lock for credential restore: {e}")
     })?;
 
-    restore_guard.disarm();
-    let restore_result = restore_credentials(provider);
+    let restore_result = restore_guard.restore();
 
     let now = Utc::now();
     let state_result = (|| -> Result<()> {
@@ -407,6 +443,7 @@ fn quota_output_has_agent_progress(output: &str) -> bool {
         || lower.contains("files changed")
 }
 
+#[cfg(test)]
 fn restore_credentials(provider: Provider) -> Result<()> {
     let backup_dir = QuotaConfig::config_dir().join("backup");
     let target = provider.auth_source();
@@ -817,5 +854,25 @@ mod tests {
         let active = fs::read(active_claude.join("credentials.json"))
             .expect("failed to read restored active claude credentials");
         assert_eq!(active, br#"{"account":"original-dir"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_credentials_removes_codex_auth_when_no_original_existed() {
+        let home = TempQuotaHome::new("quota-exec-no-original-codex");
+        let active_auth = home.home().join(".codex").join("auth.json");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "work");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        fs::write(profile_dir.join("auth.json"), br#"{"account":"profile"}"#)
+            .expect("failed to write profile auth");
+
+        let guard = swap_credentials(Provider::Codex, &profile_dir)
+            .expect("credential swap should succeed");
+        assert!(active_auth.exists());
+
+        drop(guard);
+
+        assert!(!active_auth.exists());
     }
 }

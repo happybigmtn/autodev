@@ -9,3 +9,5 @@
 - Sensitive credential copy paths need the same pre-tightened write discipline as direct writes. Reading the source and writing through the owner-only helper avoids the exposure window left by `fs::copy` followed by chmod.
 - Model shorthand flags must not silently override an explicit `--model` value. Regression tests should cover "explicit model plus convenience flag" because default-model tests alone miss precedence bugs.
 - CLI default-behavior claims need parser-level tests, not only helper-function tests. A sibling-discovery helper can pass while the exposed command still defaults to not calling it.
+- Dirty-state guards should consume Git porcelain `-z` output, not human `--short` status. Quoted paths can otherwise fingerprint as missing and hide mutations to pre-existing dirty files.
+- Credential restore guards need absence metadata as well as backup paths. If no original auth file existed, a successful swap must remove the temporary active file during restore instead of leaving the selected profile behind.

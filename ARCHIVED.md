@@ -179,3 +179,43 @@
 - Validation: `cargo test quota_config::tests::capture_rejects_symlinked_codex_auth`, `cargo test quota_config::tests::capture_prunes_stale_profile_files`, `cargo test quota_config::tests::save_writes_owner_only`, `cargo test quota_config::tests::`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - Completion artifacts: `src/quota_config.rs`
 - Remaining blockers: none.
+
+## `AD-011`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/symphony_command.rs`
+- Review result: passed. The workflow renderer validates hostile scalar inputs before writing shell/YAML workflow text, quotes branch/model/effort/path values on the generated command surfaces, and preserves the unattended Symphony operating contract. No wider trust-boundary or performance issue was found.
+- Validation: `cargo test symphony_command::tests::run_requires_symphony_root_when_unset`, `cargo test symphony_command::tests::shell_quote_escapes_single_quotes`, `cargo test symphony_command::tests::workflow_render_is_repo_specific`, `cargo test symphony_command::tests::workflow_render_rejects_hostile_branch`, `cargo test symphony_command::tests::workflow_render_rejects_hostile_model_and_effort`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-002`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/main.rs`, `src/task_parser.rs`
+- Review result: passed. The shared task parser correctly preserves status, body, dependency, verification, completion-artifact, and completion-path metadata needed by later queue/plan consumers. No parser-boundary regression was found in adjacent command surfaces.
+- Validation: `cargo test task_parser::tests::completion_path_placeholders_are_metadata_not_ready_work`, `cargo test task_parser::tests::dependencies_none_and_multiline_notes_are_stable`, `cargo test task_parser::tests::parses_all_plan_statuses_and_fields`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-016`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/qa_only_command.rs`
+- Review result: passed after fixing a [Required] dirty-state detection gap found during review. `auto qa-only` now reads `git status --porcelain=v1 -z` instead of human-formatted short status, so pre-existing dirty paths with spaces are fingerprinted by their real repo-relative path and subsequent source edits are still reported as violations.
+- Validation: `cargo test qa_only_command::tests::qa_only_allows_qa_md_and_auto_logs`, `cargo test qa_only_command::tests::qa_only_rejects_non_report_file_changes`, `cargo test qa_only_command::tests::qa_only_reports_preexisting_dirty_state`, `cargo test qa_only_command::tests::qa_only_detects_changes_to_preexisting_dirty_paths_with_spaces`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `src/qa_only_command.rs`
+- Remaining blockers: none.
+
+## `AD-013`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `scripts/run-task-verification.sh`, `scripts/verification_receipt.py`, `src/completion_artifacts.rs`
+- Review result: passed. The verification wrapper captures stdout/stderr summaries into receipts, successful command receipt-write failures fail closed, and completion evidence rejects receipt-backed zero-test runs for supported runners.
+- Validation: `cargo test completion_artifacts::tests::inspect_task_completion_evidence_accepts_quoted_command_receipts_with_argv`, `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_failed_receipts`, `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`, `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_pytest_tests`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-009`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_exec.rs`
+- Review result: passed after fixing a [Required] restore edge found during review. The quota swap guard now records whether each auth target existed before the swap, restores from backups when present, and removes temporary active auth files when no original existed. Credential writes also create missing auth parent directories before the owner-only write.
+- Validation: `cargo test quota_exec::tests::restore_credentials_restores_claude_json_backup`, `cargo test quota_exec::tests::swap_credentials_enforces_0o600`, `cargo test quota_exec::tests::swap_credentials_rejects_symlinked_claude_profile_paths`, `cargo test quota_exec::tests::swap_credentials_restores_claude_json_on_drop`, `cargo test quota_exec::tests::swap_credentials_removes_codex_auth_when_no_original_existed`, `cargo test quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error -- --nocapture`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `src/quota_exec.rs`
+- Remaining blockers: none.

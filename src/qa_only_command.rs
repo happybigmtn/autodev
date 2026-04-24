@@ -236,37 +236,40 @@ fn build_qa_only_dirty_state_report(
 }
 
 fn collect_dirty_state(repo_root: &Path) -> Result<Vec<DirtyEntry>> {
-    git_stdout(
+    let status = git_stdout(
         repo_root,
-        ["status", "--short", "--untracked-files=all", "--", "."],
-    )?
-    .lines()
-    .filter(|line| !line.trim().is_empty())
-    .map(|line| dirty_entry_from_status_line(repo_root, line))
-    .collect()
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?;
+    dirty_entries_from_porcelain_z(repo_root, &status)
 }
 
-fn dirty_entry_from_status_line(repo_root: &Path, line: &str) -> Result<DirtyEntry> {
-    let (status, path) = parse_status_line(line)?;
-    let fingerprint = fingerprint_dirty_path(repo_root, &path)?;
-    Ok(DirtyEntry {
-        status,
-        path,
-        fingerprint,
-    })
-}
-
-fn parse_status_line(line: &str) -> Result<(String, String)> {
-    if line.len() < 4 {
-        bail!("unexpected git status --short line: {line:?}");
+fn dirty_entries_from_porcelain_z(repo_root: &Path, status: &str) -> Result<Vec<DirtyEntry>> {
+    let mut entries = Vec::new();
+    let mut records = status.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            bail!("unexpected git status --porcelain record: {record:?}");
+        }
+        let state = record[..2].to_string();
+        let path = record[3..].to_string();
+        let fingerprint = fingerprint_dirty_path(repo_root, &path)?;
+        entries.push(DirtyEntry {
+            status: state.clone(),
+            path,
+            fingerprint,
+        });
+        if state.contains('R') || state.contains('C') {
+            let _ = records.next();
+        }
     }
-    let status = line[..2].to_string();
-    let path = line[3..]
-        .rsplit_once(" -> ")
-        .map(|(_, renamed_to)| renamed_to)
-        .unwrap_or(&line[3..])
-        .to_string();
-    Ok((status, path))
+    Ok(entries)
 }
 
 fn fingerprint_dirty_path(repo_root: &Path, path: &str) -> Result<String> {
@@ -470,5 +473,25 @@ mod tests {
         assert!(rendered.contains("src/main.rs"));
         assert!(rendered.contains("Pre-existing dirty state before qa-only:"));
         assert!(rendered.contains("README.md"));
+    }
+
+    #[test]
+    fn qa_only_detects_changes_to_preexisting_dirty_paths_with_spaces() {
+        let repo = init_repo("quoted-paths");
+        let spaced_path = repo.path().join("source file.rs");
+        fs::write(&spaced_path, "original\n").expect("failed to write spaced path");
+        run_git_in(repo.path(), ["add", "source file.rs"]);
+        run_git_in(repo.path(), ["commit", "-m", "add spaced path"]);
+
+        fs::write(&spaced_path, "preexisting dirty\n").expect("failed to dirty spaced path");
+        let baseline = collect_dirty_state(repo.path()).expect("baseline status should work");
+
+        fs::write(&spaced_path, "qa-only changed it\n").expect("failed to mutate spaced path");
+        let report =
+            qa_only_dirty_state_report(repo.path(), &baseline, &allowed_paths(repo.path()))
+                .expect("dirty state report should build");
+
+        assert!(report.has_violations(), "{}", report.render());
+        assert!(report.render().contains("source file.rs"));
     }
 }
