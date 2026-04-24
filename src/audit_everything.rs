@@ -104,6 +104,10 @@ struct EverythingManifest {
     context: ContextState,
     files: Vec<FileState>,
     groups: Vec<GroupState>,
+    #[serde(default)]
+    remediation_plan: StageState,
+    #[serde(default)]
+    remediation_tasks: Vec<RemediationTaskState>,
     final_review: StageState,
     merge: StageState,
 }
@@ -133,6 +137,22 @@ struct GroupState {
     report_path: String,
     synthesis_status: StageStatus,
     remediation_status: StageStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RemediationTaskState {
+    id: String,
+    group: String,
+    slug: String,
+    report_path: String,
+    owned_paths: Vec<String>,
+    dependencies: Vec<String>,
+    lane_index: usize,
+    lane_root: String,
+    lane_repo_root: String,
+    base_commit: Option<String>,
+    status: StageStatus,
+    note: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -166,6 +186,11 @@ struct PhaseConfig {
     model: String,
     effort: String,
     codex_bin: PathBuf,
+}
+
+struct RemediationLaneResult {
+    task: RemediationTaskState,
+    error: Option<String>,
 }
 
 pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
@@ -215,6 +240,7 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
                 run_final_review_phase(&args, &paths, &mut manifest).await?;
                 mark_merge_skipped(&paths, &mut manifest, "--report-only")?;
             } else {
+                run_remediation_plan_phase(&paths, &mut manifest)?;
                 run_remediation_phase(&args, &paths, &mut manifest).await?;
                 run_final_review_phase(&args, &paths, &mut manifest).await?;
                 if args.no_everything_merge {
@@ -235,11 +261,16 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
             require_first_pass_complete(&manifest)?;
             run_synthesis_phase(&args, &paths, &mut manifest).await?;
         }
+        AuditEverythingPhase::PlanRemediation => {
+            require_synthesis_complete(&manifest)?;
+            run_remediation_plan_phase(&paths, &mut manifest)?;
+        }
         AuditEverythingPhase::Remediate => {
             require_synthesis_complete(&manifest)?;
             if args.report_only {
                 mark_remediation_skipped(&paths, &mut manifest, "--report-only")?;
             } else {
+                run_remediation_plan_phase(&paths, &mut manifest)?;
                 run_remediation_phase(&args, &paths, &mut manifest).await?;
             }
         }
@@ -334,6 +365,8 @@ fn load_or_create_run(
         context: ContextState::default(),
         files: Vec::new(),
         groups: Vec::new(),
+        remediation_plan: StageState::default(),
+        remediation_tasks: Vec::new(),
         final_review: StageState::default(),
         merge: StageState::default(),
     };
@@ -552,13 +585,13 @@ async fn run_remediation_phase(
     paths: &RunPaths,
     manifest: &mut EverythingManifest,
 ) -> Result<()> {
-    let pending = manifest
-        .groups
+    reset_interrupted_remediation_tasks(manifest);
+    let pending_count = manifest
+        .remediation_tasks
         .iter()
-        .filter(|group| !matches!(group.remediation_status, StageStatus::Complete))
-        .cloned()
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
+        .filter(|task| !matches!(task.status, StageStatus::Complete | StageStatus::Skipped))
+        .count();
+    if pending_count == 0 {
         println!("remediation: complete (resume)");
         return Ok(());
     }
@@ -567,21 +600,166 @@ async fn run_remediation_phase(
         effort: args.remediation_effort.clone(),
         codex_bin: args.codex_bin.clone(),
     };
-    let workers = args.remediation_threads.clamp(1, 15);
+    let workers = args.remediation_threads.clamp(1, 10);
     println!(
-        "remediation: {} group(s), {} worker(s)",
-        pending.len(),
-        workers
+        "remediation: {} task(s), {} lane(s)",
+        pending_count, workers
     );
-    run_group_workers(
-        paths,
-        pending,
-        workers,
-        config,
-        GroupPhase::Remediation,
-        manifest,
-    )
-    .await
+    run_remediation_lanes(paths, workers, config, manifest).await
+}
+
+fn run_remediation_plan_phase(paths: &RunPaths, manifest: &mut EverythingManifest) -> Result<()> {
+    manifest.remediation_plan.status = StageStatus::Running;
+    manifest.remediation_tasks = build_remediation_tasks(paths, manifest)?;
+    write_remediation_plan_files(paths, manifest)?;
+    manifest.remediation_plan.status = StageStatus::Complete;
+    manifest.remediation_plan.artifact = Some(path_display(&remediation_plan_markdown_path(paths)));
+    manifest.remediation_plan.note = Some(format!(
+        "{} task(s), {} dependency edge(s)",
+        manifest.remediation_tasks.len(),
+        manifest
+            .remediation_tasks
+            .iter()
+            .map(|task| task.dependencies.len())
+            .sum::<usize>()
+    ));
+    write_manifest(paths, manifest)?;
+    commit_worktree_changes(paths, manifest)?;
+    Ok(())
+}
+
+async fn run_remediation_lanes(
+    paths: &RunPaths,
+    workers: usize,
+    config: PhaseConfig,
+    manifest: &mut EverythingManifest,
+) -> Result<()> {
+    let mut active = BTreeSet::<String>::new();
+    let mut join_set = JoinSet::<RemediationLaneResult>::new();
+    let mut failures = Vec::new();
+
+    loop {
+        while active.len() < workers {
+            let Some(index) = next_ready_remediation_task_index(manifest, &active) else {
+                break;
+            };
+            match try_harvest_existing_remediation_lane(paths, manifest, index) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    let task_id = manifest.remediation_tasks[index].id.clone();
+                    let error = format!("{err:#}");
+                    manifest.remediation_tasks[index].status = StageStatus::Failed;
+                    manifest.remediation_tasks[index].note = Some(error.clone());
+                    failures.push(format!("{task_id}: {error}"));
+                    write_manifest(paths, manifest)?;
+                    continue;
+                }
+            }
+            let task_id = manifest.remediation_tasks[index].id.clone();
+            manifest.remediation_tasks[index].status = StageStatus::Running;
+            manifest.remediation_tasks[index].note = Some("lane dispatched".to_string());
+            write_manifest(paths, manifest)?;
+
+            let mut task = manifest.remediation_tasks[index].clone();
+            let paths_clone = RunPaths {
+                host_root: paths.host_root.clone(),
+                manifest_path: paths.manifest_path.clone(),
+                latest_path: paths.latest_path.clone(),
+                worktree_root: paths.worktree_root.clone(),
+                report_root: paths.report_root.clone(),
+            };
+            let config_clone = config.clone();
+            active.insert(task_id);
+            join_set.spawn(async move {
+                if let Err(err) =
+                    run_one_remediation_lane(&paths_clone, &mut task, &config_clone).await
+                {
+                    return RemediationLaneResult {
+                        task,
+                        error: Some(format!("{err:#}")),
+                    };
+                }
+                RemediationLaneResult { task, error: None }
+            });
+        }
+
+        if active.is_empty() {
+            break;
+        }
+
+        let Some(result) = join_set.join_next().await else {
+            bail!("remediation lane scheduler lost all workers while tasks were active");
+        };
+        let lane_result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                failures.push(format!("lane task panicked: {err}"));
+                continue;
+            }
+        };
+        active.remove(&lane_result.task.id);
+        let task_index = manifest
+            .remediation_tasks
+            .iter()
+            .position(|task| task.id == lane_result.task.id)
+            .with_context(|| format!("missing remediation task {}", lane_result.task.id))?;
+        manifest.remediation_tasks[task_index].base_commit = lane_result.task.base_commit.clone();
+
+        if let Some(error) = lane_result.error {
+            manifest.remediation_tasks[task_index].status = StageStatus::Failed;
+            manifest.remediation_tasks[task_index].note = Some(error.clone());
+            failures.push(format!(
+                "{}: {error}",
+                manifest.remediation_tasks[task_index].id
+            ));
+            write_manifest(paths, manifest)?;
+            continue;
+        }
+
+        match land_remediation_lane(paths, &lane_result.task) {
+            Ok(changed_files) => {
+                manifest.remediation_tasks[task_index].status = StageStatus::Complete;
+                manifest.remediation_tasks[task_index].note =
+                    Some(format!("landed {} changed file(s)", changed_files.len()));
+                if let Some(group) = manifest
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.name == lane_result.task.group)
+                {
+                    group.remediation_status = StageStatus::Complete;
+                }
+                write_manifest(paths, manifest)?;
+            }
+            Err(err) => {
+                let error = format!("{err:#}");
+                manifest.remediation_tasks[task_index].status = StageStatus::Failed;
+                manifest.remediation_tasks[task_index].note = Some(error.clone());
+                failures.push(format!(
+                    "{}: {error}",
+                    manifest.remediation_tasks[task_index].id
+                ));
+                write_manifest(paths, manifest)?;
+            }
+        }
+    }
+
+    write_remediation_plan_files(paths, manifest)?;
+    commit_worktree_changes(paths, manifest)?;
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("remediation failure: {failure}");
+        }
+        bail!("remediation failed for {} task(s)", failures.len());
+    }
+    if let Some(blocked) = first_blocked_remediation_task(manifest) {
+        bail!(
+            "remediation stopped with no dependency-ready lane for `{}`; dependencies: {}",
+            blocked.id,
+            blocked.dependencies.join(", ")
+        );
+    }
+    Ok(())
 }
 
 async fn run_final_review_phase(
@@ -679,10 +857,527 @@ fn commit_worktree_changes(paths: &RunPaths, manifest: &EverythingManifest) -> R
     Ok(())
 }
 
+fn build_remediation_tasks(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+) -> Result<Vec<RemediationTaskState>> {
+    let old_by_group = manifest
+        .remediation_tasks
+        .iter()
+        .map(|task| (task.group.clone(), task.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let dependency_groups = remediation_dependency_groups(&paths.worktree_root, manifest)?;
+    let group_to_id = manifest
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.name.clone(), format!("AUD-REM-{:03}", index + 1)))
+        .collect::<BTreeMap<_, _>>();
+    let mut tasks = Vec::new();
+    for (index, group) in manifest.groups.iter().enumerate() {
+        let id = group_to_id
+            .get(&group.name)
+            .cloned()
+            .unwrap_or_else(|| format!("AUD-REM-{:03}", index + 1));
+        let lane_index = index + 1;
+        let lane_root = paths
+            .host_root
+            .join("remediation-lanes")
+            .join(format!("lane-{lane_index}"));
+        let dependencies = dependency_groups
+            .get(&group.name)
+            .into_iter()
+            .flat_map(|groups| groups.iter())
+            .filter_map(|group_name| group_to_id.get(group_name))
+            .filter(|dependency_id| *dependency_id != &id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous = old_by_group.get(&group.name);
+        let status = match previous.map(|task| task.status) {
+            Some(StageStatus::Complete) => StageStatus::Complete,
+            Some(StageStatus::Skipped) => StageStatus::Skipped,
+            _ if matches!(group.remediation_status, StageStatus::Complete) => StageStatus::Complete,
+            _ => StageStatus::Pending,
+        };
+        tasks.push(RemediationTaskState {
+            id,
+            group: group.name.clone(),
+            slug: group.slug.clone(),
+            report_path: group.report_path.clone(),
+            owned_paths: group.files.clone(),
+            dependencies,
+            lane_index,
+            lane_root: path_display(&lane_root),
+            lane_repo_root: path_display(&lane_root.join("repo")),
+            base_commit: previous.and_then(|task| task.base_commit.clone()),
+            status,
+            note: previous.and_then(|task| task.note.clone()),
+        });
+    }
+    Ok(tasks)
+}
+
+fn remediation_dependency_groups(
+    repo_root: &Path,
+    manifest: &EverythingManifest,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut dependencies = manifest
+        .groups
+        .iter()
+        .map(|group| (group.name.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let source_groups = manifest
+        .groups
+        .iter()
+        .filter(|group| group.files.iter().any(|path| is_rust_or_backend_path(path)))
+        .map(|group| group.name.clone())
+        .collect::<Vec<_>>();
+    let test_groups = manifest
+        .groups
+        .iter()
+        .filter(|group| group.files.iter().any(|path| is_test_or_perf_path(path)))
+        .map(|group| group.name.clone())
+        .collect::<Vec<_>>();
+
+    for group in &manifest.groups {
+        if group
+            .files
+            .iter()
+            .any(|path| is_docs_or_devex_path(path) || is_context_path(path))
+        {
+            extend_group_dependencies(&mut dependencies, &group.name, &source_groups);
+            extend_group_dependencies(&mut dependencies, &group.name, &test_groups);
+        }
+        if group.files.iter().any(|path| is_test_or_perf_path(path)) {
+            extend_group_dependencies(&mut dependencies, &group.name, &source_groups);
+        }
+        if group
+            .files
+            .iter()
+            .any(|path| is_release_or_deploy_path(path))
+        {
+            extend_group_dependencies(&mut dependencies, &group.name, &source_groups);
+            extend_group_dependencies(&mut dependencies, &group.name, &test_groups);
+        }
+    }
+
+    for (group, deps) in cargo_group_dependencies(repo_root, manifest)? {
+        extend_group_dependencies(&mut dependencies, &group, &deps);
+    }
+    for (group, deps) in &mut dependencies {
+        deps.remove(group);
+    }
+    Ok(dependencies)
+}
+
+fn extend_group_dependencies(
+    dependencies: &mut BTreeMap<String, BTreeSet<String>>,
+    group: &str,
+    deps: &[String],
+) {
+    if let Some(existing) = dependencies.get_mut(group) {
+        existing.extend(deps.iter().filter(|dep| dep.as_str() != group).cloned());
+    }
+}
+
+fn cargo_group_dependencies(
+    repo_root: &Path,
+    manifest: &EverythingManifest,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut package_to_group = BTreeMap::new();
+    let mut group_to_manifest = BTreeMap::new();
+    for group in &manifest.groups {
+        let root = if group.name == "." {
+            repo_root.to_path_buf()
+        } else {
+            repo_root.join(&group.name)
+        };
+        let cargo = root.join("Cargo.toml");
+        if let Ok(raw) = fs::read_to_string(&cargo) {
+            if let Ok(value) = raw.parse::<toml::Value>() {
+                if let Some(name) = value
+                    .get("package")
+                    .and_then(|pkg| pkg.get("name"))
+                    .and_then(|name| name.as_str())
+                {
+                    package_to_group.insert(name.to_string(), group.name.clone());
+                    group_to_manifest.insert(group.name.clone(), value);
+                }
+            }
+        }
+    }
+
+    let mut dependencies = BTreeMap::new();
+    for (group, manifest_value) in group_to_manifest {
+        let mut deps = Vec::new();
+        for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(table) = manifest_value
+                .get(table_name)
+                .and_then(|value| value.as_table())
+            {
+                for package in table.keys() {
+                    if let Some(dep_group) = package_to_group.get(package) {
+                        if dep_group != &group && !deps.contains(dep_group) {
+                            deps.push(dep_group.clone());
+                        }
+                    }
+                }
+            }
+        }
+        dependencies.insert(group, deps);
+    }
+    Ok(dependencies)
+}
+
+fn remediation_plan_markdown_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("REMEDIATION-PLAN.md")
+}
+
+fn remediation_plan_json_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("REMEDIATION-PLAN.json")
+}
+
+fn write_remediation_plan_files(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    let mut body = String::new();
+    body.push_str("# Remediation Plan\n\n");
+    body.push_str("Generated from synthesized audit reports. The host scheduler owns this file; remediation lanes update their assigned group report and commit source/doc/test changes in isolated worktrees.\n\n");
+    body.push_str("## Tasks\n\n");
+    for task in &manifest.remediation_tasks {
+        let deps = if task.dependencies.is_empty() {
+            "none".to_string()
+        } else {
+            task.dependencies.join(", ")
+        };
+        body.push_str(&format!(
+            "### {} `{}`\n\n- Status: {:?}\n- Group: `{}`\n- Report: `{}`\n- Lane: `{}`\n- Dependencies: {}\n",
+            task.id, task.slug, task.status, task.group, task.report_path, task.lane_root, deps
+        ));
+        if let Some(note) = task.note.as_deref().filter(|note| !note.trim().is_empty()) {
+            body.push_str(&format!("- Note: {}\n", note.trim().replace('\n', " ")));
+        }
+        body.push_str("- Owned paths:\n");
+        for path in task.owned_paths.iter().take(200) {
+            body.push_str(&format!("  - `{path}`\n"));
+        }
+        if task.owned_paths.len() > 200 {
+            body.push_str(&format!(
+                "  - _{} additional paths omitted from this summary_\n",
+                task.owned_paths.len() - 200
+            ));
+        }
+        body.push('\n');
+    }
+    atomic_write(&remediation_plan_markdown_path(paths), body.as_bytes()).with_context(|| {
+        format!(
+            "failed to write {}",
+            remediation_plan_markdown_path(paths).display()
+        )
+    })?;
+    atomic_write(
+        &remediation_plan_json_path(paths),
+        &serde_json::to_vec_pretty(&manifest.remediation_tasks)?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            remediation_plan_json_path(paths).display()
+        )
+    })
+}
+
+fn reset_interrupted_remediation_tasks(manifest: &mut EverythingManifest) {
+    for task in &mut manifest.remediation_tasks {
+        if matches!(task.status, StageStatus::Running) {
+            task.status = StageStatus::Pending;
+            task.note = Some("reset from interrupted lane".to_string());
+        }
+    }
+}
+
+fn next_ready_remediation_task_index(
+    manifest: &EverythingManifest,
+    active: &BTreeSet<String>,
+) -> Option<usize> {
+    let complete = manifest
+        .remediation_tasks
+        .iter()
+        .filter(|task| matches!(task.status, StageStatus::Complete | StageStatus::Skipped))
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    manifest
+        .remediation_tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| {
+            !active.contains(&task.id)
+                && !matches!(
+                    task.status,
+                    StageStatus::Complete | StageStatus::Skipped | StageStatus::Running
+                )
+                && task
+                    .dependencies
+                    .iter()
+                    .all(|dependency| complete.contains(dependency.as_str()))
+        })
+        .map(|(index, _)| index)
+}
+
+fn first_blocked_remediation_task(manifest: &EverythingManifest) -> Option<&RemediationTaskState> {
+    manifest
+        .remediation_tasks
+        .iter()
+        .find(|task| !matches!(task.status, StageStatus::Complete | StageStatus::Skipped))
+}
+
+fn try_harvest_existing_remediation_lane(
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+    task_index: usize,
+) -> Result<bool> {
+    let task = manifest.remediation_tasks[task_index].clone();
+    let lane_repo_root = PathBuf::from(&task.lane_repo_root);
+    if !lane_repo_root.join(".git").exists() || task.base_commit.is_none() {
+        return Ok(false);
+    }
+    let status = git_stdout(&lane_repo_root, ["status", "--short"])?;
+    let head = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if !status.trim().is_empty() || Some(head.as_str()) == task.base_commit.as_deref() {
+        return Ok(false);
+    }
+    let changed_files = land_remediation_lane(paths, &task)?;
+    manifest.remediation_tasks[task_index].status = StageStatus::Complete;
+    manifest.remediation_tasks[task_index].note = Some(format!(
+        "resumed and landed {} changed file(s)",
+        changed_files.len()
+    ));
+    if let Some(group) = manifest
+        .groups
+        .iter_mut()
+        .find(|group| group.name == task.group)
+    {
+        group.remediation_status = StageStatus::Complete;
+    }
+    write_manifest(paths, manifest)?;
+    Ok(true)
+}
+
+async fn run_one_remediation_lane(
+    paths: &RunPaths,
+    task: &mut RemediationTaskState,
+    config: &PhaseConfig,
+) -> Result<()> {
+    prepare_remediation_lane_repo(paths, task)?;
+    let lane_root = PathBuf::from(&task.lane_root);
+    let lane_repo_root = PathBuf::from(&task.lane_repo_root);
+    let prompt = build_remediation_lane_prompt(paths, task);
+    let prompt_path = lane_root.join(format!("{}-prompt.md", task.id));
+    let stderr_path = lane_root.join(format!("{}-stderr.log", task.id));
+    let stdout_path = lane_root.join(format!("{}-stdout.log", task.id));
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    let status = run_codex_exec_max_context(
+        &lane_repo_root,
+        &prompt,
+        &config.model,
+        &config.effort,
+        &config.codex_bin,
+        &stderr_path,
+        Some(&stdout_path),
+        &format!("auto audit remediation {}", task.id),
+    )
+    .await?;
+    if !status.success() {
+        bail!(
+            "remediation lane {} failed with status {status}; see {}",
+            task.id,
+            stderr_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn prepare_remediation_lane_repo(paths: &RunPaths, task: &mut RemediationTaskState) -> Result<()> {
+    let lane_root = PathBuf::from(&task.lane_root);
+    let lane_repo_root = PathBuf::from(&task.lane_repo_root);
+    if lane_repo_root.join(".git").exists() {
+        if task.base_commit.is_none() {
+            task.base_commit = Some(infer_existing_remediation_lane_base(&lane_repo_root)?);
+        }
+        return Ok(());
+    }
+    if lane_root.exists() && !lane_repo_root.exists() {
+        fs::remove_dir_all(&lane_root)
+            .with_context(|| format!("failed to remove incomplete {}", lane_root.display()))?;
+    }
+    fs::create_dir_all(&lane_root)
+        .with_context(|| format!("failed to create {}", lane_root.display()))?;
+    let base_commit = git_stdout(&paths.worktree_root, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    task.base_commit = Some(base_commit);
+    clone_audit_lane_repo(&paths.worktree_root, &lane_repo_root)?;
+    Ok(())
+}
+
+fn infer_existing_remediation_lane_base(lane_repo_root: &Path) -> Result<String> {
+    let branch = git_stdout(lane_repo_root, ["branch", "--show-current"])?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Ok(git_stdout(lane_repo_root, ["rev-parse", "HEAD"])?
+            .trim()
+            .to_string());
+    }
+    let remotes = git_stdout(lane_repo_root, ["remote"]).unwrap_or_default();
+    let remote = if remotes.lines().any(|remote| remote.trim() == "canonical") {
+        "canonical"
+    } else {
+        "origin"
+    };
+    let _ = run_git(lane_repo_root, ["fetch", "--quiet", remote, &branch]);
+    let base = git_stdout(lane_repo_root, ["merge-base", "HEAD", "FETCH_HEAD"])?
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        Ok(git_stdout(lane_repo_root, ["rev-parse", "HEAD"])?
+            .trim()
+            .to_string())
+    } else {
+        Ok(base)
+    }
+}
+
+fn clone_audit_lane_repo(repo_root: &Path, lane_repo_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg("--local")
+        .arg(repo_root)
+        .arg(lane_repo_root)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to clone audit lane repo from {} to {}",
+                repo_root.display(),
+                lane_repo_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git clone failed for audit lane {}: {}",
+            lane_repo_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let remotes = git_stdout(lane_repo_root, ["remote"]).unwrap_or_default();
+    if remotes.lines().any(|remote| remote.trim() == "origin") {
+        run_git(lane_repo_root, ["remote", "rename", "origin", "canonical"])?;
+    }
+    Ok(())
+}
+
+fn build_remediation_lane_prompt(paths: &RunPaths, task: &RemediationTaskState) -> String {
+    let deps = if task.dependencies.is_empty() {
+        "none".to_string()
+    } else {
+        task.dependencies.join(", ")
+    };
+    let owned_paths = task
+        .owned_paths
+        .iter()
+        .map(|path| format!("- `{path}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let skill_policy = render_skill_policy_for_paths(&task.owned_paths);
+    format!(
+        r#"You are an isolated remediation lane for `auto audit --everything`.
+
+Repository root for this lane: `{repo}`
+Canonical audit worktree: `{canonical}`
+Task: `{task_id}`
+Group: `{group}`
+Report: `{report}`
+Dependencies already satisfied: {deps}
+
+You are not alone in the audit. The host owns the dependency graph, landing, and `REMEDIATION-PLAN.md`.
+
+Hard boundaries:
+- Read `AGENTS.md`, `ARCHITECTURE.md`, `audit/everything/*/CONTEXT-BUNDLE.md`, the gstack skill policy, doctrine if present, and the assigned report.
+- If this lane already contains partial work from an interrupted run, inspect it first and continue from that state instead of discarding it.
+- Keep edits centered on the owned paths and directly necessary adjacent tests/docs.
+- Do not edit `REMEDIATION-PLAN.md` or `REMEDIATION-PLAN.json`; the host updates those after landing.
+- Do not push to any remote.
+- Create one or more local git commits before finishing.
+- Finish with `git status --short` clean.
+- If validation is blocked by missing external infrastructure, print `AUTO_ENV_BLOCKER: <short reason>` and exit non-zero.
+- If a validation command reports `0 tests`, do not count it as passing evidence.
+
+Selected gstack lenses:
+{skill_policy}
+
+Owned paths:
+{owned_paths}
+
+Required work:
+- Apply only recommendations from `{report}` that are supported by repository evidence.
+- Update `{report}` with completed recommendations, changed files, validation commands, and remaining blockers.
+- Run the narrowest meaningful validation for this group.
+- Commit all lane changes locally with a message starting `audit: remediate {task_id}`.
+"#,
+        repo = task.lane_repo_root,
+        canonical = paths.worktree_root.display(),
+        task_id = task.id,
+        group = task.group,
+        report = task.report_path,
+        deps = deps,
+        skill_policy = skill_policy,
+        owned_paths = owned_paths,
+    )
+}
+
+fn render_skill_policy_for_paths(paths: &[String]) -> String {
+    let mut selected = Vec::new();
+    push_unique(&mut selected, "review");
+    push_unique(&mut selected, "health");
+    push_unique(&mut selected, "investigate");
+    push_unique(&mut selected, "careful");
+    for path in paths {
+        for skill in selected_skill_names_for_file(path) {
+            push_unique(&mut selected, skill);
+        }
+    }
+    render_skill_policy(&selected)
+}
+
+fn land_remediation_lane(paths: &RunPaths, task: &RemediationTaskState) -> Result<Vec<String>> {
+    let lane_repo_root = PathBuf::from(&task.lane_repo_root);
+    let base_commit = task
+        .base_commit
+        .as_deref()
+        .context("remediation lane is missing base commit")?;
+    let status = git_stdout(&lane_repo_root, ["status", "--short"])?;
+    if !status.trim().is_empty() {
+        bail!("lane {} left a dirty worktree:\n{}", task.id, status.trim());
+    }
+    let lane_head = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if lane_head == base_commit {
+        bail!("lane {} exited without a local commit", task.id);
+    }
+    let changed_files = audit_lane_changed_files(&lane_repo_root, base_commit, &lane_head)?;
+    fetch_lane_commit(&paths.worktree_root, &lane_repo_root, &lane_head)?;
+    if !git_ref_is_ancestor(&paths.worktree_root, "FETCH_HEAD", "HEAD")? {
+        cherry_pick_lane_range(&paths.worktree_root, base_commit, "FETCH_HEAD", true)?;
+    }
+    Ok(changed_files)
+}
+
 #[derive(Clone, Copy)]
 enum GroupPhase {
     Synthesis,
-    Remediation,
 }
 
 async fn run_group_workers(
@@ -716,10 +1411,7 @@ async fn run_group_workers(
         match result {
             Ok(Ok(slug)) => {
                 if let Some(group) = manifest.groups.iter_mut().find(|group| group.slug == slug) {
-                    match phase {
-                        GroupPhase::Synthesis => group.synthesis_status = StageStatus::Complete,
-                        GroupPhase::Remediation => group.remediation_status = StageStatus::Complete,
-                    }
+                    group.synthesis_status = StageStatus::Complete;
                 }
                 write_manifest(paths, manifest)?;
             }
@@ -764,11 +1456,9 @@ async fn run_one_group_phase(
     require_nonempty_file(&report_path)?;
     let slug = match phase {
         GroupPhase::Synthesis => "synthesis",
-        GroupPhase::Remediation => "remediation",
     };
     let prompt = match phase {
         GroupPhase::Synthesis => build_synthesis_prompt(paths, group),
-        GroupPhase::Remediation => build_remediation_prompt(paths, group),
     };
     run_codex_phase_for_artifact(
         paths,
@@ -991,6 +1681,7 @@ fn skill_summary(skill: &str) -> &'static str {
 }
 
 fn is_context_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path == "agents.md"
         || path == "architecture.md"
         || path == "claude.md"
@@ -1001,6 +1692,7 @@ fn is_context_path(path: &str) -> bool {
 }
 
 fn is_rust_or_backend_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.ends_with(".rs")
         || path.ends_with(".toml")
         || path.starts_with("src/")
@@ -1012,6 +1704,7 @@ fn is_rust_or_backend_path(path: &str) -> bool {
 }
 
 fn is_security_or_ops_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.contains("auth")
         || path.contains("secret")
         || path.contains("credential")
@@ -1029,6 +1722,7 @@ fn is_security_or_ops_path(path: &str) -> bool {
 }
 
 fn is_ui_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.ends_with(".tsx")
         || path.ends_with(".jsx")
         || path.ends_with(".css")
@@ -1045,6 +1739,7 @@ fn is_ui_path(path: &str) -> bool {
 }
 
 fn is_docs_or_devex_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.ends_with(".md")
         || path.starts_with("docs/")
         || path.starts_with("examples/")
@@ -1056,6 +1751,7 @@ fn is_docs_or_devex_path(path: &str) -> bool {
 }
 
 fn is_test_or_perf_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.starts_with("tests/")
         || path.contains("/tests/")
         || path.contains("test")
@@ -1066,6 +1762,7 @@ fn is_test_or_perf_path(path: &str) -> bool {
 }
 
 fn is_release_or_deploy_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     path.contains("release")
         || path.contains("deploy")
         || path.contains("ship")
@@ -1187,45 +1884,6 @@ Revise `{report}` in place. Keep every file represented. Tighten or correct the 
 Use the selected lenses as a compact prompt injection, not as permission to bulk-load unrelated skill files. Keep the output grounded in repository evidence.
 
 Do not edit source code in this phase. Only edit `{report}` and optional notes next to it.
-"#,
-        repo = paths.worktree_root.display(),
-        group = group.name,
-        report = group.report_path,
-        skill_policy = skill_policy,
-    )
-}
-
-fn build_remediation_prompt(paths: &RunPaths, group: &GroupState) -> String {
-    let skill_policy = selected_skill_policy_for_group(group);
-    format!(
-        r#"You are the crate-by-crate remediation worker for `auto audit --everything`.
-
-Repository root: `{repo}`
-Group: `{group}`
-Report: `{report}`
-
-You are not alone in the codebase. Other audit phases may have made changes. Preserve existing changes and do not revert unrelated work.
-
-Read `AGENTS.md`, `ARCHITECTURE.md`, doctrine if present, and `{report}`. Apply bounded improvements for this group only:
-- code refactors that are clearly supported by the report
-- test additions or corrections needed for changed behavior
-- documentation clarifications when they make future agent work more legible
-- deletion/retirement only when the report confidence is high and the repo evidence confirms it
-
-Selected gstack lenses for this group:
-{skill_policy}
-
-Use these lenses prescriptively. Directly run browser/QA/benchmark/devex/documentation checks only when the group surface and report recommendations call for them and the required local services or commands are available.
-
-Keep the write set centered on this group. If a recommendation requires broad cross-group work, leave it in the report as a follow-up instead of expanding scope.
-
-Update `{report}` as you go:
-- mark completed recommendations
-- record changed files
-- record validation commands run and their result
-- record remaining blockers honestly
-
-Before finishing, run the narrowest meaningful validation you can derive for this group. If validation is blocked by missing external infrastructure, record that blocker in the report.
 "#,
         repo = paths.worktree_root.display(),
         group = group.name,
@@ -1630,6 +2288,14 @@ fn mark_remediation_skipped(
             group.remediation_status = StageStatus::Skipped;
         }
     }
+    manifest.remediation_plan.status = StageStatus::Skipped;
+    manifest.remediation_plan.note = Some(reason.to_string());
+    for task in &mut manifest.remediation_tasks {
+        if !matches!(task.status, StageStatus::Complete) {
+            task.status = StageStatus::Skipped;
+            task.note = Some(reason.to_string());
+        }
+    }
     manifest.merge.status = StageStatus::Skipped;
     manifest.merge.note = Some(format!("remediation skipped: {reason}"));
     write_manifest(paths, manifest)
@@ -1674,11 +2340,21 @@ fn print_status(manifest: &EverythingManifest) {
         .iter()
         .filter(|group| matches!(group.remediation_status, StageStatus::Complete))
         .count();
+    let remediation_tasks_done = manifest
+        .remediation_tasks
+        .iter()
+        .filter(|task| matches!(task.status, StageStatus::Complete))
+        .count();
     println!("status");
     println!("context:     {:?}", manifest.context.status);
     println!("files:       {files_done}/{}", manifest.files.len());
     println!("synthesis:   {synthesis_done}/{}", manifest.groups.len());
     println!("remediation: {remediation_done}/{}", manifest.groups.len());
+    println!("remed plan:  {:?}", manifest.remediation_plan.status);
+    println!(
+        "remed tasks: {remediation_tasks_done}/{}",
+        manifest.remediation_tasks.len()
+    );
     println!("final review:{:?}", manifest.final_review.status);
     println!("merge:       {:?}", manifest.merge.status);
 }
@@ -1733,6 +2409,95 @@ fn parse_origin_head_branch(origin_head: &str) -> Option<String> {
 
 fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
     git_ref_exists(repo_root, &format!("refs/remotes/origin/{branch}"))
+}
+
+fn audit_lane_changed_files(
+    repo_root: &Path,
+    base_commit: &str,
+    head_ref: &str,
+) -> Result<Vec<String>> {
+    if base_commit == head_ref {
+        return Ok(Vec::new());
+    }
+    let range = format!("{base_commit}..{head_ref}");
+    let output = git_stdout(repo_root, ["diff", "--name-only", &range])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn fetch_lane_commit(repo_root: &Path, lane_repo_root: &Path, lane_head: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("fetch")
+        .arg(lane_repo_root)
+        .arg(lane_head)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to fetch lane commit {} from {}",
+                lane_head,
+                lane_repo_root.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "git fetch failed in {}: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
+fn git_ref_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed checking whether {ancestor} is an ancestor of {descendant} in {}",
+                repo_root.display()
+            )
+        })?;
+    Ok(output.status.success())
+}
+
+fn cherry_pick_lane_range(
+    repo_root: &Path,
+    base_commit: &str,
+    head_ref: &str,
+    abort_on_failure: bool,
+) -> Result<()> {
+    if audit_lane_changed_files(repo_root, base_commit, head_ref)?.is_empty() {
+        return Ok(());
+    }
+    let range = format!("{base_commit}..{head_ref}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("cherry-pick")
+        .arg("--empty=drop")
+        .arg(&range)
+        .output()
+        .with_context(|| format!("failed to cherry-pick {range} in {}", repo_root.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if abort_on_failure {
+        let _ = run_git(repo_root, ["cherry-pick", "--abort"]);
+    }
+    bail!(
+        "git cherry-pick failed in {}: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 }
 
 fn git_ref_exists(repo_root: &Path, reference: &str) -> bool {
@@ -1933,5 +2698,91 @@ mod tests {
         assert!(policy.contains("`ship`"));
         assert!(policy.contains("`land-and-deploy`"));
         assert!(policy.contains("`canary`"));
+    }
+
+    #[test]
+    fn remediation_graph_orders_docs_and_tests_after_sources() {
+        let manifest = manifest_with_groups(vec![
+            group_for_test("crates/core", &["crates/core/src/lib.rs"]),
+            group_for_test("tests", &["tests/core_test.rs"]),
+            group_for_test("docs", &["docs/architecture.md"]),
+        ]);
+        let graph = remediation_dependency_groups(Path::new("."), &manifest)
+            .expect("dependency graph should build");
+        assert!(graph["tests"].contains("crates/core"));
+        assert!(graph["docs"].contains("crates/core"));
+        assert!(graph["docs"].contains("tests"));
+    }
+
+    #[test]
+    fn remediation_scheduler_waits_for_dependencies() {
+        let mut manifest = manifest_with_groups(vec![
+            group_for_test("crates/core", &["crates/core/src/lib.rs"]),
+            group_for_test("docs", &["docs/architecture.md"]),
+        ]);
+        manifest.remediation_tasks = vec![
+            task_for_test("AUD-REM-001", "crates/core", &[]),
+            task_for_test("AUD-REM-002", "docs", &["AUD-REM-001"]),
+        ];
+        assert_eq!(
+            next_ready_remediation_task_index(&manifest, &BTreeSet::new()),
+            Some(0)
+        );
+        manifest.remediation_tasks[0].status = StageStatus::Complete;
+        assert_eq!(
+            next_ready_remediation_task_index(&manifest, &BTreeSet::new()),
+            Some(1)
+        );
+    }
+
+    fn manifest_with_groups(groups: Vec<GroupState>) -> EverythingManifest {
+        EverythingManifest {
+            run_id: "test-run".to_string(),
+            repo_root: ".".to_string(),
+            worktree_root: ".".to_string(),
+            report_root: "audit/everything/test-run".to_string(),
+            branch: "main".to_string(),
+            audit_branch: "auto-audit/test".to_string(),
+            base_commit: "base".to_string(),
+            created_at: "now".to_string(),
+            context: ContextState::default(),
+            files: Vec::new(),
+            groups,
+            remediation_plan: StageState::default(),
+            remediation_tasks: Vec::new(),
+            final_review: StageState::default(),
+            merge: StageState::default(),
+        }
+    }
+
+    fn group_for_test(name: &str, files: &[&str]) -> GroupState {
+        GroupState {
+            name: name.to_string(),
+            slug: slugify(name),
+            files: files.iter().map(|file| file.to_string()).collect(),
+            report_path: format!("audit/everything/test-run/reports/{}.md", slugify(name)),
+            synthesis_status: StageStatus::Complete,
+            remediation_status: StageStatus::Pending,
+        }
+    }
+
+    fn task_for_test(id: &str, group: &str, dependencies: &[&str]) -> RemediationTaskState {
+        RemediationTaskState {
+            id: id.to_string(),
+            group: group.to_string(),
+            slug: slugify(group),
+            report_path: format!("audit/everything/test-run/reports/{}.md", slugify(group)),
+            owned_paths: Vec::new(),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| dependency.to_string())
+                .collect(),
+            lane_index: 1,
+            lane_root: ".auto/audit-everything/test/remediation-lanes/lane-1".to_string(),
+            lane_repo_root: ".auto/audit-everything/test/remediation-lanes/lane-1/repo".to_string(),
+            base_commit: None,
+            status: StageStatus::Pending,
+            note: None,
+        }
     }
 }

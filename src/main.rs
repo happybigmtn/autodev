@@ -965,9 +965,9 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 15)]
     everything_threads: usize,
 
-    /// Maximum concurrent Codex workers for remediation phases. Defaults to
-    /// serial crate-by-crate repair to keep merge conflicts tractable.
-    #[arg(long, default_value_t = 1)]
+    /// Maximum concurrent Codex remediation lanes. Each lane runs in an
+    /// isolated worktree and the host lands commits back onto the audit branch.
+    #[arg(long, default_value_t = 5)]
     remediation_threads: usize,
 
     /// Model for professional audit first-pass file analysis.
@@ -1100,7 +1100,9 @@ pub(crate) enum AuditEverythingPhase {
     FirstPass,
     /// Build and revise crate/module markdown reports from per-file analysis.
     Synthesize,
-    /// Apply crate-by-crate code/doc/test revisions and keep reports updated.
+    /// Generate the dependency graph used by parallel remediation lanes.
+    PlanRemediation,
+    /// Apply code/doc/test revisions via dependency-ready isolated remediation lanes.
     Remediate,
     /// Run the final xhigh review over reports and diff.
     FinalReview,

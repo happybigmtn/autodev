@@ -1036,7 +1036,11 @@ What it does:
 - Writes and injects `GSTACK-SKILL-POLICY.md` so every worker gets deterministic, phase-aware
   gstack lenses instead of deciding ad hoc which skills to consider
 - Runs first-pass per-file analysis with Codex `gpt-5.5` `low`
-- Runs synthesis and remediation with Codex `gpt-5.5` `high`
+- Runs synthesis with Codex `gpt-5.5` `high`
+- Generates `REMEDIATION-PLAN.md` / `REMEDIATION-PLAN.json` from the synthesized reports, with
+  dependency-ready tasks and lane ownership
+- Runs remediation as isolated worktree lanes with Codex `gpt-5.5` `high`, then host-lands lane
+  commits back onto the audit branch
 - Runs final review with Codex `gpt-5.5` `xhigh`
 - Attempts a fast-forward merge back to the resolved primary branch only after final review writes
   `Verdict: GO`, unless `--no-everything-merge` is set
@@ -1045,18 +1049,18 @@ Skill policy:
 
 - First-pass prompts inject only the selected compact lenses for that file's surface and forbid
   direct tool invocation, keeping one-file loops clean
-- Synthesis and remediation prompts inject the selected group lenses; direct browser, QA,
-  benchmark, devex, release, or documentation checks are allowed only when the group surface and
+- Synthesis and remediation-lane prompts inject the selected group lenses; direct browser, QA,
+  benchmark, devex, release, or documentation checks are allowed only when the lane surface and
   report recommendations call for them
 - Final review injects review, CSO, health, QA-only, benchmark, devex, docs, ship,
   land-and-deploy, canary, careful, and checkpoint lenses before judging merge readiness
 
 Useful controls:
 
-- `--everything-phase init-context|first-pass|synthesize|remediate|final-review|merge|status|all`
+- `--everything-phase init-context|first-pass|synthesize|plan-remediation|remediate|final-review|merge|status|all`
 - `--everything-run-id <id>` to resume a specific run
 - `--everything-threads <n>` for read-only parallel phases, capped at 15
-- `--remediation-threads <n>` for crate remediation, defaulting to 1 for safer landing
+- `--remediation-threads <n>` for isolated remediation lanes, defaulting to 5 and capped at 10
 - `--report-only` to stop before remediation
 - `--branch trunk|main` when the primary branch cannot be inferred
 
