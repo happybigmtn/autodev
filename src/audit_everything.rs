@@ -854,7 +854,10 @@ fn commit_worktree_changes(paths: &RunPaths, manifest: &EverythingManifest) -> R
     if status.trim().is_empty() {
         return Ok(());
     }
-    run_git(&paths.worktree_root, ["add", "--", "."])?;
+    run_git(
+        &paths.worktree_root,
+        ["add", "--", ".", ":(exclude)audit/everything/*/files/**"],
+    )?;
     let _ = run_git(
         &paths.worktree_root,
         [
