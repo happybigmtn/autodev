@@ -299,3 +299,43 @@
 - Validation: receipt-backed proof in `.auto/symphony/verification-receipts/AD-F05.json` for `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and the cited completion-evidence / loop-queue regressions.
 - Completion artifacts: none
 - Remaining blockers: none.
+
+## `TASK-014`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/util.rs`
+- Review result: passed after fixing a [Required] collision-hardening gap found during review. The handoff claimed rapid-collision coverage, but the regression test created contention without forcing temp-name collisions; `atomic_write` now adds an in-process monotonic suffix to the PID and timestamp temp path so same-process rapid writes have a deterministic tie-breaker.
+- Validation: `.auto/symphony/verification-receipts/TASK-014.json` exists; `cargo test util::tests::atomic_write_creates_missing_parent_dir`, `cargo test util::tests::atomic_write_handles_rapid_succession_collisions`, `cargo test util::tests::atomic_write_works_outside_git_repo`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `src/util.rs`
+- Remaining blockers: none.
+
+## `AD-F01`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`, `src/generation.rs`, `src/main.rs`, `src/super_command.rs`
+- Review result: passed. Live code exposes `--snapshot-only`, rejects `--snapshot-only` with `--sync-only`, saves generation state, and skips root spec / root plan sync for the verified snapshot path; `README.md` documents promotion through later `--sync-only`.
+- Validation: `.auto/symphony/verification-receipts/AD-F01.json` exists; `cargo test generation::tests::snapshot_only_generation_does_not_sync_root_outputs`, `cargo test generation::tests::generated_plan_rejects_missing_spec_refs`, `cargo test generation::tests::sync_replaces_same_day_duplicate_root_specs_with_canonical_snapshot`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `README.md`, `src/generation.rs`, `src/main.rs`, `src/super_command.rs`
+- Remaining blockers: none.
+
+## `AD-017`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/release-readiness-gate.md`
+- Review result: passed as a release-policy decision. The decision truthfully keeps mechanical `auto ship` enforcement as follow-on work and defines required receipts, QA/health freshness, release blockers, installed-binary proof, rollback, monitoring, and PR-state evidence. The receipt included one failed duplicate `rg` command with an unquoted pipe pattern; the corrected quoted command and live review proof passed.
+- Validation: `.auto/symphony/verification-receipts/AD-017.json` exists; `rg -n "installed-binary|QA.md|HEALTH.md|SHIP.md|receipt|rollback|monitoring|PR" docs/decisions/release-readiness-gate.md`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: `docs/decisions/release-readiness-gate.md`
+- Remaining blockers: none.
+
+## `SAT-001`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `Cargo.toml`, `src/main.rs`
+- Review result: passed. The already-satisfied claim matches the live tree: `Cargo.toml` declares package `autodev` version `0.2.0` and binary `auto` at `src/main.rs`.
+- Validation: `rg -n "name = \"autodev\"|version = \"0.2.0\"|name = \"auto\"|path = \"src/main.rs\"" Cargo.toml`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: none.
+- Remaining blockers: none.
+
+## `SAT-003`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `.github/workflows/ci.yml`
+- Review result: passed. The already-satisfied claim matches the live tree: CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and unfiltered `cargo test`; it also includes the later installed-binary smoke step without weakening the claimed checks.
+- Validation: `rg -n "cargo fmt --check|cargo clippy --all-targets --all-features -- -D warnings|cargo test|cargo install --path" .github/workflows/ci.yml`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- Completion artifacts: none.
+- Remaining blockers: none.

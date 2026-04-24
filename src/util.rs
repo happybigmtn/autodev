@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,7 @@ const AUTO_FRESH_INPUT_KEEP_ENTRIES: usize = 12;
 const AUTO_QUEUE_RUN_KEEP_ENTRIES: usize = 12;
 const PI_RUNTIME_LOG_KEEP_FILES: usize = 5;
 const PI_RUNTIME_LOG_MAX_BYTES: usize = 2 * 1024 * 1024;
+static ATOMIC_WRITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointExcludeRule {
@@ -523,10 +525,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let temp = parent.join(format!(
-        ".{}.tmp-{}-{}",
+        ".{}.tmp-{}-{}-{}",
         path.file_name().and_then(|v| v.to_str()).unwrap_or("write"),
         std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ATOMIC_WRITE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&temp, bytes).map_err(|err| {
         atomic_write_failure(err, &temp, format!("failed to write {}", temp.display()))
