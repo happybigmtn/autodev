@@ -139,3 +139,43 @@
 - Validation: `cargo test` (365 passed), `cargo check`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo install --path . --root ~/.local`.
 - Completion artifacts: `src/main.rs`, `src/quota_exec.rs`, `src/quota_selector.rs`, `src/quota_status.rs`, `src/review_command.rs`
 - Remaining blockers: none.
+
+## `TASK-016`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `Cargo.lock`, `Cargo.toml`, `COMPLETED.md`, `refs/tags/v0.2.0`
+- Review result: passed after reconciling stale duplicate queue prose. In the current checkout, `.auto/symphony/verification-receipts/TASK-016.json` exists, `Cargo.toml` and `Cargo.lock` are at `0.2.0`, and `refs/tags/v0.2.0` resolves to annotated tag object `0cef62a2f472a16e578fc433dc83c70d7bfe5085` pointing at `461fe8d04853fbd58edfbf81c5ebe53e31c77ed3`. The tag annotation lists the release baseline through `TASK-015`; later follow-on work is newer than the tag and is not part of this artifact.
+- Validation: `cargo build`, `./target/debug/auto --version`, `git tag -l v0.2.0`, `git cat-file -p v0.2.0`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `COMPLETED.md`, `refs/tags/v0.2.0`
+- Remaining blockers: none.
+
+## `AD-001`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/backend-invocation-policy.md`
+- Review result: passed. The decision is a documentation inventory gate, and the current backend surfaces still match the policy's provider, quota, logging, timeout, and dangerous-flag inventory. No code-path widening or trust-boundary regression was found in this batch surface.
+- Validation: `rg -n "Command::new|TokioCommand::new|run_codex_exec|run_claude_exec|run_claude_prompt|run_logged_author_phase|kimi-cli|pi_bin|dangerously|--yolo|quota open" src`, `rg -n "src/generation.rs|src/codex_exec.rs|src/claude_exec.rs|src/kimi_backend.rs|src/pi_backend.rs|src/bug_command.rs|src/nemesis.rs|src/audit_command.rs|src/symphony_command.rs|src/parallel_command.rs" docs/decisions/backend-invocation-policy.md`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `docs/decisions/backend-invocation-policy.md`
+- Remaining blockers: none.
+
+## `AD-012`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/verification-receipt-policy.md`
+- Review result: passed. The policy accurately records the intended receipt-output and zero-test contract, while current implementation follow-up is owned by later receipt-hardening tasks rather than this documentation decision.
+- Validation: `rg -n "verification_receipt|run-task-verification|0 tests|receipt write" scripts src/completion_artifacts.rs src/parallel_command.rs`, `rg -n "zero-test|0 tests|stdout|stderr|receipt|redact|fatal" docs/decisions/verification-receipt-policy.md`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `docs/decisions/verification-receipt-policy.md`
+- Remaining blockers: none.
+
+## `AD-006`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `docs/decisions/first-run-preflight.md`
+- Review result: passed after reconciling stale receipt prose. The formerly cited missing command is now present as a quoted, passing receipt entry, and the decision remains consistent with the later implemented `auto doctor` surface.
+- Validation: `rg -n "Doctor|doctor|self-test|preflight" src/main.rs src/*_command.rs README.md`, `rg -n "first-run|no-model|codex|claude|pi|gh|auto --version" docs/decisions/first-run-preflight.md`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `docs/decisions/first-run-preflight.md`
+- Remaining blockers: none.
+
+## `AD-008`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_config.rs`
+- Review result: passed. The quota profile capture path now stages credential copies, rejects symlinked or non-regular credential sources, writes copied files owner-only, and replaces profile directories without preserving stale files. Adjacent tests cover the trust-boundary and stale-profile cases.
+- Validation: `cargo test quota_config::tests::capture_rejects_symlinked_codex_auth`, `cargo test quota_config::tests::capture_prunes_stale_profile_files`, `cargo test quota_config::tests::save_writes_owner_only`, `cargo test quota_config::tests::`, `cargo fmt --check`, `cargo check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `src/quota_config.rs`
+- Remaining blockers: none.
