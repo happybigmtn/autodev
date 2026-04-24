@@ -2072,12 +2072,11 @@ fn reconcile_file_inventory(
         let content = fs::read(&absolute_path)
             .with_context(|| format!("failed to read {}", absolute_path.display()))?;
         let hash = sha256_hex(&content);
-        let artifact_dir = report_root
-            .join("files")
-            .join(short_hash(&hash))
-            .display()
-            .to_string();
-        let status = if artifact_complete(Path::new(&artifact_dir)) {
+        let artifact_path = file_artifact_dir(report_root, &path, &hash);
+        let legacy_artifact_path = legacy_file_artifact_dir(report_root, &hash);
+        migrate_legacy_file_artifact_if_matching(&legacy_artifact_path, &artifact_path, &path)?;
+        let artifact_dir = artifact_path.display().to_string();
+        let status = if artifact_complete(&artifact_path) {
             StageStatus::Complete
         } else {
             existing_status
@@ -2289,6 +2288,72 @@ fn prompt_file_body(path: &Path) -> Result<String> {
 
 fn artifact_complete(artifact_dir: &Path) -> bool {
     artifact_dir.join("analysis.md").exists() && artifact_dir.join("analysis.json").exists()
+}
+
+fn file_artifact_dir(report_root: &Path, path: &str, content_hash: &str) -> PathBuf {
+    report_root
+        .join("files")
+        .join(file_artifact_slug(path, content_hash))
+}
+
+fn file_artifact_slug(path: &str, content_hash: &str) -> String {
+    let path_hash = sha256_hex(path.as_bytes());
+    format!("{}-{}", short_hash(&path_hash), short_hash(content_hash))
+}
+
+fn legacy_file_artifact_dir(report_root: &Path, content_hash: &str) -> PathBuf {
+    report_root.join("files").join(short_hash(content_hash))
+}
+
+fn migrate_legacy_file_artifact_if_matching(
+    legacy_artifact_dir: &Path,
+    artifact_dir: &Path,
+    path: &str,
+) -> Result<()> {
+    if artifact_complete(artifact_dir)
+        || !artifact_complete(legacy_artifact_dir)
+        || !artifact_matches_path(legacy_artifact_dir, path)
+    {
+        return Ok(());
+    }
+    fs::create_dir_all(artifact_dir)
+        .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
+    for file_name in ["analysis.md", "analysis.json"] {
+        fs::copy(
+            legacy_artifact_dir.join(file_name),
+            artifact_dir.join(file_name),
+        )
+        .with_context(|| {
+            format!(
+                "failed to migrate {} from {} to {}",
+                file_name,
+                legacy_artifact_dir.display(),
+                artifact_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn artifact_matches_path(artifact_dir: &Path, path: &str) -> bool {
+    let json = fs::read_to_string(artifact_dir.join("analysis.json")).unwrap_or_default();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+        if ["path", "file"]
+            .iter()
+            .filter_map(|key| value.get(*key).and_then(|value| value.as_str()))
+            .any(|value| value == path)
+        {
+            return true;
+        }
+    }
+    fs::read_to_string(artifact_dir.join("analysis.md"))
+        .map(|markdown| {
+            markdown
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim() == format!("# {path}"))
+        })
+        .unwrap_or(false)
 }
 
 fn require_context_complete(manifest: &EverythingManifest) -> Result<()> {
@@ -2706,6 +2771,15 @@ mod tests {
         assert!(excluded_path("target/debug/app"));
         assert!(excluded_path("gen-20260424/spec.md"));
         assert!(!excluded_path("crates/bitino-house/src/lib.rs"));
+    }
+
+    #[test]
+    fn file_artifact_slug_is_per_file_even_for_identical_content() {
+        let content_hash = sha256_hex(b"same generated content");
+        assert_ne!(
+            file_artifact_slug("crates/a/generated.d.ts", &content_hash),
+            file_artifact_slug("crates/b/generated.d.ts", &content_hash)
+        );
     }
 
     #[test]
