@@ -1322,14 +1322,16 @@ fn build_remediation_lane_prompt(paths: &RunPaths, task: &RemediationTaskState) 
         .collect::<Vec<_>>()
         .join("\n");
     let skill_policy = render_skill_policy_for_paths(&task.owned_paths);
+    let lane_report = lane_report_path(paths, task);
     format!(
         r#"You are an isolated remediation lane for `auto audit --everything`.
 
 Repository root for this lane: `{repo}`
-Canonical audit worktree: `{canonical}`
+Canonical audit worktree: `{canonical}` (read-only for this lane)
 Task: `{task_id}`
 Group: `{group}`
-Report: `{report}`
+Lane report: `{lane_report}`
+Canonical report: `{canonical_report}` (do not edit directly)
 Dependencies already satisfied: {deps}
 
 You are not alone in the audit. The host owns the dependency graph, landing, and `REMEDIATION-PLAN.md`.
@@ -1338,6 +1340,7 @@ Hard boundaries:
 - Read `AGENTS.md`, `ARCHITECTURE.md`, `audit/everything/*/CONTEXT-BUNDLE.md`, the gstack skill policy, doctrine if present, and the assigned report.
 - If this lane already contains partial work from an interrupted run, inspect it first and continue from that state instead of discarding it.
 - Keep edits centered on the owned paths and directly necessary adjacent tests/docs.
+- Do not write into the canonical audit worktree. Edit only files inside this lane repository; the host will cherry-pick your lane commit back.
 - Do not edit `REMEDIATION-PLAN.md` or `REMEDIATION-PLAN.json`; the host updates those after landing.
 - Do not push to any remote.
 - Create one or more local git commits before finishing.
@@ -1352,8 +1355,8 @@ Owned paths:
 {owned_paths}
 
 Required work:
-- Apply only recommendations from `{report}` that are supported by repository evidence.
-- Update `{report}` with completed recommendations, changed files, validation commands, and remaining blockers.
+- Apply only recommendations from `{lane_report}` that are supported by repository evidence.
+- Update `{lane_report}` with completed recommendations, changed files, validation commands, and remaining blockers.
 - Run the narrowest meaningful validation for this group.
 - Commit all lane changes locally with a message starting `audit: remediate {task_id}`.
 "#,
@@ -1361,11 +1364,20 @@ Required work:
         canonical = paths.worktree_root.display(),
         task_id = task.id,
         group = task.group,
-        report = task.report_path,
+        lane_report = lane_report.display(),
+        canonical_report = task.report_path,
         deps = deps,
         skill_policy = skill_policy,
         owned_paths = owned_paths,
     )
+}
+
+fn lane_report_path(paths: &RunPaths, task: &RemediationTaskState) -> PathBuf {
+    let report_path = PathBuf::from(&task.report_path);
+    match report_path.strip_prefix(&paths.worktree_root) {
+        Ok(relative) => PathBuf::from(&task.lane_repo_root).join(relative),
+        Err(_) => report_path,
+    }
 }
 
 fn render_skill_policy_for_paths(paths: &[String]) -> String {
@@ -1399,11 +1411,38 @@ fn land_remediation_lane(paths: &RunPaths, task: &RemediationTaskState) -> Resul
         bail!("lane {} exited without a local commit", task.id);
     }
     let changed_files = audit_lane_changed_files(&lane_repo_root, base_commit, &lane_head)?;
+    restore_dirty_generated_reports(paths, &changed_files)?;
     fetch_lane_commit(&paths.worktree_root, &lane_repo_root, &lane_head)?;
     if !git_ref_is_ancestor(&paths.worktree_root, "FETCH_HEAD", "HEAD")? {
         cherry_pick_lane_range(&paths.worktree_root, base_commit, "FETCH_HEAD", true)?;
     }
     Ok(changed_files)
+}
+
+fn restore_dirty_generated_reports(paths: &RunPaths, changed_files: &[String]) -> Result<()> {
+    let report_prefix = format!("audit/everything/{}/reports/", report_run_id(paths));
+    let dirty = git_stdout(&paths.worktree_root, ["status", "--porcelain", "--"])?;
+    for path in changed_files
+        .iter()
+        .filter(|path| path.starts_with(&report_prefix))
+    {
+        if dirty
+            .lines()
+            .any(|line| line.get(3..) == Some(path.as_str()))
+        {
+            run_git(&paths.worktree_root, ["restore", "--", path])?;
+        }
+    }
+    Ok(())
+}
+
+fn report_run_id(paths: &RunPaths) -> String {
+    paths
+        .report_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown-run")
+        .to_string()
 }
 
 #[derive(Clone, Copy)]
@@ -2959,6 +2998,41 @@ mod tests {
         assert!(prompt.contains("exact first-pass artifact paths referenced inside it"));
         assert!(prompt.contains("Do not glob or enumerate"));
         assert!(prompt.contains("/tmp/run/worktree/audit/everything/test-run/files"));
+    }
+
+    #[test]
+    fn remediation_prompt_uses_lane_local_report_and_readonly_canonical() {
+        let paths = RunPaths {
+            host_root: PathBuf::from("/tmp/run"),
+            manifest_path: PathBuf::from("/tmp/run/manifest.json"),
+            latest_path: PathBuf::from("/tmp/run/latest"),
+            worktree_root: PathBuf::from("/tmp/run/worktree"),
+            report_root: PathBuf::from("/tmp/run/worktree/audit/everything/test-run"),
+        };
+        let task = RemediationTaskState {
+            id: "AUD-REM-001".to_string(),
+            group: ".cargo".to_string(),
+            slug: "cargo".to_string(),
+            report_path: "/tmp/run/worktree/audit/everything/test-run/reports/cargo.md".to_string(),
+            owned_paths: vec![".cargo/config.toml".to_string()],
+            dependencies: Vec::new(),
+            lane_index: 1,
+            lane_root: "/tmp/run/remediation-lanes/lane-1".to_string(),
+            lane_repo_root: "/tmp/run/remediation-lanes/lane-1/repo".to_string(),
+            base_commit: None,
+            status: StageStatus::Pending,
+            note: None,
+        };
+
+        let prompt = build_remediation_lane_prompt(&paths, &task);
+
+        assert!(prompt.contains(
+            "Lane report: `/tmp/run/remediation-lanes/lane-1/repo/audit/everything/test-run/reports/cargo.md`"
+        ));
+        assert!(prompt
+            .contains("Canonical audit worktree: `/tmp/run/worktree` (read-only for this lane)"));
+        assert!(prompt.contains("Do not write into the canonical audit worktree"));
+        assert!(prompt.contains("Canonical report: `/tmp/run/worktree/audit/everything/test-run/reports/cargo.md` (do not edit directly)"));
     }
 
     #[test]
