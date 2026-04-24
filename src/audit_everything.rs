@@ -41,6 +41,56 @@ const DEFAULT_EXCLUDE_PREFIXES: [&str; 9] = [
     "gen-",
 ];
 
+const GSTACK_SKILL_POLICY: &str = r#"# GStack Skill Policy
+
+This audit uses gstack skills as deterministic compact lenses unless the phase explicitly asks for live validation. Workers should not bulk-load full skill files by default.
+
+## Always-On Audit Lenses
+
+- review: pre-landing structural review, diff risk, SQL/data safety, LLM trust boundaries, conditional side effects, documentation staleness.
+- health: project-native typecheck, lint, tests, dead-code, shell lint, and quality score evidence.
+- investigate: root-cause discipline; no fixes or recommendations without evidence and a falsifiable theory.
+- cso: secrets archaeology, dependency and CI/CD supply chain, auth/session boundaries, OWASP/STRIDE, LLM/AI security, production safety.
+- careful: destructive-command caution, especially for deletion, force pushes, migrations, production, and shared environments.
+
+## Planning And Context Lenses
+
+- autoplan: complete plan gauntlet, represented here by CEO, engineering, design, and developer-experience review lenses.
+- plan-ceo-review: product scope, ambition, simplification, and whether the proposed best version is worth building.
+- plan-eng-review: architecture, data flow, invariants, edge cases, test plan, rollout risk, and maintainability.
+- plan-design-review: UI/UX plan quality, hierarchy, interaction model, accessibility, visual system consistency.
+- plan-devex-review: APIs, CLIs, SDKs, docs, onboarding, error messages, and time-to-hello-world.
+- design-consultation: creation or repair of DESIGN.md/design-system docs when UI surfaces lack a coherent source of truth.
+
+## Implementation And Remediation Lenses
+
+- qa: test-fix-verify loop for web or interactive surfaces when remediation is allowed.
+- qa-only: report-only web/app QA when source edits are disallowed.
+- design-review: live visual QA and design polish for implemented UI surfaces.
+- benchmark: browser-backed performance, Core Web Vitals, load time, resource and bundle regressions.
+- devex-review: live developer-experience audit of docs, CLI help, onboarding, and error messages.
+- document-release: post-change documentation synchronization across README, ARCHITECTURE, AGENTS, changelog, and TODOs.
+- ship: pre-merge readiness, base-branch sync, validation gate, version/changelog/PR hygiene.
+- land-and-deploy: merge/deploy/canary posture; use as a final-review lens, not as an automatic action inside audit workers.
+- canary: post-deploy monitoring and visual/console/performance anomaly checks when deployment exists.
+
+## State And Boundary Lenses
+
+- checkpoint, context-save, context-restore: resumability and handoff quality.
+- freeze, guard, unfreeze: write-scope control. For this audit, prefer the host runner's group boundaries over ad hoc widening.
+- learn, retro: mine previous decisions or trends only when local project artifacts make them relevant.
+
+## Browser And Artifact Tools
+
+- browse/gstack: direct browser inspection for web/app QA, screenshots, responsive checks, forms, dialogs, and state assertions.
+- connect-chrome/open-gstack-browser/setup-browser-cookies/pair-agent: direct browser setup only when authenticated or visible-browser QA is explicitly required.
+- make-pdf: optional final packaging for markdown reports; never required for merge readiness.
+
+## Usually Excluded From Audit Workers
+
+- benchmark-models, plan-tune, gstack-upgrade, design-shotgun, design-html, office-hours: meta/tooling/ideation skills. Mention only if the file itself implements those workflows or the user explicitly requested that surface.
+"#;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EverythingManifest {
     run_id: String,
@@ -362,6 +412,7 @@ async fn run_context_phase(
     write_manifest(paths, manifest)?;
     fs::create_dir_all(&paths.report_root)
         .with_context(|| format!("failed to create {}", paths.report_root.display()))?;
+    write_skill_policy_reference(paths)?;
 
     let prompt = build_context_prompt(&paths.worktree_root, &paths.report_root);
     let config = PhaseConfig {
@@ -373,6 +424,7 @@ async fn run_context_phase(
 
     require_nonempty_file(&paths.worktree_root.join("AGENTS.md"))?;
     require_nonempty_file(&paths.worktree_root.join("ARCHITECTURE.md"))?;
+    write_skill_policy_reference(paths)?;
     write_context_bundle(paths)?;
 
     manifest.context.status = StageStatus::Complete;
@@ -786,12 +838,250 @@ async fn run_codex_phase_for_artifact(
     Ok(())
 }
 
+fn write_skill_policy_reference(paths: &RunPaths) -> Result<()> {
+    fs::create_dir_all(&paths.report_root)
+        .with_context(|| format!("failed to create {}", paths.report_root.display()))?;
+    atomic_write(
+        &paths.report_root.join("GSTACK-SKILL-POLICY.md"),
+        GSTACK_SKILL_POLICY.as_bytes(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            paths.report_root.join("GSTACK-SKILL-POLICY.md").display()
+        )
+    })
+}
+
+fn selected_skill_policy_for_file(path: &str) -> String {
+    render_skill_policy(&selected_skill_names_for_file(path))
+}
+
+fn selected_skill_policy_for_group(group: &GroupState) -> String {
+    let mut selected = Vec::new();
+    push_unique(&mut selected, "review");
+    push_unique(&mut selected, "health");
+    push_unique(&mut selected, "investigate");
+    push_unique(&mut selected, "plan-eng-review");
+    for path in &group.files {
+        for skill in selected_skill_names_for_file(path) {
+            push_unique(&mut selected, skill);
+        }
+    }
+    render_skill_policy(&selected)
+}
+
+fn selected_skill_policy_for_final_review() -> String {
+    render_skill_policy(&[
+        "review",
+        "cso",
+        "health",
+        "investigate",
+        "careful",
+        "qa-only",
+        "benchmark",
+        "devex-review",
+        "document-release",
+        "ship",
+        "land-and-deploy",
+        "canary",
+        "checkpoint",
+    ])
+}
+
+fn selected_skill_names_for_file(path: &str) -> Vec<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let mut selected = Vec::new();
+    push_unique(&mut selected, "review");
+    push_unique(&mut selected, "health");
+    push_unique(&mut selected, "investigate");
+
+    if is_context_path(&lower) {
+        push_unique(&mut selected, "plan-ceo-review");
+        push_unique(&mut selected, "plan-eng-review");
+        push_unique(&mut selected, "plan-devex-review");
+        push_unique(&mut selected, "plan-design-review");
+        push_unique(&mut selected, "document-release");
+        push_unique(&mut selected, "checkpoint");
+        push_unique(&mut selected, "context-save");
+        push_unique(&mut selected, "context-restore");
+    }
+    if is_rust_or_backend_path(&lower) {
+        push_unique(&mut selected, "plan-eng-review");
+        push_unique(&mut selected, "cso");
+    }
+    if is_security_or_ops_path(&lower) {
+        push_unique(&mut selected, "cso");
+        push_unique(&mut selected, "careful");
+        push_unique(&mut selected, "ship");
+    }
+    if is_ui_path(&lower) {
+        push_unique(&mut selected, "plan-design-review");
+        push_unique(&mut selected, "design-review");
+        push_unique(&mut selected, "qa");
+        push_unique(&mut selected, "qa-only");
+        push_unique(&mut selected, "browse");
+        push_unique(&mut selected, "benchmark");
+    }
+    if is_docs_or_devex_path(&lower) {
+        push_unique(&mut selected, "plan-devex-review");
+        push_unique(&mut selected, "devex-review");
+        push_unique(&mut selected, "document-release");
+    }
+    if is_test_or_perf_path(&lower) {
+        push_unique(&mut selected, "qa");
+        push_unique(&mut selected, "qa-only");
+        push_unique(&mut selected, "benchmark");
+    }
+    if is_release_or_deploy_path(&lower) {
+        push_unique(&mut selected, "ship");
+        push_unique(&mut selected, "land-and-deploy");
+        push_unique(&mut selected, "canary");
+        push_unique(&mut selected, "setup-deploy");
+    }
+
+    selected
+}
+
+fn push_unique<'a>(items: &mut Vec<&'a str>, item: &'a str) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
+}
+
+fn render_skill_policy(skills: &[&str]) -> String {
+    skills
+        .iter()
+        .map(|skill| format!("- `{skill}`: {}", skill_summary(skill)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn skill_summary(skill: &str) -> &'static str {
+    match skill {
+        "autoplan" => "run the CEO, engineering, design, and DX review gauntlet as one planning lens.",
+        "benchmark" => "check page speed, Core Web Vitals, resource size, and bundle/performance regressions.",
+        "browse" => "use browser evidence for UI state, screenshots, responsive behavior, forms, dialogs, and flows.",
+        "canary" => "use post-deploy health, console, screenshot, and performance anomaly checks as release criteria.",
+        "careful" => "treat destructive commands, deletions, force pushes, production, and shared resources as gated risks.",
+        "checkpoint" => "preserve resumability: decisions, git state, remaining work, and handoff clarity.",
+        "context-restore" => "verify restored context is sufficient before resuming interrupted work.",
+        "context-save" => "capture progress and remaining work in durable, resume-friendly artifacts.",
+        "cso" => "audit secrets, auth boundaries, supply chain, CI/CD, LLM trust boundaries, OWASP, and STRIDE risks.",
+        "design-consultation" => "create or repair design-system source-of-truth docs when UI lacks coherent direction.",
+        "design-review" => "judge implemented UI for visual hierarchy, spacing, consistency, accessibility, and interaction polish.",
+        "devex-review" => "test docs, CLI/API ergonomics, onboarding, error messages, and time-to-hello-world.",
+        "document-release" => "keep README, AGENTS, ARCHITECTURE, changelog, specs, and TODOs aligned with shipped behavior.",
+        "freeze" => "hold remediation to the intended directory or module boundary.",
+        "guard" => "combine destructive-command caution with strict write-scope discipline.",
+        "health" => "prefer project-native check, lint, test, dead-code, and shell-lint evidence over guesswork.",
+        "investigate" => "insist on root cause, falsifiable hypotheses, and direct evidence before proposing fixes.",
+        "land-and-deploy" => "judge merge/deploy/canary readiness; do not perform deployment from an audit worker.",
+        "plan-ceo-review" => "challenge scope, ambition, product value, and whether the best-version recommendation is worthwhile.",
+        "plan-design-review" => "score UI/UX plans for interaction model, accessibility, visual system, hierarchy, and polish.",
+        "plan-devex-review" => "score developer-facing APIs, CLIs, docs, onboarding, and friction before implementation.",
+        "plan-eng-review" => "review architecture, invariants, data flow, edge cases, test plan, performance, and rollout risk.",
+        "qa" => "when edits are allowed, run a test-fix-verify loop for app and browser-facing behavior.",
+        "qa-only" => "when edits are disallowed, produce report-only QA evidence with repro steps and health score.",
+        "review" => "pre-landing code-review lens for structural bugs, behavioral regressions, and stale documentation.",
+        "setup-deploy" => "verify deployment configuration, production URL, health checks, and status commands exist and are current.",
+        "ship" => "evaluate base-branch sync, validation, version/changelog, diff hygiene, and PR readiness.",
+        _ => "use only when the audited surface directly implements or depends on this skill.",
+    }
+}
+
+fn is_context_path(path: &str) -> bool {
+    path == "agents.md"
+        || path == "architecture.md"
+        || path == "claude.md"
+        || path.starts_with("doctrine/")
+        || path.starts_with("specs/")
+        || path.starts_with("plans/")
+        || path.contains("architecture")
+}
+
+fn is_rust_or_backend_path(path: &str) -> bool {
+    path.ends_with(".rs")
+        || path.ends_with(".toml")
+        || path.starts_with("src/")
+        || path.starts_with("crates/")
+        || path.starts_with("packages/")
+        || path.contains("/server/")
+        || path.contains("/backend/")
+        || path.contains("/api/")
+}
+
+fn is_security_or_ops_path(path: &str) -> bool {
+    path.contains("auth")
+        || path.contains("secret")
+        || path.contains("credential")
+        || path.contains("token")
+        || path.contains("session")
+        || path.contains("cookie")
+        || path.contains("tls")
+        || path.contains("security")
+        || path.contains("policy")
+        || path.starts_with(".github/")
+        || path.starts_with("infra/")
+        || path.starts_with("ops/")
+        || path.starts_with("deploy/")
+        || path.contains("docker")
+}
+
+fn is_ui_path(path: &str) -> bool {
+    path.ends_with(".tsx")
+        || path.ends_with(".jsx")
+        || path.ends_with(".css")
+        || path.ends_with(".scss")
+        || path.ends_with(".html")
+        || path.contains("/ui/")
+        || path.contains("/frontend/")
+        || path.contains("/client/")
+        || path.contains("/web/")
+        || path.contains("/tui/")
+        || path.contains("component")
+        || path.contains("screen")
+        || path.contains("view")
+}
+
+fn is_docs_or_devex_path(path: &str) -> bool {
+    path.ends_with(".md")
+        || path.starts_with("docs/")
+        || path.starts_with("examples/")
+        || path.starts_with("scripts/")
+        || path.contains("readme")
+        || path.contains("cli")
+        || path.contains("help")
+        || path.contains("onboard")
+}
+
+fn is_test_or_perf_path(path: &str) -> bool {
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("test")
+        || path.contains("spec")
+        || path.contains("bench")
+        || path.contains("perf")
+        || path.contains("playwright")
+}
+
+fn is_release_or_deploy_path(path: &str) -> bool {
+    path.contains("release")
+        || path.contains("deploy")
+        || path.contains("ship")
+        || path.contains("version")
+        || path.contains("changelog")
+        || path.contains("canary")
+        || path.starts_with(".github/workflows/")
+}
+
 fn build_context_prompt(worktree_root: &Path, report_root: &Path) -> String {
     format!(
         r#"You are preparing the context layer for `auto audit --everything`.
 
 Repository root: `{worktree_root}`
 Report root: `{report_root}`
+GStack skill policy: `{report_root}/GSTACK-SKILL-POLICY.md`
 
 Edit only repository-local context documents and the report root:
 - Create or revise root `AGENTS.md`.
@@ -803,7 +1093,8 @@ Context engineering requirements:
 - Keep `AGENTS.md` concise and operational. Point to deeper docs instead of copying them.
 - Follow Matklad's `ARCHITECTURE.md` guidance: describe the problem, codemap, module boundaries, invariants, and cross-cutting concerns. Keep details stable and avoid stale links.
 - If `doctrine/` exists and contains files, reference it explicitly as doctrine injected into every audit loop. If it does not exist or is empty, ignore it.
-- Add a short skill policy for future audit workers: use relevant gstack/Codex skills or reviewer lenses when the surface calls for them (`review`, `code-simplicity-reviewer`, `correctness-reviewer`, `testing-reviewer`, `security-reviewer`, `performance-reviewer`, `frontend-design`, `design-review`, `qa`, `ship`), but do not bulk-load unrelated skills.
+- Reference the gstack skill policy as a compact routing artifact for future audit workers. Do not paste the full policy into `AGENTS.md`; point to it and keep `AGENTS.md` short.
+- Treat gstack skills as deterministic lenses by phase. Direct tool-like invocation is reserved for remediation/final validation when the selected surface calls for browser, QA, benchmark, deploy, or documentation checks.
 - Favor evidence-backed statements. Mark inferred architecture as inferred instead of pretending certainty.
 - These first target repos are Bitino and Autonomy, so make the docs useful for Rust workspace/crate-heavy systems, runtime operators, and agent workers.
 
@@ -815,6 +1106,7 @@ Do not edit source code in this phase. Do not run formatters across the repo.
 }
 
 fn build_file_prompt(file: &FileState, context: &str, file_body: &str) -> String {
+    let skill_policy = selected_skill_policy_for_file(&file.path);
     format!(
         r#"You are running first-pass professional audit analysis for exactly one tracked file.
 
@@ -824,10 +1116,13 @@ Hard boundaries:
 - Do not read neighboring source files in this first pass.
 - The only architectural context you may use is the injected context below.
 - Write outputs only in the artifact directory.
-- Apply relevant professional reviewer lenses for this file's surface: correctness, simplicity, maintainability, tests, security, performance, data integrity, frontend/design, QA, or release readiness. Do not invoke or discuss unrelated lenses.
+- Apply only the selected gstack lenses below for this file's surface. Do not invoke tools in this first pass. Do not discuss unrelated lenses.
 
 Injected context:
 {context}
+
+Selected gstack lenses:
+{skill_policy}
 
 File under audit:
 - Path: `{path}`
@@ -857,6 +1152,7 @@ Target file content:
 ```
 "#,
         context = context,
+        skill_policy = skill_policy,
         path = file.path,
         group = file.group,
         hash = file.content_hash,
@@ -866,6 +1162,7 @@ Target file content:
 }
 
 fn build_synthesis_prompt(paths: &RunPaths, group: &GroupState) -> String {
+    let skill_policy = selected_skill_policy_for_group(group);
     format!(
         r#"You are the second-pass cross-file synthesis reviewer for one professional audit group.
 
@@ -874,6 +1171,9 @@ Group: `{group}`
 Report: `{report}`
 
 Read the group report and the per-file first-pass analyses it references. You may now reason across files in this group and across the concise context docs (`AGENTS.md`, `ARCHITECTURE.md`, and `doctrine/` if present).
+
+Selected gstack lenses for this group:
+{skill_policy}
 
 Revise `{report}` in place. Keep every file represented. Tighten or correct the first-pass assessments based on relationships surfaced between files:
 - duplicated responsibilities
@@ -884,17 +1184,19 @@ Revise `{report}` in place. Keep every file represented. Tighten or correct the 
 - docs that should move into `AGENTS.md`, `ARCHITECTURE.md`, doctrine, or inline comments
 - cross-crate/API seams
 
-Use relevant gstack/Codex skills or reviewer lenses for this group when applicable, especially review, code simplicity, correctness, testing, security, performance, frontend design, QA, and release readiness. Keep the output grounded in repository evidence.
+Use the selected lenses as a compact prompt injection, not as permission to bulk-load unrelated skill files. Keep the output grounded in repository evidence.
 
 Do not edit source code in this phase. Only edit `{report}` and optional notes next to it.
 "#,
         repo = paths.worktree_root.display(),
         group = group.name,
         report = group.report_path,
+        skill_policy = skill_policy,
     )
 }
 
 fn build_remediation_prompt(paths: &RunPaths, group: &GroupState) -> String {
+    let skill_policy = selected_skill_policy_for_group(group);
     format!(
         r#"You are the crate-by-crate remediation worker for `auto audit --everything`.
 
@@ -910,7 +1212,10 @@ Read `AGENTS.md`, `ARCHITECTURE.md`, doctrine if present, and `{report}`. Apply 
 - documentation clarifications when they make future agent work more legible
 - deletion/retirement only when the report confidence is high and the repo evidence confirms it
 
-Use relevant gstack/Codex skills or reviewer lenses for the group surface. For example, use correctness/testing/security/performance lenses for backend crates, frontend-design/design-review/qa lenses for UI surfaces, and ship/release-readiness lenses for operator or deployment surfaces.
+Selected gstack lenses for this group:
+{skill_policy}
+
+Use these lenses prescriptively. Directly run browser/QA/benchmark/devex/documentation checks only when the group surface and report recommendations call for them and the required local services or commands are available.
 
 Keep the write set centered on this group. If a recommendation requires broad cross-group work, leave it in the report as a follow-up instead of expanding scope.
 
@@ -925,10 +1230,12 @@ Before finishing, run the narrowest meaningful validation you can derive for thi
         repo = paths.worktree_root.display(),
         group = group.name,
         report = group.report_path,
+        skill_policy = skill_policy,
     )
 }
 
 fn build_final_review_prompt(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    let skill_policy = selected_skill_policy_for_final_review();
     format!(
         r#"You are the final professional audit reviewer.
 
@@ -938,6 +1245,9 @@ Base commit: `{base}`
 Audit branch: `{branch}`
 
 Review all group reports under the report root and the full git diff from `{base}` to HEAD.
+
+Selected gstack lenses for final review:
+{skill_policy}
 
 Use `gpt-5.5 xhigh` judgment standards:
 - Verify changes correspond to report findings.
@@ -960,6 +1270,7 @@ Do not merge. The host runner handles merge only after this file says `Verdict: 
         report_root = paths.report_root.display(),
         base = manifest.base_commit,
         branch = manifest.audit_branch,
+        skill_policy = skill_policy,
     )
 }
 
@@ -988,6 +1299,12 @@ fn write_context_bundle(paths: &RunPaths) -> Result<()> {
         &mut body,
         "ARCHITECTURE.md",
         &paths.worktree_root.join("ARCHITECTURE.md"),
+        true,
+    )?;
+    append_named_file(
+        &mut body,
+        "GSTACK-SKILL-POLICY.md",
+        &paths.report_root.join("GSTACK-SKILL-POLICY.md"),
         true,
     )?;
     let doctrine_dir = paths.worktree_root.join("doctrine");
@@ -1577,5 +1894,44 @@ mod tests {
         assert!(excluded_path("target/debug/app"));
         assert!(excluded_path("gen-20260424/spec.md"));
         assert!(!excluded_path("crates/bitino-house/src/lib.rs"));
+    }
+
+    #[test]
+    fn selected_skill_policy_matches_ui_surface() {
+        let skills = selected_skill_names_for_file("web/client/src/components/Board.tsx");
+        assert!(skills.contains(&"plan-design-review"));
+        assert!(skills.contains(&"design-review"));
+        assert!(skills.contains(&"qa"));
+        assert!(skills.contains(&"browse"));
+        assert!(skills.contains(&"benchmark"));
+    }
+
+    #[test]
+    fn selected_skill_policy_matches_security_and_deploy_surface() {
+        let skills = selected_skill_names_for_file(".github/workflows/deploy-auth.yml");
+        assert!(skills.contains(&"cso"));
+        assert!(skills.contains(&"careful"));
+        assert!(skills.contains(&"ship"));
+        assert!(skills.contains(&"land-and-deploy"));
+        assert!(skills.contains(&"setup-deploy"));
+    }
+
+    #[test]
+    fn selected_skill_policy_matches_docs_and_context_surface() {
+        let skills = selected_skill_names_for_file("ARCHITECTURE.md");
+        assert!(skills.contains(&"plan-ceo-review"));
+        assert!(skills.contains(&"plan-eng-review"));
+        assert!(skills.contains(&"plan-devex-review"));
+        assert!(skills.contains(&"document-release"));
+        assert!(skills.contains(&"checkpoint"));
+    }
+
+    #[test]
+    fn final_review_policy_is_merge_readiness_oriented() {
+        let policy = selected_skill_policy_for_final_review();
+        assert!(policy.contains("`review`"));
+        assert!(policy.contains("`ship`"));
+        assert!(policy.contains("`land-and-deploy`"));
+        assert!(policy.contains("`canary`"));
     }
 }

@@ -1033,11 +1033,23 @@ What it does:
 - Creates a resumable run under `.auto/audit-everything/<run-id>`
 - Creates an audit worktree on `auto-audit/<repo>-<run-id>` from the primary branch
 - Writes human reports under `audit/everything/<run-id>` in the audit worktree
+- Writes and injects `GSTACK-SKILL-POLICY.md` so every worker gets deterministic, phase-aware
+  gstack lenses instead of deciding ad hoc which skills to consider
 - Runs first-pass per-file analysis with Codex `gpt-5.5` `low`
 - Runs synthesis and remediation with Codex `gpt-5.5` `high`
 - Runs final review with Codex `gpt-5.5` `xhigh`
 - Attempts a fast-forward merge back to the resolved primary branch only after final review writes
   `Verdict: GO`, unless `--no-everything-merge` is set
+
+Skill policy:
+
+- First-pass prompts inject only the selected compact lenses for that file's surface and forbid
+  direct tool invocation, keeping one-file loops clean
+- Synthesis and remediation prompts inject the selected group lenses; direct browser, QA,
+  benchmark, devex, release, or documentation checks are allowed only when the group surface and
+  report recommendations call for them
+- Final review injects review, CSO, health, QA-only, benchmark, devex, docs, ship,
+  land-and-deploy, canary, careful, and checkpoint lenses before judging merge readiness
 
 Useful controls:
 
