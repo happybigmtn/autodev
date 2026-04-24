@@ -179,7 +179,11 @@ fn require_receipt(
 }
 
 fn receipt_passed(receipt: &VerificationReceiptCommand) -> bool {
-    let status_passed = receipt.status.as_deref() == Some("passed") || receipt.exit_code == Some(0);
+    let status_passed = match receipt.status.as_deref() {
+        Some("passed") => receipt.exit_code.unwrap_or(0) == 0,
+        Some(_) => false,
+        None => receipt.exit_code == Some(0),
+    };
     let zero_test = receipt
         .runner_summary
         .as_ref()
@@ -401,6 +405,7 @@ fn record_ship_gate_bypass(
     reason: &str,
     report: &ShipGateReport,
 ) -> Result<()> {
+    validate_ship_gate_bypass_reason(reason)?;
     write_ship_gate_section(
         repo_root,
         branch,
@@ -409,6 +414,16 @@ fn record_ship_gate_bypass(
         Some(reason),
         report,
     )
+}
+
+fn validate_ship_gate_bypass_reason(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("--bypass-release-gate requires a non-empty reason");
+    }
+    if reason.contains('\n') || reason.contains('\r') {
+        bail!("--bypass-release-gate reason must be a single line");
+    }
+    Ok(())
 }
 
 fn write_ship_gate_section(
@@ -489,9 +504,7 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
     let ship_gate = evaluate_ship_gate(&repo_root, &push_branch, &base_branch);
     if let Some(reason) = args.bypass_release_gate.as_deref() {
         let reason = reason.trim();
-        if reason.is_empty() {
-            bail!("--bypass-release-gate requires a non-empty reason");
-        }
+        validate_ship_gate_bypass_reason(reason)?;
         record_ship_gate_bypass(&repo_root, &push_branch, &base_branch, reason, &ship_gate)?;
         println!("release gate: bypassed; reason recorded in SHIP.md");
     } else if ship_gate.is_blocked() {
@@ -750,6 +763,12 @@ mod tests {
         );
     }
 
+    fn write_receipt_json(repo_root: &std::path::Path, json: &str) {
+        let receipt_dir = repo_root.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
+        fs::write(receipt_dir.join("release.json"), json).expect("failed to write receipt");
+    }
+
     #[test]
     fn ship_gate_fails_without_installed_binary_proof() {
         let repo = test_dir("missing-installed-proof");
@@ -774,6 +793,30 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("QA.md")));
+    }
+
+    #[test]
+    fn ship_gate_rejects_failed_status_even_with_zero_exit() {
+        let repo = test_dir("failed-status-zero-exit");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_receipt_json(
+            &repo,
+            r#"{"commands":[
+{"command":"cargo fmt --check","exit_code":0,"status":"passed"},
+{"command":"cargo clippy --all-targets --all-features -- -D warnings","exit_code":0,"status":"passed"},
+{"command":"cargo test","exit_code":0,"status":"failed"},
+{"command":"cargo install --path . --root /tmp/autodev-install-proof","exit_code":0,"status":"passed"},
+{"command":"auto --version","exit_code":0,"status":"passed"}
+]}"#,
+        );
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(report.is_blocked());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "red validation receipt: `cargo test`"));
     }
 
     #[test]
@@ -829,6 +872,29 @@ mod tests {
         assert!(ship.contains("Bypassed before model execution"));
         assert!(ship.contains("Operator bypass reason: release manager accepted live CI evidence"));
         assert!(ship.contains("missing validation receipt: `cargo test`"));
+    }
+
+    #[test]
+    fn ship_gate_bypass_rejects_multiline_operator_reason() {
+        let repo = test_dir("bypass-multiline");
+        let report = ShipGateReport {
+            blockers: vec!["missing validation receipt: `cargo test`".to_string()],
+        };
+
+        let err = record_ship_gate_bypass(
+            &repo,
+            "feature/ship",
+            "main",
+            "live CI is green\n- Blockers: none",
+            &report,
+        )
+        .expect_err("multiline bypass reason should fail");
+
+        assert!(err.to_string().contains("single line"));
+        assert!(
+            !repo.join("SHIP.md").exists(),
+            "invalid bypass reason should not write SHIP.md"
+        );
     }
 
     #[test]

@@ -260,6 +260,38 @@
 - Completion artifacts: `README.md`
 - Remaining blockers: none.
 
+## `SAT-006`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/parallel_command.rs`, `tests/parallel_status.rs`
+- Review result: passed. `auto parallel status` now reports health when the run root has no lane directory, excludes the status process from host PID reporting, and leaves the inspected run root uncreated. No correctness, boundary, security, or performance issue was found in the reviewed status surface.
+- Validation: `cargo test --test parallel_status`, `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `SAT-007`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/completion_artifacts.rs`
+- Review result: passed. Completion evidence now resolves verification receipts from the host `.auto/symphony/verification-receipts` root when inspecting a parallel lane checkout at `.auto/parallel/lanes/<lane>/repo`, while preserving the normal repo-local path outside lane workspaces.
+- Validation: `cargo test completion_artifacts::tests::inspect_task_completion_evidence_reads_parallel_lane_receipts`, `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `SAT-008`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/symphony_command.rs`
+- Review result: passed. The Symphony task parser test now locks pending, blocked, lowercase done, and uppercase done status parsing through the shared parser, matching the current queue-state contract.
+- Validation: `cargo test symphony_command::tests::parse_tasks_extracts_pending_items_and_dependencies`, `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-F06`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`, `src/main.rs`, `src/ship_command.rs`
+- Review result: passed after fixing two required release-gate hardening findings. The mechanical ship gate no longer accepts a verification receipt whose explicit status is failed even when `exit_code` is zero, and `--bypass-release-gate` now rejects multiline operator reasons before writing `SHIP.md`.
+- Validation: live receipt `.auto/symphony/verification-receipts/AD-F06.json`, `cargo test ship_command::tests::ship_gate`, `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `README.md`
+- Remaining blockers: none.
+
 ## `AD-005`
 - Source: auto parallel host handoff synthesized after lane landing.
 - Files: `docs/decisions/snapshot-only-generation.md`
