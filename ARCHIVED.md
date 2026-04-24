@@ -219,3 +219,43 @@
 - Validation: `cargo test quota_exec::tests::restore_credentials_restores_claude_json_backup`, `cargo test quota_exec::tests::swap_credentials_enforces_0o600`, `cargo test quota_exec::tests::swap_credentials_rejects_symlinked_claude_profile_paths`, `cargo test quota_exec::tests::swap_credentials_restores_claude_json_on_drop`, `cargo test quota_exec::tests::swap_credentials_removes_codex_auth_when_no_original_existed`, `cargo test quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error -- --nocapture`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - Completion artifacts: `src/quota_exec.rs`
 - Remaining blockers: none.
+
+## `AD-003`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/generation.rs`, `src/task_parser.rs`
+- Review result: passed. Generated plan merging now uses the shared task-header parser, so existing `[!]` blocked tasks are preserved as open work when absent from a newly generated plan while `[x]` and `[X]` rows remain completed and are not requeued. No parser-boundary, trust-boundary, or performance issue was found in the reviewed surface.
+- Validation: `cargo test generation::tests::merge_generated_plan_preserves_blocked_tasks`, `cargo test generation::tests::merges_existing_open_tasks_not_present_in_new_plan`, `cargo test parallel_command::tests::parse_loop_plan_tracks_ready_and_blocked_dependencies`, `cargo test symphony_command::tests::parse_tasks_extracts_pending_items_and_dependencies`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-010`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: none recorded by host
+- Review result: passed as a validation checkpoint. The live receipt and rerun proofs cover quota profile symlink rejection, stale profile pruning, Claude home JSON restore, and owner-only credential swaps; the checkpoint owns queue handoff rather than new code.
+- Validation: `cargo test quota_config::tests::capture_rejects_symlinked_codex_auth`, `cargo test quota_config::tests::capture_prunes_stale_profile_files`, `cargo test quota_exec::tests::restore_credentials_restores_claude_json_backup`, `cargo test quota_exec::tests::swap_credentials_enforces_0o600`, `rg -n "AD-010|quota|credential|symlink|stale" ARCHIVED.md`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `REVIEW.md`
+- Remaining blockers: none.
+
+## `AD-F03`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/backend_policy.rs`, `src/main.rs`
+- Review result: passed. The backend policy module is static inventory metadata, is registered in the binary, and its test pins the known backend/provider set plus critical model and quota-routing values. No behavior default changed in this surface.
+- Validation: `cargo test backend_policy::tests::serializes_known_backend_policy_inventory`, `cargo test generation::tests::generation_author_backend_uses_codex_for_non_claude_models`, `cargo test kimi_backend::tests::exec_args_contain_yolo_and_print_and_stream_json`, `cargo test pi_backend::tests::minimax_alias_defaults_to_m27_highspeed`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: none
+- Remaining blockers: none.
+
+## `AD-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: none recorded by host
+- Review result: passed as a parser/generation checkpoint. The live proofs cover shared status parsing, blocked-task merge preservation, and completion-evidence gating; no additional parser migration is hidden in this checkpoint surface.
+- Validation: `cargo test task_parser::tests::parses_all_plan_statuses_and_fields`, `cargo test generation::tests::merge_generated_plan_preserves_blocked_tasks`, `cargo test completion_artifacts::tests::inspect_task_completion_evidence_requires_review_and_receipts`, `rg -n "AD-004|parser|blocked" ARCHIVED.md`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `REVIEW.md`
+- Remaining blockers: none.
+
+## `TASK-002`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`
+- Review result: passed. The README now has detailed `auto steward`, `auto audit`, and `auto symphony` subsections with the expected artifact paths, doctrine default, and command entries; this is a newer README tightening beyond the earlier archived TASK-002 handoff.
+- Validation: `rg -n '^### .*auto (steward|audit|symphony)' README.md`, `rg -n 'DRIFT.md|HINGES.md|RETIRE.md|HAZARDS.md|STEWARDSHIP-REPORT.md|PROMOTIONS.md' README.md`, `rg -n 'audit/DOCTRINE.md' README.md`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Completion artifacts: `README.md`
+- Remaining blockers: none.
