@@ -839,12 +839,22 @@ fn attempt_merge(
 }
 
 fn commit_worktree_changes(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    let generated_file_artifacts = format!("audit/everything/{}/files", manifest.run_id);
+    let _ = run_git(
+        &paths.worktree_root,
+        [
+            "rm",
+            "-r",
+            "--cached",
+            "--ignore-unmatch",
+            &generated_file_artifacts,
+        ],
+    );
     let status = git_stdout(&paths.worktree_root, ["status", "--short"])?;
     if status.trim().is_empty() {
         return Ok(());
     }
     run_git(&paths.worktree_root, ["add", "--", "."])?;
-    let generated_file_artifacts = format!("audit/everything/{}/files", manifest.run_id);
     let _ = run_git(
         &paths.worktree_root,
         [
