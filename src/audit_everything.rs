@@ -1911,6 +1911,8 @@ Report: `{report}`
 
 Read the group report and the per-file first-pass analyses it references. You may now reason across files in this group and across the concise context docs (`AGENTS.md`, `ARCHITECTURE.md`, and `doctrine/` if present).
 
+The authoritative input set is the report plus the exact first-pass artifact paths referenced inside it. Do not glob or enumerate `{report_root}/files`; unreferenced artifact directories may be stale leftovers from interrupted or upgraded runs.
+
 Selected gstack lenses for this group:
 {skill_policy}
 
@@ -1930,6 +1932,7 @@ Do not edit source code in this phase. Only edit `{report}` and optional notes n
         repo = paths.worktree_root.display(),
         group = group.name,
         report = group.report_path,
+        report_root = paths.report_root.display(),
         skill_policy = skill_policy,
     )
 }
@@ -2244,17 +2247,19 @@ fn build_initial_group_reports(paths: &RunPaths, manifest: &EverythingManifest) 
     })?;
     for group in &manifest.groups {
         let report_path = PathBuf::from(&group.report_path);
-        if report_path.exists() {
+        if report_path.exists() && matches!(group.synthesis_status, StageStatus::Complete) {
             continue;
         }
         let mut body = String::new();
         body.push_str(&format!("# Audit Report: {}\n\n", group.name));
         body.push_str("## Scope\n\n");
         body.push_str("This report is assembled from first-pass one-file analyses. The synthesis pass may revise it based on cross-file relationships.\n\n");
+        body.push_str("The authoritative first-pass inputs are the artifact paths listed under each file below. Ignore unreferenced artifact directories; interrupted or upgraded runs may leave stale artifacts in `audit/everything/*/files`.\n\n");
         for file_path in &group.files {
             if let Some(file) = manifest.files.iter().find(|file| &file.path == file_path) {
                 body.push_str(&format!("## `{}`\n\n", file.path));
                 let analysis = Path::new(&file.artifact_dir).join("analysis.md");
+                body.push_str(&format!("First-pass artifact: `{}`\n\n", file.artifact_dir));
                 if analysis.exists() {
                     body.push_str(
                         &fs::read_to_string(&analysis)
@@ -2833,6 +2838,86 @@ mod tests {
         assert!(!artifact_complete(&dir));
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn pending_group_report_rebuilds_with_authoritative_artifact_refs() {
+        let dir = std::env::temp_dir().join(format!(
+            "auto-audit-group-report-rebuild-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("audit/everything/test-run");
+        let artifact_dir = report_root.join("files/path-hash-content-hash");
+        fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
+        fs::write(
+            artifact_dir.join("analysis.md"),
+            "# src/lib.rs\n\nA focused first-pass analysis.\n",
+        )
+        .expect("failed to write analysis");
+
+        let report_path = report_root.join("reports/src.md");
+        fs::create_dir_all(report_path.parent().unwrap()).expect("failed to create reports dir");
+        fs::write(&report_path, "stale partial synthesis\n").expect("failed to write stale report");
+
+        let mut manifest = manifest_with_groups(vec![GroupState {
+            name: "src".to_string(),
+            slug: "src".to_string(),
+            files: vec!["src/lib.rs".to_string()],
+            report_path: report_path.display().to_string(),
+            synthesis_status: StageStatus::Pending,
+            remediation_status: StageStatus::Pending,
+        }]);
+        manifest.files = vec![FileState {
+            path: "src/lib.rs".to_string(),
+            group: "src".to_string(),
+            content_hash: "content-hash".to_string(),
+            artifact_dir: artifact_dir.display().to_string(),
+            status: StageStatus::Complete,
+        }];
+
+        let paths = RunPaths {
+            host_root: dir.clone(),
+            manifest_path: dir.join("manifest.json"),
+            latest_path: dir.join("latest"),
+            worktree_root: dir.clone(),
+            report_root,
+        };
+
+        build_initial_group_reports(&paths, &manifest).expect("failed to build group reports");
+        let report = fs::read_to_string(&report_path).expect("failed to read report");
+
+        assert!(!report.contains("stale partial synthesis"));
+        assert!(report.contains("First-pass artifact:"));
+        assert!(report.contains("path-hash-content-hash"));
+        assert!(report.contains("Ignore unreferenced artifact directories"));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn synthesis_prompt_warns_against_unreferenced_artifact_globs() {
+        let paths = RunPaths {
+            host_root: PathBuf::from("/tmp/run"),
+            manifest_path: PathBuf::from("/tmp/run/manifest.json"),
+            latest_path: PathBuf::from("/tmp/run/latest"),
+            worktree_root: PathBuf::from("/tmp/run/worktree"),
+            report_root: PathBuf::from("/tmp/run/worktree/audit/everything/test-run"),
+        };
+        let group = GroupState {
+            name: "src".to_string(),
+            slug: "src".to_string(),
+            files: vec!["src/lib.rs".to_string()],
+            report_path: "/tmp/run/worktree/audit/everything/test-run/reports/src.md".to_string(),
+            synthesis_status: StageStatus::Pending,
+            remediation_status: StageStatus::Pending,
+        };
+
+        let prompt = build_synthesis_prompt(&paths, &group);
+
+        assert!(prompt.contains("exact first-pass artifact paths referenced inside it"));
+        assert!(prompt.contains("Do not glob or enumerate"));
+        assert!(prompt.contains("/tmp/run/worktree/audit/everything/test-run/files"));
     }
 
     #[test]
