@@ -1023,8 +1023,9 @@ Defaults:
 Purpose:
 
 - Run a professional whole-codebase audit with one fresh Codex loop per tracked file
-- Start with context engineering: a dedicated worktree, revised `AGENTS.md`, revised
-  `ARCHITECTURE.md`, and injected `doctrine/` content when present
+- Start with context engineering: a dedicated audit checkout (or the current checkout with
+  `--everything-in-place`), revised `AGENTS.md`, revised `ARCHITECTURE.md`, and injected
+  `doctrine/` content when present
 - Produce comprehensive markdown reports split by logical crate/module group, then revise those
   reports based on cross-file relationships before attempting bounded crate-by-crate remediation
 
@@ -1032,6 +1033,7 @@ What it does:
 
 - Creates a resumable run under `.auto/audit-everything/<run-id>`
 - Creates an audit worktree on `auto-audit/<repo>-<run-id>` from the primary branch
+  unless `--everything-in-place` is set
 - Writes human reports under `audit/everything/<run-id>` in the audit worktree
 - Writes and injects `GSTACK-SKILL-POLICY.md` so every worker gets deterministic, phase-aware
   gstack lenses instead of deciding ad hoc which skills to consider
@@ -1042,8 +1044,17 @@ What it does:
 - Runs remediation as isolated worktree lanes with Codex `gpt-5.5` `high`, then host-lands lane
   commits back onto the audit branch
 - Runs final review with Codex `gpt-5.5` `xhigh`
+- If final review writes `Verdict: NO-GO` with actionable required blockers, runs a bounded
+  repair pass and reruns final review before merge judgment
+- Writes `CODEBASE-BOOK/` as the final human-readable codebase explanation: a chaptered,
+  first-principles tour organized by the repository's logical architecture, with readable
+  file-catalog chapters covering every audited file, audit-made changes, documentation updates,
+  validation, residual risks, and pointers back to evidence
 - Attempts a fast-forward merge back to the resolved primary branch only after final review writes
   `Verdict: GO`, unless `--no-everything-merge` is set
+- `--everything-in-place` runs against the current checkout, requires a clean checkout for a new
+  run, writes reports directly under that checkout, and marks merge complete once the final
+  `Verdict: GO` artifacts are committed because changes are already in place
 
 Skill policy:
 
@@ -1059,8 +1070,11 @@ Useful controls:
 
 - `--everything-phase init-context|first-pass|synthesize|plan-remediation|remediate|final-review|merge|status|all`
 - `--everything-run-id <id>` to resume a specific run
+- `--everything-in-place` to use the current checkout instead of creating the canonical audit
+  worktree
 - `--everything-threads <n>` for read-only parallel phases, capped at 15
 - `--remediation-threads <n>` for isolated remediation lanes, defaulting to 5 and capped at 10
+- `--final-review-retries <n>` to control the bounded NO-GO repair/rerun loop, defaulting to 1
 - `--report-only` to stop before remediation
 - `--branch trunk|main` when the primary branch cannot be inferred
 

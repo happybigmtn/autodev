@@ -961,6 +961,12 @@ pub(crate) struct AuditArgs {
     #[arg(long)]
     everything_run_root: Option<PathBuf>,
 
+    /// Run the professional audit directly in the current checkout instead of
+    /// creating a separate canonical audit worktree. New in-place runs require
+    /// a clean checkout and commit the GO audit result directly in place.
+    #[arg(long)]
+    everything_in_place: bool,
+
     /// Maximum concurrent Codex workers for read-only professional audit phases.
     #[arg(long, default_value_t = 15)]
     everything_threads: usize,
@@ -1001,6 +1007,11 @@ pub(crate) struct AuditArgs {
     /// Reasoning effort for professional audit final review.
     #[arg(long, default_value = "xhigh")]
     final_review_effort: String,
+
+    /// Number of final-review repair attempts to run when final review writes
+    /// Verdict: NO-GO with actionable blockers.
+    #[arg(long, default_value_t = 1)]
+    final_review_retries: usize,
 
     /// Do not attempt to merge the professional audit branch back into the
     /// primary branch after final review, even if the final review is GO.

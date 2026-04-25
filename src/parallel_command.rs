@@ -2681,6 +2681,48 @@ async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::None => {
+                match reconcile_parallel_clean_no_commit(
+                    repo_root,
+                    target_branch,
+                    &assignment,
+                    parallel_logger,
+                ) {
+                    Ok(true) => {
+                        if let Some(tracker) = linear_tracker.as_mut() {
+                            if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                                eprintln!(
+                                    "warning: failed to archive `{}` in Linear: {err:#}",
+                                    assignment.task.id
+                                );
+                            }
+                        }
+                        landed += 1;
+                        attempted_partial_followups.remove(&assignment.task.id);
+                        deferred_partial_tasks.remove(&assignment.task.id);
+                        parallel_logger.info(format!(
+                            "self-heal:   [{}] {} closed from canonical evidence after lane-{} exited cleanly without a commit (total landed: {})",
+                            classify_task_execution_kind(&assignment.task),
+                            assignment.task.id,
+                            assignment.lane_index,
+                            landed
+                        ));
+                        append_lane_host_event(
+                            &assignment.stdout_log_path,
+                            assignment.lane_index,
+                            &assignment.task.id,
+                            "self-heal: worker exited cleanly without a commit, but canonical review/receipt/artifact evidence is complete; host marked the task done",
+                        );
+                        last_idle_summary = None;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed checking canonical evidence for clean no-commit lane-{} `{}`: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        ));
+                    }
+                }
                 parallel_logger.warn(format!(
                     "warning: parallel lane-{} (`{}`) exited cleanly without producing a local commit; shelving for the rest of this run. see {}",
                     assignment.lane_index,
@@ -3337,6 +3379,7 @@ fn audit_parallel_completion_drift(
     let snapshot = parse_loop_plan(plan_text);
     let mut updated = plan_text.to_string();
     let mut demoted = Vec::new();
+    let mut promoted = Vec::new();
 
     for task in snapshot
         .tasks
@@ -3351,15 +3394,37 @@ fn audit_parallel_completion_drift(
         demoted.push(task.id.clone());
     }
 
+    for task in snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Partial)
+    {
+        let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        if !evidence.is_fully_evidenced() {
+            continue;
+        }
+        updated = update_task_completion_in_plan_text(&updated, &task.id, LoopTaskStatus::Done);
+        promoted.push(task.id.clone());
+    }
+
     if updated != plan_text {
         let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
         atomic_write(&plan_path, updated.as_bytes())
             .with_context(|| format!("failed to write {}", plan_path.display()))?;
-        parallel_logger.warn(format!(
-            "warning: demoted {} completed task(s) to `[~]` because repo-local completion evidence drifted ({})",
-            demoted.len(),
-            demoted.join(", ")
-        ));
+        if !demoted.is_empty() {
+            parallel_logger.warn(format!(
+                "warning: demoted {} completed task(s) to `[~]` because repo-local completion evidence drifted ({})",
+                demoted.len(),
+                demoted.join(", ")
+            ));
+        }
+        if !promoted.is_empty() {
+            parallel_logger.info(format!(
+                "self-heal: promoted {} partial task(s) to `[x]` because repo-local completion evidence is complete ({})",
+                promoted.len(),
+                promoted.join(", ")
+            ));
+        }
     }
 
     Ok(updated)
@@ -5387,6 +5452,60 @@ fn lane_changed_files(repo_root: &Path, base_commit: &str, head_ref: &str) -> Re
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+fn reconcile_parallel_clean_no_commit(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<bool> {
+    let evidence_before =
+        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let review_can_complete_evidence = !evidence_before.has_review_handoff
+        && evidence_before.verification_receipt_present
+        && evidence_before.missing_completion_artifacts.is_empty();
+    let review_added = if evidence_before.is_fully_evidenced() || review_can_complete_evidence {
+        ensure_host_review_handoff(repo_root, &assignment.task.id, &[], &evidence_before)?
+    } else {
+        false
+    };
+    let evidence_after =
+        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    if !evidence_after.is_fully_evidenced() {
+        return Ok(false);
+    }
+
+    let plan_updated =
+        update_task_completion_in_plan(repo_root, &assignment.task.id, LoopTaskStatus::Done)?;
+    if review_added || plan_updated {
+        let mut queue_files = Vec::new();
+        if review_added {
+            queue_files.push("REVIEW.md");
+        }
+        if plan_updated {
+            queue_files.push("IMPLEMENTATION_PLAN.md");
+        }
+        let mut args = vec!["add"];
+        args.extend(queue_files);
+        run_git(repo_root, args)?;
+        if repo_has_staged_queue_updates(repo_root)? {
+            let message = format!(
+                "{}: {} evidence self-heal",
+                repo_name(repo_root),
+                assignment.task.id
+            );
+            run_git(repo_root, ["commit", "-m", &message])?;
+            if push_branch_with_remote_sync(repo_root, target_branch)? {
+                parallel_logger.info(format!(
+                    "remote sync: rebased onto origin/{} after evidence self-heal",
+                    target_branch
+                ));
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 fn reconcile_parallel_landed_task(
