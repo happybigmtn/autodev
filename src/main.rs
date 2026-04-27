@@ -1,6 +1,7 @@
 mod audit_command;
 mod audit_everything;
 mod backend_policy;
+mod book_command;
 mod bug_command;
 mod claude_exec;
 mod codex_exec;
@@ -76,6 +77,8 @@ enum Command {
     QaOnly(QaOnlyArgs),
     /// Run a repo-wide quality and verification health report
     Health(HealthArgs),
+    /// Rewrite the last audit's CODEBASE-BOOK as a detailed narrative walkthrough
+    Book(BookArgs),
     /// Run a no-model first-run preflight for local layout, binary metadata, and help surfaces
     Doctor(doctor_command::DoctorArgs),
     /// Review completed work on the current branch
@@ -1013,6 +1016,12 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 1)]
     final_review_retries: usize,
 
+    /// Maximum file-quality rerating/remediation passes after a GO final
+    /// review. Each pass rerates every first-pass file and runs per-file
+    /// deliverables for files below 9/10 before the final review is rerun.
+    #[arg(long, default_value_t = 10)]
+    file_quality_passes: usize,
+
     /// Do not attempt to merge the professional audit branch back into the
     /// primary branch after final review, even if the final review is GO.
     #[arg(long)]
@@ -1366,6 +1375,46 @@ pub(crate) struct NemesisArgs {
     use_kimi_cli: bool,
 }
 
+#[derive(Args, Clone)]
+pub(crate) struct BookArgs {
+    /// Audit run id under audit/everything/<run-id>. Defaults to the latest
+    /// run recorded by .auto/audit-everything/latest-run, then the newest
+    /// directory under audit/everything.
+    #[arg(long)]
+    audit_run_id: Option<String>,
+
+    /// Override the audit/everything root. Defaults to <repo>/audit/everything.
+    #[arg(long)]
+    audit_root: Option<PathBuf>,
+
+    /// Override the CODEBASE-BOOK output directory. Defaults to
+    /// <audit-root>/<run-id>/CODEBASE-BOOK.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Codex model used to rewrite the narrative book.
+    #[arg(long, default_value = "gpt-5.5")]
+    model: String,
+
+    /// Codex reasoning effort used to rewrite the narrative book.
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Codex executable used for the book rewrite.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Print the generated book prompt and exit without invoking Codex.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip the post-write quality review. By default `auto book` asks Codex
+    /// to judge whether the book is deep enough for a junior developer to
+    /// understand the codebase without reading source files.
+    #[arg(long)]
+    skip_quality_review: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -1379,6 +1428,7 @@ async fn main() -> Result<()> {
         Command::Qa(args) => qa_command::run_qa(args).await,
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
         Command::Health(args) => health_command::run_health(args).await,
+        Command::Book(args) => book_command::run_book(args).await,
         Command::Doctor(args) => doctor_command::run_doctor(args).await,
         Command::Review(args) => review_command::run_review(args).await,
         Command::Steward(args) => steward_command::run_steward(args).await,
@@ -1421,7 +1471,7 @@ mod tests {
     fn top_level_command_surface_matches_live_enum() {
         let expected = [
             "corpus", "gen", "super", "reverse", "bug", "loop", "parallel", "qa", "qa-only",
-            "health", "doctor", "review", "steward", "audit", "ship", "nemesis", "quota",
+            "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis", "quota",
             "symphony",
         ];
         let cli_command = Cli::command();

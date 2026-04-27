@@ -1037,6 +1037,9 @@ What it does:
 - Writes human reports under `audit/everything/<run-id>` in the audit worktree
 - Writes and injects `GSTACK-SKILL-POLICY.md` so every worker gets deterministic, phase-aware
   gstack lenses instead of deciding ad hoc which skills to consider
+- Writes and injects `CODEBASE-IMPROVEMENT-POLICY.md` so the audit treats orphaned code,
+  deprecated paths, accumulated technical debt, weak architecture, and AI-slop as first-class
+  remediation targets
 - Runs first-pass per-file analysis with Codex `gpt-5.5` `low`
 - Runs synthesis with Codex `gpt-5.5` `high`
 - Generates `REMEDIATION-PLAN.md` / `REMEDIATION-PLAN.json` from the synthesized reports, with
@@ -1047,11 +1050,24 @@ What it does:
 - If final review writes `Verdict: NO-GO` with actionable required blockers, runs a bounded
   repair pass and reruns final review before merge judgment
 - Writes `CODEBASE-BOOK/` as the final human-readable codebase explanation: a chaptered,
-  first-principles tour organized by the repository's logical architecture, with readable
-  file-catalog chapters covering every audited file, audit-made changes, documentation updates,
-  validation, residual risks, and pointers back to evidence
+  first-principles tour organized by the repository's logical architecture. The expected standard
+  is a Feynman-style technical walkthrough that teaches a smart junior developer the important
+  crates/files, runtime flows, state boundaries, validation posture, and production risks before
+  they open the raw source.
+- Keeps `reports/` as durable evidence behind the book. The book is the readable map; the
+  reports are the group-by-group audit trail used by remediation and final review. Bulky
+  first-pass mirrors under `audit/everything/<run-id>/files/**` remain transient by default and
+  should not be committed unless an operator explicitly asks to preserve them.
+- Use `auto book` after a completed audit when the first generated book is too high-level. It
+  rewrites only the narrative `CODEBASE-BOOK/` chapters from the last audit corpus using Codex's
+  maximum context window, preserves appendix/file-catalog walkthroughs byte-for-byte, and runs a
+  quality review against the "deep codebase substitute for a junior developer" standard.
 - Attempts a fast-forward merge back to the resolved primary branch only after final review writes
   `Verdict: GO`, unless `--no-everything-merge` is set
+- After a successful merge, refreshes `RUN-STATUS.md` with an explicit final-status note and
+  lands that status refresh so the committed run artifact records merge completion. Exact branch
+  heads can still move after the status commit, so `git rev-parse` remains the source of truth for
+  current commit IDs.
 - `--everything-in-place` runs against the current checkout, requires a clean checkout for a new
   run, writes reports directly under that checkout, and marks merge complete once the final
   `Verdict: GO` artifacts are committed because changes are already in place
@@ -1059,12 +1075,25 @@ What it does:
 Skill policy:
 
 - First-pass prompts inject only the selected compact lenses for that file's surface and forbid
-  direct tool invocation, keeping one-file loops clean
+  direct tool invocation, keeping one-file loops clean. They also require orphan/deprecation,
+  AI-slop, deletion-candidate, architecture-smell, and behavior-preservation findings.
 - Synthesis and remediation-lane prompts inject the selected group lenses; direct browser, QA,
   benchmark, devex, release, or documentation checks are allowed only when the lane surface and
-  report recommendations call for them
+  report recommendations call for them. Group reports include a debt register whose classes are
+  `safe_delete`, `deprecated_remove`, `consolidate`, `simplify`, `deepen_module`, and
+  `leave_with_reason`.
+- Remediation lanes may delete, retire, consolidate, simplify, or deepen modules when the group
+  report supplies proof. Required deletion proof includes references/imports/exports, entrypoints,
+  config/docs/generated bindings, API/CLI/operator/runtime impact, and narrow validation or
+  behavior characterization.
 - Final review injects review, CSO, health, QA-only, benchmark, devex, docs, ship,
   land-and-deploy, canary, careful, and checkpoint lenses before judging merge readiness
+- Final review must include an evidence-class checklist that distinguishes local static/build/unit
+  validation, generated contract/binding validation, browser QA, deployment/canary health, live
+  production or mainnet/on-chain proof, external-owner proof, and documentation/status integrity.
+  Local, fixture, regtest, or synthetic proof must not be counted as live production proof.
+- Final review must also include a deletion/refactor proof checklist and reject deletions or
+  architectural rewrites that cannot show no product substance was lost.
 
 Useful controls:
 
@@ -1077,6 +1106,38 @@ Useful controls:
 - `--final-review-retries <n>` to control the bounded NO-GO repair/rerun loop, defaulting to 1
 - `--report-only` to stop before remediation
 - `--branch trunk|main` when the primary branch cannot be inferred
+
+#### `auto book`
+
+Purpose:
+
+- Rewrite the latest professional audit's `CODEBASE-BOOK/` into a detailed narrative walkthrough
+  without rerunning file analysis, synthesis, remediation, or final review
+- Use the last audit's `reports/`, `FINAL-REVIEW.md`, `REMEDIATION-PLAN.md`, `RUN-STATUS.md`,
+  existing appendix/catalog files, and referenced first-pass artifacts as the source corpus
+- Teach the codebase Feynman-style: first principles, concrete runtime/data/control-flow
+  walkthroughs, key crates/files and functions, validation evidence, production risks, and plain
+  explanations suitable for a junior developer who has not read the source yet
+
+What it does:
+
+- Defaults to the run recorded in `.auto/audit-everything/latest-run`, falling back to the newest
+  directory under `audit/everything/`
+- Invokes Codex through the max-context execution path (`model_context_window=1000000`)
+- Preserves existing appendix/catalog markdown files byte-for-byte while rewriting narrative book
+  chapters
+- Writes logs under `.auto/book/<run-id>/<timestamp>/`
+- Runs a second max-context quality review and writes `CODEBASE-BOOK/BOOK-QUALITY-REVIEW.md`
+  with `Verdict: PASS` or `Verdict: NO-GO`; the command exits nonzero on NO-GO
+
+Useful controls:
+
+- `--audit-run-id <id>` to target a specific audit run
+- `--audit-root <path>` when the audit artifacts live somewhere other than `audit/everything`
+- `--output-dir <path>` to write the book somewhere else
+- `--model <model>` / `--reasoning-effort <effort>` / `--codex-bin <path>`
+- `--dry-run` to print the book prompt without invoking Codex
+- `--skip-quality-review` for a faster rewrite when you want to inspect the book yourself
 
 ### `auto symphony`
 

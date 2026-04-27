@@ -28,11 +28,16 @@ const LATEST_RUN_FILE: &str = "latest-run";
 const PAUSE_REQUEST_FILE: &str = "PAUSE";
 const MAX_FILE_PROMPT_BYTES: usize = 220_000;
 const LEGACY_LARGE_FILE_OMISSION_MARKER: &str = "[file omitted from prompt because";
+const DEFAULT_FILE_QUALITY_PASS_LIMIT: usize = 10;
+const FILE_QUALITY_ACCEPT_SCORE: f64 = 9.0;
+const FILE_QUALITY_TARGET_SCORE: f64 = 10.0;
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["trunk", "main", "master"];
-const DEFAULT_EXCLUDE_PREFIXES: [&str; 10] = [
+const DEFAULT_EXCLUDE_PREFIXES: [&str; 16] = [
     ".git/",
     ".auto/",
     ".claude/worktrees/",
+    ".gstack/",
+    "audit/",
     "target/",
     "node_modules/",
     "dist/",
@@ -40,6 +45,21 @@ const DEFAULT_EXCLUDE_PREFIXES: [&str; 10] = [
     "bug/",
     "nemesis/",
     "gen-",
+    ".github/ISSUE_TEMPLATE/",
+    "docs/ops/operator-evidence/",
+    "web/client/dist/",
+    "web/play/dist/",
+];
+const DEFAULT_EXCLUDE_PATH_SEGMENTS: [&str; 3] = ["/node_modules/", "/target/", "/dist/"];
+const DEFAULT_EXCLUDE_SUFFIXES: [&str; 12] = [
+    ".lock", ".map", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".ico", ".mp4", ".mov",
+    ".zip",
+];
+const DEFAULT_EXCLUDE_FILENAMES: [&str; 4] = [
+    "Cargo.lock",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "bun.lockb",
 ];
 
 const GSTACK_SKILL_POLICY: &str = r#"# GStack Skill Policy
@@ -92,6 +112,45 @@ This audit uses gstack skills as deterministic compact lenses unless the phase e
 - benchmark-models, plan-tune, gstack-upgrade, design-shotgun, design-html, office-hours: meta/tooling/ideation skills. Mention only if the file itself implements those workflows or the user explicitly requested that surface.
 "#;
 
+const CODEBASE_IMPROVEMENT_POLICY: &str = r#"# Codebase Improvement Policy
+
+This audit is allowed to improve architecture, delete proved-dead code, and remove accumulated agent-written filler. It should not degrade product substance in exchange for a cleaner-looking diff.
+
+## Default Posture
+
+- Prefer deletion, consolidation, and simplification when repository evidence proves code is orphaned, deprecated, duplicated, transitional, or hollow.
+- Improve module boundaries and dependency direction when a group report shows shallow modules, misplaced ownership, leaked invariants, or domain vocabulary drift.
+- Treat "AI slop" as real debt: vague comments, generic wrappers, fake extensibility, repeated boilerplate, overexplained docs, and abstractions that do not protect an invariant or simplify a caller.
+- Preserve behavior unless the synthesized report explicitly recommends changing it and the final review can explain why.
+
+## Required Proof Before Removal
+
+A remediation lane may delete or retire code only when it records proof in the lane report:
+
+- reachability evidence from references, imports, exports, entrypoints, commands, config, docs, generated bindings, and tests
+- public API, CLI, operator, or runtime behavior either preserved or intentionally updated
+- narrow validation or characterization evidence for the affected surface
+- confirmation that durable audit evidence, production/mainnet proof, generated runtime state, and operator artifacts were not removed merely because they looked unused
+
+## Debt Register Classes
+
+Use these classes in group reports and remediation notes:
+
+- `safe_delete`: no live references or external contract remain
+- `deprecated_remove`: an obsolete path can be removed with compatibility/docs updated
+- `consolidate`: duplicated responsibilities should merge behind one owner
+- `simplify`: code remains, but ceremony, wrappers, comments, or branches should shrink
+- `deepen_module`: boundaries, names, invariants, or dependency direction need architectural repair
+- `leave_with_reason`: suspicious code should stay because evidence shows it still carries substance
+
+## Refactor Discipline
+
+- Characterize behavior before risky refactors or deletions.
+- Prefer vertical, reviewable changes over broad cosmetic churn.
+- Update `ARCHITECTURE.md`, focused docs, or ADR-like notes when ownership, vocabulary, dependency direction, or durable invariants change.
+- If proof is incomplete, leave the code in place and document the missing evidence instead of guessing.
+"#;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EverythingManifest {
     run_id: String,
@@ -113,8 +172,16 @@ struct EverythingManifest {
     remediation_tasks: Vec<RemediationTaskState>,
     #[serde(default)]
     final_review_repairs: Vec<StageState>,
+    #[serde(default)]
+    file_quality: StageState,
+    #[serde(default)]
+    file_quality_passes: Vec<FileQualityPassState>,
+    #[serde(default)]
+    change_summary: StageState,
     final_review: StageState,
     merge: StageState,
+    #[serde(default)]
+    final_status: StageState,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -157,6 +224,24 @@ struct RemediationTaskState {
     lane_repo_root: String,
     base_commit: Option<String>,
     status: StageStatus,
+    note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FileQualityPassState {
+    pass_index: usize,
+    status: StageStatus,
+    artifact_dir: String,
+    ratings: Vec<FileQualityRatingState>,
+    note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FileQualityRatingState {
+    path: String,
+    score_out_of_10: Option<f64>,
+    status: StageStatus,
+    artifact_dir: String,
     note: Option<String>,
 }
 
@@ -212,6 +297,9 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
     }
     if args.remediation_threads == 0 {
         bail!("--remediation-threads must be greater than 0");
+    }
+    if args.file_quality_passes == 0 {
+        bail!("--file-quality-passes must be greater than 0");
     }
 
     let repo_root = git_repo_root()?;
@@ -280,13 +368,15 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
                     print_status(&paths, &manifest);
                     return Ok(());
                 }
-                run_final_review_phase(&args, &paths, &mut manifest).await?;
+                run_final_review_and_file_quality_phase(&args, &paths, &mut manifest).await?;
                 if manifest.in_place {
                     complete_in_place_run(&paths, &mut manifest)?;
+                    refresh_final_status_after_merge(&repo_root, &paths, &mut manifest)?;
                 } else if args.no_everything_merge {
                     mark_merge_skipped(&paths, &mut manifest, "--no-everything-merge")?;
                 } else {
                     attempt_merge(&repo_root, &paths, &mut manifest)?;
+                    refresh_final_status_after_merge(&repo_root, &paths, &mut manifest)?;
                 }
             }
         }
@@ -315,14 +405,16 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
             }
         }
         AuditEverythingPhase::FinalReview => {
-            run_final_review_phase(&args, &paths, &mut manifest).await?;
+            run_final_review_and_file_quality_phase(&args, &paths, &mut manifest).await?;
         }
         AuditEverythingPhase::Merge => {
-            run_final_review_phase(&args, &paths, &mut manifest).await?;
+            run_final_review_and_file_quality_phase(&args, &paths, &mut manifest).await?;
             if manifest.in_place {
                 complete_in_place_run(&paths, &mut manifest)?;
+                refresh_final_status_after_merge(&repo_root, &paths, &mut manifest)?;
             } else {
                 attempt_merge(&repo_root, &paths, &mut manifest)?;
+                refresh_final_status_after_merge(&repo_root, &paths, &mut manifest)?;
             }
         }
         AuditEverythingPhase::Pause
@@ -442,8 +534,12 @@ fn load_or_create_run(
         remediation_plan: StageState::default(),
         remediation_tasks: Vec::new(),
         final_review_repairs: Vec::new(),
+        file_quality: StageState::default(),
+        file_quality_passes: Vec::new(),
+        change_summary: StageState::default(),
         final_review: StageState::default(),
         merge: StageState::default(),
+        final_status: StageState::default(),
     };
     atomic_write(&paths.latest_path, run_id.as_bytes())
         .with_context(|| format!("failed to write {}", paths.latest_path.display()))?;
@@ -984,6 +1080,52 @@ async fn run_final_review_phase(
     }
 }
 
+async fn run_final_review_and_file_quality_phase(
+    args: &AuditArgs,
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+) -> Result<()> {
+    run_final_review_phase(args, paths, manifest).await?;
+    if !final_review_is_go(paths) || args.report_only {
+        finalize_change_summary_phase(paths, manifest, !args.report_only)?;
+        return Ok(());
+    }
+    let changed = run_file_quality_gate_phase(args, paths, manifest).await?;
+    if changed {
+        manifest.final_review.status = StageStatus::Pending;
+        manifest.final_review.note = Some(
+            "file-quality deliverables changed the audit branch; final review must rerun"
+                .to_string(),
+        );
+        write_manifest(paths, manifest)?;
+        run_final_review_phase(args, paths, manifest).await?;
+    }
+    finalize_change_summary_phase(paths, manifest, true)?;
+    Ok(())
+}
+
+fn finalize_change_summary_phase(
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+    commit: bool,
+) -> Result<()> {
+    manifest.change_summary.status = StageStatus::Running;
+    manifest.change_summary.artifact = Some(path_display(&change_summary_markdown_path(paths)));
+    write_manifest(paths, manifest)?;
+
+    write_change_summary_markdown(paths, manifest)?;
+
+    manifest.change_summary.status = StageStatus::Complete;
+    manifest.change_summary.note = Some(
+        "engineer-readable audit change summary written from audit branch git history".to_string(),
+    );
+    write_manifest(paths, manifest)?;
+    if commit {
+        commit_worktree_changes(paths, manifest)?;
+    }
+    Ok(())
+}
+
 async fn run_final_review_once(
     args: &AuditArgs,
     paths: &RunPaths,
@@ -1008,6 +1150,150 @@ async fn run_final_review_once(
     manifest.final_review.note = first_verdict_line(&review);
     manifest.final_review.status = StageStatus::Complete;
     write_manifest(paths, manifest)?;
+    Ok(())
+}
+
+async fn run_file_quality_gate_phase(
+    args: &AuditArgs,
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+) -> Result<bool> {
+    if matches!(manifest.file_quality.status, StageStatus::Complete) {
+        println!("file quality: complete (resume)");
+        return Ok(false);
+    }
+
+    let limit = args
+        .file_quality_passes
+        .clamp(1, DEFAULT_FILE_QUALITY_PASS_LIMIT);
+    manifest.file_quality.status = StageStatus::Running;
+    manifest.file_quality.artifact = Some(path_display(&file_quality_root_path(paths)));
+    write_manifest(paths, manifest)?;
+
+    let mut changed = false;
+    let config = PhaseConfig {
+        model: args.final_review_model.clone(),
+        effort: args.final_review_effort.clone(),
+        codex_bin: args.codex_bin.clone(),
+    };
+
+    for pass_index in next_file_quality_pass_index(manifest)..=limit {
+        let pass = run_one_file_quality_pass(paths, manifest, pass_index, &config).await?;
+        let below_threshold = pass
+            .ratings
+            .iter()
+            .filter(|rating| rating.score_out_of_10.unwrap_or(0.0) < FILE_QUALITY_ACCEPT_SCORE)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        manifest.file_quality_passes.push(pass);
+        if below_threshold.is_empty() {
+            manifest.file_quality.status = StageStatus::Complete;
+            manifest.file_quality.note = Some(format!(
+                "all files rerated at least {FILE_QUALITY_ACCEPT_SCORE:.0}/10 after pass {pass_index}"
+            ));
+            write_manifest(paths, manifest)?;
+            return Ok(changed);
+        }
+
+        println!(
+            "file quality: pass {pass_index} found {} file(s) below {FILE_QUALITY_ACCEPT_SCORE:.0}/10",
+            below_threshold.len()
+        );
+        run_file_quality_deliverables(paths, manifest, pass_index, &below_threshold, &config)
+            .await?;
+        changed = true;
+        manifest.file_quality.note = Some(format!(
+            "pass {pass_index} ran {} per-file deliverable set(s); next pass will rerate all files",
+            below_threshold.len()
+        ));
+        write_manifest(paths, manifest)?;
+        commit_worktree_changes(paths, manifest)?;
+    }
+
+    manifest.file_quality.status = StageStatus::Failed;
+    manifest.file_quality.note = Some(format!(
+        "files remained below {FILE_QUALITY_ACCEPT_SCORE:.0}/10 after {limit} quality pass(es)"
+    ));
+    write_manifest(paths, manifest)?;
+    bail!(
+        "file-quality gate failed: at least one file remained below {FILE_QUALITY_ACCEPT_SCORE:.0}/10 after {limit} pass(es)"
+    )
+}
+
+async fn run_one_file_quality_pass(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    pass_index: usize,
+    config: &PhaseConfig,
+) -> Result<FileQualityPassState> {
+    let pass_dir = file_quality_pass_path(paths, pass_index);
+    fs::create_dir_all(&pass_dir)
+        .with_context(|| format!("failed to create {}", pass_dir.display()))?;
+    let mut ratings = Vec::new();
+    for file in &manifest.files {
+        let artifact_dir = file_quality_file_path(paths, pass_index, file);
+        let rating_json = artifact_dir.join("rating.json");
+        if !rating_json.exists() {
+            let prompt = build_file_quality_rerate_prompt(paths, manifest, file, pass_index);
+            let phase_slug = format!(
+                "file-quality-rerate-{pass_index}-{}",
+                file_artifact_slug(&file.path, &file.content_hash)
+            );
+            run_codex_phase_for_artifact(paths, &artifact_dir, &phase_slug, &prompt, config)
+                .await?;
+        }
+        require_nonempty_file(&rating_json)?;
+        let score = read_file_quality_score(&rating_json)?;
+        ratings.push(FileQualityRatingState {
+            path: file.path.clone(),
+            score_out_of_10: score,
+            status: StageStatus::Complete,
+            artifact_dir: path_display(&artifact_dir),
+            note: score.map(|score| format!("rerated {score:.1}/10")),
+        });
+    }
+
+    let below = ratings
+        .iter()
+        .filter(|rating| rating.score_out_of_10.unwrap_or(0.0) < FILE_QUALITY_ACCEPT_SCORE)
+        .count();
+    Ok(FileQualityPassState {
+        pass_index,
+        status: if below == 0 {
+            StageStatus::Complete
+        } else {
+            StageStatus::Running
+        },
+        artifact_dir: path_display(&pass_dir),
+        ratings,
+        note: Some(format!(
+            "{below} file(s) below {FILE_QUALITY_ACCEPT_SCORE:.0}/10 on rerating"
+        )),
+    })
+}
+
+async fn run_file_quality_deliverables(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    pass_index: usize,
+    ratings: &[FileQualityRatingState],
+    config: &PhaseConfig,
+) -> Result<()> {
+    for rating in ratings {
+        let Some(file) = manifest.files.iter().find(|file| file.path == rating.path) else {
+            bail!("quality rating referenced missing file `{}`", rating.path);
+        };
+        let artifact_dir = PathBuf::from(&rating.artifact_dir);
+        let prompt =
+            build_file_quality_deliverables_prompt(paths, manifest, file, rating, pass_index);
+        let phase_slug = format!(
+            "file-quality-deliverables-{pass_index}-{}",
+            file_artifact_slug(&file.path, &file.content_hash)
+        );
+        run_codex_phase_for_artifact(paths, &artifact_dir, &phase_slug, &prompt, config).await?;
+        require_nonempty_file(&artifact_dir.join("deliverables.md"))?;
+    }
     Ok(())
 }
 
@@ -1119,6 +1405,51 @@ fn complete_in_place_run(paths: &RunPaths, manifest: &mut EverythingManifest) ->
     manifest.merge.note =
         Some("in-place run: audit changes are committed on the primary checkout".to_string());
     write_manifest(paths, manifest)?;
+    Ok(())
+}
+
+fn refresh_final_status_after_merge(
+    repo_root: &Path,
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+) -> Result<()> {
+    if !matches!(manifest.merge.status, StageStatus::Complete) {
+        return Ok(());
+    }
+    manifest.final_status.status = StageStatus::Complete;
+    manifest.final_status.artifact = Some(path_display(&run_status_markdown_path(paths)));
+    manifest.final_status.note = Some(
+        "RUN-STATUS refreshed after merge completion; committed status is generated immediately before the final status commit, so use `git rev-parse` for exact post-commit heads"
+            .to_string(),
+    );
+    write_manifest(paths, manifest)?;
+    commit_worktree_changes(paths, manifest)?;
+
+    if manifest.in_place {
+        return Ok(());
+    }
+
+    let current_branch = git_stdout(repo_root, ["branch", "--show-current"])?
+        .trim()
+        .to_string();
+    if current_branch != manifest.branch {
+        bail!(
+            "final status refresh requires canonical checkout on `{}` (current: `{}`)",
+            manifest.branch,
+            current_branch
+        );
+    }
+    let status = git_stdout(repo_root, ["status", "--short"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "canonical checkout is dirty after merge; cannot land final status refresh:\n{}",
+            status
+        );
+    }
+    run_git(repo_root, ["merge", "--ff-only", &manifest.audit_branch])?;
+    if remote_branch_exists(repo_root, &manifest.branch) {
+        run_git(repo_root, ["push", "origin", &manifest.branch])?;
+    }
     Ok(())
 }
 
@@ -1345,10 +1676,16 @@ fn remediation_plan_json_path(paths: &RunPaths) -> PathBuf {
     paths.report_root.join("REMEDIATION-PLAN.json")
 }
 
+fn codebase_improvement_policy_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("CODEBASE-IMPROVEMENT-POLICY.md")
+}
+
 fn write_remediation_plan_files(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
     let mut body = String::new();
     body.push_str("# Remediation Plan\n\n");
     body.push_str("Generated from synthesized audit reports. The host scheduler owns this file; remediation lanes update their assigned group report and commit source/doc/test changes in isolated worktrees.\n\n");
+    body.push_str("## Debt And Architecture Contract\n\n");
+    body.push_str("Remediation is allowed to remove proved-dead code, retire deprecated paths, consolidate duplicates, simplify agent-written filler, and deepen module boundaries when the group report records repository evidence. Follow `CODEBASE-IMPROVEMENT-POLICY.md` for proof requirements and debt classes.\n\n");
     body.push_str("## Tasks\n\n");
     for task in &manifest.remediation_tasks {
         let deps = if task.dependencies.is_empty() {
@@ -1715,6 +2052,7 @@ You are not alone in the audit. The host owns the dependency graph, landing, and
 
 Hard boundaries:
 - Read `AGENTS.md`, `ARCHITECTURE.md`, `audit/everything/*/CONTEXT-BUNDLE.md`, the gstack skill policy, doctrine if present, and the assigned report.
+- Read `audit/everything/*/CODEBASE-IMPROVEMENT-POLICY.md` and the assigned report's `## Debt Register` before editing.
 - If this lane already contains partial work from an interrupted run, inspect it first and continue from that state instead of discarding it.
 - Keep edits centered on the owned paths and directly necessary adjacent tests/docs.
 - Do not write into the canonical audit worktree. Edit only files inside this lane repository; the host will cherry-pick your lane commit back.
@@ -1733,6 +2071,9 @@ Owned paths:
 
 Required work:
 - Apply only recommendations from `{lane_report}` that are supported by repository evidence.
+- Systematically address this lane's debt register: delete proved-dead code, remove deprecated paths, consolidate duplicates, simplify AI-slop, or deepen module boundaries when the report supplies enough evidence.
+- Before deleting or retiring code, record deletion proof in `{lane_report}`: references/imports/exports checked, public API/CLI/operator/runtime impact, docs/config/generated bindings reviewed, and validation or characterization evidence.
+- If proof is incomplete, leave the code in place and update `{lane_report}` with `leave_with_reason` and the exact missing evidence.
 - Update `{lane_report}` with completed recommendations, changed files, validation commands, and remaining blockers.
 - If your changes alter module responsibilities, runtime flows, user-facing behavior, operator workflows, or durable invariants, update the relevant architecture/docs files in the same lane, especially root `ARCHITECTURE.md` and focused docs under `docs/`.
 - Run the narrowest meaningful validation for this group.
@@ -2017,6 +2358,16 @@ fn write_skill_policy_reference(paths: &RunPaths) -> Result<()> {
             "failed to write {}",
             paths.report_root.join("GSTACK-SKILL-POLICY.md").display()
         )
+    })?;
+    atomic_write(
+        &codebase_improvement_policy_path(paths),
+        CODEBASE_IMPROVEMENT_POLICY.as_bytes(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            codebase_improvement_policy_path(paths).display()
+        )
     })
 }
 
@@ -2256,6 +2607,7 @@ fn build_context_prompt(worktree_root: &Path, report_root: &Path) -> String {
 Repository root: `{worktree_root}`
 Report root: `{report_root}`
 GStack skill policy: `{report_root}/GSTACK-SKILL-POLICY.md`
+Codebase improvement policy: `{report_root}/CODEBASE-IMPROVEMENT-POLICY.md`
 
 Edit only repository-local context documents and the report root:
 - Create or revise root `AGENTS.md`.
@@ -2268,7 +2620,9 @@ Context engineering requirements:
 - Follow Matklad's `ARCHITECTURE.md` guidance: describe the problem, codemap, module boundaries, invariants, and cross-cutting concerns. Keep details stable and avoid stale links.
 - If `doctrine/` exists and contains files, reference it explicitly as doctrine injected into every audit loop. If it does not exist or is empty, ignore it.
 - Reference the gstack skill policy as a compact routing artifact for future audit workers. Do not paste the full policy into `AGENTS.md`; point to it and keep `AGENTS.md` short.
+- Reference the codebase improvement policy as the audit's default-on debt, deletion, AI-slop, and architecture-deepening contract. Do not paste the whole policy into root docs.
 - Treat gstack skills as deterministic lenses by phase. Direct tool-like invocation is reserved for remediation/final validation when the selected surface calls for browser, QA, benchmark, deploy, or documentation checks.
+- Add architecture context that helps later workers find domain boundaries, deprecated surfaces, orphan-risk areas, and evidence sources for safe deletion.
 - Favor evidence-backed statements. Mark inferred architecture as inferred instead of pretending certainty.
 - These first target repos are Bitino and Autonomy, so make the docs useful for Rust workspace/crate-heavy systems, runtime operators, and agent workers.
 
@@ -2299,6 +2653,12 @@ Injected context:
 Selected gstack lenses:
 {skill_policy}
 
+Default-on codebase improvement policy:
+- Look for orphaned, deprecated, duplicated, transitional, overabstracted, or agent-generated filler in this file.
+- Apply the deletion test even in first pass: what references, exports, config, docs, generated bindings, tests, or runtime entrypoints would prove this file or part of it is still live?
+- Prefer architectural depth over micro-edits: identify whether this file owns a real invariant, belongs in this module, leaks responsibilities, or should consolidate with another owner.
+- Do not recommend deletion unless you can name the proof still needed or already visible from this file plus injected context.
+
 File under audit:
 - Path: `{path}`
 - Group: `{group}`
@@ -2315,12 +2675,14 @@ Write these files:
 - Important public types/functions/modules/configuration it owns.
 - How it appears to fit the architecture.
 - Whether it is the best version of itself it could be.
+- Orphan/deprecation signals, AI-slop signals, and simplification/deletion candidates with the evidence needed before removal.
+- Architecture/debt assessment: ownership, module depth, domain vocabulary, dependency direction, duplicated responsibilities, and whether this file appears to carry real substance.
 - A coverage note stating whether the full file content was provided inline or reviewed from disk in chunks.
 - If not 10/10, list expansions, deletions, revisions, clarifications, tests, code refactors, documentation moves, or retirement steps that would make it an idiomatic 10/10 work product.
 - Cross-file questions or likely relationships surfaced by this file, without resolving them from other source files in this pass.
 
 `analysis.json` must be valid JSON with:
-`path`, `group`, `score_out_of_10`, `summary`, `best_version_assessment`, `recommended_actions`, `cross_file_questions`, `coverage`, `confidence`.
+`path`, `group`, `score_out_of_10`, `summary`, `best_version_assessment`, `orphaned_or_deprecated_signals`, `ai_slop_signals`, `deletion_candidates`, `architecture_smells`, `behavior_preservation_needs`, `recommended_actions`, `cross_file_questions`, `coverage`, `confidence`.
 
 Target file content:
 ```text
@@ -2353,14 +2715,25 @@ The authoritative input set is the report plus the exact first-pass artifact pat
 Selected gstack lenses for this group:
 {skill_policy}
 
+Default-on codebase improvement policy:
+- Build or update a debt register for this group. Use the classes `safe_delete`, `deprecated_remove`, `consolidate`, `simplify`, `deepen_module`, and `leave_with_reason`.
+- Treat orphaned/deprecated code and AI-slop as first-class audit findings, not optional polish.
+- Prefer cross-file architecture fixes over isolated micro-edits when duplicated responsibility, shallow modules, or weak domain boundaries are the real problem.
+- Require proof before deletion: references/imports/exports, entrypoints, config, docs, generated bindings, tests, runtime paths, and behavior characterization where needed.
+- If proof is missing, record exactly what evidence would be needed instead of guessing.
+
 Revise `{report}` in place. Keep every file represented. Tighten or correct the first-pass assessments based on relationships surfaced between files:
 - duplicated responsibilities
 - unclear ownership or misplaced modules
 - missing invariants
 - dead code or files that should retire
+- deprecated paths, transitional scaffolding, and orphaned exports
+- AI-slop: generic wrappers, hollow abstractions, vague comments, repeated boilerplate, or docs that add words without operational value
 - test gaps
 - docs that should move into `AGENTS.md`, `ARCHITECTURE.md`, doctrine, or inline comments
 - cross-crate/API seams
+
+`{report}` must include a `## Debt Register` section. For each candidate, include path(s), class, recommended action, deletion/refactor proof found, proof still missing, behavior-preservation needs, and risk.
 
 Use the selected lenses as a compact prompt injection, not as permission to bulk-load unrelated skill files. Keep the output grounded in repository evidence.
 
@@ -2393,6 +2766,7 @@ Use `gpt-5.5 xhigh` judgment standards:
 - Verify changes correspond to report findings.
 - Reject speculative rewrites not grounded in file reports.
 - Check for broken architecture docs, stale AGENTS instructions, overbroad edits, missing tests, and merge-risk.
+- Verify debt-removal and architecture-deepening work: deletion candidates are evidence-backed, deprecated paths are intentionally retired, AI-slop was removed where safe, and refactors preserve product substance.
 - Run or inspect the narrowest feasible validation for the changed surfaces.
 
 Write `{report_root}/FINAL-REVIEW.md` with:
@@ -2401,10 +2775,27 @@ Write `{report_root}/FINAL-REVIEW.md` with:
 - Diff summary
 - Report consistency assessment
 - Validation run and result
+- Evidence class checklist
+- Deletion and refactor proof checklist
 - Required blockers before merge
 - Optional follow-ups
 
+The evidence class checklist must classify each evidence class as `pass`, `not run`, `blocked`, or `not applicable`; cite the exact artifact, command, or report path for each non-`not applicable` row; and state what claims the evidence does and does not support. Include at least these classes:
+- local static/build/unit validation
+- generated contract/binding validation
+- browser QA or visual/product workflow validation
+- deployment/canary/health validation
+- live production or mainnet/on-chain validation
+- external-owner or cross-repo validation
+- documentation/status artifact integrity
+
+The deletion and refactor proof checklist must classify each debt-removal claim as `pass`, `blocked`, or `not applicable`; cite the group report, debt-register item, diff path, and validation/characterization proof. Reject the audit with `Verdict: NO-GO` if code was deleted or behavior was refactored without enough evidence to show no substance was lost.
+
+Do not count local, fixture, regtest, or synthetic proof as live production proof. Do not merge bulky first-pass mirrors such as `audit/everything/<run-id>/files/**` unless the host explicitly requested them; they should remain transient evidence caches by default.
+
 Also write a chaptered codebase book under `{report_root}/CODEBASE-BOOK/`. This is the final explanatory artifact for a human who wants to understand the audited codebase without rereading every source file. It must not be a single giant markdown file. Write it in a Feynman-style teaching voice: clear first principles, concrete examples, patient logical order, and plain-spoken explanations. Avoid hype and vague praise.
+
+The book standard is intentionally higher than an executive audit summary. A smart junior developer who is otherwise unfamiliar with this repository should be able to read the book and gain a deep technical understanding of the important crates/files, runtime flows, state boundaries, validation posture, and production risks before opening the source code.
 
 `CODEBASE-BOOK/` must include:
 - `README.md` with `# CODEBASE BOOK`, the table of contents, the recommended reading path, and links to all chapter files.
@@ -2415,6 +2806,8 @@ Also write a chaptered codebase book under `{report_root}/CODEBASE-BOOK/`. This 
 - Pointers back to the group reports and first-pass artifacts for readers who want evidence.
 
 The book must cover every tracked file included in this audit. Every file needs a reasonably detailed explanation of what it does, why it exists, what owns it or calls it, and how it fits into the surrounding subsystem. Do not use empty boilerplate like "utility file" without explanation. For files changed by this audit, include `changed:` in that file's entry and summarize the substance of the change.
+
+For key files and key sections, include narrative code walkthroughs: name the important modules, functions, types, tests, configuration, and command paths; explain why each matters and how control or data moves through it. If the first draft becomes too high-level, prefer fewer but deeper narrative chapters plus appendix links over shallow coverage everywhere. The standalone `auto book` command can later rewrite these narrative chapters from the completed audit corpus using Codex's maximum context window while preserving appendix/catalog files.
 
 Do not merge. The host runner handles merge only after this file says `Verdict: GO`.
 "#,
@@ -2461,6 +2854,132 @@ Rules:
     )
 }
 
+fn build_file_quality_rerate_prompt(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    file: &FileState,
+    pass_index: usize,
+) -> String {
+    let first_pass = Path::new(&file.artifact_dir).join("analysis.json");
+    let first_pass_markdown = Path::new(&file.artifact_dir).join("analysis.md");
+    let group_report = manifest
+        .groups
+        .iter()
+        .find(|group| group.name == file.group)
+        .map(|group| group.report_path.as_str())
+        .unwrap_or("");
+    let artifact_dir = file_quality_file_path(paths, pass_index, file);
+    format!(
+        r#"You are the file-quality rerating reviewer for `auto audit --everything`.
+
+Repository root: `{repo}`
+Report root: `{report_root}`
+Pass: {pass_index}
+File under rerating: `{path}`
+First-pass JSON: `{first_pass}`
+First-pass markdown: `{first_pass_markdown}`
+Group report: `{group_report}`
+Final review: `{final_review}`
+Output directory: `{artifact_dir}`
+
+Regrade the first-pass rating for exactly this file against the current repository state. Read the file itself, the first-pass artifacts, the group report, and the final review. Do not edit source code in this rerating step.
+
+Apply strict professional standards. The target is {target:.0}/10. A score below {accept:.0}/10 means this file still needs another deliverable pass before merge. Regrade independently; do not rubber-stamp the original first-pass score.
+
+Penalize the file if it still contains unnecessary code, orphaned/deprecated surfaces, duplicated responsibility, AI-slop, shallow ownership, vague comments, fake extensibility, or missed consolidation opportunities. A file should not reach {accept:.0}/10 if it obviously needs deletion, retirement, or architectural relocation and the audit failed to handle or document that.
+
+Write:
+1. `{artifact_dir}/rating.md`
+2. `{artifact_dir}/rating.json`
+
+`rating.md` must include:
+- Current score out of 10.
+- Whether the first-pass score was too high, too low, or accurate.
+- Concrete deliverables needed to make the file a {target:.0}/10 work product.
+- Any remaining deletion, consolidation, simplification, AI-slop, or architecture-deepening deliverables.
+- What would be acceptable evidence that the file is at least {accept:.0}/10.
+
+`rating.json` must be valid JSON with:
+`path`, `pass_index`, `score_out_of_10`, `previous_score_out_of_10`, `first_pass_grade_was`, `debt_or_architecture_findings`, `deliverables_to_reach_10`, `minimum_evidence_for_9`, `confidence`.
+"#,
+        repo = paths.worktree_root.display(),
+        report_root = paths.report_root.display(),
+        pass_index = pass_index,
+        path = file.path,
+        first_pass = first_pass.display(),
+        first_pass_markdown = first_pass_markdown.display(),
+        group_report = group_report,
+        final_review = final_review_markdown_path(paths).display(),
+        artifact_dir = artifact_dir.display(),
+        target = FILE_QUALITY_TARGET_SCORE,
+        accept = FILE_QUALITY_ACCEPT_SCORE,
+    )
+}
+
+fn build_file_quality_deliverables_prompt(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    file: &FileState,
+    rating: &FileQualityRatingState,
+    pass_index: usize,
+) -> String {
+    let group_report = manifest
+        .groups
+        .iter()
+        .find(|group| group.name == file.group)
+        .map(|group| group.report_path.as_str())
+        .unwrap_or("");
+    let artifact_dir = PathBuf::from(&rating.artifact_dir);
+    format!(
+        r#"You are running a per-file quality deliverable pass for `auto audit --everything`.
+
+Repository root: `{repo}`
+Report root: `{report_root}`
+Pass: {pass_index}
+Owned file: `{path}`
+Current rerating score: {score}
+Rating artifact: `{rating_json}`
+Rating notes: `{rating_md}`
+Group report: `{group_report}`
+Final review: `{final_review}`
+
+Raise this file toward a {target:.0}/10 work product. The immediate acceptance floor is {accept:.0}/10 on the next rerating pass, but the deliverables should aim at {target:.0}/10.
+
+Rules:
+- Keep the primary edit scope to `{path}`.
+- You may update the nearest tests or focused docs only when that is necessary to prove or explain this file's change; list those as scope exceptions in your output.
+- You may delete, simplify, consolidate, or relocate code when the rating artifact and group report provide evidence that this is the right way to raise quality.
+- Before deleting or retiring code, prove the removal with references/imports/exports, entrypoints, config/docs/generated bindings, and narrow validation or behavior characterization where practical.
+- Do not broaden into unrelated cleanup.
+- Preserve evidence. Do not delete first-pass, group, final-review, or previous file-quality artifacts.
+- Run or inspect the narrowest meaningful validation for this file when practical.
+- Commit nothing manually; the host runner owns commits.
+
+Write `{artifact_dir}/deliverables.md` with:
+- Deliverables applied.
+- Changed files.
+- Deletion/refactor proof, or `not applicable`.
+- Validation command/result or the reason validation was not practical.
+- Remaining work, if any, to reach {target:.0}/10.
+"#,
+        repo = paths.worktree_root.display(),
+        report_root = paths.report_root.display(),
+        pass_index = pass_index,
+        path = file.path,
+        score = rating
+            .score_out_of_10
+            .map(|score| format!("{score:.1}/10"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        rating_json = artifact_dir.join("rating.json").display(),
+        rating_md = artifact_dir.join("rating.md").display(),
+        group_report = group_report,
+        final_review = final_review_markdown_path(paths).display(),
+        target = FILE_QUALITY_TARGET_SCORE,
+        accept = FILE_QUALITY_ACCEPT_SCORE,
+        artifact_dir = artifact_dir.display(),
+    )
+}
+
 fn read_context_bundle(paths: &RunPaths) -> Result<String> {
     let bundle = paths.report_root.join("CONTEXT-BUNDLE.md");
     if bundle.exists() {
@@ -2492,6 +3011,12 @@ fn write_context_bundle(paths: &RunPaths) -> Result<()> {
         &mut body,
         "GSTACK-SKILL-POLICY.md",
         &paths.report_root.join("GSTACK-SKILL-POLICY.md"),
+        true,
+    )?;
+    append_named_file(
+        &mut body,
+        "CODEBASE-IMPROVEMENT-POLICY.md",
+        &codebase_improvement_policy_path(paths),
         true,
     )?;
     let doctrine_dir = paths.worktree_root.join("doctrine");
@@ -2611,7 +3136,23 @@ fn enumerate_tracked_files(repo_root: &Path) -> Result<Vec<String>> {
 }
 
 fn excluded_path(path: &str) -> bool {
-    if path.starts_with("audit/everything/") {
+    let path = path.trim_start_matches("./");
+    if DEFAULT_EXCLUDE_FILENAMES
+        .iter()
+        .any(|filename| path == *filename || path.ends_with(&format!("/{filename}")))
+    {
+        return true;
+    }
+    if DEFAULT_EXCLUDE_SUFFIXES
+        .iter()
+        .any(|suffix| path.to_ascii_lowercase().ends_with(suffix))
+    {
+        return true;
+    }
+    if DEFAULT_EXCLUDE_PATH_SEGMENTS
+        .iter()
+        .any(|segment| path.contains(segment))
+    {
         return true;
     }
     DEFAULT_EXCLUDE_PREFIXES.iter().any(|prefix| {
@@ -2620,6 +3161,127 @@ fn excluded_path(path: &str) -> bool {
         } else {
             path == *prefix || path.starts_with(prefix)
         }
+    })
+}
+
+fn write_change_summary_markdown(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
+    fs::create_dir_all(&paths.report_root)
+        .with_context(|| format!("failed to create {}", paths.report_root.display()))?;
+
+    let head = git_stdout(&paths.worktree_root, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let range = format!("{}..{head}", manifest.base_commit);
+    let changed_files = git_stdout(
+        &paths.worktree_root,
+        ["diff", "--name-status", "--find-renames", &range],
+    )?;
+    let diff_stat = git_stdout(
+        &paths.worktree_root,
+        ["diff", "--stat", "--find-renames", &range],
+    )?;
+    let commit_log = git_stdout(
+        &paths.worktree_root,
+        [
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--stat",
+            "--find-renames",
+            "--date=short",
+            "--pretty=format:## Commit %h%n%n- Subject: %s%n- Author: %an <%ae>%n- Date: %ad%n",
+            &range,
+        ],
+    )?;
+
+    let mut body = String::new();
+    body.push_str("# Auto Audit Change Summary\n\n");
+    body.push_str("This artifact summarizes repository changes made by the `auto audit --everything` run. It is intended to let an engineer understand what changed without reconstructing the run from scattered commits, lane logs, and review notes.\n\n");
+    body.push_str("## Run\n\n");
+    body.push_str(&format!("- Run id: `{}`\n", manifest.run_id));
+    body.push_str(&format!("- Primary branch: `{}`\n", manifest.branch));
+    body.push_str(&format!("- Audit branch: `{}`\n", manifest.audit_branch));
+    body.push_str(&format!("- Base commit: `{}`\n", manifest.base_commit));
+    body.push_str(&format!("- Audit head: `{head}`\n"));
+    body.push_str(&format!(
+        "- Final review: {:?}\n",
+        manifest.final_review.status
+    ));
+    body.push_str(&format!(
+        "- File quality: {:?}\n",
+        manifest.file_quality.status
+    ));
+    body.push_str(&format!("- Merge: {:?}\n\n", manifest.merge.status));
+
+    body.push_str("## High-Level Diff Stat\n\n");
+    if diff_stat.trim().is_empty() {
+        body.push_str("No source or report changes are present on the audit branch beyond the base commit.\n\n");
+    } else {
+        body.push_str("```text\n");
+        body.push_str(diff_stat.trim_end());
+        body.push_str("\n```\n\n");
+    }
+
+    body.push_str("## Changed Files\n\n");
+    if changed_files.trim().is_empty() {
+        body.push_str("- none\n\n");
+    } else {
+        for line in changed_files.lines() {
+            body.push_str(&format!("- `{}`\n", line.trim()));
+        }
+        body.push('\n');
+    }
+
+    body.push_str("## Remediation Task Summary\n\n");
+    if manifest.remediation_tasks.is_empty() {
+        body.push_str("- No remediation tasks were generated for this run.\n\n");
+    } else {
+        for task in &manifest.remediation_tasks {
+            body.push_str(&format!(
+                "- `{}` ({:?}) group `{}`: {}\n",
+                task.id,
+                task.status,
+                task.group,
+                task.note
+                    .as_deref()
+                    .map(one_line)
+                    .unwrap_or_else(|| "no note recorded".to_string())
+            ));
+        }
+        body.push('\n');
+    }
+
+    body.push_str("## Commit-by-Commit Detail\n\n");
+    if commit_log.trim().is_empty() {
+        body.push_str("No audit commits were created after the base commit.\n\n");
+    } else {
+        body.push_str(commit_log.trim_end());
+        body.push_str("\n\n");
+    }
+
+    body.push_str("## Related Artifacts\n\n");
+    body.push_str(&format!(
+        "- Run status: `{}`\n",
+        run_status_markdown_path(paths).display()
+    ));
+    body.push_str(&format!(
+        "- Remediation plan: `{}`\n",
+        remediation_plan_markdown_path(paths).display()
+    ));
+    body.push_str(&format!(
+        "- Final review: `{}`\n",
+        final_review_markdown_path(paths).display()
+    ));
+    body.push_str(&format!(
+        "- File quality reratings: `{}`\n",
+        file_quality_root_path(paths).display()
+    ));
+
+    atomic_write(&change_summary_markdown_path(paths), body.as_bytes()).with_context(|| {
+        format!(
+            "failed to write {}",
+            change_summary_markdown_path(paths).display()
+        )
     })
 }
 
@@ -2742,6 +3404,8 @@ fn build_initial_group_reports(paths: &RunPaths, manifest: &EverythingManifest) 
         body.push_str("## Scope\n\n");
         body.push_str("This report is assembled from first-pass one-file analyses. The synthesis pass may revise it based on cross-file relationships.\n\n");
         body.push_str("The authoritative first-pass inputs are the artifact paths listed under each file below. Ignore unreferenced artifact directories; interrupted or upgraded runs may leave stale artifacts in `audit/everything/*/files`.\n\n");
+        body.push_str("## Debt Register\n\n");
+        body.push_str("Synthesis must classify debt candidates with `safe_delete`, `deprecated_remove`, `consolidate`, `simplify`, `deepen_module`, or `leave_with_reason`. Each item needs path(s), action, proof found, proof still missing, behavior-preservation needs, and risk. If no candidates exist, write `No actionable debt candidates found.`\n\n");
         for file_path in &group.files {
             if let Some(file) = manifest.files.iter().find(|file| &file.path == file_path) {
                 body.push_str(&format!("## `{}`\n\n", file.path));
@@ -2954,8 +3618,8 @@ fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
             let normalized = trimmed.trim_start_matches('#').trim();
-            if start.is_some() {
-                return Some(&text[start.unwrap()..offset]);
+            if let Some(start) = start {
+                return Some(&text[start..offset]);
             }
             if normalized.eq_ignore_ascii_case(heading) {
                 start = Some(line_start);
@@ -3063,6 +3727,8 @@ fn print_status(paths: &RunPaths, manifest: &EverythingManifest) {
         codebase_book_root_path(paths).display()
     );
     println!("final review:{:?}", manifest.final_review.status);
+    println!("file quality:{:?}", manifest.file_quality.status);
+    println!("change summary:{:?}", manifest.change_summary.status);
     println!("merge:       {:?}", manifest.merge.status);
 }
 
@@ -3087,12 +3753,59 @@ fn final_review_markdown_path(paths: &RunPaths) -> PathBuf {
     paths.report_root.join("FINAL-REVIEW.md")
 }
 
+fn change_summary_markdown_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("CHANGE-SUMMARY.md")
+}
+
 fn codebase_book_root_path(paths: &RunPaths) -> PathBuf {
     paths.report_root.join("CODEBASE-BOOK")
 }
 
 fn codebase_book_index_path(paths: &RunPaths) -> PathBuf {
     codebase_book_root_path(paths).join("README.md")
+}
+
+fn file_quality_root_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("FILE-QUALITY")
+}
+
+fn file_quality_pass_path(paths: &RunPaths, pass_index: usize) -> PathBuf {
+    file_quality_root_path(paths).join(format!("pass-{pass_index:02}"))
+}
+
+fn file_quality_file_path(paths: &RunPaths, pass_index: usize, file: &FileState) -> PathBuf {
+    file_quality_pass_path(paths, pass_index)
+        .join(file_artifact_slug(&file.path, &file.content_hash))
+}
+
+fn next_file_quality_pass_index(manifest: &EverythingManifest) -> usize {
+    manifest
+        .file_quality_passes
+        .iter()
+        .map(|pass| pass.pass_index)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn read_file_quality_score(path: &Path) -> Result<Option<f64>> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(value
+        .get("score_out_of_10")
+        .or_else(|| value.get("rerated_score_out_of_10"))
+        .or_else(|| value.get("score"))
+        .and_then(json_number_or_string))
+}
+
+fn json_number_or_string(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|score| score.trim().parse::<f64>().ok())
+    })
 }
 
 fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
@@ -3186,7 +3899,29 @@ fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) ->
         "- Final review: {:?}\n",
         manifest.final_review.status
     ));
-    body.push_str(&format!("- Merge: {:?}\n\n", manifest.merge.status));
+    body.push_str(&format!(
+        "- File quality: {:?}\n",
+        manifest.file_quality.status
+    ));
+    if let Some(note) = manifest.file_quality.note.as_deref() {
+        body.push_str(&format!("- File quality note: {}\n", one_line(note)));
+    }
+    body.push_str(&format!(
+        "- Change summary: {:?}\n",
+        manifest.change_summary.status
+    ));
+    if let Some(note) = manifest.change_summary.note.as_deref() {
+        body.push_str(&format!("- Change summary note: {}\n", one_line(note)));
+    }
+    body.push_str(&format!("- Merge: {:?}\n", manifest.merge.status));
+    body.push_str(&format!(
+        "- Final status refresh: {:?}\n",
+        manifest.final_status.status
+    ));
+    if let Some(note) = manifest.final_status.note.as_deref() {
+        body.push_str(&format!("- Final status note: {}\n", one_line(note)));
+    }
+    body.push('\n');
     body.push_str("## Branch State\n\n");
     body.push_str(&format!("- Primary branch: `{}`", manifest.branch));
     if let Some(head) = branch_summary.primary_head.as_deref() {
@@ -3204,6 +3939,17 @@ fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) ->
         ));
     }
     body.push_str(&format!("- Interpretation: {}\n\n", branch_summary.state));
+    body.push_str("## Evidence Class Checklist\n\n");
+    body.push_str(
+        "Final review must classify each evidence class as `pass`, `not run`, `blocked`, or `not applicable`, with exact artifact or command evidence. Treat local, fixture, regtest, and synthetic proof as non-production evidence unless live production/mainnet artifacts are cited.\n\n",
+    );
+    body.push_str("- Local static/build/unit validation\n");
+    body.push_str("- Generated contract/binding validation\n");
+    body.push_str("- Browser QA or visual/product workflow validation\n");
+    body.push_str("- Deployment/canary/health validation\n");
+    body.push_str("- Live production or mainnet/on-chain validation\n");
+    body.push_str("- External-owner or cross-repo validation\n");
+    body.push_str("- Documentation/status artifact integrity\n\n");
     body.push_str("## Important Paths\n\n");
     body.push_str(&format!(
         "- Manifest: `{}`\n",
@@ -3231,8 +3977,16 @@ fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) ->
         final_review_markdown_path(paths).display()
     ));
     body.push_str(&format!(
+        "- Change summary: `{}`\n",
+        change_summary_markdown_path(paths).display()
+    ));
+    body.push_str(&format!(
         "- Codebase book: `{}`\n\n",
         codebase_book_root_path(paths).display()
+    ));
+    body.push_str(&format!(
+        "- File quality reratings: `{}`\n\n",
+        file_quality_root_path(paths).display()
     ));
     body.push_str("## Remediation Tasks\n\n");
     append_status_tasks(&mut body, "Running", manifest, StageStatus::Running);
@@ -3702,6 +4456,14 @@ mod tests {
         assert!(excluded_path(
             "audit/everything/20260424-115535/reports/src.md"
         ));
+        assert!(excluded_path("audit/old-run/FINAL-REVIEW.md"));
+        assert!(excluded_path("docs/ops/operator-evidence/canary.md"));
+        assert!(excluded_path("web/client/dist/bitino-client.js"));
+        assert!(excluded_path("web/play/dist/rplay.js"));
+        assert!(excluded_path(".github/ISSUE_TEMPLATE/bug.md"));
+        assert!(excluded_path("Cargo.lock"));
+        assert!(excluded_path("web/play/dist/rplay.js.map"));
+        assert!(excluded_path("docs/ops/operator-evidence/smoke.png"));
         assert!(excluded_path(
             "audit/everything/20260424-115535/files/hash/analysis.md"
         ));
@@ -3761,6 +4523,33 @@ mod tests {
     }
 
     #[test]
+    fn codebase_improvement_policy_defines_deletion_contract() {
+        assert!(CODEBASE_IMPROVEMENT_POLICY.contains("proved-dead code"));
+        assert!(CODEBASE_IMPROVEMENT_POLICY.contains("AI slop"));
+        assert!(CODEBASE_IMPROVEMENT_POLICY.contains("Required Proof Before Removal"));
+        assert!(CODEBASE_IMPROVEMENT_POLICY.contains("safe_delete"));
+        assert!(CODEBASE_IMPROVEMENT_POLICY.contains("leave_with_reason"));
+    }
+
+    #[test]
+    fn first_pass_prompt_collects_debt_and_architecture_fields() {
+        let file = FileState {
+            path: "src/lib.rs".to_string(),
+            group: "src".to_string(),
+            content_hash: "hash".to_string(),
+            artifact_dir: "/tmp/run/worktree/audit/everything/test-run/files/src-lib".to_string(),
+            status: StageStatus::Pending,
+        };
+        let prompt = build_file_prompt(&file, "# Context\n", "pub fn live() {}\n");
+
+        assert!(prompt.contains("orphaned, deprecated, duplicated"));
+        assert!(prompt.contains("AI-slop signals"));
+        assert!(prompt.contains("deletion_candidates"));
+        assert!(prompt.contains("architecture_smells"));
+        assert!(prompt.contains("behavior_preservation_needs"));
+    }
+
+    #[test]
     fn pending_group_report_rebuilds_with_authoritative_artifact_refs() {
         let dir = std::env::temp_dir().join(format!(
             "auto-audit-group-report-rebuild-{}",
@@ -3813,6 +4602,8 @@ mod tests {
         assert!(report.contains("First-pass artifact:"));
         assert!(report.contains("path-hash-content-hash"));
         assert!(report.contains("Ignore unreferenced artifact directories"));
+        assert!(report.contains("## Debt Register"));
+        assert!(report.contains("safe_delete"));
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
@@ -3842,6 +4633,9 @@ mod tests {
         assert!(prompt.contains("exact first-pass artifact paths referenced inside it"));
         assert!(prompt.contains("Do not glob or enumerate"));
         assert!(prompt.contains("/tmp/run/worktree/audit/everything/test-run/files"));
+        assert!(prompt.contains("Build or update a debt register"));
+        assert!(prompt.contains("AI-slop"));
+        assert!(prompt.contains("## Debt Register"));
     }
 
     #[test]
@@ -3880,6 +4674,9 @@ mod tests {
         assert!(prompt.contains("Do not write into the canonical audit worktree"));
         assert!(prompt.contains("Canonical report: `/tmp/run/worktree/audit/everything/test-run/reports/cargo.md` (do not edit directly)"));
         assert!(prompt.contains("update the relevant architecture/docs files"));
+        assert!(prompt.contains("CODEBASE-IMPROVEMENT-POLICY.md"));
+        assert!(prompt.contains("delete proved-dead code"));
+        assert!(prompt.contains("record deletion proof"));
     }
 
     #[test]
@@ -3940,6 +4737,10 @@ mod tests {
         assert!(prompt.contains("File-catalog chapters split by subsystem/group"));
         assert!(prompt.contains("cover every tracked file"));
         assert!(prompt.contains("changed:"));
+        assert!(prompt.contains("Evidence class checklist"));
+        assert!(prompt.contains("Deletion and refactor proof checklist"));
+        assert!(prompt.contains("live production or mainnet/on-chain validation"));
+        assert!(prompt.contains("Do not merge bulky first-pass mirrors"));
     }
 
     #[test]
@@ -4000,6 +4801,71 @@ mod tests {
         assert!(prompt.contains("only concrete, actionable blockers"));
         assert!(prompt.contains("Do not broaden the audit"));
         assert!(prompt.contains("host will rerun final review"));
+    }
+
+    #[test]
+    fn file_quality_prompts_target_ten_and_accept_nine() {
+        let file = FileState {
+            path: "src/lib.rs".to_string(),
+            group: "src".to_string(),
+            content_hash: "hash".to_string(),
+            artifact_dir: "/tmp/run/worktree/audit/everything/test-run/files/src-lib".to_string(),
+            status: StageStatus::Complete,
+        };
+        let mut manifest = manifest_with_groups(vec![group_for_test("src", &["src/lib.rs"])]);
+        manifest.files = vec![file.clone()];
+        let paths = RunPaths {
+            host_root: PathBuf::from("/tmp/run"),
+            manifest_path: PathBuf::from("/tmp/run/MANIFEST.json"),
+            latest_path: PathBuf::from("/tmp/run/latest-run"),
+            worktree_root: PathBuf::from("/tmp/run/worktree"),
+            report_root: PathBuf::from("/tmp/run/worktree/audit/everything/test-run"),
+            pause_path: PathBuf::from("/tmp/run/PAUSE"),
+            in_place: false,
+        };
+
+        let rerate = build_file_quality_rerate_prompt(&paths, &manifest, &file, 3);
+        assert!(rerate.contains("Regrade the first-pass rating"));
+        assert!(rerate.contains("target is 10/10"));
+        assert!(rerate.contains("below 9/10"));
+        assert!(rerate.contains("rating.json"));
+        assert!(rerate.contains("AI-slop"));
+        assert!(rerate.contains("debt_or_architecture_findings"));
+
+        let rating = FileQualityRatingState {
+            path: file.path.clone(),
+            score_out_of_10: Some(8.0),
+            status: StageStatus::Complete,
+            artifact_dir:
+                "/tmp/run/worktree/audit/everything/test-run/FILE-QUALITY/pass-03/src-lib"
+                    .to_string(),
+            note: None,
+        };
+        let deliverables =
+            build_file_quality_deliverables_prompt(&paths, &manifest, &file, &rating, 3);
+        assert!(deliverables.contains("Owned file: `src/lib.rs`"));
+        assert!(deliverables.contains("acceptance floor is 9/10"));
+        assert!(deliverables.contains("aim at 10/10"));
+        assert!(deliverables.contains("deliverables.md"));
+        assert!(deliverables.contains("delete, simplify, consolidate, or relocate code"));
+        assert!(deliverables.contains("Deletion/refactor proof"));
+    }
+
+    #[test]
+    fn file_quality_score_parser_accepts_number_and_string_scores() {
+        let dir =
+            std::env::temp_dir().join(format!("auto-audit-quality-score-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let numeric = dir.join("numeric.json");
+        fs::write(&numeric, r#"{"score_out_of_10":8.75}"#).expect("failed to write score");
+        assert_eq!(read_file_quality_score(&numeric).unwrap(), Some(8.75));
+
+        let string = dir.join("string.json");
+        fs::write(&string, r#"{"rerated_score_out_of_10":"9.5"}"#).expect("failed to write score");
+        assert_eq!(read_file_quality_score(&string).unwrap(), Some(9.5));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 
     #[test]
@@ -4114,6 +4980,9 @@ mod tests {
         assert!(status.contains("`AUD-REM-002` `docs`"));
         assert!(status.contains("REMEDIATION-PLAN.md"));
         assert!(status.contains("CODEBASE-BOOK"));
+        assert!(status.contains("Final status refresh:"));
+        assert!(status.contains("Evidence Class Checklist"));
+        assert!(status.contains("Live production or mainnet/on-chain validation"));
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
@@ -4135,8 +5004,12 @@ mod tests {
             remediation_plan: StageState::default(),
             remediation_tasks: Vec::new(),
             final_review_repairs: Vec::new(),
+            file_quality: StageState::default(),
+            file_quality_passes: Vec::new(),
+            change_summary: StageState::default(),
             final_review: StageState::default(),
             merge: StageState::default(),
+            final_status: StageState::default(),
         }
     }
 

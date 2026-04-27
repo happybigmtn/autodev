@@ -1804,6 +1804,7 @@ diff --git a/README.md b/README.md
             final_review_model: "gpt-5.5".to_string(),
             final_review_effort: "xhigh".to_string(),
             final_review_retries: 1,
+            file_quality_passes: 10,
             no_everything_merge: false,
             doctrine_prompt: PathBuf::from("audit/DOCTRINE.md"),
             rubric_prompt: None,

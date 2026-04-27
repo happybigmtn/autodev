@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
+use std::{env, ffi::OsStr};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -203,6 +204,11 @@ fn has_staged_changes(repo_root: &Path) -> Result<bool> {
 pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<bool> {
     ensure_checked_out_branch(repo_root, branch, "sync")?;
 
+    if skip_remote_sync() {
+        eprintln!("warning: AUTO_SKIP_REMOTE_SYNC=1; skipping pull/rebase for branch `{branch}`");
+        return Ok(false);
+    }
+
     if !remote_branch_exists(repo_root, branch)? {
         return Ok(false);
     }
@@ -247,6 +253,13 @@ pub(crate) fn sync_branch_with_remote(repo_root: &Path, branch: &str) -> Result<
 pub(crate) fn push_branch_with_remote_sync(repo_root: &Path, branch: &str) -> Result<bool> {
     ensure_checked_out_branch(repo_root, branch, "push")?;
 
+    if skip_remote_sync() {
+        eprintln!(
+            "warning: AUTO_SKIP_REMOTE_SYNC=1; skipping remote sync/push for branch `{branch}`"
+        );
+        return Ok(false);
+    }
+
     let mut synced = sync_branch_with_remote(repo_root, branch)?;
     let output = git_output(repo_root, ["push", "origin", branch])?;
     if output.status.success() {
@@ -273,6 +286,10 @@ pub(crate) fn push_branch_with_remote_sync(repo_root: &Path, branch: &str) -> Re
         );
     }
     Ok(synced)
+}
+
+fn skip_remote_sync() -> bool {
+    env::var_os("AUTO_SKIP_REMOTE_SYNC").is_some_and(|value| value != OsStr::new(""))
 }
 
 fn git_output<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
