@@ -86,9 +86,24 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/dist/**",
     "**/build/**",
     "**/.auto/**",
+    "**/.cache/**",
+    "**/.claude/worktrees/**",
+    "**/.config/**",
+    "**/.next/**",
+    "**/.pytest_cache/**",
+    "**/.turbo/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
     "**/bug/**",
+    "**/coverage/**",
     "**/nemesis/**",
+    "**/playwright-report/**",
+    "**/reports/**",
     "**/steward/**",
+    "**/temp/**",
+    "**/test-results/**",
+    "**/tmp/**",
+    "**/venv/**",
     "**/audit/**",
     "**/fixtures/**",
     "**/vendor/**",
@@ -1300,8 +1315,9 @@ mod tests {
     use crate::{AuditArgs, AuditResumeMode};
 
     use super::{
-        apply_verdict, build_file_prompt, commit_scoped, glob_match, plan_audit_queue, run_auditor,
-        sha256_hex, EntryStatus, FileVerdict, Manifest, ManifestEntry,
+        apply_verdict, build_file_prompt, commit_scoped, glob_match, matches_any, plan_audit_queue,
+        run_auditor, sha256_hex, EntryStatus, FileVerdict, Manifest, ManifestEntry,
+        DEFAULT_EXCLUDE_GLOBS,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1418,6 +1434,32 @@ mod tests {
     fn glob_match_handles_literal_path() {
         assert!(glob_match("AGENTS.md", "AGENTS.md"));
         assert!(!glob_match("AGENTS.md", "foo/AGENTS.md"));
+    }
+
+    #[test]
+    fn default_excludes_generated_audit_and_build_artifacts() {
+        let exclude_globs = DEFAULT_EXCLUDE_GLOBS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>();
+        for path in [
+            ".auto/audit-everything/MANIFEST.json",
+            ".cache/tool/index.json",
+            ".claude/worktrees/lane/README.md",
+            ".config/quota-router/profiles/default.json",
+            "audit/files/deadbeef/verdict.json",
+            "apps/web/.next/static/chunk.js",
+            "apps/web/.turbo/cache.bin",
+            "apps/web/coverage/lcov.info",
+            "apps/web/playwright-report/index.html",
+            "apps/web/test-results/results.json",
+            "reports/final-review.md",
+            "tmp/generated.md",
+            "venv/lib/python/site.py",
+            "src/__pycache__/module.pyc",
+        ] {
+            assert!(matches_any(path, &exclude_globs), "{path}");
+        }
     }
 
     #[test]
