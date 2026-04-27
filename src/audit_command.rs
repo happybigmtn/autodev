@@ -304,6 +304,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     if args.dry_run && total > 0 {
         let first = &plan[0];
         let preview_prompt = build_file_prompt(
+            &repo_root,
             &repo_root.join(&first.path),
             &doctrine,
             &rubric,
@@ -365,7 +366,14 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         }
         fs::create_dir_all(&file_dir)
             .with_context(|| format!("failed to create {}", file_dir.display()))?;
-        let prompt = build_file_prompt(&abs_path, &doctrine, &rubric, &output_dir, &entry.path)?;
+        let prompt = build_file_prompt(
+            &repo_root,
+            &abs_path,
+            &doctrine,
+            &rubric,
+            &output_dir,
+            &entry.path,
+        )?;
         let prompt_path = file_dir.join("prompt.md");
         atomic_write(&prompt_path, prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))?;
@@ -745,6 +753,7 @@ fn file_artifact_dir(output_dir: &Path, rel_path: &str) -> PathBuf {
 }
 
 fn build_file_prompt(
+    repo_root: &Path,
     abs_path: &Path,
     doctrine: &str,
     rubric: &str,
@@ -759,12 +768,7 @@ fn build_file_prompt(
     })?;
     let file_dir = file_artifact_dir(output_dir, rel_path);
     let file_dir_rel = file_dir
-        .strip_prefix(
-            abs_path
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(Path::new(".")),
-        )
+        .strip_prefix(repo_root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file_dir.display().to_string());
     Ok(format!(
@@ -1296,8 +1300,8 @@ mod tests {
     use crate::{AuditArgs, AuditResumeMode};
 
     use super::{
-        apply_verdict, commit_scoped, glob_match, plan_audit_queue, run_auditor, sha256_hex,
-        EntryStatus, FileVerdict, Manifest, ManifestEntry,
+        apply_verdict, build_file_prompt, commit_scoped, glob_match, plan_audit_queue, run_auditor,
+        sha256_hex, EntryStatus, FileVerdict, Manifest, ManifestEntry,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1459,6 +1463,69 @@ mod tests {
         .expect("plan should succeed");
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn file_prompt_uses_repo_relative_artifact_dir_for_root_files() {
+        let repo = TestTempDir::new("prompt-root-artifact-dir");
+        fs::write(repo.path().join("AGENTS.md"), "# agents\n").expect("failed to write AGENTS");
+        let prompt = build_file_prompt(
+            repo.path(),
+            &repo.path().join("AGENTS.md"),
+            "doctrine",
+            "rubric",
+            &repo.path().join("audit"),
+            "AGENTS.md",
+        )
+        .expect("prompt should build");
+
+        assert!(
+            prompt.contains("Artifact directory for your outputs: `audit/files/a54ff182c7e8acf5`")
+        );
+        assert!(!prompt.contains("`prompt-root-artifact-dir/audit/files/"));
+    }
+
+    #[test]
+    fn file_prompt_uses_repo_relative_artifact_dir_for_nested_files() {
+        let repo = TestTempDir::new("prompt-nested-artifact-dir");
+        fs::create_dir_all(repo.path().join("docs")).expect("failed to create docs");
+        fs::write(repo.path().join("docs/README.md"), "# docs\n")
+            .expect("failed to write docs README");
+        let prompt = build_file_prompt(
+            repo.path(),
+            &repo.path().join("docs/README.md"),
+            "doctrine",
+            "rubric",
+            &repo.path().join("audit"),
+            "docs/README.md",
+        )
+        .expect("prompt should build");
+
+        assert!(
+            prompt.contains("Artifact directory for your outputs: `audit/files/0b5ca119d2be595a`")
+        );
+        assert!(!prompt.contains("`README.md/audit/files/"));
+    }
+
+    #[test]
+    fn file_prompt_keeps_external_output_dir_absolute() {
+        let repo = TestTempDir::new("prompt-external-artifact-dir");
+        fs::write(repo.path().join("AGENTS.md"), "# agents\n").expect("failed to write AGENTS");
+        let output_dir = std::env::temp_dir().join("autodev-audit-external-output");
+        let prompt = build_file_prompt(
+            repo.path(),
+            &repo.path().join("AGENTS.md"),
+            "doctrine",
+            "rubric",
+            &output_dir,
+            "AGENTS.md",
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.contains(&format!(
+            "Artifact directory for your outputs: `{}`",
+            output_dir.join("files/a54ff182c7e8acf5").display()
+        )));
     }
 
     #[test]
