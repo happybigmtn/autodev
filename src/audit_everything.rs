@@ -1133,12 +1133,18 @@ async fn run_final_review_once(
 ) -> Result<()> {
     manifest.final_review.status = StageStatus::Running;
     write_manifest(paths, manifest)?;
-    let prompt = build_final_review_prompt(paths, manifest);
     let config = PhaseConfig {
         model: args.final_review_model.clone(),
         effort: args.final_review_effort.clone(),
         codex_bin: args.codex_bin.clone(),
     };
+    let workers = args.everything_threads.clamp(1, 15);
+    let shard_root = if workers > 1 && manifest.groups.len() > 1 {
+        Some(run_final_review_shards(args, paths, manifest, &config, workers).await?)
+    } else {
+        None
+    };
+    let prompt = build_final_review_synthesis_prompt(paths, manifest, shard_root.as_deref());
     run_codex_phase(paths, "final-review", &prompt, &config).await?;
     let review_path = final_review_markdown_path(paths);
     let book_index_path = codebase_book_index_path(paths);
@@ -1151,6 +1157,66 @@ async fn run_final_review_once(
     manifest.final_review.status = StageStatus::Complete;
     write_manifest(paths, manifest)?;
     Ok(())
+}
+
+async fn run_final_review_shards(
+    _args: &AuditArgs,
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    config: &PhaseConfig,
+    workers: usize,
+) -> Result<PathBuf> {
+    let shard_root = final_review_shards_path(paths);
+    if shard_root.exists() {
+        fs::remove_dir_all(&shard_root)
+            .with_context(|| format!("failed to clear {}", shard_root.display()))?;
+    }
+    fs::create_dir_all(&shard_root)
+        .with_context(|| format!("failed to create {}", shard_root.display()))?;
+    let shard_count = workers.min(manifest.groups.len()).max(1);
+    println!("final review: {} group-shard reviewer(s)", shard_count);
+    let mut groups = manifest.groups.clone();
+    groups.sort_by(|left, right| left.slug.cmp(&right.slug));
+    let mut buckets = vec![Vec::<GroupState>::new(); shard_count];
+    for (idx, group) in groups.into_iter().enumerate() {
+        buckets[idx % shard_count].push(group);
+    }
+    let mut join_set = JoinSet::new();
+    for (idx, bucket) in buckets.into_iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        let paths = paths.clone();
+        let config = config.clone();
+        let artifact_dir = shard_root.join(format!("shard-{idx:02}"));
+        let prompt = build_final_review_shard_prompt(&paths, manifest, idx, &bucket, &artifact_dir);
+        join_set.spawn(async move {
+            let phase_slug = format!("final-review-shard-{idx:02}");
+            run_codex_phase_for_artifact(&paths, &artifact_dir, &phase_slug, &prompt, &config)
+                .await?;
+            let shard_path = artifact_dir.join("shard.md");
+            require_nonempty_file(&shard_path)?;
+            Ok::<_, anyhow::Error>(shard_path)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(path)) => println!("final review shard: {}", path.display()),
+            Ok(Err(err)) => failures.push(format!("{err:#}")),
+            Err(err) => failures.push(format!("final-review shard task panicked: {err}")),
+        }
+    }
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("final review shard failure: {failure}");
+        }
+        bail!(
+            "final review shard phase failed for {} shard(s)",
+            failures.len()
+        );
+    }
+    Ok(shard_root)
 }
 
 async fn run_file_quality_gate_phase(
@@ -1171,14 +1237,23 @@ async fn run_file_quality_gate_phase(
     write_manifest(paths, manifest)?;
 
     let mut changed = false;
-    let config = PhaseConfig {
-        model: args.final_review_model.clone(),
-        effort: args.final_review_effort.clone(),
+    let rerate_config = PhaseConfig {
+        model: args.first_pass_model.clone(),
+        effort: args.first_pass_effort.clone(),
         codex_bin: args.codex_bin.clone(),
     };
+    let deliverable_config = PhaseConfig {
+        model: args.remediation_model.clone(),
+        effort: args.remediation_effort.clone(),
+        codex_bin: args.codex_bin.clone(),
+    };
+    let rerate_workers = args.everything_threads.clamp(1, 15);
+    let deliverable_workers = args.remediation_threads.clamp(1, 10);
 
     for pass_index in next_file_quality_pass_index(manifest)..=limit {
-        let pass = run_one_file_quality_pass(paths, manifest, pass_index, &config).await?;
+        let pass =
+            run_one_file_quality_pass(paths, manifest, pass_index, &rerate_config, rerate_workers)
+                .await?;
         let below_threshold = pass
             .ratings
             .iter()
@@ -1200,8 +1275,15 @@ async fn run_file_quality_gate_phase(
             "file quality: pass {pass_index} found {} file(s) below {FILE_QUALITY_ACCEPT_SCORE:.0}/10",
             below_threshold.len()
         );
-        run_file_quality_deliverables(paths, manifest, pass_index, &below_threshold, &config)
-            .await?;
+        run_file_quality_deliverables(
+            paths,
+            manifest,
+            pass_index,
+            &below_threshold,
+            &deliverable_config,
+            deliverable_workers,
+        )
+        .await?;
         changed = true;
         manifest.file_quality.note = Some(format!(
             "pass {pass_index} ran {} per-file deliverable set(s); next pass will rerate all files",
@@ -1226,23 +1308,77 @@ async fn run_one_file_quality_pass(
     manifest: &EverythingManifest,
     pass_index: usize,
     config: &PhaseConfig,
+    workers: usize,
 ) -> Result<FileQualityPassState> {
     let pass_dir = file_quality_pass_path(paths, pass_index);
     fs::create_dir_all(&pass_dir)
         .with_context(|| format!("failed to create {}", pass_dir.display()))?;
+    let pending = manifest
+        .files
+        .iter()
+        .filter(|file| {
+            !file_quality_file_path(paths, pass_index, file)
+                .join("rating.json")
+                .exists()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        println!(
+            "file quality: pass {pass_index} rerating {} file(s), {} worker(s)",
+            pending.len(),
+            workers
+        );
+        let mut join_set = JoinSet::new();
+        let mut pending_iter = pending.into_iter();
+        let mut active = 0usize;
+        for _ in 0..workers {
+            if let Some(file) = pending_iter.next() {
+                spawn_file_quality_rerate_worker(
+                    &mut join_set,
+                    paths.clone(),
+                    manifest.clone(),
+                    file,
+                    pass_index,
+                    config.clone(),
+                );
+                active += 1;
+            }
+        }
+        let mut failures = Vec::new();
+        while active > 0 {
+            let Some(result) = join_set.join_next().await else {
+                break;
+            };
+            active -= 1;
+            match result {
+                Ok(Ok(path)) => println!("file quality rating: {}", path.display()),
+                Ok(Err(err)) => failures.push(format!("{err:#}")),
+                Err(err) => failures.push(format!("file-quality rerate task panicked: {err}")),
+            }
+            if let Some(file) = pending_iter.next() {
+                spawn_file_quality_rerate_worker(
+                    &mut join_set,
+                    paths.clone(),
+                    manifest.clone(),
+                    file,
+                    pass_index,
+                    config.clone(),
+                );
+                active += 1;
+            }
+        }
+        if !failures.is_empty() {
+            for failure in &failures {
+                eprintln!("file quality rerate failure: {failure}");
+            }
+            bail!("file quality rerate failed for {} file(s)", failures.len());
+        }
+    }
     let mut ratings = Vec::new();
     for file in &manifest.files {
         let artifact_dir = file_quality_file_path(paths, pass_index, file);
         let rating_json = artifact_dir.join("rating.json");
-        if !rating_json.exists() {
-            let prompt = build_file_quality_rerate_prompt(paths, manifest, file, pass_index);
-            let phase_slug = format!(
-                "file-quality-rerate-{pass_index}-{}",
-                file_artifact_slug(&file.path, &file.content_hash)
-            );
-            run_codex_phase_for_artifact(paths, &artifact_dir, &phase_slug, &prompt, config)
-                .await?;
-        }
         require_nonempty_file(&rating_json)?;
         let score = read_file_quality_score(&rating_json)?;
         ratings.push(FileQualityRatingState {
@@ -1273,28 +1409,116 @@ async fn run_one_file_quality_pass(
     })
 }
 
+fn spawn_file_quality_rerate_worker(
+    join_set: &mut JoinSet<Result<PathBuf>>,
+    paths: RunPaths,
+    manifest: EverythingManifest,
+    file: FileState,
+    pass_index: usize,
+    config: PhaseConfig,
+) {
+    join_set.spawn(async move {
+        let artifact_dir = file_quality_file_path(&paths, pass_index, &file);
+        let prompt = build_file_quality_rerate_prompt(&paths, &manifest, &file, pass_index);
+        let phase_slug = format!(
+            "file-quality-rerate-{pass_index}-{}",
+            file_artifact_slug(&file.path, &file.content_hash)
+        );
+        run_codex_phase_for_artifact(&paths, &artifact_dir, &phase_slug, &prompt, &config).await?;
+        let rating_json = artifact_dir.join("rating.json");
+        require_nonempty_file(&rating_json)?;
+        Ok(rating_json)
+    });
+}
+
 async fn run_file_quality_deliverables(
     paths: &RunPaths,
     manifest: &EverythingManifest,
     pass_index: usize,
     ratings: &[FileQualityRatingState],
     config: &PhaseConfig,
+    workers: usize,
 ) -> Result<()> {
-    for rating in ratings {
+    println!(
+        "file quality: pass {pass_index} deliverables {} file(s), {} worker(s)",
+        ratings.len(),
+        workers
+    );
+    let mut pending = ratings.to_vec().into_iter();
+    let mut join_set = JoinSet::new();
+    let mut active = 0usize;
+    for _ in 0..workers {
+        if let Some(rating) = pending.next() {
+            spawn_file_quality_deliverable_worker(
+                &mut join_set,
+                paths.clone(),
+                manifest.clone(),
+                rating,
+                pass_index,
+                config.clone(),
+            );
+            active += 1;
+        }
+    }
+    let mut failures = Vec::new();
+    while active > 0 {
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        active -= 1;
+        match result {
+            Ok(Ok(path)) => println!("file quality deliverable: {}", path.display()),
+            Ok(Err(err)) => failures.push(format!("{err:#}")),
+            Err(err) => failures.push(format!("file-quality deliverable task panicked: {err}")),
+        }
+        if let Some(rating) = pending.next() {
+            spawn_file_quality_deliverable_worker(
+                &mut join_set,
+                paths.clone(),
+                manifest.clone(),
+                rating,
+                pass_index,
+                config.clone(),
+            );
+            active += 1;
+        }
+    }
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("file quality deliverable failure: {failure}");
+        }
+        bail!(
+            "file quality deliverables failed for {} file(s)",
+            failures.len()
+        );
+    }
+    Ok(())
+}
+
+fn spawn_file_quality_deliverable_worker(
+    join_set: &mut JoinSet<Result<PathBuf>>,
+    paths: RunPaths,
+    manifest: EverythingManifest,
+    rating: FileQualityRatingState,
+    pass_index: usize,
+    config: PhaseConfig,
+) {
+    join_set.spawn(async move {
         let Some(file) = manifest.files.iter().find(|file| file.path == rating.path) else {
             bail!("quality rating referenced missing file `{}`", rating.path);
         };
         let artifact_dir = PathBuf::from(&rating.artifact_dir);
         let prompt =
-            build_file_quality_deliverables_prompt(paths, manifest, file, rating, pass_index);
+            build_file_quality_deliverables_prompt(&paths, &manifest, file, &rating, pass_index);
         let phase_slug = format!(
             "file-quality-deliverables-{pass_index}-{}",
             file_artifact_slug(&file.path, &file.content_hash)
         );
-        run_codex_phase_for_artifact(paths, &artifact_dir, &phase_slug, &prompt, config).await?;
-        require_nonempty_file(&artifact_dir.join("deliverables.md"))?;
-    }
-    Ok(())
+        run_codex_phase_for_artifact(&paths, &artifact_dir, &phase_slug, &prompt, &config).await?;
+        let deliverables = artifact_dir.join("deliverables.md");
+        require_nonempty_file(&deliverables)?;
+        Ok(deliverables)
+    });
 }
 
 async fn run_final_review_repair_phase(
@@ -2747,8 +2971,27 @@ Do not edit source code in this phase. Only edit `{report}` and optional notes n
     )
 }
 
+#[allow(dead_code)]
 fn build_final_review_prompt(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    build_final_review_synthesis_prompt(paths, manifest, None)
+}
+
+fn build_final_review_synthesis_prompt(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    shard_root: Option<&Path>,
+) -> String {
     let skill_policy = selected_skill_policy_for_final_review();
+    let shard_instruction = shard_root
+        .map(|path| {
+            format!(
+                "Parallel reviewer shard reports are available under `{}`. Read every `shard.md` there and synthesize them with your own full-diff review. Treat shards as advisory evidence, not as a substitute for final judgment.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            "No parallel reviewer shard reports were generated for this run.".to_string()
+        });
     format!(
         r#"You are the final professional audit reviewer.
 
@@ -2756,6 +2999,7 @@ Repository root: `{repo}`
 Report root: `{report_root}`
 Base commit: `{base}`
 Audit branch: `{branch}`
+Reviewer shards: {shard_instruction}
 
 Review all group reports under the report root and the full git diff from `{base}` to HEAD.
 
@@ -2815,6 +3059,68 @@ Do not merge. The host runner handles merge only after this file says `Verdict: 
         report_root = paths.report_root.display(),
         base = manifest.base_commit,
         branch = manifest.audit_branch,
+        shard_instruction = shard_instruction,
+        skill_policy = skill_policy,
+    )
+}
+
+fn build_final_review_shard_prompt(
+    paths: &RunPaths,
+    manifest: &EverythingManifest,
+    shard_index: usize,
+    groups: &[GroupState],
+    artifact_dir: &Path,
+) -> String {
+    let skill_policy = selected_skill_policy_for_final_review();
+    let group_list = groups
+        .iter()
+        .map(|group| {
+            format!(
+                "- `{}` report `{}` ({} file(s))",
+                group.name,
+                group.report_path,
+                group.files.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"You are a parallel final-review shard for `auto audit --everything`.
+
+Repository root: `{repo}`
+Report root: `{report_root}`
+Base commit: `{base}`
+Audit branch: `{branch}`
+Shard index: {shard_index}
+Output file: `{artifact_dir}/shard.md`
+
+Assigned group reports:
+{group_list}
+
+Selected gstack lenses for final review:
+{skill_policy}
+
+Review the assigned group reports, their debt registers, first-pass evidence when needed, and the git diff from `{base}` to HEAD for paths owned by these groups. You are not the final synthesizer; do not write `FINAL-REVIEW.md` and do not write `CODEBASE-BOOK/`.
+
+Write `{artifact_dir}/shard.md` with:
+- `# FINAL REVIEW SHARD {shard_index}`
+- Assigned groups covered.
+- GO/NO-GO recommendation for this shard only.
+- Highest-risk blockers with exact report paths and diff paths.
+- Evidence checklist gaps relevant to these groups.
+- Deletion/refactor proof gaps relevant to these groups.
+- Validation you inspected or ran, if any.
+- Optional follow-ups that should not block.
+
+Be concise but evidence-backed. Do not merge. Do not edit source code.
+"#,
+        repo = paths.worktree_root.display(),
+        report_root = paths.report_root.display(),
+        base = manifest.base_commit,
+        branch = manifest.audit_branch,
+        shard_index = shard_index,
+        artifact_dir = artifact_dir.display(),
+        group_list = group_list,
         skill_policy = skill_policy,
     )
 }
@@ -3751,6 +4057,10 @@ fn run_status_markdown_path(paths: &RunPaths) -> PathBuf {
 
 fn final_review_markdown_path(paths: &RunPaths) -> PathBuf {
     paths.report_root.join("FINAL-REVIEW.md")
+}
+
+fn final_review_shards_path(paths: &RunPaths) -> PathBuf {
+    paths.report_root.join("FINAL-REVIEW-SHARDS")
 }
 
 fn change_summary_markdown_path(paths: &RunPaths) -> PathBuf {

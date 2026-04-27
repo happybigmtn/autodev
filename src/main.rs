@@ -1053,6 +1053,11 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 0)]
     max_files: usize,
 
+    /// Maximum concurrent workers for the legacy per-file audit first pass.
+    /// The host still applies verdicts and writes the manifest centrally.
+    #[arg(long = "audit-threads", alias = "threads", default_value_t = 15)]
+    audit_threads: usize,
+
     /// Directory for audit artifacts. Defaults to <repo>/audit
     #[arg(long)]
     output_dir: Option<PathBuf>,
@@ -1081,7 +1086,7 @@ pub(crate) struct AuditArgs {
     model: String,
 
     /// Auditor reasoning effort / thinking.
-    #[arg(long, default_value = "high")]
+    #[arg(long, default_value = "low")]
     reasoning_effort: String,
 
     /// Escalation model for DRIFT-LARGE / REFACTOR verdicts that write

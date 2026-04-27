@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -46,10 +47,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
+use tokio::task::JoinSet;
 use tokio::time;
 
 use crate::codex_exec::MAX_CODEX_MODEL_CONTEXT_WINDOW;
-use crate::codex_stream::{capture_codex_output, capture_pi_output};
+use crate::codex_stream::{capture_codex_output_prefixed, capture_pi_output};
 use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
@@ -151,6 +153,14 @@ struct FileVerdict {
     touched_paths: Vec<String>,
     #[serde(default)]
     escalate: bool,
+}
+
+struct AuditWorkerResult {
+    idx: usize,
+    entry: ManifestEntry,
+    content_hash: String,
+    file_dir: PathBuf,
+    response: String,
 }
 
 pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
@@ -351,82 +361,90 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     let mut worklisted = 0usize;
     let mut retired = 0usize;
     let mut apply_failed = 0usize;
-    for (idx, entry) in plan.iter().enumerate() {
-        if idx >= cap {
-            break;
-        }
-        let abs_path = repo_root.join(&entry.path);
-        if !abs_path.exists() {
-            mark_entry(
-                &mut manifest,
-                &entry.path,
-                EntryStatus::Skipped,
-                None,
-                None,
-                None,
-                None,
-                None,
+    let workers = args.audit_threads.clamp(1, 15).min(cap.max(1));
+    println!("workers:      {workers}");
+    let selected_plan = plan.into_iter().take(cap).collect::<Vec<_>>();
+    let repo_root_arc = Arc::new(repo_root.clone());
+    let output_dir_arc = Arc::new(output_dir.clone());
+    let doctrine_arc = Arc::new(doctrine);
+    let rubric_arc = Arc::new(rubric);
+    let mut join_set = JoinSet::new();
+    let mut plan_iter = selected_plan.into_iter().enumerate();
+    let mut active = 0usize;
+    for _ in 0..workers {
+        if let Some((idx, entry)) = plan_iter.next() {
+            spawn_audit_worker(
+                &mut join_set,
+                repo_root_arc.clone(),
+                output_dir_arc.clone(),
+                doctrine_arc.clone(),
+                rubric_arc.clone(),
+                args.clone(),
+                idx,
+                cap,
+                entry,
             );
-            write_manifest(&manifest_path, &manifest)?;
-            continue;
+            active += 1;
         }
-        let content = fs::read(&abs_path)
-            .with_context(|| format!("failed to read {}", abs_path.display()))?;
-        let content_hash = sha256_hex(&content);
-        let file_dir = file_artifact_dir(&output_dir, &entry.path);
-        // Start each file's artifact dir fresh so we never mix a partial prior
-        // run's verdict.json with this run's outputs.
-        if file_dir.exists() {
-            fs::remove_dir_all(&file_dir).ok();
-        }
-        fs::create_dir_all(&file_dir)
-            .with_context(|| format!("failed to create {}", file_dir.display()))?;
-        let prompt = build_file_prompt(
-            &repo_root,
-            &abs_path,
-            &doctrine,
-            &rubric,
-            &output_dir,
-            &entry.path,
-        )?;
-        let prompt_path = file_dir.join("prompt.md");
-        atomic_write(&prompt_path, prompt.as_bytes())
-            .with_context(|| format!("failed to write {}", prompt_path.display()))?;
-        println!();
-        println!(
-            "[{idx}/{cap}] audit {path}",
-            idx = idx + 1,
-            cap = cap,
-            path = entry.path
-        );
+    }
 
-        let run_result = run_auditor(&repo_root, &prompt, &args).await;
-        let response = match run_result {
-            Ok(r) => r,
+    while active > 0 {
+        let Some(joined) = join_set.join_next().await else {
+            break;
+        };
+        active -= 1;
+        let worker = match joined {
+            Ok(Ok(worker)) => worker,
+            Ok(Err(err)) => {
+                eprintln!("audit worker failed: {err:#}");
+                if let Some((idx, entry)) = plan_iter.next() {
+                    spawn_audit_worker(
+                        &mut join_set,
+                        repo_root_arc.clone(),
+                        output_dir_arc.clone(),
+                        doctrine_arc.clone(),
+                        rubric_arc.clone(),
+                        args.clone(),
+                        idx,
+                        cap,
+                        entry,
+                    );
+                    active += 1;
+                }
+                continue;
+            }
             Err(err) => {
-                eprintln!("audit failed for {}: {err:#}", entry.path);
-                mark_entry(
-                    &mut manifest,
-                    &entry.path,
-                    EntryStatus::Pending,
-                    Some(content_hash.clone()),
-                    Some(doctrine_hash.clone()),
-                    Some(rubric_hash.clone()),
-                    None,
-                    None,
-                );
-                write_manifest(&manifest_path, &manifest)?;
+                eprintln!("audit worker task panicked: {err}");
+                if let Some((idx, entry)) = plan_iter.next() {
+                    spawn_audit_worker(
+                        &mut join_set,
+                        repo_root_arc.clone(),
+                        output_dir_arc.clone(),
+                        doctrine_arc.clone(),
+                        rubric_arc.clone(),
+                        args.clone(),
+                        idx,
+                        cap,
+                        entry,
+                    );
+                    active += 1;
+                }
                 continue;
             }
         };
-        atomic_write(&file_dir.join("response.log"), response.as_bytes()).with_context(|| {
+
+        atomic_write(
+            &worker.file_dir.join("response.log"),
+            worker.response.as_bytes(),
+        )
+        .with_context(|| {
             format!(
                 "failed to write {}",
-                file_dir.join("response.log").display()
+                worker.file_dir.join("response.log").display()
             )
         })?;
 
-        let verdict_path = file_dir.join("verdict.json");
+        let verdict_path = worker.file_dir.join("verdict.json");
         let verdict = match fs::read_to_string(&verdict_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<FileVerdict>(&raw).ok())
@@ -435,34 +453,51 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
             None => {
                 eprintln!(
                     "audit finished but verdict.json missing / invalid for {}; keeping pending",
-                    entry.path
+                    worker.entry.path
                 );
                 mark_entry(
                     &mut manifest,
-                    &entry.path,
+                    &worker.entry.path,
                     EntryStatus::Pending,
-                    Some(content_hash.clone()),
+                    Some(worker.content_hash),
                     Some(doctrine_hash.clone()),
                     Some(rubric_hash.clone()),
                     None,
                     None,
                 );
                 write_manifest(&manifest_path, &manifest)?;
+                if let Some((idx, entry)) = plan_iter.next() {
+                    spawn_audit_worker(
+                        &mut join_set,
+                        repo_root_arc.clone(),
+                        output_dir_arc.clone(),
+                        doctrine_arc.clone(),
+                        rubric_arc.clone(),
+                        args.clone(),
+                        idx,
+                        cap,
+                        entry,
+                    );
+                    active += 1;
+                }
                 continue;
             }
         };
         println!(
-            "verdict:      {} — {}",
-            verdict.verdict,
-            first_line(&verdict.rationale)
+            "verdict [{idx}/{cap}] {path}: {verdict} — {rationale}",
+            idx = worker.idx + 1,
+            cap = cap,
+            path = worker.entry.path,
+            verdict = verdict.verdict,
+            rationale = first_line(&verdict.rationale)
         );
 
         let (new_status, commit_sha) = apply_verdict(
             &repo_root,
             &output_dir,
             &current_branch,
-            &entry.path,
-            &file_dir,
+            &worker.entry.path,
+            &worker.file_dir,
             &verdict,
             args.report_only,
         )?;
@@ -480,9 +515,9 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         audited += 1;
         mark_entry(
             &mut manifest,
-            &entry.path,
+            &worker.entry.path,
             new_status,
-            Some(content_hash),
+            Some(worker.content_hash),
             Some(doctrine_hash.clone()),
             Some(rubric_hash.clone()),
             Some(verdict.verdict.clone()),
@@ -500,6 +535,20 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
                 retired,
                 apply_failed,
             )?;
+        }
+        if let Some((idx, entry)) = plan_iter.next() {
+            spawn_audit_worker(
+                &mut join_set,
+                repo_root_arc.clone(),
+                output_dir_arc.clone(),
+                doctrine_arc.clone(),
+                rubric_arc.clone(),
+                args.clone(),
+                idx,
+                cap,
+                entry,
+            );
+            active += 1;
         }
     }
 
@@ -526,6 +575,79 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         println!("remote sync: rebased onto origin/{}", current_branch);
     }
     Ok(())
+}
+
+fn spawn_audit_worker(
+    join_set: &mut JoinSet<Result<AuditWorkerResult>>,
+    repo_root: Arc<PathBuf>,
+    output_dir: Arc<PathBuf>,
+    doctrine: Arc<String>,
+    rubric: Arc<String>,
+    args: AuditArgs,
+    idx: usize,
+    cap: usize,
+    entry: ManifestEntry,
+) {
+    join_set.spawn(async move {
+        run_audit_worker(
+            repo_root, output_dir, doctrine, rubric, args, idx, cap, entry,
+        )
+        .await
+    });
+}
+
+async fn run_audit_worker(
+    repo_root: Arc<PathBuf>,
+    output_dir: Arc<PathBuf>,
+    doctrine: Arc<String>,
+    rubric: Arc<String>,
+    args: AuditArgs,
+    idx: usize,
+    cap: usize,
+    entry: ManifestEntry,
+) -> Result<AuditWorkerResult> {
+    let abs_path = repo_root.join(&entry.path);
+    if !abs_path.exists() {
+        bail!(
+            "tracked audit path disappeared before worker start: {}",
+            entry.path
+        );
+    }
+    let content =
+        fs::read(&abs_path).with_context(|| format!("failed to read {}", abs_path.display()))?;
+    let content_hash = sha256_hex(&content);
+    let file_dir = file_artifact_dir(&output_dir, &entry.path);
+    if file_dir.exists() {
+        fs::remove_dir_all(&file_dir).ok();
+    }
+    fs::create_dir_all(&file_dir)
+        .with_context(|| format!("failed to create {}", file_dir.display()))?;
+    let prompt = build_file_prompt(
+        &repo_root,
+        &abs_path,
+        &doctrine,
+        &rubric,
+        &output_dir,
+        &entry.path,
+    )?;
+    let prompt_path = file_dir.join("prompt.md");
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!(
+        "[{idx}/{cap}] audit {path}",
+        idx = idx + 1,
+        cap = cap,
+        path = entry.path
+    );
+    let label = format!("audit:{}/{}", idx + 1, entry.path);
+    let response = run_auditor_labeled(&repo_root, &prompt, &args, Some(&label)).await?;
+    Ok(AuditWorkerResult {
+        idx,
+        entry,
+        content_hash,
+        file_dir,
+        response,
+    })
 }
 
 fn initial_manifest(
@@ -1116,13 +1238,23 @@ fn write_progress_snapshot(
         .with_context(|| "failed to write AUDIT-PROGRESS.md".to_string())
 }
 
+#[allow(dead_code)]
 async fn run_auditor(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
+    run_auditor_labeled(repo_root, prompt, args, None).await
+}
+
+async fn run_auditor_labeled(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+    label: Option<&str>,
+) -> Result<String> {
     if args.use_kimi_cli && is_kimi_model(&args.model) {
         run_auditor_kimi(repo_root, prompt, args).await
     } else if is_kimi_model(&args.model) {
         bail!("auto audit Kimi models currently require --use-kimi-cli");
     } else {
-        run_auditor_codex(repo_root, prompt, args).await
+        run_auditor_codex(repo_root, prompt, args, label).await
     }
 }
 
@@ -1131,7 +1263,12 @@ fn is_kimi_model(model: &str) -> bool {
     lower.contains("kimi") || lower.starts_with("k2.") || lower.starts_with("k2p")
 }
 
-async fn run_auditor_codex(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
+async fn run_auditor_codex(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+    label: Option<&str>,
+) -> Result<String> {
     let mut command = TokioCommand::new(&args.codex_bin);
     command
         .arg("exec")
@@ -1181,7 +1318,11 @@ async fn run_auditor_codex(repo_root: &Path, prompt: &str, args: &AuditArgs) -> 
         .stderr
         .take()
         .context("Codex stderr should be piped for auto audit")?;
-    let stdout_task = tokio::spawn(async move { capture_codex_output(stdout).await });
+    let label = label.map(str::to_string);
+    let stdout_task =
+        tokio::spawn(
+            async move { capture_codex_output_prefixed(stdout, label.as_deref(), None).await },
+        );
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
     let wait_result = time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
     let timed_out = wait_result.is_err();
@@ -1853,6 +1994,7 @@ diff --git a/README.md b/README.md
             include_paths: Vec::new(),
             exclude_paths: Vec::new(),
             max_files: 0,
+            audit_threads: 15,
             output_dir: None,
             resume_mode: AuditResumeMode::Resume,
             report_only: false,
