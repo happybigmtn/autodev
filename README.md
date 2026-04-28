@@ -1049,6 +1049,9 @@ What it does:
 - Runs final review with Codex `gpt-5.5` `xhigh`
 - If final review writes `Verdict: NO-GO` with actionable required blockers, runs a bounded
   repair pass and reruns final review before merge judgment
+- For non-report runs, successful completion requires both a `Verdict: GO` final review and a
+  completed file-quality gate where every tracked file rerates at least 9/10. `--no-everything-merge`
+  skips only the primary-branch merge; it does not bypass final-review or file-quality closeout.
 - Writes `CODEBASE-BOOK/` as the final human-readable codebase explanation: a chaptered,
   first-principles tour organized by the repository's logical architecture. The expected standard
   is a Feynman-style technical walkthrough that teaches a smart junior developer the important

@@ -1086,11 +1086,24 @@ async fn run_final_review_and_file_quality_phase(
     manifest: &mut EverythingManifest,
 ) -> Result<()> {
     run_final_review_phase(args, paths, manifest).await?;
-    if !final_review_is_go(paths) || args.report_only {
+    if args.report_only {
         finalize_change_summary_phase(paths, manifest, !args.report_only)?;
         return Ok(());
     }
+    if !final_review_is_go(paths) {
+        manifest.file_quality.status = StageStatus::Failed;
+        manifest.file_quality.note = Some(
+            "final review is not GO; audit cannot complete until final-review blockers are resolved and every file rerates at least 9/10"
+                .to_string(),
+        );
+        write_manifest(paths, manifest)?;
+        finalize_change_summary_phase(paths, manifest, true)?;
+        bail!(
+            "final review is not GO; auto audit will not exit successfully until final-review blockers are resolved and every file rerates at least {FILE_QUALITY_ACCEPT_SCORE:.0}/10"
+        );
+    }
     let changed = run_file_quality_gate_phase(args, paths, manifest).await?;
+    require_file_quality_acceptance(manifest)?;
     if changed {
         manifest.final_review.status = StageStatus::Pending;
         manifest.final_review.note = Some(
@@ -1099,6 +1112,12 @@ async fn run_final_review_and_file_quality_phase(
         );
         write_manifest(paths, manifest)?;
         run_final_review_phase(args, paths, manifest).await?;
+        if !final_review_is_go(paths) {
+            finalize_change_summary_phase(paths, manifest, true)?;
+            bail!(
+                "final review is not GO after file-quality deliverables; auto audit will not exit successfully until the rerun is GO and every file remains at least {FILE_QUALITY_ACCEPT_SCORE:.0}/10"
+            );
+        }
     }
     finalize_change_summary_phase(paths, manifest, true)?;
     Ok(())
@@ -1576,6 +1595,7 @@ fn attempt_merge(
         write_manifest(paths, manifest)?;
         bail!("final review is not GO; not attempting merge");
     }
+    require_file_quality_acceptance(manifest)?;
     if manifest.in_place {
         return complete_in_place_run(paths, manifest);
     }
@@ -1624,6 +1644,7 @@ fn complete_in_place_run(paths: &RunPaths, manifest: &mut EverythingManifest) ->
         write_manifest(paths, manifest)?;
         bail!("final review is not GO; in-place run left changes for review");
     }
+    require_file_quality_acceptance(manifest)?;
     commit_worktree_changes(paths, manifest)?;
     manifest.merge.status = StageStatus::Complete;
     manifest.merge.note =
@@ -4098,6 +4119,78 @@ fn next_file_quality_pass_index(manifest: &EverythingManifest) -> usize {
         + 1
 }
 
+fn require_file_quality_acceptance(manifest: &EverythingManifest) -> Result<()> {
+    if manifest.files.is_empty() {
+        return Ok(());
+    }
+    if !matches!(manifest.file_quality.status, StageStatus::Complete) {
+        bail!(
+            "file-quality gate is not complete; auto audit requires every file to rerate at least {FILE_QUALITY_ACCEPT_SCORE:.0}/10 before successful completion"
+        );
+    }
+    let Some(pass) = latest_file_quality_pass(manifest) else {
+        bail!("file-quality gate is marked complete but has no recorded rating pass");
+    };
+    let ratings_by_path = pass
+        .ratings
+        .iter()
+        .map(|rating| (rating.path.as_str(), rating))
+        .collect::<BTreeMap<_, _>>();
+    let missing = manifest
+        .files
+        .iter()
+        .filter(|file| !ratings_by_path.contains_key(file.path.as_str()))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "file-quality gate is missing rating(s) for {} file(s): {}",
+            missing.len(),
+            missing
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let below = pass
+        .ratings
+        .iter()
+        .filter(|rating| rating.score_out_of_10.unwrap_or(0.0) < FILE_QUALITY_ACCEPT_SCORE)
+        .map(|rating| {
+            format!(
+                "{} ({})",
+                rating.path,
+                rating
+                    .score_out_of_10
+                    .map(|score| format!("{score:.1}/10"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        })
+        .collect::<Vec<_>>();
+    if !below.is_empty() {
+        bail!(
+            "file-quality gate still has {} file(s) below {FILE_QUALITY_ACCEPT_SCORE:.0}/10: {}",
+            below.len(),
+            below
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn latest_file_quality_pass(manifest: &EverythingManifest) -> Option<&FileQualityPassState> {
+    manifest
+        .file_quality_passes
+        .iter()
+        .max_by_key(|pass| pass.pass_index)
+}
+
 fn read_file_quality_score(path: &Path) -> Result<Option<f64>> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -5176,6 +5269,58 @@ mod tests {
         assert_eq!(read_file_quality_score(&string).unwrap(), Some(9.5));
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn file_quality_acceptance_requires_complete_nine_plus_ratings() {
+        let mut manifest = manifest_with_groups(vec![group_for_test("src", &["src/lib.rs"])]);
+        manifest.files = vec![
+            FileState {
+                path: "src/lib.rs".to_string(),
+                group: "src".to_string(),
+                content_hash: "hash-a".to_string(),
+                artifact_dir: "artifact-a".to_string(),
+                status: StageStatus::Complete,
+            },
+            FileState {
+                path: "src/other.rs".to_string(),
+                group: "src".to_string(),
+                content_hash: "hash-b".to_string(),
+                artifact_dir: "artifact-b".to_string(),
+                status: StageStatus::Complete,
+            },
+        ];
+        manifest.file_quality.status = StageStatus::Complete;
+        manifest.file_quality_passes = vec![FileQualityPassState {
+            pass_index: 1,
+            status: StageStatus::Complete,
+            artifact_dir: "quality/pass-01".to_string(),
+            ratings: vec![FileQualityRatingState {
+                path: "src/lib.rs".to_string(),
+                score_out_of_10: Some(9.0),
+                status: StageStatus::Complete,
+                artifact_dir: "quality/pass-01/src-lib".to_string(),
+                note: None,
+            }],
+            note: None,
+        }];
+        let missing = require_file_quality_acceptance(&manifest).unwrap_err();
+        assert!(format!("{missing:#}").contains("missing rating"));
+
+        manifest.file_quality_passes[0]
+            .ratings
+            .push(FileQualityRatingState {
+                path: "src/other.rs".to_string(),
+                score_out_of_10: Some(8.9),
+                status: StageStatus::Complete,
+                artifact_dir: "quality/pass-01/src-other".to_string(),
+                note: None,
+            });
+        let below = require_file_quality_acceptance(&manifest).unwrap_err();
+        assert!(format!("{below:#}").contains("below 9"));
+
+        manifest.file_quality_passes[0].ratings[1].score_out_of_10 = Some(9.1);
+        require_file_quality_acceptance(&manifest).expect("all files should meet quality floor");
     }
 
     #[test]
