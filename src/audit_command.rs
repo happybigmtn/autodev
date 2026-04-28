@@ -1287,6 +1287,41 @@ fn resolve_real_cargo() -> Result<String> {
     Ok(path)
 }
 
+fn resolve_auto_executable() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("AUTODEV_AUTO_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if current.exists() {
+            return Ok(current);
+        }
+        let current_text = current.to_string_lossy();
+        if let Some(stripped) = current_text.strip_suffix(" (deleted)") {
+            let stripped = PathBuf::from(stripped);
+            if stripped.exists() {
+                return Ok(stripped);
+            }
+        }
+    }
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg("command -v auto")
+        .output()
+        .context("failed to resolve auto executable from PATH")?;
+    if output.status.success() {
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "failed to resolve auto executable; set AUTODEV_AUTO_BIN to the installed auto binary path"
+    )
+}
+
 fn cargo_guard_wrapper_script() -> &'static str {
     r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -1618,7 +1653,7 @@ async fn rerun_only_drifted_audit(
     output_dir: &Path,
     args: &AuditArgs,
 ) -> Result<()> {
-    let exe = std::env::current_exe().context("failed to resolve current auto executable")?;
+    let exe = resolve_auto_executable()?;
     let mut command = TokioCommand::new(exe);
     command
         .arg("audit")
