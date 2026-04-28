@@ -1034,6 +1034,10 @@ async fn resolve_audit_findings(
         .filter(|entry| repo_root.join(&entry.path).exists())
         .cloned()
         .collect::<Vec<_>>();
+    let finding_paths = findings
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
 
     if findings.is_empty() {
         println!("auto audit resolve findings: no existing flagged files to remediate");
@@ -1206,7 +1210,7 @@ async fn resolve_audit_findings(
         &target_root,
         &lane_statuses,
     )?;
-    rerun_only_drifted_audit(repo_root, output_dir, &args).await?;
+    rerun_only_drifted_audit(repo_root, output_dir, &args, &finding_paths).await?;
     verify_audit_findings(repo_root, output_dir)?;
     write_finding_resolution_status(
         output_dir,
@@ -2015,6 +2019,7 @@ async fn rerun_only_drifted_audit(
     repo_root: &Path,
     output_dir: &Path,
     args: &AuditArgs,
+    focus_paths: &[String],
 ) -> Result<()> {
     let exe = resolve_auto_executable()?;
     let mut command = TokioCommand::new(exe);
@@ -2055,7 +2060,12 @@ async fn rerun_only_drifted_audit(
     if let Some(branch) = args.branch.as_deref() {
         command.arg("--branch").arg(branch);
     }
-    for path in &args.include_paths {
+    let include_paths = if focus_paths.is_empty() {
+        &args.include_paths
+    } else {
+        focus_paths
+    };
+    for path in include_paths {
         command.arg("--paths").arg(path);
     }
     for path in &args.exclude_paths {
