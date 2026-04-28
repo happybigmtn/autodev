@@ -63,6 +63,7 @@ use crate::util::{
 use crate::{AuditArgs, AuditResumeMode};
 
 const AUDITOR_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes per file — generous
+const FINDING_RESOLUTION_TIMEOUT_SECS: u64 = 4 * 60 * 60; // remediation lanes can pay fresh dependency-build cost
 const BUNDLED_RUBRIC: &str = include_str!("audit_rubric.md");
 const DEFAULT_INCLUDE_GLOBS: &[&str] = &[
     "**/*.rs",
@@ -1909,9 +1910,15 @@ async fn run_finding_resolution_lane(
         lane.name
     );
     let label = format!("audit-resolve:{}/{}", lane.id + 1, lane.name);
-    let response =
-        run_auditor_labeled_with_env(&lane_repo_root, &prompt, &args, Some(&label), &lane_env)
-            .await?;
+    let response = run_auditor_labeled_with_env_and_timeout(
+        &lane_repo_root,
+        &prompt,
+        &args,
+        Some(&label),
+        &lane_env,
+        FINDING_RESOLUTION_TIMEOUT_SECS,
+    )
+    .await?;
     atomic_write(&lane_dir.join("response.log"), response.as_bytes())?;
     commit_finding_resolution_lane_changes(&lane_repo_root, &lane, &base_commit)?;
     Ok(FindingResolutionLaneOutcome {
@@ -2582,12 +2589,31 @@ async fn run_auditor_labeled_with_env(
     label: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<String> {
+    run_auditor_labeled_with_env_and_timeout(
+        repo_root,
+        prompt,
+        args,
+        label,
+        extra_env,
+        AUDITOR_TIMEOUT_SECS,
+    )
+    .await
+}
+
+async fn run_auditor_labeled_with_env_and_timeout(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+    label: Option<&str>,
+    extra_env: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<String> {
     if args.use_kimi_cli && is_kimi_model(&args.model) {
-        run_auditor_kimi(repo_root, prompt, args, extra_env).await
+        run_auditor_kimi(repo_root, prompt, args, extra_env, timeout_secs).await
     } else if is_kimi_model(&args.model) {
         bail!("auto audit Kimi models currently require --use-kimi-cli");
     } else {
-        run_auditor_codex(repo_root, prompt, args, label, extra_env).await
+        run_auditor_codex(repo_root, prompt, args, label, extra_env, timeout_secs).await
     }
 }
 
@@ -2602,6 +2628,7 @@ async fn run_auditor_codex(
     args: &AuditArgs,
     label: Option<&str>,
     extra_env: &[(String, String)],
+    timeout_secs: u64,
 ) -> Result<String> {
     let mut command = TokioCommand::new(&args.codex_bin);
     command
@@ -2661,7 +2688,7 @@ async fn run_auditor_codex(
             async move { capture_codex_output_prefixed(stdout, label.as_deref(), None).await },
         );
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
-    let wait_result = time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
+    let wait_result = time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
     let timed_out = wait_result.is_err();
     if timed_out {
         let _ = child.kill().await;
@@ -2674,7 +2701,7 @@ async fn run_auditor_codex(
         .await
         .context("Codex stderr capture task panicked")??;
     if timed_out {
-        bail!("Codex audit pass timed out after {}s", AUDITOR_TIMEOUT_SECS);
+        bail!("Codex audit pass timed out after {}s", timeout_secs);
     }
     let status = wait_result
         .expect("timeout already handled")
@@ -2697,6 +2724,7 @@ async fn run_auditor_kimi(
     prompt: &str,
     args: &AuditArgs,
     extra_env: &[(String, String)],
+    timeout_secs: u64,
 ) -> Result<String> {
     let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
     let model = resolve_kimi_cli_model(&args.model);
@@ -2729,7 +2757,7 @@ async fn run_auditor_kimi(
     let stdout_task =
         tokio::spawn(async move { capture_pi_output(stdout, "auto audit kimi-cli", 30).await });
     let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
-    let wait_result = time::timeout(Duration::from_secs(AUDITOR_TIMEOUT_SECS), child.wait()).await;
+    let wait_result = time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
     let timed_out = wait_result.is_err();
     if timed_out {
         let _ = child.kill().await;
@@ -2742,10 +2770,7 @@ async fn run_auditor_kimi(
         .await
         .context("kimi-cli stderr capture task panicked")??;
     if timed_out {
-        bail!(
-            "kimi-cli audit pass timed out after {}s",
-            AUDITOR_TIMEOUT_SECS
-        );
+        bail!("kimi-cli audit pass timed out after {}s", timeout_secs);
     }
     let status = wait_result
         .expect("timeout already handled")
