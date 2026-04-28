@@ -29,6 +29,7 @@ mod quota_status;
 mod quota_usage;
 mod review_command;
 mod ship_command;
+mod spec_command;
 mod state;
 mod steward_command;
 mod super_command;
@@ -61,6 +62,8 @@ enum Command {
     Corpus(CorpusArgs),
     /// Generate specs and a new implementation plan from genesis/
     Gen(GenerationArgs),
+    /// Turn a prompt into a conformant spec plus IMPLEMENTATION_PLAN.md task items
+    Spec(SpecArgs),
     /// Run the all-in-one production-grade workflow: corpus, gen, gates, then parallel
     Super(SuperArgs),
     /// Reverse-engineer specs from code reality using genesis/ as supporting context
@@ -510,6 +513,36 @@ pub(crate) struct GenerationArgs {
     /// Skip authoring and only verify/sync an existing gen-* output dir
     #[arg(long)]
     sync_only: bool,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct SpecArgs {
+    /// High-level request to turn into a conformant spec and plan items
+    prompt: Option<String>,
+
+    /// Explicit spec output path. Defaults to specs/<ddmmyy-prompt-slug>.md
+    #[arg(long)]
+    spec_path: Option<PathBuf>,
+
+    /// Implementation plan path. Defaults to IMPLEMENTATION_PLAN.md
+    #[arg(long)]
+    plan_path: Option<PathBuf>,
+
+    /// Model used for spec authoring
+    #[arg(long, default_value = "gpt-5.5")]
+    model: String,
+
+    /// Reasoning effort used for spec authoring
+    #[arg(long, default_value = "xhigh")]
+    reasoning_effort: String,
+
+    /// Codex executable to invoke
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Preview the generated prompt without invoking the model
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Clone)]
@@ -1455,6 +1488,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Corpus(args) => generation::run_corpus(args).await,
         Command::Gen(args) => generation::run_gen(args).await,
+        Command::Spec(args) => spec_command::run_spec(args).await,
         Command::Super(args) => super_command::run_super(args).await,
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
@@ -1505,9 +1539,9 @@ mod tests {
     #[test]
     fn top_level_command_surface_matches_live_enum() {
         let expected = [
-            "corpus", "gen", "super", "reverse", "bug", "loop", "parallel", "qa", "qa-only",
-            "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis", "quota",
-            "symphony",
+            "corpus", "gen", "spec", "super", "reverse", "bug", "loop", "parallel", "qa",
+            "qa-only", "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis",
+            "quota", "symphony",
         ];
         let cli_command = Cli::command();
         let actual = cli_command

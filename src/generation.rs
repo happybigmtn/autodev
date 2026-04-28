@@ -110,21 +110,44 @@ const IMPLEMENTATION_PLAN_HEADER: &str = "# IMPLEMENTATION_PLAN";
 const SPEC_OBJECTIVE_HEADER: &str = "## Objective";
 const SPEC_ACCEPTANCE_CRITERIA_HEADER: &str = "## Acceptance Criteria";
 const SPEC_VERIFICATION_HEADER: &str = "## Verification";
+const REQUIRED_SPEC_SECTIONS: [&str; 12] = [
+    SPEC_OBJECTIVE_HEADER,
+    "## Source Of Truth",
+    "## Evidence Status",
+    "## Runtime Contract",
+    "## UI Contract",
+    "## Generated Artifacts",
+    "## Fixture Policy",
+    "## Retired / Superseded Surfaces",
+    SPEC_ACCEPTANCE_CRITERIA_HEADER,
+    SPEC_VERIFICATION_HEADER,
+    "## Review And Closeout",
+    "## Open Questions",
+];
 const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Priority Work",
     "## Follow-On Work",
     "## Completed / Already Satisfied",
 ];
-const REQUIRED_PLAN_TASK_FIELDS: [&str; 13] = [
+const REQUIRED_PLAN_TASK_FIELDS: [&str; 22] = [
     "Spec:",
     "Why now:",
     "Codebase evidence:",
+    "Source of truth:",
+    "Runtime owner:",
+    "UI consumers:",
+    "Generated artifacts:",
+    "Fixture boundary:",
+    "Retired surfaces:",
     "Owns:",
     "Integration touchpoints:",
     "Scope boundary:",
     "Acceptance criteria:",
     "Verification:",
     "Required tests:",
+    "Contract generation:",
+    "Cross-surface tests:",
+    "Review/closeout:",
     "Completion artifacts:",
     "Dependencies:",
     "Estimated scope:",
@@ -2005,6 +2028,10 @@ DX review pass, when applicable:
 Generated spec validation:
 - Every spec under `{output_dir}/specs/` must start with `# Specification:`.
 - Every spec must include non-empty `## Objective`, `## Evidence Status`, `## Acceptance Criteria`, `## Verification`, and `## Open Questions`.
+- Every spec must also include non-empty `## Source Of Truth`, `## Runtime Contract`, `## UI Contract`, `## Generated Artifacts`, `## Fixture Policy`, `## Retired / Superseded Surfaces`, and `## Review And Closeout`.
+- `## Source Of Truth` must name runtime owners, UI consumers, generated artifacts, and retired/superseded surfaces.
+- `## UI Contract` must prohibit production UI from duplicating runtime-owned catalogs, constants, risk classifications, settlement math, eligibility rules, or fixture fallback truth.
+- `## Fixture Policy` must quarantine sample/demo/test data away from production components.
 - `## Evidence Status` must separate verified code facts from recommendations, hypotheses, and unresolved questions.
 - Acceptance criteria must be observable, testable outcomes, not vague capability prose.
 - Specs must cite concrete files, commands, APIs, or primary-source documentation for exact current-state claims.
@@ -2013,6 +2040,8 @@ Generated implementation plan validation:
 - `{output_dir}/IMPLEMENTATION_PLAN.md` must start with `# IMPLEMENTATION_PLAN`.
 - It must include `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`.
 - Every unfinished task must include `Spec:`, `Why now:`, `Codebase evidence:`, `Owns:`, `Integration touchpoints:`, `Scope boundary:`, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Completion artifacts:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
+- Every unfinished task must also include `Source of truth:`, `Runtime owner:`, `UI consumers:`, `Generated artifacts:`, `Fixture boundary:`, `Retired surfaces:`, `Contract generation:`, `Cross-surface tests:`, and `Review/closeout:`.
+- Runtime-impacting tasks should implement runtime/API truth before UI consumers, regenerate contracts before consumer adaptation, and include an independent closeout proof that catches the original drift.
 - Every `Spec:` reference must point to a spec file that exists under `{output_dir}/specs/`.
 - Behavior-changing tasks should prefer a prove-it validation path: failing test or repro first, green proof, then broader regression check.
 - Research or design tasks must name the closing artifact or decision and must not promise implementation details before the prerequisite evidence exists.
@@ -2106,21 +2135,35 @@ Required output contract:
 - Filenames must use `ddmmyy-topic-slug.md`
 - Each file must start with `# Specification: ...`
 - Each file must include `## Objective`
+- Each file must include `## Source Of Truth`
 - Each file must include `## Evidence Status`
+- Each file must include `## Runtime Contract`
+- Each file must include `## UI Contract`
+- Each file must include `## Generated Artifacts`
+- Each file must include `## Fixture Policy`
+- Each file must include `## Retired / Superseded Surfaces`
 - Each file must include a `## Acceptance Criteria` section
 - Each file must include a `## Verification` section
+- Each file must include `## Review And Closeout`
 - Each file must include `## Open Questions`
+- `## Source Of Truth` must name runtime owner modules/APIs, UI consumers, generated artifacts, and retired/superseded surfaces; use `none` only after checking
 - Acceptance criteria must be concrete, testable, and phrased as truthful observable outcomes
 - Acceptance criteria should use flat bullet points, not prose paragraphs
 - Specs must be concrete, file-grounded, and implementation-oriented
 - Avoid placeholders and abstract framework prose
 - Surface important assumptions or spec/code conflicts explicitly instead of smoothing them over
 - Include commands, boundaries, or open questions when they materially affect implementation or verification
+- `## Runtime Contract` must say which engine/runtime/API owns canonical facts and what must fail closed when that data is absent
+- `## UI Contract` must say how UI or presentation consumers avoid duplicating runtime constants, catalogs, eligibility rules, risk classifications, settlement math, or sample fallback truth
+- `## Generated Artifacts` must name bindings, schemas, docs, snapshots, or generation commands to refresh; write `none` only when there are no generated contracts
+- `## Fixture Policy` must quarantine fixture/demo/sample data to test-only or dev-only surfaces and say what production code must not import
+- `## Retired / Superseded Surfaces` must name stale specs/files/contracts to delete, archive, or tombstone, or `none`
 - Every exact current-state fact should be backed by a file path, command, or primary-source documentation citation in `## Evidence Status`
 - `## Evidence Status` must separate:
   - verified facts grounded in code or primary-source documentation
   - recommendations for the intended system
   - hypotheses / unresolved questions
+- `## Review And Closeout` must explain how a reviewer independently proves each original requirement was satisfied, including grep/assertion proof when normal tests would not catch the drift
 - Treat the live codebase as authoritative for current-state facts in every mode
 - Any exact version, timeout, threshold, dependency tag, benchmark target, chain choice, or protocol step that is not verified must be labeled as a recommendation or hypothesis instead of stated as settled fact
 - If a spec describes a future phase or unresolved surface, keep it at research/design level and avoid implementation detail that the evidence does not yet support
@@ -2221,12 +2264,21 @@ Output requirements:
   - `Spec:`
   - `Why now:`
   - `Codebase evidence:`
+  - `Source of truth:`
+  - `Runtime owner:`
+  - `UI consumers:`
+  - `Generated artifacts:`
+  - `Fixture boundary:`
+  - `Retired surfaces:`
   - `Owns:`
   - `Integration touchpoints:`
   - `Scope boundary:`
   - `Acceptance criteria:`
   - `Verification:`
   - `Required tests:`
+  - `Contract generation:`
+  - `Cross-surface tests:`
+  - `Review/closeout:`
   - `Completion artifacts:`
   - `Dependencies:`
   - `Estimated scope:`
@@ -2235,6 +2287,12 @@ Output requirements:
 - `Spec:` values must point to `specs/*.md`
 - Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames
 - Keep the plan concrete, file-grounded, and executable
+- `Source of truth:` must name the canonical runtime/API/spec/doc owner for facts changed by the task
+- `Runtime owner:` must name the engine/runtime path or `none`
+- `UI consumers:` must name concrete UI/presentation paths/routes or `none`
+- `Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`
+- `Fixture boundary:` must state production cannot import fixture/demo/sample data, or explain why not applicable
+- `Retired surfaces:` must name stale specs/files/contracts to delete/archive/tombstone, or `none`
 - `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docker-compose.yml`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there. Tasks whose only output is a git ref (annotated tag, branch) MUST write the ref path directly, e.g. `Owns: refs/tags/v0.2.0` or `Owns: refs/heads/release/0.3` — prose like `git tags only` is rejected
 - `Integration touchpoints:` should name concrete adjacent modules, route prefixes, commands, or config files; if none exist, write `none`
 - Do not include lane prose, staffing prose, or meta commentary
@@ -2249,6 +2307,9 @@ Output requirements:
 - Do not write `decomposition required`, `split before implementation`, or similar placeholders; the generated plan is responsible for doing that decomposition now
 - `Required tests:` must list concrete test names or an explicit `none` for docs-only tasks; never write `See spec`, `TBD`, or a broad module name
 - No unfinished task may list more than five required tests; split the task if it needs more
+- `Contract generation:` must name the generation/check command for affected generated artifacts, or `none -- no generated contract`
+- `Cross-surface tests:` must name a runtime-output-to-UI/readback proof when UI is affected, or `none -- no UI/runtime boundary`
+- `Review/closeout:` must describe independent proof for the original requirement. It cannot be only `cargo check`; include test, grep/assertion, artifact, or reviewer checklist proof that would catch the original drift returning
 - `Completion artifacts:` must list concrete repo-relative evidence files or directories that must exist before the task can truthfully become done; write `none` only when the task has no durable artifact beyond code/tests/review handoff
 - `Verification:` must stay narrow: prefer exact test-name filters and affected-crate checks; do not use `cargo check --workspace`, `cargo test --workspace`, `cargo test --all`, or equivalent broad workspace sweeps as the primary item verification
 - Every `cargo test` verification command must include a concrete test-name/filter token after package or target flags; reject package-wide commands such as `cargo test -p crate`, `cargo test -p crate --lib`, or `cargo test -p crate --test integration_file`
@@ -2297,11 +2358,7 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
                 spec.display()
             );
         }
-        for section in [
-            SPEC_OBJECTIVE_HEADER,
-            SPEC_ACCEPTANCE_CRITERIA_HEADER,
-            SPEC_VERIFICATION_HEADER,
-        ] {
+        for section in REQUIRED_SPEC_SECTIONS {
             if !generated_spec_has_section(&normalized, section) {
                 bail!(
                     "generated spec {} must include `{}`",
@@ -2309,18 +2366,6 @@ fn verify_generated_specs(output_dir: &Path) -> Result<Vec<GeneratedSpecDocument
                     section
                 );
             }
-        }
-        if !generated_spec_has_section(&normalized, "## Evidence Status") {
-            bail!(
-                "generated spec {} must include `## Evidence Status`",
-                spec.display()
-            );
-        }
-        if !generated_spec_has_section(&normalized, "## Open Questions") {
-            bail!(
-                "generated spec {} must include `## Open Questions`",
-                spec.display()
-            );
         }
         if !generated_spec_has_acceptance_criteria(&normalized) {
             bail!(
@@ -2659,7 +2704,8 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
         );
     }
 
-    let required_tests = plan_task_field_body(block, "Required tests:", "Completion artifacts:")
+    let required_tests = plan_task_field_body(block, "Required tests:", "Contract generation:")
+        .or_else(|| plan_task_field_body(block, "Required tests:", "Completion artifacts:"))
         .or_else(|| plan_task_field_body(block, "Required tests:", "Dependencies:"))
         .with_context(|| format!("task `{}` missing `Required tests:` body", block.task_id))?;
     verify_required_tests_are_scoped(block, &required_tests)?;
@@ -2677,10 +2723,74 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
                 )
             })?;
     verify_completion_artifacts_are_concrete(block, &completion_artifacts)?;
+    verify_generated_plan_process_fields(block)?;
     verify_generated_plan_task_has_concrete_ownership(block)?;
     verify_generated_plan_task_prose_gates_are_explicit(block)?;
 
     Ok(())
+}
+
+fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
+    for field in [
+        "Source of truth:",
+        "Runtime owner:",
+        "UI consumers:",
+        "Generated artifacts:",
+        "Fixture boundary:",
+        "Retired surfaces:",
+        "Contract generation:",
+        "Cross-surface tests:",
+        "Review/closeout:",
+    ] {
+        let value = plan_task_field_line_value(block, field)
+            .with_context(|| format!("task `{}` missing `{field}`", block.task_id))?;
+        let lowercase = value.to_ascii_lowercase();
+        for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
+            if lowercase.contains(forbidden) {
+                bail!(
+                    "generated implementation plan task `{}` has vague `{field}` content `{forbidden}`",
+                    block.task_id
+                );
+            }
+        }
+    }
+
+    let ui_consumers = plan_task_field_line_value(block, "UI consumers:").unwrap_or("none");
+    let has_ui = !field_value_is_none(ui_consumers);
+    let cross_surface = plan_task_field_line_value(block, "Cross-surface tests:").unwrap_or("none");
+    if has_ui && field_value_is_none(cross_surface) {
+        bail!(
+            "generated implementation plan task `{}` names UI consumers but has no `Cross-surface tests:` proof",
+            block.task_id
+        );
+    }
+
+    let generated_artifacts =
+        plan_task_field_line_value(block, "Generated artifacts:").unwrap_or("none");
+    let contract_generation =
+        plan_task_field_line_value(block, "Contract generation:").unwrap_or("none");
+    if !field_value_is_none(generated_artifacts) && field_value_is_none(contract_generation) {
+        bail!(
+            "generated implementation plan task `{}` names generated artifacts but has no `Contract generation:` command",
+            block.task_id
+        );
+    }
+
+    let review_closeout = plan_task_field_line_value(block, "Review/closeout:").unwrap_or("");
+    let review_lower = review_closeout.to_ascii_lowercase();
+    if review_lower == "cargo check" || review_lower.contains("cargo check only") {
+        bail!(
+            "generated implementation plan task `{}` cannot use only cargo check for `Review/closeout:`",
+            block.task_id
+        );
+    }
+
+    Ok(())
+}
+
+fn field_value_is_none(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized == "none" || normalized.starts_with("none --") || normalized.starts_with("none -")
 }
 
 fn strip_list_bullet(line: &str) -> &str {
@@ -3612,7 +3722,7 @@ mod tests {
         fs::create_dir_all(&specs_dir).unwrap();
         fs::write(
             specs_dir.join("050426-real.md"),
-            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Evidence Status\n\n- ok\n\n## Open Questions\n\n- none\n",
+            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Source Of Truth\n\n- docs owns this fact; runtime owner none; UI consumers none; generated artifacts none; retired surfaces none\n\n## Evidence Status\n\n- verified\n\n## Runtime Contract\n\n- none\n\n## UI Contract\n\n- none\n\n## Generated Artifacts\n\n- none\n\n## Fixture Policy\n\n- production code does not import fixture data\n\n## Retired / Superseded Surfaces\n\n- none\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Review And Closeout\n\n- grep/assertion proof checks the documented requirement\n\n## Open Questions\n\n- none\n",
         )
         .unwrap();
     }
@@ -3622,6 +3732,12 @@ mod tests {
             "Spec: `specs/050426-real.md`",
             "Why now: needed",
             "Codebase evidence: present",
+            "Source of truth: docs",
+            "Runtime owner: none",
+            "UI consumers: none",
+            "Generated artifacts: none",
+            "Fixture boundary: production code cannot import fixture/demo/sample data",
+            "Retired surfaces: none",
             "Owns: docs",
             "Integration touchpoints: docs",
             "Scope boundary: docs only",
@@ -3632,6 +3748,9 @@ mod tests {
             "    ```",
             "Required tests:",
             "    - `exact_docs_test`",
+            "Contract generation: none -- no generated contract",
+            "Cross-surface tests: none -- no UI/runtime boundary",
+            "Review/closeout: `grep -n docs docs/README.md` plus exact_docs_test catches drift",
             "Completion artifacts: none",
             "Dependencies: none",
             "Estimated scope: S",
@@ -4864,12 +4983,12 @@ No external dependencies.
         fs::create_dir_all(&specs_dir).unwrap();
         fs::write(
             specs_dir.join("050426-real.md"),
-            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Evidence Status\n\n- ok\n\n## Open Questions\n\n- none\n",
+            "# Specification: Real\n\n## Objective\n\n- ok\n\n## Source Of Truth\n\n- docs owns this fact; runtime owner none; UI consumers none; generated artifacts none; retired surfaces none\n\n## Evidence Status\n\n- verified\n\n## Runtime Contract\n\n- none\n\n## UI Contract\n\n- none\n\n## Generated Artifacts\n\n- none\n\n## Fixture Policy\n\n- production code does not import fixture data\n\n## Retired / Superseded Surfaces\n\n- none\n\n## Acceptance Criteria\n\n- ok\n\n## Verification\n\n- ok\n\n## Review And Closeout\n\n- grep/assertion proof checks the documented requirement\n\n## Open Questions\n\n- none\n",
         )
         .unwrap();
         fs::write(
             root.join("IMPLEMENTATION_PLAN.md"),
-            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\nSpec: `specs/060426-missing.md`\nWhy now: needed\nCodebase evidence: present\nOwns: docs\nIntegration touchpoints: none\nScope boundary: docs only\nAcceptance criteria: docs land\nVerification: check file\nRequired tests: none\nCompletion artifacts: none\nDependencies: none\nEstimated scope: S\nCompletion signal: merged\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DOC-001` Write docs\nSpec: `specs/060426-missing.md`\nWhy now: needed\nCodebase evidence: present\nSource of truth: docs\nRuntime owner: none\nUI consumers: none\nGenerated artifacts: none\nFixture boundary: production code cannot import fixture/demo/sample data\nRetired surfaces: none\nOwns: docs\nIntegration touchpoints: none\nScope boundary: docs only\nAcceptance criteria: docs land\nVerification: check file\nRequired tests: none\nContract generation: none -- no generated contract\nCross-surface tests: none -- no UI/runtime boundary\nReview/closeout: grep proof checks docs land\nCompletion artifacts: none\nDependencies: none\nEstimated scope: S\nCompletion signal: merged\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
         )
         .unwrap();
 
@@ -5029,12 +5148,21 @@ No external dependencies.
             "- **Spec:** `specs/050426-real.md`",
             "- **Why now:** needed",
             "- **Codebase evidence:** present",
+            "- **Source of truth:** docs",
+            "- **Runtime owner:** none",
+            "- **UI consumers:** none",
+            "- **Generated artifacts:** none",
+            "- **Fixture boundary:** production code cannot import fixture/demo/sample data",
+            "- **Retired surfaces:** none",
             "- **Owns:** docs/evidence.md",
             "- **Integration touchpoints:** docs",
             "- **Scope boundary:** docs only",
             "- **Acceptance criteria:** evidence lands",
             "- **Verification:** `grep -n evidence docs/evidence.md` returns one match.",
             "- **Required tests:** None (evidence task; no code change).",
+            "- **Contract generation:** none -- no generated contract",
+            "- **Cross-surface tests:** none -- no UI/runtime boundary",
+            "- **Review/closeout:** `grep -n evidence docs/evidence.md` catches the original drift.",
             "- **Completion artifacts:** `docs/evidence.md`",
             "- **Dependencies:** none",
             "- **Estimated scope:** XS",

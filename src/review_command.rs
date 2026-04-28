@@ -29,9 +29,13 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"You are running one iteration 
 1. **Treat the claim as suspect.** Queue prose is frozen at write time; the live tree is ground truth. Verify cited file paths, cited test names, and cited behaviors against the current code.
 2. **Blast-radius reconstruct.** Find the changed files from git history for the item, scan adjacent tests / integration surfaces, compare against the base branch if discoverable.
 3. **Review along five axes.** Correctness; readability + simplicity; architecture + boundaries; security + trust boundaries; performance + scalability. Pay special attention to SQL/query safety, trust-boundary violations, unintended conditional side effects, stale config or migration coupling, and blast-radius-wider-than-touched-files.
-4. **Verify the verification story.** Run the cited cargo / pnpm / bash commands. If a command fails or names a non-existent test, that's a finding.
-5. **Bounded simplification only** — inside the reviewed surface, no drive-by cleanup.
-6. **Severity-tag findings** as `Critical`, `Required`, `Optional`, or `FYI`.
+4. **Source-of-truth review.** For every behavior claim, identify the runtime/API/spec owner. UI must consume canonical runtime output and must not duplicate engine-owned catalogs, constants, settlement math, eligibility rules, risk classifications, balances, or status derivations.
+5. **Contract and fixture review.** Verify generated bindings/schemas/docs were regenerated when runtime/API shapes changed. Verify production code does not import fixture/demo/sample data as fallback truth.
+6. **Cross-surface review.** When UI/presentation changed, require at least one runtime-output-to-UI/readback proof or explain why no runtime/UI boundary exists. Component-only tests are insufficient when the original risk is runtime/UI drift.
+7. **Retirement review.** If specs, modules, routes, tests, or generated artifacts were marked retired/superseded, verify they were deleted, archived, tombstoned, or explicitly gated so future agents cannot keep implementing from them.
+8. **Verify the verification story.** Run the cited cargo / pnpm / bash commands. If a command fails, reports `0 tests`, names a non-existent test, or cannot prove the original claim, that's a finding.
+9. **Bounded simplification only** — inside the reviewed surface, no drive-by cleanup.
+10. **Severity-tag findings** as `Critical`, `Required`, `Optional`, or `FYI`.
 
 ## If you find problems
 - Fix the finding directly when the root cause is clear and bounded.
@@ -54,6 +58,7 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"You are running one iteration 
 - Do not archive an item the code + tests do not support.
 - This is a bug-finding and hardening pass, not a feature pass.
 - If the tests do not prove the claim, the implementation does not get a free pass.
+- A simple compile/check is not enough when the claim was about drift removal, retired surface deletion, generated contract synchronization, or runtime/UI consistency. Use grep/assertion proof, generated diff proof, fixture-boundary proof, or runtime-to-UI readback proof.
 - Do not invent work if the batch is empty — stop."#;
 
 const EMPTY_COMPLETED_DOC: &str = "# COMPLETED\n\n";

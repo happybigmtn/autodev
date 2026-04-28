@@ -8,10 +8,11 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns eighteen commands:
+`auto` owns twenty commands:
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
+- `auto spec` turns a prompt into a conformant spec plus matching implementation-plan items.
 - `auto super` runs the all-in-one production-grade workflow: corpus, gen, gates, then parallel.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
 - `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
@@ -20,6 +21,7 @@ The local CLI command is `auto`.
 - `auto qa` runs a runtime QA and ship-readiness pass on the current branch.
 - `auto qa-only` runs a report-only runtime QA pass on the current branch.
 - `auto health` runs a repo-wide quality and verification health report.
+- `auto book` rewrites the audit book into a deeper navigable codebase guide.
 - `auto doctor` runs a no-model first-run preflight for local layout, binary metadata, and help surfaces.
 - `auto review` reviews completed work on the current branch.
 - `auto steward` runs a stewardship pass for a mid-flight repo.
@@ -224,9 +226,16 @@ What it actually does:
   behavior claims
 - Requires each generated spec to include:
   - `## Objective`
+  - `## Source Of Truth`
+  - `## Evidence Status`
+  - `## Runtime Contract`
+  - `## UI Contract`
+  - `## Generated Artifacts`
+  - `## Fixture Policy`
+  - `## Retired / Superseded Surfaces`
   - `## Acceptance Criteria`
   - `## Verification`
-  - `## Evidence Status`
+  - `## Review And Closeout`
   - `## Open Questions`
 - Refuses to accept generated specs that contradict each other on shared contracts such as message
   shapes, signature policy, or speculative future-phase behavior
@@ -236,10 +245,19 @@ What it actually does:
   - spec reference
   - why now
   - codebase evidence
+  - source of truth
+  - runtime owner
+  - UI consumers
+  - generated artifacts
+  - fixture boundary
+  - retired surfaces
   - owned surfaces
   - scope boundary
   - acceptance criteria
   - verification commands or runtime checks
+  - contract generation
+  - cross-surface tests
+  - independent review/closeout proof
   - dependencies
   - estimated scope
   - completion signal
@@ -276,6 +294,35 @@ Binary provenance:
 
 - `auto --version` prints the package version plus embedded git commit, dirty/clean status, and
   build profile so operators can confirm which binary they are actually running
+
+### `auto spec`
+
+Purpose:
+
+- Turn a natural-language request into one conformant spec and matching plan items without relying
+  on a hand-written prompt template
+
+What it writes:
+
+- `specs/<ddmmyy-topic-slug>.md` by default, or `--spec-path <path>`
+- `IMPLEMENTATION_PLAN.md` by default, or `--plan-path <path>`
+- prompt and model logs under `.auto/spec/`
+
+What it enforces:
+
+- The same spec sections and plan-task fields required by `auto gen`
+- Runtime/API source-of-truth ownership before UI consumer work
+- Generated-artifact regeneration commands when contracts change
+- Fixture/demo/sample-data quarantine for production surfaces
+- Retired or superseded surfaces named explicitly instead of left as active doctrine
+- Cross-surface runtime-to-UI/readback proof when UI consumers are affected
+- Independent review/closeout proof that can catch the original drift returning
+
+Example:
+
+```bash
+auto spec "sync the portfolio UI with runtime-owned account balances"
+```
 
 ### `auto super`
 
