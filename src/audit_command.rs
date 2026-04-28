@@ -720,8 +720,15 @@ fn plan_audit_queue(
 ) -> Result<Vec<ManifestEntry>> {
     let mut queue = Vec::new();
     for entry in &manifest.files {
-        let current_content = fs::read(repo_root.join(&entry.path))
-            .with_context(|| format!("failed to read {}", repo_root.join(&entry.path).display()))?;
+        let current_content = match fs::read(repo_root.join(&entry.path)) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read {}", repo_root.join(&entry.path).display())
+                });
+            }
+        };
         let current_content_hash = sha256_hex(&current_content);
         let content_matches_last_audit =
             entry.content_hash.as_deref() == Some(current_content_hash.as_str());
@@ -767,7 +774,9 @@ fn enumerate_tracked_files(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    files.retain(|path| matches_any(path, include) && !matches_any(path, exclude));
+    files.retain(|path| {
+        matches_any(path, include) && !matches_any(path, exclude) && repo_root.join(path).exists()
+    });
     files.sort();
     files.dedup();
     Ok(files)
@@ -1456,9 +1465,9 @@ mod tests {
     use crate::{AuditArgs, AuditResumeMode};
 
     use super::{
-        apply_verdict, build_file_prompt, commit_scoped, glob_match, matches_any, plan_audit_queue,
-        run_auditor, sha256_hex, EntryStatus, FileVerdict, Manifest, ManifestEntry,
-        DEFAULT_EXCLUDE_GLOBS,
+        apply_verdict, build_file_prompt, commit_scoped, enumerate_tracked_files, glob_match,
+        matches_any, plan_audit_queue, run_auditor, sha256_hex, EntryStatus, FileVerdict, Manifest,
+        ManifestEntry, DEFAULT_EXCLUDE_GLOBS,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1646,6 +1655,38 @@ mod tests {
         .expect("plan should succeed");
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn resume_skips_manifest_entries_for_deleted_files() {
+        let repo = TestTempDir::new("resume-deleted-file");
+        let mut manifest = audited_manifest("deleted.md", b"# old\n");
+
+        let queue = plan_audit_queue(
+            &mut manifest,
+            AuditResumeMode::Resume,
+            repo.path(),
+            "doctrine-new",
+            "rubric-new",
+        )
+        .expect("plan should tolerate deleted manifest entries");
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn enumerate_tracked_files_skips_deleted_worktree_paths() {
+        let repo = init_repo("enumerate-deleted-tracked");
+        fs::write(repo.path().join("gone.md"), "# gone\n").expect("failed to write tracked file");
+        run_git_in(repo.path(), ["add", "gone.md"]);
+        run_git_in(repo.path(), ["commit", "-m", "track gone"]);
+        fs::remove_file(repo.path().join("gone.md")).expect("failed to delete tracked file");
+
+        let files = enumerate_tracked_files(repo.path(), &["**".to_string()], &[])
+            .expect("enumeration should tolerate dirty deletes");
+
+        assert!(files.contains(&"README.md".to_string()));
+        assert!(!files.contains(&"gone.md".to_string()));
     }
 
     #[test]
