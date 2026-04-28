@@ -59,10 +59,12 @@ impl CheckpointExcludeRule {
     }
 }
 
-const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 9] = [
+const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 11] = [
     CheckpointExcludeRule::Root(".auto"),
     CheckpointExcludeRule::PathPrefix(".claude/worktrees"),
     CheckpointExcludeRule::Exact("audit/AUDIT-PROGRESS.md"),
+    CheckpointExcludeRule::PathPrefix("audit/finding-resolution"),
+    CheckpointExcludeRule::PathPrefix("audit/logs"),
     CheckpointExcludeRule::Exact("audit/MANIFEST.json"),
     CheckpointExcludeRule::Exact("audit/live.log"),
     CheckpointExcludeRule::PathPrefix("audit/files"),
