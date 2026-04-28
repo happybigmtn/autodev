@@ -213,7 +213,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     println!("model:       {}", args.model);
     println!("effort:      {}", args.reasoning_effort);
     println!(
-        "codex review:{}",
+        "review pass: {}",
         if args.skip_codex_review {
             " skipped".to_string()
         } else {
@@ -300,7 +300,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let codex_review = if args.skip_codex_review {
         None
     } else {
-        print_stage("run corpus codex review", run_started_at);
+        print_stage("run corpus independent review", run_started_at);
         let report_path = codex_review_report_path(&repo_root, "corpus-codex-review");
         let review_prompt = build_corpus_codex_review_prompt(
             &repo_root,
@@ -436,7 +436,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("model:       {}", args.model);
     println!("effort:      {}", args.reasoning_effort);
     println!(
-        "codex review:{}",
+        "review pass: {}",
         if args.skip_codex_review {
             " skipped".to_string()
         } else {
@@ -576,7 +576,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     let codex_review = if args.skip_codex_review {
         None
     } else {
-        print_stage("run generation codex review", run_started_at);
+        print_stage("run generation independent review", run_started_at);
         let report_path = codex_review_report_path(&repo_root, mode.codex_review_phase_slug());
         let review_prompt = build_generation_codex_review_prompt(
             mode,
@@ -620,7 +620,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("model:       {}", args.model);
     println!("effort:      {}", args.reasoning_effort);
     println!(
-        "codex review:{}",
+        "review pass: {}",
         if args.skip_codex_review {
             " skipped".to_string()
         } else {
@@ -954,7 +954,7 @@ async fn run_logged_codex_review(
     .await?;
     if !status.success() {
         bail!(
-            "Codex review phase `{phase_slug}` failed with status {status}; see {}",
+            "independent review phase `{phase_slug}` failed with status {status}; see {}",
             stderr_log_path.display()
         );
     }
@@ -969,7 +969,7 @@ async fn run_logged_codex_review(
 fn verify_codex_review_report(report_path: &Path) -> Result<()> {
     if !report_path.exists() {
         bail!(
-            "Codex review completed but did not write required report {}",
+            "independent review completed but did not write required report {}",
             report_path.display()
         );
     }
@@ -977,7 +977,7 @@ fn verify_codex_review_report(report_path: &Path) -> Result<()> {
         .with_context(|| format!("failed to read {}", report_path.display()))?;
     if report.trim().is_empty() {
         bail!(
-            "Codex review report {} must not be empty",
+            "independent review report {} must not be empty",
             report_path.display()
         );
     }

@@ -16,7 +16,7 @@ snapshot-only, no-sync, or spec-only flag.
 
 Normal generation currently writes a `gen-*` output directory, verifies
 generated specs and the generated `IMPLEMENTATION_PLAN.md`, optionally runs the
-Codex review pass, and then calls `sync_verified_generation_outputs`. That sync
+independent review pass, and then calls `sync_verified_generation_outputs`. That sync
 copies verified generated specs into root `specs/`, rewrites generated plan
 `Spec:` references to the root spec filenames, and for `auto gen` updates root
 `IMPLEMENTATION_PLAN.md`.

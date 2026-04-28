@@ -427,19 +427,19 @@ pub(crate) struct CorpusArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Model used for the independent Codex review pass after corpus authoring
-    #[arg(long, default_value = "gpt-5.5")]
+    /// Model used for the independent review pass after corpus authoring
+    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.5")]
     codex_review_model: String,
 
-    /// Reasoning effort used for the independent Codex review pass
-    #[arg(long, default_value = "xhigh")]
+    /// Reasoning effort used for the independent review pass
+    #[arg(long, visible_alias = "review-effort", default_value = "xhigh")]
     codex_review_effort: String,
 
-    /// Codex executable to invoke for the independent review pass
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Skip the independent Codex review pass
+    /// Skip the independent review pass
     #[arg(long)]
     skip_codex_review: bool,
 
@@ -478,19 +478,19 @@ pub(crate) struct GenerationArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Model used for the independent Codex review pass after generation
-    #[arg(long, default_value = "gpt-5.5")]
+    /// Model used for the independent review pass after generation
+    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.5")]
     codex_review_model: String,
 
-    /// Reasoning effort used for the independent Codex review pass
-    #[arg(long, default_value = "xhigh")]
+    /// Reasoning effort used for the independent review pass
+    #[arg(long, visible_alias = "review-effort", default_value = "xhigh")]
     codex_review_effort: String,
 
-    /// Codex executable to invoke for the independent review pass
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
-    /// Skip the independent Codex review pass
+    /// Skip the independent review pass
     #[arg(long)]
     skip_codex_review: bool,
 
@@ -536,7 +536,7 @@ pub(crate) struct SpecArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Codex executable to invoke
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
@@ -578,7 +578,7 @@ pub(crate) struct SuperArgs {
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
 
-    /// Codex executable used for Codex-backed phases
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
@@ -756,7 +756,7 @@ pub(crate) struct LoopArgs {
     #[arg(long)]
     run_root: Option<PathBuf>,
 
-    /// Codex executable to invoke
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
@@ -827,7 +827,7 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     run_root: Option<PathBuf>,
 
-    /// Codex executable to invoke
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 
@@ -882,7 +882,7 @@ pub(crate) struct ReviewArgs {
     #[arg(long, default_value = "gpt-5.5")]
     model: String,
 
-    /// Reasoning effort to pass through to the Codex review worker
+    /// Reasoning effort to pass through to the review worker
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
@@ -904,7 +904,7 @@ pub(crate) struct ReviewArgs {
     #[arg(long)]
     run_root: Option<PathBuf>,
 
-    /// Codex executable to invoke
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
 

@@ -71,7 +71,245 @@ need to pass directories in the normal case.
 
 ## How To Think About The Commands
 
-The commands form one opinionated lifecycle:
+The canonical lifecycle is the **Perfect Development Playbook** below. It is
+the doctrine path for agents building projects with `autodev`, including
+Autonomy-world agents generating GDP through their own software projects.
+
+### Perfect Development Playbook
+
+Use explicit stages instead of a hidden macro when quality matters. Each stage
+accepts a model override. A MiniMax agent can set `MODEL=minimax`; a Kimi agent
+can set `MODEL=kimi`; a Codex agent can leave the defaults alone.
+
+Recommended shell setup:
+
+```bash
+MODEL="${MODEL:-gpt-5.5}"
+PLAN_EFFORT="${PLAN_EFFORT:-xhigh}"
+WORK_EFFORT="${WORK_EFFORT:-high}"
+AUDIT_FIRST_PASS_EFFORT="${AUDIT_FIRST_PASS_EFFORT:-low}"
+THREADS="${THREADS:-8}"
+```
+
+Provider notes:
+
+- `gpt-*`, `o*`, and other Codex model names route through `codex`.
+- `kimi`, `k2.6`, `k2p6`, and provider-qualified Kimi names route through
+  `kimi-cli`; set `FABRO_KIMI_CLI_BIN` or `FABRO_KIMI_CLI_MODEL` when needed.
+- `minimax` and `minimax/*` route through `pi`; set `FABRO_PI_BIN` when the
+  binary is not on `PATH`.
+- Claude remains an explicit harness for `auto loop`, `auto parallel`, and
+  `auto review` via `--claude`; generation-style commands route Claude-like
+  names through their Claude authoring path.
+
+#### 0. Preflight The Checkout
+
+Run this before model-backed work:
+
+```bash
+auto doctor
+git status --short
+```
+
+The checkout should have a clear branch, readable agent instructions, a sane
+binary surface, and no unexplained dirty files. Dirty state is allowed only when
+the next step explicitly owns it.
+
+#### 1. Create Or Refresh The Spec
+
+For a single prompt or product idea, start with `auto spec`:
+
+```bash
+auto spec "$PROMPT" \
+  --model "$MODEL" \
+  --reasoning-effort "$PLAN_EFFORT"
+```
+
+`auto spec` writes one conformant `specs/*.md` file and matching
+`IMPLEMENTATION_PLAN.md` items. The generated plan must name source of truth,
+runtime owners, UI consumers, generated artifacts, fixture boundaries, retired
+surfaces, contract generation, cross-surface tests, and independent closeout
+proof.
+
+For a repo-wide replan or greenfield project with meaningful existing code,
+create a corpus first:
+
+```bash
+auto corpus \
+  --idea "$PROMPT" \
+  --model "$MODEL" \
+  --reasoning-effort "$PLAN_EFFORT" \
+  --review-model "$MODEL" \
+  --review-effort "$PLAN_EFFORT"
+```
+
+The corpus is disposable understanding under `genesis/`. It is not doctrine.
+It exists so the spec and plan can be grounded in the live tree instead of a
+thin manual prompt.
+
+#### 2. Generate Durable Specs And Plan
+
+When using a corpus, promote it into durable repo doctrine:
+
+```bash
+auto gen \
+  --model "$MODEL" \
+  --reasoning-effort "$PLAN_EFFORT" \
+  --review-model "$MODEL" \
+  --review-effort "$PLAN_EFFORT"
+```
+
+This is the standardization gate. If generated specs or plan rows omit the
+required runtime/UI/generated/fixture/retire/review fields, `auto gen` fails
+before workers can act on inconsistent doctrine.
+
+Use `auto gen --snapshot-only` when you want to inspect the generated `gen-*`
+output before syncing root specs and the root plan. Use `auto gen --sync-only
+--output-dir <gen-dir>` to promote an accepted snapshot.
+
+#### 3. Execute The Queue With Parallel Workers
+
+Use `auto parallel` as the canonical executor, even when you only want one
+worker:
+
+```bash
+auto parallel \
+  --threads "$THREADS" \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT"
+```
+
+Workers receive one dependency-ready task at a time. The host owns queue
+truth, lane worktrees, checkpoint commits, landing, partial-completion
+classification, and receipt-backed reconciliation.
+
+Monitor progress from another shell:
+
+```bash
+auto parallel status
+```
+
+If a lane blocks, fix the underlying issue or update the task blocker. Do not
+mark work complete from a successful compile alone; the task's acceptance
+criteria, required tests, generated artifacts, and review/closeout proof must
+all hold.
+
+#### 4. Independently Review Completed Work
+
+Run review after implementation commits land:
+
+```bash
+auto review \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT"
+```
+
+`auto review` treats queue claims as suspect. It rechecks source-of-truth
+ownership, generated contract sync, fixture boundaries, retired surfaces,
+runtime-to-UI proof, and whether the cited validation would catch the original
+failure returning.
+
+#### 5. Runtime QA And Health
+
+For user-facing or runtime-sensitive projects:
+
+```bash
+auto qa \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT"
+
+auto health \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT"
+```
+
+Use `auto qa-only` when you need a report without fixes. Use `auto health`
+when you want a broader repo health artifact after the targeted queue work is
+reviewed.
+
+#### 6. Whole-Repo Audit Before Treating The Project As Mature
+
+For mature projects, write or update `audit/DOCTRINE.md`, then run the
+professional audit:
+
+```bash
+auto audit --everything \
+  --everything-threads 15 \
+  --remediation-threads "$THREADS" \
+  --first-pass-model "$MODEL" \
+  --first-pass-effort "$AUDIT_FIRST_PASS_EFFORT" \
+  --synthesis-model "$MODEL" \
+  --synthesis-effort "$WORK_EFFORT" \
+  --remediation-model "$MODEL" \
+  --remediation-effort "$WORK_EFFORT" \
+  --final-review-model "$MODEL" \
+  --final-review-effort "$PLAN_EFFORT"
+```
+
+Use the legacy doctrine audit only when you specifically want per-file verdict
+resolution against an existing `audit/MANIFEST.json`:
+
+```bash
+auto audit --resolve-findings \
+  --model "$MODEL" \
+  --reasoning-effort "$AUDIT_FIRST_PASS_EFFORT" \
+  --escalation-model "$MODEL" \
+  --escalation-effort "$WORK_EFFORT"
+```
+
+#### 7. Ship Only After Evidence Is Durable
+
+When review, QA/health, and any required audit pass are green:
+
+```bash
+auto ship \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT"
+```
+
+The ship step should not be used to discover whether the project is ready. It
+is the final packaging and release-readiness check after the earlier gates have
+already produced evidence.
+
+### Canonical Vs Specialist Commands
+
+The canonical end-to-end workflow is:
+
+1. `auto doctor`
+2. `auto spec` for prompt-to-spec work, or `auto corpus` then `auto gen` for
+   repo-wide planning
+3. `auto parallel`
+4. `auto review`
+5. `auto qa` and `auto health`
+6. `auto audit --everything` for mature whole-repo assurance
+7. `auto ship`
+
+Specialist commands:
+
+- `auto reverse` is for legacy repos whose current behavior must be documented
+  before planning; do not use it for normal greenfield work.
+- `auto steward` is for mid-flight repos with existing planning drift; it is
+  not the normal first step for a new project.
+- `auto bug` and `auto nemesis` are focused hardening/audit tools. They are
+  useful after the canonical path, not replacements for specs and queue truth.
+- `auto book` is an audit comprehension artifact after `auto audit
+  --everything`.
+- `auto symphony` is an optional Linear/Symphony coordination surface.
+- `auto quota` supports account routing and is not part of project doctrine.
+
+Commands that should be demoted over time:
+
+- `auto loop` overlaps with `auto parallel --threads 1` but has weaker host
+  reconciliation. Prefer `auto parallel` for both serial and parallel work.
+- `auto super` is convenient, but it hides checkpoints between corpus, gen,
+  gates, and execution. Prefer explicit stages for high-stakes autonomous
+  development.
+- `auto qa-only` is a report-only variant of `auto qa`; keep it for audits,
+  but do not treat it as a completion gate by itself.
+
+### Older Lifecycle Summary
+
+The commands originally formed this lifecycle:
 
 1. `auto corpus` builds a disposable understanding of the repo and folds in light strategy and DX
    thinking.
@@ -87,7 +325,7 @@ The commands form one opinionated lifecycle:
 `auto corpus`, adds production-readiness review artifacts, runs `auto gen`, gates the generated
 root queue, and launches `auto parallel`.
 
-The other ten commands are side lanes:
+The other commands are side lanes:
 
 - `auto doctor` proves the first-run local checkout and binary surface without model credentials.
 - `auto reverse` documents current behavior from code reality.
@@ -135,7 +373,8 @@ What it actually does:
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
 - Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
-- Gives the authoring and independent review passes the maximum Codex model context window
+- Gives Codex-backed authoring and independent review passes the maximum Codex model context
+  window; Kimi and MiniMax model aliases use their provider CLI limits
 - Reviews the repo as the primary truth source
 - Determines the active planning surface from the repo's own instructions and
   control docs instead of assuming root-level primacy from filenames alone
@@ -191,9 +430,11 @@ Useful flags:
   coverage
 - `--idea "..."` to seed the corpus from a desired product direction or greenfield-style concept
 - `--reference-repo <dir>` to require inspection of sibling or external repos as first-class
-  reference inputs during corpus authoring and the mandatory Codex review pass
-- `--model <name>` to pick a different Claude model
-- `--reasoning-effort <level>` to change the Claude effort level
+  reference inputs during corpus authoring and the mandatory independent review pass
+- `--model <name>` to pick a different authoring model
+- `--reasoning-effort <level>` to change the authoring effort level
+- `--review-model <name>` and `--review-effort <level>` to use the same provider for the
+  independent review pass
 - `--max-turns <n>` to raise or lower the planning budget
 - `--parallelism <n>` to encourage more or less parallel planning work
 - `--dry-run` to preview without invoking the model
@@ -220,7 +461,8 @@ What it actually does:
 
 - Generates fresh specs from the planning corpus
 - Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
-- Gives the authoring and independent review passes the maximum Codex model context window
+- Gives Codex-backed authoring and independent review passes the maximum Codex model context
+  window; Kimi and MiniMax model aliases use their provider CLI limits
 - Uses the planning corpus for intended future direction, but treats the live codebase as
   authoritative for current-state facts such as commands, counts, metric names, filenames, and
   behavior claims
@@ -1340,11 +1582,12 @@ workflow.
 ## Runtime Requirements
 
 - Git repository with a valid `origin`
-- `codex` on `PATH` for `auto corpus`, `auto gen`, `auto reverse`, `auto bug`,
-  `auto nemesis`, `auto audit`, `auto loop`, `auto parallel`, `auto qa`, `auto qa-only`,
-  `auto health`, `auto review`, and `auto ship`
+- `codex` on `PATH` for Codex-backed runs of `auto corpus`, `auto gen`, `auto spec`,
+  `auto reverse`, `auto bug`, `auto nemesis`, `auto audit`, `auto loop`, `auto parallel`,
+  `auto qa`, `auto qa-only`, `auto health`, `auto review`, and `auto ship`
 - `codex` and `claude` logged in locally if you want `auto quota` to capture and rotate accounts
-- `kimi-cli` or `pi` on `PATH` only when you explicitly select Kimi/PI legacy models
+- `kimi-cli` on `PATH` when `--model kimi`, `--model k2.6`, or another Kimi alias is selected
+- `pi` on `PATH` when `--model minimax` or another MiniMax alias is selected
 - `gh` on `PATH` if you want `auto ship` to create or refresh pull requests
 
 Recommended environment:
