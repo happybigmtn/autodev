@@ -29,6 +29,7 @@ static ATOMIC_WRITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointExcludeRule {
+    Exact(&'static str),
     Root(&'static str),
     PathPrefix(&'static str),
     TopLevelPrefix(&'static str),
@@ -37,6 +38,7 @@ enum CheckpointExcludeRule {
 impl CheckpointExcludeRule {
     fn git_pathspec(self) -> String {
         match self {
+            Self::Exact(path) => format!(":(exclude){path}"),
             Self::Root(root) => format!(":(exclude){root}"),
             Self::PathPrefix(prefix) => format!(":(exclude){prefix}*"),
             Self::TopLevelPrefix(prefix) => format!(":(exclude){prefix}*"),
@@ -46,6 +48,7 @@ impl CheckpointExcludeRule {
     fn matches(self, path: &str) -> bool {
         let first_segment = path.split('/').next().unwrap_or(path);
         match self {
+            Self::Exact(exact) => path == exact,
             Self::Root(root) => first_segment == root,
             Self::PathPrefix(prefix) => {
                 let prefix = prefix.trim_end_matches('/');
@@ -56,9 +59,13 @@ impl CheckpointExcludeRule {
     }
 }
 
-const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 5] = [
+const CHECKPOINT_EXCLUDE_RULES: [CheckpointExcludeRule; 9] = [
     CheckpointExcludeRule::Root(".auto"),
     CheckpointExcludeRule::PathPrefix(".claude/worktrees"),
+    CheckpointExcludeRule::Exact("audit/AUDIT-PROGRESS.md"),
+    CheckpointExcludeRule::Exact("audit/MANIFEST.json"),
+    CheckpointExcludeRule::Exact("audit/live.log"),
+    CheckpointExcludeRule::PathPrefix("audit/files"),
     CheckpointExcludeRule::Root("bug"),
     CheckpointExcludeRule::Root("nemesis"),
     CheckpointExcludeRule::TopLevelPrefix("gen-"),
@@ -834,6 +841,12 @@ mod tests {
         for path in [
             ".auto/review/log.txt",
             ".claude/worktrees/agent-a123/README.md",
+            "audit/AUDIT-PROGRESS.md",
+            "audit/MANIFEST.json",
+            "audit/files/deadbeef/prompt.md",
+            "audit/files/deadbeef/response.log",
+            "audit/files/deadbeef/verdict.json",
+            "audit/live.log",
             "bug/BUG_REPORT.md",
             "nemesis/nemesis-audit.md",
             "gen-001/SPEC.md",
@@ -846,6 +859,12 @@ mod tests {
         for path in [
             ".auto/review/log.txt",
             ".claude/worktrees/agent-a123/README.md",
+            "audit/AUDIT-PROGRESS.md",
+            "audit/MANIFEST.json",
+            "audit/files/deadbeef/prompt.md",
+            "audit/files/deadbeef/response.log",
+            "audit/files/deadbeef/verdict.json",
+            "audit/live.log",
             "bug/BUG_REPORT.md",
             "nemesis/nemesis-audit.md",
             "gen-001/SPEC.md",
@@ -958,6 +977,11 @@ mod tests {
             ".auto/logs/run.log",
             ".claude/worktrees",
             ".claude/worktrees/agent-a123",
+            "audit/AUDIT-PROGRESS.md",
+            "audit/MANIFEST.json",
+            "audit/files",
+            "audit/files/deadbeef/prompt.md",
+            "audit/live.log",
             "bug",
             "bug/BUG_REPORT.md",
             "nemesis",
@@ -974,6 +998,9 @@ mod tests {
             "",
             "README.md",
             "src/main.rs",
+            "audit/everything/20260424-115535/FINAL-REVIEW.md",
+            "audit/everything/20260424-115535/RUN-STATUS.md",
+            "audit/some-durable-report.md",
             "generated/output.md",
             "notes/gen-plan.md",
         ] {
