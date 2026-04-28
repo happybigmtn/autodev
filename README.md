@@ -1008,6 +1008,9 @@ What it produces:
 - `audit/files/<hash-prefix>/patch.diff` for patchable verdicts
 - `audit/files/<hash-prefix>/worklist-entry.md` or `audit/files/<hash-prefix>/retire-reason.md`
   for escalated verdicts
+- `audit/FINDING-VERIFY.{md,json}` when run with `--verify-findings`; this is the closure gate
+  that independently checks every `DRIFT-LARGE`, `DRIFT-SMALL`, `REFACTOR`, `RETIRE`,
+  apply-failed, or escalated manifest entry before declaring the audit findings closed
 
 Defaults:
 
@@ -1017,6 +1020,13 @@ Defaults:
 - The primary auditor defaults to Codex `gpt-5.5` with `high`
 - Escalations default to Codex `gpt-5.5` with `high`
 - Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
+
+Closure verification:
+
+- After remediation, run `auto audit --resume-mode only-drifted` so changed files are re-audited
+  against the same manifest.
+- Then run `auto audit --verify-findings`. It fails with `NO-GO` until every flagged finding is
+  either re-audited out of the manifest's significant verdict set or removed from the current tree.
 
 #### `auto audit --everything`
 

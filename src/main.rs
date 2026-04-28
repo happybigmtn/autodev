@@ -1062,6 +1062,17 @@ pub(crate) struct AuditArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
+    /// Verify that every previously flagged legacy audit finding has either
+    /// been re-audited clean or removed from the current tree.
+    #[arg(long)]
+    verify_findings: bool,
+
+    /// Remediate existing legacy audit findings from MANIFEST.json without
+    /// producing a fresh first-pass audit, then re-audit drifted files and run
+    /// the finding verifier.
+    #[arg(long)]
+    resolve_findings: bool,
+
     /// Resume mode. `resume` (default) picks up at first pending file;
     /// `fresh` archives the old manifest and starts over; `only-drifted`
     /// re-audits files whose content or doctrine hash changed.

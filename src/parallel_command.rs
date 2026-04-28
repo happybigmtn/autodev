@@ -5464,7 +5464,8 @@ fn reconcile_parallel_clean_no_commit(
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     let review_can_complete_evidence = !evidence_before.has_review_handoff
         && evidence_before.verification_receipt_present
-        && evidence_before.missing_completion_artifacts.is_empty();
+        && evidence_before.missing_completion_artifacts.is_empty()
+        && evidence_before.unresolved_audit_findings.is_empty();
     let review_added = if evidence_before.is_fully_evidenced() || review_can_complete_evidence {
         ensure_host_review_handoff(repo_root, &assignment.task.id, &[], &evidence_before)?
     } else {

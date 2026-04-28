@@ -155,12 +155,48 @@ struct FileVerdict {
     escalate: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct FindingVerificationReport {
+    generated_at: String,
+    manifest_path: String,
+    total_flagged: usize,
+    resolved_removed: usize,
+    still_open: usize,
+    needs_reaudit: usize,
+    findings: Vec<FindingVerificationEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FindingVerificationEntry {
+    path: String,
+    verdict: String,
+    status: EntryStatus,
+    result: FindingVerificationResult,
+    manifest_content_hash: Option<String>,
+    current_content_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum FindingVerificationResult {
+    ResolvedRemoved,
+    NeedsReaudit,
+    StillOpen,
+}
+
 struct AuditWorkerResult {
     idx: usize,
     entry: ManifestEntry,
     content_hash: String,
     file_dir: PathBuf,
     response: String,
+}
+
+#[derive(Clone, Debug)]
+struct FindingResolutionLane {
+    id: usize,
+    name: String,
+    entries: Vec<ManifestEntry>,
 }
 
 pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
@@ -185,6 +221,21 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
             );
         }
     }
+
+    let output_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| repo_root.join("audit"));
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    if args.verify_findings {
+        return verify_audit_findings(&repo_root, &output_dir);
+    }
+    if args.resolve_findings {
+        return resolve_audit_findings(&repo_root, &output_dir, args).await;
+    }
+    fs::create_dir_all(output_dir.join("files"))
+        .with_context(|| format!("failed to create {}", output_dir.join("files").display()))?;
 
     let doctrine_path = if args.doctrine_prompt.is_absolute() {
         args.doctrine_prompt.clone()
@@ -217,15 +268,6 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
         BUNDLED_RUBRIC.to_string()
     };
     let rubric_hash = sha256_hex(rubric.as_bytes());
-
-    let output_dir = args
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| repo_root.join("audit"));
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
-    fs::create_dir_all(output_dir.join("files"))
-        .with_context(|| format!("failed to create {}", output_dir.join("files").display()))?;
 
     if args.use_kimi_cli && is_kimi_model(&args.model) && !args.dry_run {
         let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
@@ -761,6 +803,434 @@ fn plan_audit_queue(
         }
     }
     Ok(queue)
+}
+
+fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
+    let manifest_path = output_dir.join("MANIFEST.json");
+    if !manifest_path.exists() {
+        bail!(
+            "audit finding verification requires an existing manifest at {}",
+            manifest_path.display()
+        );
+    }
+
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+
+    let mut findings = Vec::new();
+    for entry in manifest.files.iter().filter(audit_entry_requires_closure) {
+        let path = repo_root.join(&entry.path);
+        let current_content_hash = match fs::read(&path) {
+            Ok(content) => Some(sha256_hex(&content)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let result = match current_content_hash.as_deref() {
+            None => FindingVerificationResult::ResolvedRemoved,
+            Some(current_hash) if entry.content_hash.as_deref() != Some(current_hash) => {
+                FindingVerificationResult::NeedsReaudit
+            }
+            Some(_) => FindingVerificationResult::StillOpen,
+        };
+        findings.push(FindingVerificationEntry {
+            path: entry.path.clone(),
+            verdict: entry
+                .verdict
+                .clone()
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            status: entry.status,
+            result,
+            manifest_content_hash: entry.content_hash.clone(),
+            current_content_hash,
+        });
+    }
+
+    findings.sort_by(|left, right| left.path.cmp(&right.path));
+    let report = FindingVerificationReport {
+        generated_at: now_iso8601(),
+        manifest_path: manifest_path.display().to_string(),
+        total_flagged: findings.len(),
+        resolved_removed: findings
+            .iter()
+            .filter(|finding| finding.result == FindingVerificationResult::ResolvedRemoved)
+            .count(),
+        needs_reaudit: findings
+            .iter()
+            .filter(|finding| finding.result == FindingVerificationResult::NeedsReaudit)
+            .count(),
+        still_open: findings
+            .iter()
+            .filter(|finding| finding.result == FindingVerificationResult::StillOpen)
+            .count(),
+        findings,
+    };
+    write_finding_verification_report(output_dir, &report)?;
+
+    println!("auto audit finding verification");
+    println!("manifest:         {}", manifest_path.display());
+    println!("flagged findings: {}", report.total_flagged);
+    println!("resolved removed: {}", report.resolved_removed);
+    println!("needs re-audit:   {}", report.needs_reaudit);
+    println!("still open:       {}", report.still_open);
+    println!(
+        "report:           {}",
+        output_dir.join("FINDING-VERIFY.md").display()
+    );
+
+    if report.needs_reaudit > 0 || report.still_open > 0 {
+        bail!(
+            "audit findings are not fully closed: {} need re-audit, {} are still open",
+            report.needs_reaudit,
+            report.still_open
+        );
+    }
+
+    Ok(())
+}
+
+fn audit_entry_requires_closure(entry: &&ManifestEntry) -> bool {
+    matches!(
+        entry.verdict.as_deref(),
+        Some("DRIFT-LARGE" | "DRIFT-SMALL" | "REFACTOR" | "RETIRE")
+    ) || matches!(
+        entry.status,
+        EntryStatus::ApplyFailed | EntryStatus::Escalated
+    )
+}
+
+fn write_finding_verification_report(
+    output_dir: &Path,
+    report: &FindingVerificationReport,
+) -> Result<()> {
+    let json = serde_json::to_vec_pretty(report)?;
+    atomic_write(&output_dir.join("FINDING-VERIFY.json"), &json)?;
+
+    let mut markdown = String::new();
+    markdown.push_str("# Audit Finding Verification\n\n");
+    markdown.push_str(&format!("- Generated: `{}`\n", report.generated_at));
+    markdown.push_str(&format!("- Manifest: `{}`\n", report.manifest_path));
+    markdown.push_str(&format!("- Flagged findings: `{}`\n", report.total_flagged));
+    markdown.push_str(&format!(
+        "- Resolved by removal: `{}`\n",
+        report.resolved_removed
+    ));
+    markdown.push_str(&format!("- Needs re-audit: `{}`\n", report.needs_reaudit));
+    markdown.push_str(&format!("- Still open: `{}`\n\n", report.still_open));
+
+    if report.needs_reaudit == 0 && report.still_open == 0 {
+        markdown.push_str("Verdict: GO. Every flagged finding has independent closure evidence.\n");
+    } else {
+        markdown.push_str(
+            "Verdict: NO-GO. Re-run `auto audit --resume-mode only-drifted` after remediation, \
+             then run `auto audit --verify-findings` again.\n\n",
+        );
+        markdown.push_str("| Result | Verdict | Status | Path |\n");
+        markdown.push_str("|---|---|---|---|\n");
+        for finding in &report.findings {
+            if finding.result == FindingVerificationResult::ResolvedRemoved {
+                continue;
+            }
+            markdown.push_str(&format!(
+                "| `{:?}` | `{}` | `{:?}` | `{}` |\n",
+                finding.result, finding.verdict, finding.status, finding.path
+            ));
+        }
+    }
+    atomic_write(&output_dir.join("FINDING-VERIFY.md"), markdown.as_bytes())
+}
+
+async fn resolve_audit_findings(
+    repo_root: &Path,
+    output_dir: &Path,
+    args: AuditArgs,
+) -> Result<()> {
+    let manifest_path = output_dir.join("MANIFEST.json");
+    if !manifest_path.exists() {
+        bail!(
+            "audit finding resolution requires an existing manifest at {}",
+            manifest_path.display()
+        );
+    }
+    fs::create_dir_all(output_dir.join("files"))
+        .with_context(|| format!("failed to create {}", output_dir.join("files").display()))?;
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let findings = manifest
+        .files
+        .iter()
+        .filter(audit_entry_requires_closure)
+        .filter(|entry| repo_root.join(&entry.path).exists())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if findings.is_empty() {
+        println!("auto audit resolve findings: no existing flagged files to remediate");
+        return verify_audit_findings(repo_root, output_dir);
+    }
+
+    let max_lanes = args.audit_threads.clamp(1, 8).min(findings.len());
+    let lanes = build_finding_resolution_lanes(findings, max_lanes);
+    let run_dir = output_dir
+        .join("finding-resolution")
+        .join(crate::util::timestamp_slug());
+    fs::create_dir_all(&run_dir)
+        .with_context(|| format!("failed to create {}", run_dir.display()))?;
+
+    println!("auto audit resolve findings");
+    println!("manifest: {}", manifest_path.display());
+    println!("lanes:    {} (max {})", lanes.len(), max_lanes);
+    println!("run dir:  {}", run_dir.display());
+
+    let mut join_set = JoinSet::new();
+    for lane in lanes {
+        let repo_root = repo_root.to_path_buf();
+        let output_dir = output_dir.to_path_buf();
+        let run_dir = run_dir.clone();
+        let args = args.clone();
+        join_set.spawn(async move {
+            run_finding_resolution_lane(repo_root, output_dir, run_dir, args, lane).await
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        result.context("finding resolution lane panicked")??;
+    }
+
+    rerun_only_drifted_audit(repo_root, output_dir, &args).await?;
+    verify_audit_findings(repo_root, output_dir)
+}
+
+fn build_finding_resolution_lanes(
+    findings: Vec<ManifestEntry>,
+    max_lanes: usize,
+) -> Vec<FindingResolutionLane> {
+    let mut by_architecture: HashMap<String, Vec<ManifestEntry>> = HashMap::new();
+    for finding in findings {
+        by_architecture
+            .entry(finding_architecture_key(&finding.path))
+            .or_default()
+            .push(finding);
+    }
+
+    let mut groups = by_architecture.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left_key.cmp(right_key))
+    });
+
+    let mut lanes = (0..max_lanes)
+        .map(|id| FindingResolutionLane {
+            id,
+            name: format!("lane-{}", id + 1),
+            entries: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    for (key, mut entries) in groups {
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let target = lanes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, lane)| lane.entries.len())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        if lanes[target].entries.is_empty() {
+            lanes[target].name = key;
+        } else {
+            lanes[target].name = format!("{}+{}", lanes[target].name, key);
+        }
+        lanes[target].entries.extend(entries);
+    }
+    lanes.retain(|lane| !lane.entries.is_empty());
+    lanes
+}
+
+fn finding_architecture_key(path: &str) -> String {
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["crates", name, ..] => format!("crates/{name}"),
+        ["apps", name, ..] => format!("apps/{name}"),
+        ["packages", name, ..] => format!("packages/{name}"),
+        ["src", ..] => "src".to_string(),
+        ["docs", ..] => "docs".to_string(),
+        ["specs", ..] => "specs".to_string(),
+        ["scripts", ..] => "scripts".to_string(),
+        ["tests", ..] => "tests".to_string(),
+        [file] if file.ends_with(".md") => "root-docs".to_string(),
+        [first, ..] => (*first).to_string(),
+        [] => "root".to_string(),
+    }
+}
+
+async fn run_finding_resolution_lane(
+    repo_root: PathBuf,
+    output_dir: PathBuf,
+    run_dir: PathBuf,
+    args: AuditArgs,
+    lane: FindingResolutionLane,
+) -> Result<()> {
+    let prompt = build_finding_resolution_prompt(&repo_root, &output_dir, &lane)?;
+    let lane_dir = run_dir.join(format!("{:02}-{}", lane.id + 1, slugify(&lane.name)));
+    fs::create_dir_all(&lane_dir)
+        .with_context(|| format!("failed to create {}", lane_dir.display()))?;
+    atomic_write(&lane_dir.join("prompt.md"), prompt.as_bytes())?;
+    println!(
+        "[resolve:{}/{}] {} finding(s) across {}",
+        lane.id + 1,
+        lane.entries.len(),
+        lane.entries.len(),
+        lane.name
+    );
+    let label = format!("audit-resolve:{}/{}", lane.id + 1, lane.name);
+    let response = run_auditor_labeled(&repo_root, &prompt, &args, Some(&label)).await?;
+    atomic_write(&lane_dir.join("response.log"), response.as_bytes())
+}
+
+fn build_finding_resolution_prompt(
+    repo_root: &Path,
+    output_dir: &Path,
+    lane: &FindingResolutionLane,
+) -> Result<String> {
+    let mut body = String::new();
+    body.push_str(
+        "You are a standalone `auto audit --resolve-findings` remediation lane.\n\
+         Work only on the findings listed below. Do not produce a new initial audit report. \
+         Resolve the current audit finding in the live codebase.\n\n\
+         Required behavior:\n\
+         - For RETIRE findings, delete the obsolete file/code if it is truly unused, or simplify it until the retirement finding is no longer valid.\n\
+         - For DRIFT-LARGE, DRIFT-SMALL, REFACTOR, ApplyFailed, or Escalated findings, make the smallest code/docs/spec changes needed for the file to pass re-audit.\n\
+         - Keep edits scoped to this lane's paths and direct dependencies.\n\
+         - Do not mark implementation-plan rows complete and do not edit audit/MANIFEST.json.\n\
+         - Run targeted validation when practical and summarize what changed.\n\n",
+    );
+    body.push_str("# Lane Scope\n\n");
+    body.push_str(&format!("Lane: `{}`\n\n", lane.name));
+    for entry in &lane.entries {
+        body.push_str(&format!(
+            "## `{}`\n\n- Verdict: `{}`\n- Status: `{:?}`\n",
+            entry.path,
+            entry.verdict.as_deref().unwrap_or("UNKNOWN"),
+            entry.status
+        ));
+        let artifact_dir = file_artifact_dir(output_dir, &entry.path);
+        let artifact_rel = artifact_dir
+            .strip_prefix(repo_root)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| artifact_dir.display().to_string());
+        body.push_str(&format!("- Artifact directory: `{artifact_rel}`\n"));
+        append_optional_artifact(
+            &mut body,
+            &artifact_dir.join("verdict.json"),
+            "verdict.json",
+        )?;
+        append_optional_artifact(
+            &mut body,
+            &artifact_dir.join("worklist-entry.md"),
+            "worklist-entry.md",
+        )?;
+        append_optional_artifact(
+            &mut body,
+            &artifact_dir.join("retire-reason.md"),
+            "retire-reason.md",
+        )?;
+        body.push('\n');
+    }
+    let retire_batch = output_dir.join("RETIRE-BATCH.md");
+    append_optional_artifact(&mut body, &retire_batch, "RETIRE-BATCH.md")?;
+    Ok(body)
+}
+
+fn append_optional_artifact(body: &mut String, path: &Path, label: &str) -> Result<()> {
+    let Ok(mut text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    const MAX_ARTIFACT_BYTES: usize = 12_000;
+    if text.len() > MAX_ARTIFACT_BYTES {
+        text.truncate(MAX_ARTIFACT_BYTES);
+        text.push_str("\n[truncated]\n");
+    }
+    body.push_str(&format!("\n### `{label}`\n\n```text\n{text}\n```\n"));
+    Ok(())
+}
+
+async fn rerun_only_drifted_audit(
+    repo_root: &Path,
+    output_dir: &Path,
+    args: &AuditArgs,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current auto executable")?;
+    let mut command = TokioCommand::new(exe);
+    command
+        .arg("audit")
+        .arg("--resume-mode")
+        .arg("only-drifted")
+        .arg("--audit-threads")
+        .arg(args.audit_threads.clamp(1, 8).to_string())
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--model")
+        .arg(&args.model)
+        .arg("--reasoning-effort")
+        .arg(&args.reasoning_effort)
+        .arg("--escalation-model")
+        .arg(&args.escalation_model)
+        .arg("--escalation-effort")
+        .arg(&args.escalation_effort)
+        .arg("--codex-bin")
+        .arg(&args.codex_bin)
+        .arg("--kimi-bin")
+        .arg(&args.kimi_bin)
+        .arg("--pi-bin")
+        .arg(&args.pi_bin)
+        .arg("--use-kimi-cli")
+        .arg(if args.use_kimi_cli { "true" } else { "false" })
+        .current_dir(repo_root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(path) = args.rubric_prompt.as_deref() {
+        command.arg("--rubric-prompt").arg(path);
+    }
+    command.arg("--doctrine-prompt").arg(&args.doctrine_prompt);
+    if args.report_only {
+        command.arg("--report-only");
+    }
+    if let Some(branch) = args.branch.as_deref() {
+        command.arg("--branch").arg(branch);
+    }
+    for path in &args.include_paths {
+        command.arg("--paths").arg(path);
+    }
+    for path in &args.exclude_paths {
+        command.arg("--exclude").arg(path);
+    }
+
+    let status = command
+        .status()
+        .await
+        .context("failed to launch only-drifted audit subprocess")?;
+    if !status.success() {
+        bail!("only-drifted audit subprocess failed with status {status}");
+    }
+    Ok(())
+}
+
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
 }
 
 fn enumerate_tracked_files(
@@ -1466,8 +1936,8 @@ mod tests {
 
     use super::{
         apply_verdict, build_file_prompt, commit_scoped, enumerate_tracked_files, glob_match,
-        matches_any, plan_audit_queue, run_auditor, sha256_hex, EntryStatus, FileVerdict, Manifest,
-        ManifestEntry, DEFAULT_EXCLUDE_GLOBS,
+        matches_any, plan_audit_queue, run_auditor, sha256_hex, verify_audit_findings, EntryStatus,
+        FileVerdict, Manifest, ManifestEntry, DEFAULT_EXCLUDE_GLOBS,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1672,6 +2142,74 @@ mod tests {
         .expect("plan should tolerate deleted manifest entries");
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn verify_audit_findings_requires_reaudit_for_changed_flagged_files() {
+        let repo = TestTempDir::new("verify-findings-reaudit");
+        let audit_dir = repo.path().join("audit");
+        fs::create_dir_all(&audit_dir).unwrap();
+        fs::write(repo.path().join("a.rs"), "fn old() {}\n").unwrap();
+        let manifest = Manifest {
+            started_at: "2026-04-28T00:00:00Z".to_string(),
+            repo_head: "HEAD".to_string(),
+            doctrine_hash: "doctrine".to_string(),
+            rubric_hash: "rubric".to_string(),
+            files: vec![ManifestEntry {
+                path: "a.rs".to_string(),
+                status: EntryStatus::Audited,
+                content_hash: Some(sha256_hex(b"fn old() {}\n")),
+                audited_doctrine_hash: Some("doctrine".to_string()),
+                audited_rubric_hash: Some("rubric".to_string()),
+                verdict: Some("DRIFT-LARGE".to_string()),
+                audited_at: Some("2026-04-28T00:00:00Z".to_string()),
+                commit: None,
+            }],
+        };
+        fs::write(
+            audit_dir.join("MANIFEST.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(repo.path().join("a.rs"), "fn fixed() {}\n").unwrap();
+
+        let err = verify_audit_findings(repo.path(), &audit_dir)
+            .expect_err("changed flagged files must be re-audited before closure");
+        assert!(err.to_string().contains("need re-audit"), "{err}");
+        let report = fs::read_to_string(audit_dir.join("FINDING-VERIFY.md")).unwrap();
+        assert!(report.contains("NeedsReaudit"), "{report}");
+    }
+
+    #[test]
+    fn verify_audit_findings_accepts_removed_flagged_files() {
+        let repo = TestTempDir::new("verify-findings-removed");
+        let audit_dir = repo.path().join("audit");
+        fs::create_dir_all(&audit_dir).unwrap();
+        let manifest = Manifest {
+            started_at: "2026-04-28T00:00:00Z".to_string(),
+            repo_head: "HEAD".to_string(),
+            doctrine_hash: "doctrine".to_string(),
+            rubric_hash: "rubric".to_string(),
+            files: vec![ManifestEntry {
+                path: "retire-me.rs".to_string(),
+                status: EntryStatus::Audited,
+                content_hash: Some(sha256_hex(b"obsolete\n")),
+                audited_doctrine_hash: Some("doctrine".to_string()),
+                audited_rubric_hash: Some("rubric".to_string()),
+                verdict: Some("RETIRE".to_string()),
+                audited_at: Some("2026-04-28T00:00:00Z".to_string()),
+                commit: None,
+            }],
+        };
+        fs::write(
+            audit_dir.join("MANIFEST.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        verify_audit_findings(repo.path(), &audit_dir).unwrap();
+        let report = fs::read_to_string(audit_dir.join("FINDING-VERIFY.md")).unwrap();
+        assert!(report.contains("Verdict: GO"), "{report}");
     }
 
     #[test]
@@ -2037,6 +2575,8 @@ diff --git a/README.md b/README.md
             max_files: 0,
             audit_threads: 15,
             output_dir: None,
+            verify_findings: false,
+            resolve_findings: false,
             resume_mode: AuditResumeMode::Resume,
             report_only: false,
             dry_run: false,

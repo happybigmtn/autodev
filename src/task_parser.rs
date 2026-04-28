@@ -198,7 +198,7 @@ fn parse_task_completion_path(markdown: &str) -> Option<String> {
     })
 }
 
-const TASK_FIELD_BOUNDARIES: &[&str] = &[
+pub(crate) const TASK_FIELD_BOUNDARIES: &[&str] = &[
     "Spec:",
     "Why now:",
     "Codebase evidence:",
@@ -215,7 +215,11 @@ const TASK_FIELD_BOUNDARIES: &[&str] = &[
     "Status:",
 ];
 
-fn task_field_body_until_any(markdown: &str, field: &str, next_fields: &[&str]) -> Option<String> {
+pub(crate) fn task_field_body_until_any(
+    markdown: &str,
+    field: &str,
+    next_fields: &[&str],
+) -> Option<String> {
     let mut collecting = false;
     let mut body = Vec::new();
     for line in markdown.lines() {
