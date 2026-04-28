@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,7 @@ const DEFAULT_INCLUDE_GLOBS: &[&str] = &[
     "**/*.py",
     "specs/**/*.md",
     "AUTONOMY-GDD.md",
+    "RSOCIETY-GDD.md",
     "SECURITY_PLAN.md",
     "IMPLEMENTATION_PLAN.md",
     "DESIGN.md",
@@ -197,6 +198,33 @@ struct FindingResolutionLane {
     id: usize,
     name: String,
     entries: Vec<ManifestEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FindingResolutionRunStatus {
+    generated_at: String,
+    run_id: String,
+    phase: String,
+    run_dir: String,
+    target_root: String,
+    lanes: Vec<FindingResolutionLaneStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FindingResolutionLaneStatus {
+    id: usize,
+    name: String,
+    finding_count: usize,
+    state: String,
+    target_dir: String,
+    prompt_path: String,
+    response_path: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FindingResolutionLaneOutcome {
+    lane_id: usize,
 }
 
 pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
@@ -948,6 +976,7 @@ async fn resolve_audit_findings(
     output_dir: &Path,
     args: AuditArgs,
 ) -> Result<()> {
+    preflight_finding_resolution_roots(repo_root, &args)?;
     let manifest_path = output_dir.join("MANIFEST.json");
     if !manifest_path.exists() {
         bail!(
@@ -976,34 +1005,136 @@ async fn resolve_audit_findings(
 
     let max_lanes = args.audit_threads.clamp(1, 8).min(findings.len());
     let lanes = build_finding_resolution_lanes(findings, max_lanes);
-    let run_dir = output_dir
-        .join("finding-resolution")
-        .join(crate::util::timestamp_slug());
+    let run_id = crate::util::timestamp_slug();
+    let run_dir = output_dir.join("finding-resolution").join(&run_id);
+    let target_root = finding_resolution_target_root(repo_root, &run_id);
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create {}", run_dir.display()))?;
+    fs::create_dir_all(&target_root)
+        .with_context(|| format!("failed to create {}", target_root.display()))?;
 
     println!("auto audit resolve findings");
     println!("manifest: {}", manifest_path.display());
     println!("lanes:    {} (max {})", lanes.len(), max_lanes);
     println!("run dir:  {}", run_dir.display());
+    println!("targets:  {}", target_root.display());
+
+    prune_finding_resolution_artifacts(
+        repo_root,
+        output_dir,
+        &run_id,
+        args.resolve_keep_runs,
+        !args.no_resolve_target_prune,
+        false,
+    )?;
+
+    let mut lane_statuses = lanes
+        .iter()
+        .map(|lane| {
+            let lane_dir = finding_resolution_lane_dir(&run_dir, lane);
+            FindingResolutionLaneStatus {
+                id: lane.id,
+                name: lane.name.clone(),
+                finding_count: lane.entries.len(),
+                state: "running".to_string(),
+                target_dir: finding_resolution_lane_target_dir(&target_root, lane)
+                    .display()
+                    .to_string(),
+                prompt_path: lane_dir.join("prompt.md").display().to_string(),
+                response_path: lane_dir.join("response.log").display().to_string(),
+                error: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    write_finding_resolution_status(
+        output_dir,
+        &run_id,
+        "running",
+        &run_dir,
+        &target_root,
+        &lane_statuses,
+    )?;
 
     let mut join_set = JoinSet::new();
     for lane in lanes {
         let repo_root = repo_root.to_path_buf();
         let output_dir = output_dir.to_path_buf();
         let run_dir = run_dir.clone();
+        let target_root = target_root.clone();
         let args = args.clone();
+        let lane_id = lane.id;
         join_set.spawn(async move {
-            run_finding_resolution_lane(repo_root, output_dir, run_dir, args, lane).await
+            run_finding_resolution_lane(repo_root, output_dir, run_dir, target_root, args, lane)
+                .await
+                .map_err(|err| (lane_id, err.to_string()))
         });
     }
 
+    let mut failures = Vec::new();
     while let Some(result) = join_set.join_next().await {
-        result.context("finding resolution lane panicked")??;
+        let outcome = result.context("finding resolution lane panicked")?;
+        match outcome {
+            Ok(outcome) => {
+                if let Some(status) = lane_statuses
+                    .iter_mut()
+                    .find(|status| status.id == outcome.lane_id)
+                {
+                    status.state = "done".to_string();
+                    status.error = None;
+                }
+            }
+            Err((lane_id, error)) => {
+                if let Some(status) = lane_statuses.iter_mut().find(|status| status.id == lane_id) {
+                    status.state = "failed".to_string();
+                    status.error = Some(error.clone());
+                }
+                failures.push(format!("lane {} failed: {error}", lane_id + 1));
+            }
+        }
+        write_finding_resolution_status(
+            output_dir,
+            &run_id,
+            if failures.is_empty() {
+                "running"
+            } else {
+                "failed"
+            },
+            &run_dir,
+            &target_root,
+            &lane_statuses,
+        )?;
     }
 
+    if !failures.is_empty() {
+        bail!("{}", failures.join("\n"));
+    }
+
+    write_finding_resolution_status(
+        output_dir,
+        &run_id,
+        "re-auditing-drifted",
+        &run_dir,
+        &target_root,
+        &lane_statuses,
+    )?;
     rerun_only_drifted_audit(repo_root, output_dir, &args).await?;
-    verify_audit_findings(repo_root, output_dir)
+    verify_audit_findings(repo_root, output_dir)?;
+    write_finding_resolution_status(
+        output_dir,
+        &run_id,
+        "verified",
+        &run_dir,
+        &target_root,
+        &lane_statuses,
+    )?;
+    prune_finding_resolution_artifacts(
+        repo_root,
+        output_dir,
+        &run_id,
+        args.resolve_keep_runs,
+        !args.no_resolve_target_prune,
+        true,
+    )
 }
 
 fn build_finding_resolution_lanes(
@@ -1069,15 +1200,319 @@ fn finding_architecture_key(path: &str) -> String {
     }
 }
 
+fn finding_resolution_lane_dir(run_dir: &Path, lane: &FindingResolutionLane) -> PathBuf {
+    run_dir.join(format!("{:02}-{}", lane.id + 1, slugify(&lane.name)))
+}
+
+fn finding_resolution_target_root(repo_root: &Path, run_id: &str) -> PathBuf {
+    repo_root
+        .join(".auto")
+        .join("audit-resolve-targets")
+        .join(run_id)
+}
+
+fn finding_resolution_lane_target_dir(target_root: &Path, lane: &FindingResolutionLane) -> PathBuf {
+    target_root.join(format!("{:02}-{}", lane.id + 1, slugify(&lane.name)))
+}
+
+fn prepare_finding_resolution_lane_env(
+    repo_root: &Path,
+    lane_target_dir: &Path,
+    validation_threads: usize,
+) -> Result<Vec<(String, String)>> {
+    fs::create_dir_all(lane_target_dir)
+        .with_context(|| format!("failed to create {}", lane_target_dir.display()))?;
+    let bin_dir = lane_target_dir.join("autodev-bin");
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+    let real_cargo = resolve_real_cargo()?;
+    let wrapper = bin_dir.join("cargo");
+    atomic_write(&wrapper, cargo_guard_wrapper_script().as_bytes())
+        .with_context(|| format!("failed to write {}", wrapper.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&wrapper)
+            .with_context(|| format!("failed to stat {}", wrapper.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions)
+            .with_context(|| format!("failed to chmod {}", wrapper.display()))?;
+    }
+    let current_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+    let path = format!("{}:{current_path}", bin_dir.display());
+    Ok(vec![
+        (
+            "CARGO_TARGET_DIR".to_string(),
+            lane_target_dir.display().to_string(),
+        ),
+        (
+            "CARGO_BUILD_JOBS".to_string(),
+            validation_threads.max(1).to_string(),
+        ),
+        ("AUTODEV_REAL_CARGO".to_string(), real_cargo),
+        ("PATH".to_string(), path),
+        (
+            "AUTO_AUDIT_RESOLVE_VALIDATION_THREADS".to_string(),
+            validation_threads.max(1).to_string(),
+        ),
+        (
+            "AUTO_AUDIT_REPO_ROOT".to_string(),
+            repo_root.display().to_string(),
+        ),
+    ])
+}
+
+fn resolve_real_cargo() -> Result<String> {
+    if let Ok(path) = std::env::var("AUTODEV_REAL_CARGO") {
+        if !path.trim().is_empty() {
+            return Ok(path);
+        }
+    }
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg("command -v cargo")
+        .output()
+        .context("failed to resolve cargo executable")?;
+    if !output.status.success() {
+        bail!(
+            "failed to resolve cargo executable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        bail!("failed to resolve cargo executable: command -v cargo returned empty output");
+    }
+    Ok(path)
+}
+
+fn cargo_guard_wrapper_script() -> &'static str {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+real="${AUTODEV_REAL_CARGO:?AUTODEV_REAL_CARGO is required}"
+
+if [[ "${1:-}" == "test" ]]; then
+  filters=0
+  skip_next=0
+  after_dashdash=0
+  for arg in "${@:2}"; do
+    if [[ "$after_dashdash" == "1" ]]; then
+      continue
+    fi
+    if [[ "$skip_next" == "1" ]]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      --)
+        after_dashdash=1
+        continue
+        ;;
+      -p|--package|--manifest-path|--target|--target-dir|--bin|--test|--bench|--example|--features|--color|--message-format|--jobs|--profile)
+        skip_next=1
+        continue
+        ;;
+      --package=*|--manifest-path=*|--target=*|--target-dir=*|--bin=*|--test=*|--bench=*|--example=*|--features=*|--color=*|--message-format=*|--jobs=*|--profile=*)
+        continue
+        ;;
+      --lib|--bins|--tests|--benches|--examples|--all-targets|--all-features|--no-default-features|--workspace|--all|--locked|--offline|--frozen|--release|--no-fail-fast|--doc|--quiet|--verbose|-q|-v)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      *)
+        filters=$((filters + 1))
+        ;;
+    esac
+  done
+  if (( filters > 1 )); then
+    echo "AUTO_AUDIT_CARGO_FILTER_ERROR: cargo test accepts only one test filter. Split exact tests into separate commands or use one common module-level filter." >&2
+    exit 64
+  fi
+fi
+
+exec "$real" "$@"
+"#
+}
+
+fn preflight_finding_resolution_roots(repo_root: &Path, args: &AuditArgs) -> Result<()> {
+    if args.allow_missing_resolve_roots {
+        return Ok(());
+    }
+    let tracked_candidates = [
+        "AGENTS.md",
+        "IMPLEMENTATION_PLAN.md",
+        "REVIEW.md",
+        "audit/DOCTRINE.md",
+        "AUTONOMY-GDD.md",
+    ];
+    let agents_text = fs::read_to_string(repo_root.join("AGENTS.md")).unwrap_or_default();
+    let mut missing = Vec::new();
+    for path in tracked_candidates {
+        if !tracked_path_exists(repo_root, path)? {
+            continue;
+        }
+        if repo_root.join(path).exists() {
+            continue;
+        }
+        if path == "AUTONOMY-GDD.md" && agents_text.contains("RSOCIETY-GDD.md") {
+            eprintln!(
+                "auto audit resolve findings: tracked AUTONOMY-GDD.md is missing, but AGENTS.md names RSOCIETY-GDD.md as canonical successor"
+            );
+            continue;
+        }
+        missing.push(path.to_string());
+    }
+    if !missing.is_empty() {
+        bail!(
+            "auto audit --resolve-findings refuses to run with missing source-of-truth file(s): {}. Restore them, update AGENTS.md to name the successor doctrine, or pass --allow-missing-resolve-roots.",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn tracked_path_exists(repo_root: &Path, path: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to check whether {path} is tracked"))?;
+    Ok(output.status.success())
+}
+
+fn write_finding_resolution_status(
+    output_dir: &Path,
+    run_id: &str,
+    phase: &str,
+    run_dir: &Path,
+    target_root: &Path,
+    lanes: &[FindingResolutionLaneStatus],
+) -> Result<()> {
+    let status = FindingResolutionRunStatus {
+        generated_at: chrono_like_now(),
+        run_id: run_id.to_string(),
+        phase: phase.to_string(),
+        run_dir: run_dir.display().to_string(),
+        target_root: target_root.display().to_string(),
+        lanes: lanes.to_vec(),
+    };
+    let json = serde_json::to_vec_pretty(&status)?;
+    atomic_write(&output_dir.join("FINDING-RESOLVE-STATUS.json"), &json)?;
+
+    let mut markdown = String::new();
+    markdown.push_str("# FINDING-RESOLVE-STATUS\n\n");
+    markdown.push_str(&format!("- run id: `{}`\n", status.run_id));
+    markdown.push_str(&format!("- phase: `{}`\n", status.phase));
+    markdown.push_str(&format!("- run dir: `{}`\n", status.run_dir));
+    markdown.push_str(&format!("- target root: `{}`\n\n", status.target_root));
+    markdown.push_str("| Lane | State | Findings | Target |\n");
+    markdown.push_str("|---|---|---:|---|\n");
+    for lane in &status.lanes {
+        markdown.push_str(&format!(
+            "| `{}` | `{}` | {} | `{}` |\n",
+            lane.name, lane.state, lane.finding_count, lane.target_dir
+        ));
+        if let Some(error) = lane.error.as_deref() {
+            markdown.push_str(&format!(
+                "|  | error |  | `{}` |\n",
+                error.replace('|', "\\|")
+            ));
+        }
+    }
+    atomic_write(
+        &output_dir.join("FINDING-RESOLVE-STATUS.md"),
+        markdown.as_bytes(),
+    )
+}
+
+fn chrono_like_now() -> String {
+    crate::util::timestamp_slug()
+}
+
+fn prune_finding_resolution_artifacts(
+    repo_root: &Path,
+    output_dir: &Path,
+    current_run_id: &str,
+    keep_runs: usize,
+    prune_targets: bool,
+    include_current_targets: bool,
+) -> Result<()> {
+    let run_root = output_dir.join("finding-resolution");
+    prune_child_dirs_by_name(&run_root, current_run_id, keep_runs, false)?;
+    if prune_targets {
+        let target_parent = repo_root.join(".auto").join("audit-resolve-targets");
+        prune_child_dirs_by_name(
+            &target_parent,
+            current_run_id,
+            keep_runs,
+            include_current_targets,
+        )?;
+    }
+    Ok(())
+}
+
+fn prune_child_dirs_by_name(
+    parent: &Path,
+    current_run_id: &str,
+    keep_runs: usize,
+    include_current: bool,
+) -> Result<()> {
+    if !parent.exists() {
+        return Ok(());
+    }
+    let mut dirs = fs::read_dir(parent)
+        .with_context(|| format!("failed to read {}", parent.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            Some((
+                entry.file_name().to_string_lossy().to_string(),
+                entry.path(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort_by(|left, right| right.0.cmp(&left.0));
+    for (idx, (name, path)) in dirs.into_iter().enumerate() {
+        let keep_by_count = idx < keep_runs;
+        let is_current = name == current_run_id;
+        if is_current && include_current {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to prune {}", path.display()))?;
+            continue;
+        }
+        if keep_by_count || (is_current && !include_current) {
+            continue;
+        }
+        fs::remove_dir_all(&path).with_context(|| format!("failed to prune {}", path.display()))?;
+    }
+    Ok(())
+}
+
 async fn run_finding_resolution_lane(
     repo_root: PathBuf,
     output_dir: PathBuf,
     run_dir: PathBuf,
+    target_root: PathBuf,
     args: AuditArgs,
     lane: FindingResolutionLane,
-) -> Result<()> {
-    let prompt = build_finding_resolution_prompt(&repo_root, &output_dir, &lane)?;
-    let lane_dir = run_dir.join(format!("{:02}-{}", lane.id + 1, slugify(&lane.name)));
+) -> Result<FindingResolutionLaneOutcome> {
+    let lane_target_dir = finding_resolution_lane_target_dir(&target_root, &lane);
+    let lane_env = prepare_finding_resolution_lane_env(
+        &repo_root,
+        &lane_target_dir,
+        args.resolve_validation_threads,
+    )?;
+    let prompt =
+        build_finding_resolution_prompt(&repo_root, &output_dir, &lane, &lane_target_dir, &args)?;
+    let lane_dir = finding_resolution_lane_dir(&run_dir, &lane);
     fs::create_dir_all(&lane_dir)
         .with_context(|| format!("failed to create {}", lane_dir.display()))?;
     atomic_write(&lane_dir.join("prompt.md"), prompt.as_bytes())?;
@@ -1089,14 +1524,18 @@ async fn run_finding_resolution_lane(
         lane.name
     );
     let label = format!("audit-resolve:{}/{}", lane.id + 1, lane.name);
-    let response = run_auditor_labeled(&repo_root, &prompt, &args, Some(&label)).await?;
-    atomic_write(&lane_dir.join("response.log"), response.as_bytes())
+    let response =
+        run_auditor_labeled_with_env(&repo_root, &prompt, &args, Some(&label), &lane_env).await?;
+    atomic_write(&lane_dir.join("response.log"), response.as_bytes())?;
+    Ok(FindingResolutionLaneOutcome { lane_id: lane.id })
 }
 
 fn build_finding_resolution_prompt(
     repo_root: &Path,
     output_dir: &Path,
     lane: &FindingResolutionLane,
+    lane_target_dir: &Path,
+    args: &AuditArgs,
 ) -> Result<String> {
     let mut body = String::new();
     body.push_str(
@@ -1108,7 +1547,21 @@ fn build_finding_resolution_prompt(
          - For DRIFT-LARGE, DRIFT-SMALL, REFACTOR, ApplyFailed, or Escalated findings, make the smallest code/docs/spec changes needed for the file to pass re-audit.\n\
          - Keep edits scoped to this lane's paths and direct dependencies.\n\
          - Do not mark implementation-plan rows complete and do not edit audit/MANIFEST.json.\n\
-         - Run targeted validation when practical and summarize what changed.\n\n",
+         - Run targeted validation when practical and summarize what changed.\n\
+         - Use the provided lane-local CARGO_TARGET_DIR. Do not override it.\n\
+         - Cargo accepts only one test filter per `cargo test` command. Split multiple exact tests into separate commands or use one module-level/common filter.\n\n",
+    );
+    body.push_str("# Validation Environment\n\n");
+    body.push_str(&format!(
+        "- `CARGO_TARGET_DIR={}`\n",
+        lane_target_dir.display()
+    ));
+    body.push_str(&format!(
+        "- `CARGO_BUILD_JOBS={}`\n",
+        args.resolve_validation_threads.max(1)
+    ));
+    body.push_str(
+        "- The lane PATH contains an `auto audit` Cargo guard wrapper that rejects multi-filter `cargo test` invocations before they waste compile time.\n\n",
     );
     body.push_str("# Lane Scope\n\n");
     body.push_str(&format!("Lane: `{}`\n\n", lane.name));
@@ -1728,12 +2181,22 @@ async fn run_auditor_labeled(
     args: &AuditArgs,
     label: Option<&str>,
 ) -> Result<String> {
+    run_auditor_labeled_with_env(repo_root, prompt, args, label, &[]).await
+}
+
+async fn run_auditor_labeled_with_env(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+    label: Option<&str>,
+    extra_env: &[(String, String)],
+) -> Result<String> {
     if args.use_kimi_cli && is_kimi_model(&args.model) {
-        run_auditor_kimi(repo_root, prompt, args).await
+        run_auditor_kimi(repo_root, prompt, args, extra_env).await
     } else if is_kimi_model(&args.model) {
         bail!("auto audit Kimi models currently require --use-kimi-cli");
     } else {
-        run_auditor_codex(repo_root, prompt, args, label).await
+        run_auditor_codex(repo_root, prompt, args, label, extra_env).await
     }
 }
 
@@ -1747,6 +2210,7 @@ async fn run_auditor_codex(
     prompt: &str,
     args: &AuditArgs,
     label: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> Result<String> {
     let mut command = TokioCommand::new(&args.codex_bin);
     command
@@ -1771,6 +2235,9 @@ async fn run_auditor_codex(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(repo_root);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
 
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -1834,7 +2301,12 @@ async fn run_auditor_codex(
     Ok(stdout)
 }
 
-async fn run_auditor_kimi(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
+async fn run_auditor_kimi(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+    extra_env: &[(String, String)],
+) -> Result<String> {
     let kimi_bin = resolve_kimi_bin(&args.kimi_bin);
     let model = resolve_kimi_cli_model(&args.model);
     let exec_args = kimi_exec_args(&model, &args.reasoning_effort, prompt);
@@ -1845,6 +2317,9 @@ async fn run_auditor_kimi(repo_root: &Path, prompt: &str, args: &AuditArgs) -> R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(repo_root);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to launch kimi-cli at {} from {}",
@@ -2577,6 +3052,10 @@ diff --git a/README.md b/README.md
             output_dir: None,
             verify_findings: false,
             resolve_findings: false,
+            resolve_validation_threads: 2,
+            resolve_keep_runs: 2,
+            no_resolve_target_prune: false,
+            allow_missing_resolve_roots: false,
             resume_mode: AuditResumeMode::Resume,
             report_only: false,
             dry_run: false,

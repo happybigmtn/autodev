@@ -1073,6 +1073,25 @@ pub(crate) struct AuditArgs {
     #[arg(long)]
     resolve_findings: bool,
 
+    /// Maximum Cargo validation concurrency each resolve lane should use.
+    /// This is passed to lane prompts and CARGO_BUILD_JOBS.
+    #[arg(long, default_value_t = 2)]
+    resolve_validation_threads: usize,
+
+    /// Number of finding-resolution run logs to keep after successful
+    /// resolution. Older run directories and lane target directories are pruned.
+    #[arg(long, default_value_t = 2)]
+    resolve_keep_runs: usize,
+
+    /// Disable pruning of completed finding-resolution Cargo target dirs.
+    #[arg(long)]
+    no_resolve_target_prune: bool,
+
+    /// Allow resolve-findings to continue when a tracked legacy doctrine file
+    /// was intentionally deleted and the repo entrypoint names a successor.
+    #[arg(long)]
+    allow_missing_resolve_roots: bool,
+
     /// Resume mode. `resume` (default) picks up at first pending file;
     /// `fresh` archives the old manifest and starts over; `only-drifted`
     /// re-audits files whose content or doctrine hash changed.
