@@ -1075,7 +1075,7 @@ async fn resolve_audit_findings(
             let lane_repo_root = lane_root.join("repo");
             let lane_target_dir = lane_root.join("cargo-target");
             reset_finding_resolution_lane_root(&lane_root)?;
-            clone_finding_resolution_lane_repo(repo_root, &lane_repo_root)?;
+            clone_finding_resolution_lane_repo(repo_root, &target_branch, &lane_repo_root)?;
             let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?
                 .trim()
                 .to_string();
@@ -1657,13 +1657,20 @@ fn reset_finding_resolution_lane_root(lane_root: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", lane_root.display()))
 }
 
-fn clone_finding_resolution_lane_repo(repo_root: &Path, lane_repo_root: &Path) -> Result<()> {
+fn clone_finding_resolution_lane_repo(
+    repo_root: &Path,
+    target_branch: &str,
+    lane_repo_root: &Path,
+) -> Result<()> {
     let parent = lane_repo_root
         .parent()
         .with_context(|| format!("{} has no parent", lane_repo_root.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let output = Command::new("git")
-        .args(["clone", "--quiet", "--no-local"])
+        .args(["clone", "--quiet", "--local"])
+        .arg("--branch")
+        .arg(target_branch)
+        .arg("--single-branch")
         .arg(repo_root)
         .arg(lane_repo_root)
         .output()
@@ -1679,6 +1686,10 @@ fn clone_finding_resolution_lane_repo(repo_root: &Path, lane_repo_root: &Path) -
             lane_repo_root.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    let remotes = git_stdout(lane_repo_root, ["remote"]).unwrap_or_default();
+    if remotes.lines().any(|remote| remote.trim() == "origin") {
+        run_git(lane_repo_root, ["remote", "rename", "origin", "canonical"])?;
     }
     run_git(lane_repo_root, ["checkout", "--quiet", "--detach", "HEAD"])
 }
