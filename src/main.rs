@@ -8,6 +8,7 @@ mod codex_exec;
 mod codex_stream;
 mod completion_artifacts;
 mod corpus;
+mod design_command;
 mod doctor_command;
 mod generation;
 mod health_command;
@@ -17,6 +18,7 @@ mod loop_command;
 mod nemesis;
 mod parallel_command;
 mod pi_backend;
+mod prompt_ethos;
 mod qa_command;
 mod qa_only_command;
 mod quota_accounts;
@@ -64,7 +66,9 @@ enum Command {
     Gen(GenerationArgs),
     /// Turn a prompt into a conformant spec plus IMPLEMENTATION_PLAN.md task items
     Spec(SpecArgs),
-    /// Run the all-in-one production-grade workflow: corpus, gen, gates, then parallel
+    /// Audit and improve frontend design doctrine with runtime/UI contract proof
+    Design(DesignArgs),
+    /// Run the CEO 14-day production race: corpus, design gate, functional reviews, gen, gates, parallel
     Super(SuperArgs),
     /// Reverse-engineer specs from code reality using genesis/ as supporting context
     Reverse(GenerationArgs),
@@ -546,8 +550,46 @@ pub(crate) struct SpecArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct DesignArgs {
+    /// Optional focus prompt for the design pass
+    prompt: Option<String>,
+
+    /// Planning corpus root. Defaults to <repo>/genesis when present
+    #[arg(long)]
+    planning_root: Option<PathBuf>,
+
+    /// Output directory for design artifacts. Defaults to <repo>/.auto/design/<timestamp>
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Apply bounded repo edits to DESIGN.md, specs, or IMPLEMENTATION_PLAN.md instead of report-only artifacts
+    #[arg(long)]
+    apply: bool,
+
+    /// Skip browser/runtime QA attempts and produce the design + contract audit only
+    #[arg(long)]
+    skip_qa: bool,
+
+    /// Model used for design analysis
+    #[arg(long, default_value = "gpt-5.5")]
+    model: String,
+
+    /// Reasoning effort used for design analysis
+    #[arg(long, default_value = "high")]
+    reasoning_effort: String,
+
+    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+
+    /// Preview the design prompt without invoking the model
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct SuperArgs {
-    /// Single high-level instruction for the production-grade workflow
+    /// Single high-level instruction for the CEO production-race workflow
     prompt: Option<String>,
 
     /// Planning corpus root. Defaults to <repo>/genesis
@@ -614,13 +656,17 @@ pub(crate) struct SuperArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Skip launching `auto parallel` after the production-grade gates pass
+    /// Skip launching `auto parallel` after the production-race gates pass
     #[arg(long)]
     no_execute: bool,
 
-    /// Skip the additional super-only model review gates, leaving corpus/gen controls in place
+    /// Skip the CEO functional review and execution gates, leaving corpus/gen controls in place
     #[arg(long)]
     skip_super_review: bool,
+
+    /// Skip the design perfection gate before functional reviews and generation
+    #[arg(long)]
+    skip_design: bool,
 
     /// Preview the planned super workflow without invoking models or launching workers
     #[arg(long)]
@@ -670,7 +716,7 @@ pub(crate) struct BugArgs {
     finder_model: String,
 
     /// Effort / variant for the initial finder pass
-    #[arg(long, default_value = "high")]
+    #[arg(long, default_value = "low")]
     finder_effort: String,
 
     /// Model for the adversarial skeptic pass
@@ -678,7 +724,7 @@ pub(crate) struct BugArgs {
     skeptic_model: String,
 
     /// Effort / variant for the skeptic pass
-    #[arg(long, default_value = "high")]
+    #[arg(long, default_value = "low")]
     skeptic_effort: String,
 
     /// Model for the implementation pass after review verification
@@ -1494,6 +1540,7 @@ async fn main() -> Result<()> {
         Command::Corpus(args) => generation::run_corpus(args).await,
         Command::Gen(args) => generation::run_gen(args).await,
         Command::Spec(args) => spec_command::run_spec(args).await,
+        Command::Design(args) => design_command::run_design(args).await,
         Command::Super(args) => super_command::run_super(args).await,
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
@@ -1544,7 +1591,7 @@ mod tests {
     #[test]
     fn top_level_command_surface_matches_live_enum() {
         let expected = [
-            "corpus", "gen", "spec", "super", "reverse", "bug", "loop", "parallel", "qa",
+            "corpus", "gen", "spec", "design", "super", "reverse", "bug", "loop", "parallel", "qa",
             "qa-only", "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis",
             "quota", "symphony",
         ];
@@ -1608,6 +1655,36 @@ mod tests {
             Ok(_) => panic!("expected help output"),
         };
         assert!(help.contains("Usage: auto doctor"));
+    }
+
+    #[test]
+    fn design_command_is_parseable() {
+        let cli = Cli::try_parse_from(["auto", "design", "sync UI to runtime"]).expect("cli parse");
+        let Command::Design(args) = cli.command else {
+            panic!("expected design command");
+        };
+        assert_eq!(args.prompt.as_deref(), Some("sync UI to runtime"));
+
+        let help = match Cli::try_parse_from(["auto", "design", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected help output"),
+        };
+        assert!(help.contains("Usage: auto design"));
+        assert!(help.contains("--skip-qa"));
+    }
+
+    #[test]
+    fn bug_finder_and_skeptic_default_to_low_effort() {
+        let cli = Cli::try_parse_from(["auto", "bug"]).expect("cli parse");
+        let Command::Bug(args) = cli.command else {
+            panic!("expected bug command");
+        };
+
+        assert_eq!(args.finder_effort, "low");
+        assert_eq!(args.skeptic_effort, "low");
+        assert_eq!(args.reviewer_effort, "high");
+        assert_eq!(args.fixer_effort, "high");
+        assert_eq!(args.finalizer_effort, "high");
     }
 
     #[test]

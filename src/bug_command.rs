@@ -20,6 +20,7 @@ use crate::kimi_backend::{
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
@@ -28,6 +29,7 @@ use crate::util::{
 use crate::{BugArgs, HardeningProfile};
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT: &str = "low";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 const JSON_REPAIR_MAX_BYTES: usize = 256 * 1024;
@@ -208,22 +210,24 @@ fn apply_bug_profile(
     match profile {
         HardeningProfile::Balanced => {}
         HardeningProfile::Fast => {
-            set_default_effort(finder, "medium");
-            set_default_effort(skeptic, "medium");
-            set_default_effort(reviewer, "medium");
-            set_default_effort(fixer, "high");
-            set_default_effort(finalizer, "high");
+            set_default_effort(finder, DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT, "low");
+            set_default_effort(skeptic, DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT, "low");
+            set_default_effort(reviewer, DEFAULT_CODEX_REASONING_EFFORT, "medium");
+            set_default_effort(fixer, DEFAULT_CODEX_REASONING_EFFORT, "high");
+            set_default_effort(finalizer, DEFAULT_CODEX_REASONING_EFFORT, "high");
         }
         HardeningProfile::MaxQuality => {
-            for config in [finder, skeptic, reviewer, fixer, finalizer] {
-                set_default_effort(config, "xhigh");
-            }
+            set_default_effort(finder, DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT, "xhigh");
+            set_default_effort(skeptic, DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT, "xhigh");
+            set_default_effort(reviewer, DEFAULT_CODEX_REASONING_EFFORT, "xhigh");
+            set_default_effort(fixer, DEFAULT_CODEX_REASONING_EFFORT, "xhigh");
+            set_default_effort(finalizer, DEFAULT_CODEX_REASONING_EFFORT, "xhigh");
         }
     }
 }
 
-fn set_default_effort(config: &mut PhaseConfig, effort: &str) {
-    if config.model == DEFAULT_CODEX_MODEL && config.effort == DEFAULT_CODEX_REASONING_EFFORT {
+fn set_default_effort(config: &mut PhaseConfig, default_effort: &str, effort: &str) {
+    if config.model == DEFAULT_CODEX_MODEL && config.effort == default_effort {
         config.effort = effort.to_string();
     }
 }
@@ -1437,6 +1441,7 @@ async fn run_backend_prompt(
     stream_label: &str,
     timeout: Duration,
 ) -> Result<String> {
+    let prompt = with_autodev_prompt_ethos(prompt);
     match backend {
         LlmBackend::Codex {
             model,
@@ -1543,7 +1548,7 @@ async fn run_backend_prompt(
                 .arg("--no-session")
                 .arg("--tools")
                 .arg("read,bash,edit,write,grep,find,ls")
-                .arg(prompt)
+                .arg(&prompt)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1614,7 +1619,7 @@ async fn run_backend_prompt(
             thinking,
             kimi_bin,
         } => {
-            let args = kimi_exec_args(model, thinking, prompt);
+            let args = kimi_exec_args(model, thinking, &prompt);
             let mut command = TokioCommand::new(kimi_bin);
             command
                 .args(&args)

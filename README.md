@@ -8,12 +8,13 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns twenty commands:
+`auto` owns twenty-one commands:
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
 - `auto spec` turns a prompt into a conformant spec plus matching implementation-plan items.
-- `auto super` runs the all-in-one production-grade workflow: corpus, gen, gates, then parallel.
+- `auto design` perfects frontend/design doctrine with runtime/UI contract and QA proof.
+- `auto super` runs the all-in-one CEO production-race workflow: corpus, design gate, functional reviews, gen, gates, then parallel.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
 - `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
 - `auto loop` runs the implementation loop on the repo's primary branch.
@@ -43,14 +44,16 @@ need to pass directories in the normal case.
 - Internal state and logs live under `<repo>/.auto/`
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs `gpt-5.5` `high` finder, skeptic, fixer, reviewer, and finalizer
-  passes by default
+- `auto bug` runs `gpt-5.5` `low` finder and skeptic passes, then `gpt-5.5`
+  `high` fixer, reviewer, and finalizer passes by default
 - `auto loop` runs on the repo's primary branch by default with `gpt-5.5` and `high`
 - `auto parallel` runs on the repo's primary branch by default with five workers; outside tmux it
   launches a detached `<repo>-parallel` tmux session automatically
+- `auto design` runs with `gpt-5.5` `high`, writes `.auto/design/<run-id>/`, and is report-only
+  unless `--apply` is supplied
 - `auto super` runs corpus and generation with `gpt-5.5` `xhigh`, runs additional
-  production-readiness and execution-gate reviews, then launches `auto parallel` with
-  `gpt-5.5` `high` workers unless `--no-execute` is supplied
+  design-perfection, functional-review, production-readiness, and execution-gate reviews, then
+  launches `auto parallel` with `gpt-5.5` `high` workers unless `--no-execute` is supplied
 - `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
   state, worker PIDs, and latest lane log lines
 - `auto qa` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and the
@@ -101,6 +104,13 @@ Provider notes:
 - Claude remains an explicit harness for `auto loop`, `auto parallel`, and
   `auto review` via `--claude`; generation-style commands route Claude-like
   names through their Claude authoring path.
+
+Every model-backed stage receives the Autodev Builder Ethos prompt preamble:
+boil the lake when the operator asks for it, search before building, protect
+user sovereignty, prefer runtime truth over presentation, and demand evidence
+for claims. This is inspired by gstack `ETHOS.md`; the local copy is embedded
+in code so MiniMax, Kimi, Codex, and other model-routed agents receive the same
+doctrine.
 
 #### 0. Preflight The Checkout
 
@@ -167,7 +177,26 @@ Use `auto gen --snapshot-only` when you want to inspect the generated `gen-*`
 output before syncing root specs and the root plan. Use `auto gen --sync-only
 --output-dir <gen-dir>` to promote an accepted snapshot.
 
-#### 3. Execute The Queue With Parallel Workers
+#### 3. Perfect Design And Runtime/UI Contracts
+
+Before implementation workers touch frontend or user-facing surfaces, run the
+design gate:
+
+```bash
+auto design "$PROMPT" \
+  --model "$MODEL" \
+  --reasoning-effort "$WORK_EFFORT" \
+  --apply
+```
+
+`auto design` reads the existing product doctrine, `DESIGN.md`, frontend code,
+runtime/engine/API owners, generated bindings, and available QA surfaces. It
+writes a design audit, design-system proposal, engine/UI contract, frontend QA
+report, queue-ready design plan items, and a GO/NO-GO report. It rejects fake
+mockups, manual frontend truth, fixture fallbacks, and pretty UI proposals that
+are not wired to runtime-owned facts.
+
+#### 4. Execute The Queue With Parallel Workers
 
 Use `auto parallel` as the canonical executor, even when you only want one
 worker:
@@ -194,7 +223,7 @@ mark work complete from a successful compile alone; the task's acceptance
 criteria, required tests, generated artifacts, and review/closeout proof must
 all hold.
 
-#### 4. Independently Review Completed Work
+#### 5. Independently Review Completed Work
 
 Run review after implementation commits land:
 
@@ -209,7 +238,7 @@ ownership, generated contract sync, fixture boundaries, retired surfaces,
 runtime-to-UI proof, and whether the cited validation would catch the original
 failure returning.
 
-#### 5. Runtime QA And Health
+#### 6. Runtime QA And Health
 
 For user-facing or runtime-sensitive projects:
 
@@ -227,7 +256,7 @@ Use `auto qa-only` when you need a report without fixes. Use `auto health`
 when you want a broader repo health artifact after the targeted queue work is
 reviewed.
 
-#### 6. Whole-Repo Audit Before Treating The Project As Mature
+#### 7. Whole-Repo Audit Before Treating The Project As Mature
 
 For mature projects, write or update `audit/DOCTRINE.md`, then run the
 professional audit:
@@ -261,7 +290,7 @@ auto audit --resolve-findings \
   --resolve-passes 10
 ```
 
-#### 7. Ship Only After Evidence Is Durable
+#### 8. Ship Only After Evidence Is Durable
 
 When review, QA/health, and any required audit pass are green:
 
@@ -282,11 +311,12 @@ The canonical end-to-end workflow is:
 1. `auto doctor`
 2. `auto spec` for prompt-to-spec work, or `auto corpus` then `auto gen` for
    repo-wide planning
-3. `auto parallel`
-4. `auto review`
-5. `auto qa` and `auto health`
-6. `auto audit --everything` for mature whole-repo assurance
-7. `auto ship`
+3. `auto design` for design/runtime/UI contract proof
+4. `auto parallel`
+5. `auto review`
+6. `auto qa` and `auto health`
+7. `auto audit --everything` for mature whole-repo assurance
+8. `auto ship`
 
 Specialist commands:
 
@@ -305,9 +335,9 @@ Commands that should be demoted over time:
 
 - `auto loop` overlaps with `auto parallel --threads 1` but has weaker host
   reconciliation. Prefer `auto parallel` for both serial and parallel work.
-- `auto super` is convenient, but it hides checkpoints between corpus, gen,
-  gates, and execution. Prefer explicit stages for high-stakes autonomous
-  development.
+- `auto super` is the canonical macro only when you intentionally want a CEO
+  production-race campaign. Prefer explicit stages when humans need to inspect
+  each checkpoint before continuing.
 - `auto qa-only` is a report-only variant of `auto qa`; keep it for audits,
   but do not treat it as a completion gate by itself.
 
@@ -325,9 +355,9 @@ The commands originally formed this lifecycle:
 7. `auto ship` prepares the branch to land, updates release artifacts, and creates or refreshes a
    PR when appropriate.
 
-`auto super` is the high-agency composition of steps 1-3 for production-grade work: it runs
-`auto corpus`, adds production-readiness review artifacts, runs `auto gen`, gates the generated
-root queue, and launches `auto parallel`.
+`auto super` is the high-agency composition for production-grade work: it runs
+`auto corpus`, blocks on design perfection, runs functional CEO reviews, runs
+`auto gen`, gates the generated root queue, and launches `auto parallel`.
 
 The other commands are side lanes:
 
@@ -570,19 +600,62 @@ Example:
 auto spec "sync the portfolio UI with runtime-owned account balances"
 ```
 
+### `auto design`
+
+Purpose:
+
+- Perfect product-specific frontend/design doctrine before implementation
+- Tie every UI proposal to runtime/API/generated source of truth
+- Find existing breaks between frontend surfaces and engine/runtime contracts
+- Produce queue-ready plan items for unresolved design/runtime gaps
+
+What it reads:
+
+- `AGENTS.md`, product doctrine, `DESIGN.md`, specs, plans, and review history
+- Frontend routes, components, styles, tokens, tests, and build/dev scripts
+- Runtime/engine/API code that owns facts rendered by the UI
+- Generated clients, schemas, hooks, stores, and regeneration commands
+
+What it writes:
+
+- `.auto/design/<run-id>/DESIGN-AUDIT.md`
+- `.auto/design/<run-id>/DESIGN-SYSTEM-PROPOSAL.md`
+- `.auto/design/<run-id>/ENGINE-UI-CONTRACT.md`
+- `.auto/design/<run-id>/FRONTEND-QA.md`
+- `.auto/design/<run-id>/DESIGN-PLAN-ITEMS.md`
+- `.auto/design/<run-id>/DESIGN-REPORT.md`
+
+What it enforces:
+
+- No fake mockups as acceptance evidence
+- No duplicated frontend constants, catalogs, balances, risk classes, eligibility rules, or status
+  derivations when runtime/API/generated truth exists
+- No fixture/demo/sample data as production fallback truth
+- Every design improvement names the runtime owner, API/schema or generator impact, UI consumer,
+  and proof that would catch drift returning
+- `DESIGN-REPORT.md` must end with `Verdict: GO` or `Verdict: NO-GO`
+
+Example:
+
+```bash
+auto design "make the console production-ready without drifting from engine state" --apply
+```
+
 ### `auto super`
 
 Purpose:
 
-- Run the all-in-one "make this repo production-grade" workflow
+- Run the all-in-one "new CEO, 14 days to production" workflow
 - Keep `auto corpus` and `auto gen` as the control primitives
-- Add production-readiness review gates before allowing parallel implementation
+- Perfect design first, then apply similarly rigorous functional reviews before allowing parallel
+  implementation
 
 What it reads:
 
 - The live repository
 - Existing planning docs and root queue files
 - `genesis/` after the corpus stage creates it
+- `.auto/super/<run-id>/design/` after the design perfection gate creates it
 - generated `gen-*` outputs after the generation stage creates them
 - any explicit `--reference-repo <dir>` inputs
 
@@ -591,6 +664,9 @@ What it writes:
 - `genesis/` via the normal `auto corpus` control path
 - root `specs/*.md` and root `IMPLEMENTATION_PLAN.md` via the normal `auto gen` control path
 - `.auto/super/<run-id>/manifest.json`
+- `.auto/super/<run-id>/design/`
+- `.auto/super/<run-id>/CEO-14-DAY-PLAN.md`
+- `.auto/super/<run-id>/FUNCTIONAL-REVIEWS.md`
 - `.auto/super/<run-id>/PRODUCTION-READINESS.md`
 - `.auto/super/<run-id>/RISK-REGISTER.md`
 - `.auto/super/<run-id>/QUALITY-GATES.md`
@@ -602,11 +678,14 @@ What it writes:
 
 What it actually does:
 
-- Builds a production-grade focus brief from the positional prompt and optional `--focus`
+- Builds a CEO 14-day production-race focus brief from the positional prompt and optional `--focus`
 - Runs `auto corpus` with GPT-5.5 `xhigh` and max Codex context
-- Runs a super corpus review board across CEO/Product, Principal Engineer, Security,
-  Reliability/Ops, QA/Test Architect, DX/Operator, and Release Manager perspectives
-- Lets that review amend `genesis/` before generation starts
+- Runs a design perfection gate that reads `DESIGN.md`, frontend code, runtime owners, generated
+  bindings, and QA surfaces, then blocks on `Verdict: GO`
+- Runs a CEO functional review board across Product, Design/Frontend, Architecture, Runtime/Engine,
+  Security/Trust, Reliability/Ops, QA/Test, Data/Contracts, Performance, DX/Agent Workflow, and
+  Release perspectives
+- Lets design and functional reviews amend `genesis/` before generation starts
 - Runs `auto gen` with GPT-5.5 `xhigh` and max Codex context
 - Runs an execution-gate review that may amend root specs and `IMPLEMENTATION_PLAN.md`
 - Requires `EXECUTION-GATE.md` to say exactly `Verdict: GO`
@@ -619,12 +698,14 @@ When to run it:
 - When the goal is broad production readiness rather than a narrow planning refresh
 - When you want one command to generate the corpus, produce the execution queue, validate it, and
   start tmux-backed implementation
-- When the repo needs a release-blocker campaign rather than a loose backlog
+- When the repo needs a max-compute release-blocker campaign rather than a loose backlog
 
 Useful flags:
 
 - `auto super "make this repo production grade"` supplies the main steering prompt
 - `--no-execute` stops after corpus, generation, and gates without launching workers
+- `--skip-design` skips the design perfection gate; use only when an equivalent design/runtime
+  review is already current and file-backed
 - `--skip-super-review` keeps only the normal corpus/gen review controls and deterministic gate
 - `--threads <n>` controls parallel worker lanes
 - `--max-iterations <n>` limits successful parallel lands
@@ -714,8 +795,8 @@ What it actually does:
 
 Default model layout:
 
-- finder: Codex `gpt-5.5` with `high`
-- skeptic: Codex `gpt-5.5` with `high`
+- finder: Codex `gpt-5.5` with `low`
+- skeptic: Codex `gpt-5.5` with `low`
 - reviewer: Codex `gpt-5.5` with `high`
 - fixer: Codex `gpt-5.5` with `high`
 - finalizer: Codex `gpt-5.5` with `high`
@@ -723,8 +804,8 @@ Default model layout:
 
 Profiles:
 
-- `--profile balanced` keeps the default `gpt-5.5 high` layout.
-- `--profile fast` lowers read-only discovery/review effort to `medium` unless explicitly overridden.
+- `--profile balanced` keeps the default layout: low finder/skeptic, high reviewer/fixer/finalizer.
+- `--profile fast` keeps finder/skeptic at `low` and lowers review effort to `medium` unless explicitly overridden.
 - `--profile max-quality` raises default Codex efforts to `xhigh` unless explicitly overridden.
 
 Safety behavior:
@@ -1645,6 +1726,7 @@ auto --version
 auto --help
 auto corpus --help
 auto gen --help
+auto design --help
 auto parallel --help
 auto quota --help
 auto symphony --help

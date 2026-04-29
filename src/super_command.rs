@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::codex_exec::run_codex_exec_max_context;
+use crate::design_command;
 use crate::generation;
 use crate::parallel_command;
 use crate::state::load_state;
@@ -16,7 +17,9 @@ use crate::{
     CorpusArgs, GenerationArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, SuperArgs,
 };
 
-const SUPER_REPORT_FILES: [&str; 5] = [
+const SUPER_REPORT_FILES: [&str; 7] = [
+    "CEO-14-DAY-PLAN.md",
+    "FUNCTIONAL-REVIEWS.md",
     "PRODUCTION-READINESS.md",
     "RISK-REGISTER.md",
     "QUALITY-GATES.md",
@@ -42,6 +45,7 @@ struct SuperManifest {
     max_concurrent_workers: usize,
     max_iterations: Option<usize>,
     execute: bool,
+    design_enabled: bool,
     stages: Vec<SuperStage>,
 }
 
@@ -82,7 +86,10 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
 
     if args.dry_run {
         println!("mode:        dry-run");
-        println!("stages:      corpus -> super corpus review -> gen -> execution gate -> parallel");
+        println!(
+            "stages:      corpus -> design perfection gate{} -> CEO functional review -> gen -> execution gate -> parallel",
+            if args.skip_design { " (skipped)" } else { "" }
+        );
         return Ok(());
     }
 
@@ -106,6 +113,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         max_concurrent_workers: args.max_concurrent_workers.max(1),
         max_iterations: args.max_iterations,
         execute: !args.no_execute,
+        design_enabled: !args.skip_design,
         stages: Vec::new(),
     };
     write_manifest(&super_root, &manifest)?;
@@ -136,6 +144,27 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         Some(&planning_root),
     )?;
 
+    if args.skip_design {
+        push_stage(
+            &super_root,
+            &mut manifest,
+            "design perfection gate",
+            "skipped",
+            None,
+        )?;
+    } else {
+        println!("stage:       design perfection gate");
+        design_command::run_super_design_module(&args, &repo_root, &planning_root, &super_root)
+            .await?;
+        push_stage(
+            &super_root,
+            &mut manifest,
+            "design perfection gate",
+            "complete",
+            Some(&super_root.join("design")),
+        )?;
+    }
+
     if args.skip_super_review {
         push_stage(
             &super_root,
@@ -145,12 +174,12 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             None,
         )?;
     } else {
-        println!("stage:       super corpus review");
+        println!("stage:       CEO functional review");
         run_super_corpus_review(&args, &repo_root, &planning_root, &super_root).await?;
         push_stage(
             &super_root,
             &mut manifest,
-            "super corpus review",
+            "CEO functional review",
             "complete",
             Some(&super_root),
         )?;
@@ -272,7 +301,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
 fn build_super_focus(prompt: Option<&str>, focus: Option<&str>) -> String {
     let mut parts = Vec::new();
     parts.push(
-        "Make this repository production-grade in an all-encompassing way. Keep auto corpus and auto gen as the control primitives, but shape the corpus toward release blockers, operator trust, security, reliability, verification evidence, first-run DX, and maintainable execution contracts.",
+        "You are the new CEO inheriting this codebase. Over the next 14 days, race it to production with unlimited compute and resources. Do not capacity-trim the ambition: prioritize the deliverables that maximize production readiness, then assume max parallel execution can attack them. Perfect design/runtime integrity first, then run equally rigorous functional reviews across product, engineering, security, reliability, QA, data/contracts, operations, release, DX, and performance. Keep auto corpus and auto gen as the control primitives, but shape the corpus toward release blockers, operator trust, verification evidence, first-run DX, and maintainable execution contracts.",
     );
     if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
         parts.push(prompt.trim());
@@ -383,14 +412,23 @@ fn build_super_corpus_review_prompt(
     super_root: &Path,
 ) -> String {
     format!(
-        r#"You are the production-readiness board for `auto super`.
+        r#"You are the new CEO of this codebase running the `auto super` functional review war room.
 
-The normal `auto corpus` authoring and review passes have already produced `{planning_root}` for the repository at `{repo_root}`. Your job is to make that model-driven corpus more effective at moving the codebase to a production-grade state.
+The normal `auto corpus` authoring and review passes have already produced `{planning_root}` for the repository at `{repo_root}`. The design perfection gate may also have written design/runtime artifacts under `{super_root}/design`. Treat those design artifacts as the first production-readiness input, not as a subordinate style appendix.
+
+Mission:
+- You inherited this codebase today.
+- You have 14 days to race it to production.
+- Compute and implementation capacity are not constraints; prioritization is about production leverage, risk, and dependency order.
+- Design/runtime integrity was perfected first. Now apply the same severity and precision across every functional lane.
 
 Edit boundary:
 - You may read the repository at `{repo_root}` and the planning corpus at `{planning_root}`.
+- You may read `{super_root}/design` and should preserve its runtime-first design/UI findings when they exist.
 - You may edit markdown files under `{planning_root}`.
 - You must write these non-empty files under `{super_root}`:
+  - `CEO-14-DAY-PLAN.md`
+  - `FUNCTIONAL-REVIEWS.md`
   - `PRODUCTION-READINESS.md`
   - `RISK-REGISTER.md`
   - `QUALITY-GATES.md`
@@ -398,23 +436,29 @@ Edit boundary:
   - `SUPER-REPORT.md`
 - Do not edit source code, root specs, root implementation plans, generated `gen-*` dirs, or skill definition directories.
 
-Run these review phases and synthesize their disagreements:
-- CEO/Product: production definition, non-goals, opportunity cost, scope discipline.
-- Principal Engineer: architecture seams, data flow, state, dependency order, maintainability.
-- Security: credentials, shell/YAML injection, secrets, dangerous flags, logs, trust boundaries.
-- Reliability/Ops: idempotence, resume, partial failure, recovery, observability, receipts.
-- QA/Test Architect: missing regression tests, integration proof, false-positive verification.
-- DX/Operator: first-run success, CLI help, errors, honest examples, setup friction.
-- Release Manager: CI, install proof, versioning, rollback, release blockers.
+Run these functional reviews and synthesize their disagreements:
+- CEO/Product: production definition, 10-star user outcome, non-goals, opportunity cost, scope discipline.
+- Design/Frontend: design-system clarity, modern UI quality, accessibility, AI-slop risk, and runtime/UI drift; respect `{super_root}/design` as the opening gate.
+- Principal Engineer/Architecture: architecture seams, data flow, state, dependency order, maintainability.
+- Runtime/Engine: source-of-truth ownership, generated contracts, API/schema drift, state transitions, invariants.
+- Security/Trust: credentials, shell/YAML injection, secrets, dangerous flags, logs, authz, trust boundaries.
+- Reliability/Ops: idempotence, resume, partial failure, recovery, observability, receipts, operator handoff.
+- QA/Test Architect: missing regression tests, integration proof, false-positive verification, browser/runtime evidence.
+- Data/Contracts: migrations, compatibility, durable artifacts, schema ownership, backfill or rollback hazards.
+- Performance/Scale: hot paths, large repos, concurrency, resource cleanup, timeout behavior.
+- DX/Agent Workflow: first-run success, CLI help, errors, honest examples, setup friction, model/provider routing.
+- Release Manager: CI, install proof, versioning, rollback, release blockers, ship/no-ship criteria.
 
 Required output semantics:
+- `CEO-14-DAY-PLAN.md` must define the 14-day production race, top outcomes, dependency waves, and prioritized deliverables without capacity trimming.
+- `FUNCTIONAL-REVIEWS.md` must contain the lane-by-lane review board findings, severity, owner, needed artifact, and proof for each discipline above.
 - `PRODUCTION-READINESS.md` must contain a matrix by major subsystem with grade, evidence, production blocker, required fix, and proof artifact/command.
 - `RISK-REGISTER.md` must rank risks by severity, likelihood, blast radius, mitigation, and release-blocking status.
 - `QUALITY-GATES.md` must define hard gates before parallel execution, before release candidate, and before ship.
 - `SYSTEM-MAP.md` must map command surface, state files, external CLIs, credential flows, write paths, and generated artifacts.
-- `SUPER-REPORT.md` must summarize top blockers, top non-blocking improvements, not-doing list, and any amendments made to `{planning_root}`.
+- `SUPER-REPORT.md` must summarize top blockers, top non-blocking improvements, not-doing list, how design was handled first, functional-lane risks, and any amendments made to `{planning_root}`.
 
-If the corpus under `{planning_root}` is missing production-readiness framing, amend it in place so the next `auto gen` pass produces release-oriented specs and executable plan tasks. Keep `genesis/` as corpus input, not a competing active control plane unless repository instructions explicitly say otherwise.
+If the corpus under `{planning_root}` is missing production-readiness framing, amend it in place so the next `auto gen` pass produces release-oriented specs and executable plan tasks. Deliverables should be dependency-ordered for max-compute parallelism, not limited by a small team capacity assumption. Keep `genesis/` as corpus input, not a competing active control plane unless repository instructions explicitly say otherwise.
 "#,
         repo_root = repo_root.display(),
         planning_root = planning_root.display(),
@@ -438,13 +482,17 @@ The repository is `{repo_root}`. The planning corpus is `{planning_root}`. The g
 
 Edit boundary:
 - You may read the repository, `{planning_root}`, generated output, root `specs/`, and root `IMPLEMENTATION_PLAN.md`.
+- You may read `{super_root}/design`; design/runtime UI contract risks are execution-gate inputs, not decoration.
+- You must read `{super_root}/CEO-14-DAY-PLAN.md`, `{super_root}/FUNCTIONAL-REVIEWS.md`, `{super_root}/PRODUCTION-READINESS.md`, `{super_root}/RISK-REGISTER.md`, `{super_root}/QUALITY-GATES.md`, and `{super_root}/SYSTEM-MAP.md` when present.
 - You may edit only root `IMPLEMENTATION_PLAN.md`, root `specs/*.md`, and `{super_root}/EXECUTION-GATE.md`.
 - Do not edit source code, `genesis/`, `gen-*`, skill definition directories, or worker artifacts.
 
-Review the root execution queue as if multiple tmux-backed implementation workers will start immediately.
+Review the root execution queue as if max-compute tmux-backed implementation workers will start immediately.
 
 Gate criteria:
-- The queue must be production-grade oriented, not a generic cleanup backlog.
+- The queue must implement the CEO 14-day production race, not a generic cleanup backlog or capacity-trimmed wishlist.
+- UI/design tasks must be tied to runtime/API source of truth, generated bindings, existing frontend helpers, and cross-surface readback proof. Reject fake mockups, manual frontend bindings, and fixture-data fallbacks as acceptance evidence.
+- Security, reliability, QA, data/contracts, operations, release, DX, and performance lanes must receive the same severity and proof standard as design.
 - Priority tasks must be dependency-ordered and small enough for one focused worker session.
 - Every unfinished task must have concrete ownership, acceptance criteria, verification, required tests, completion artifacts, dependencies, estimated scope, and completion signal.
 - Verification must be narrow and meaningful. Reject broad package-wide test commands, malformed shell snippets, zero-test filters, and directory greps as sole proof.
@@ -794,7 +842,9 @@ mod tests {
     #[test]
     fn build_super_focus_combines_production_directive_and_prompt() {
         let focus = build_super_focus(Some("ship the CLI"), Some("security first"));
-        assert!(focus.contains("production-grade"));
+        assert!(focus.contains("new CEO"));
+        assert!(focus.contains("14 days"));
+        assert!(focus.contains("Perfect design/runtime integrity first"));
         assert!(focus.contains("ship the CLI"));
         assert!(focus.contains("security first"));
     }

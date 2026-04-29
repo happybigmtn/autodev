@@ -16,6 +16,7 @@ use crate::codex_stream::capture_codex_output_with_heartbeat;
 use crate::completion_artifacts::{
     default_review_doc, inspect_task_completion_evidence, review_contains_task,
 };
+use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::quota_config::Provider;
 use crate::quota_exec;
 use crate::task_parser::{
@@ -871,6 +872,7 @@ async fn run_codex_planner(
     reasoning_effort: &str,
     codex_bin: &Path,
 ) -> Result<(String, String)> {
+    let prompt = with_autodev_prompt_ethos(prompt);
     let mut command = planner_command(repo_root, model, reasoning_effort, codex_bin)?;
     command
         .stdin(Stdio::piped())

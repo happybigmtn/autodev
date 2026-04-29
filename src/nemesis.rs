@@ -15,6 +15,7 @@ use crate::kimi_backend::{
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, push_branch_with_remote_sync, repo_name, run_git,
@@ -1067,18 +1068,19 @@ async fn run_nemesis_backend(
     backend: &NemesisBackend,
     codex_bin: &Path,
 ) -> Result<String> {
+    let prompt = with_autodev_prompt_ethos(prompt);
     match backend {
         NemesisBackend::Codex {
             model,
             reasoning_effort,
             codex_bin,
-        } => run_codex(repo_root, prompt, model, reasoning_effort, codex_bin).await,
+        } => run_codex(repo_root, &prompt, model, reasoning_effort, codex_bin).await,
         NemesisBackend::Pi {
             model,
             thinking,
             pi_bin,
             ..
-        } => match run_pi(repo_root, prompt, model, thinking, pi_bin).await {
+        } => match run_pi(repo_root, &prompt, model, thinking, pi_bin).await {
             Ok(output) => Ok(output),
             Err(e) => {
                 eprintln!("[auto-nemesis] Kimi (pi) backend failed: {e:#}");
@@ -1091,7 +1093,7 @@ async fn run_nemesis_backend(
                 print_phase_header("fallback", &fallback);
                 run_codex(
                     repo_root,
-                    prompt,
+                    &prompt,
                     DEFAULT_CODEX_NEMESIS_MODEL,
                     "high",
                     codex_bin,
@@ -1103,7 +1105,7 @@ async fn run_nemesis_backend(
             model,
             thinking,
             kimi_bin,
-        } => match run_kimi_cli(repo_root, prompt, model, thinking, kimi_bin).await {
+        } => match run_kimi_cli(repo_root, &prompt, model, thinking, kimi_bin).await {
             Ok(output) => Ok(output),
             Err(e) => {
                 eprintln!("[auto-nemesis] kimi-cli backend failed: {e:#}");
@@ -1116,7 +1118,7 @@ async fn run_nemesis_backend(
                 print_phase_header("fallback", &fallback);
                 run_codex(
                     repo_root,
-                    prompt,
+                    &prompt,
                     DEFAULT_CODEX_NEMESIS_MODEL,
                     "high",
                     codex_bin,

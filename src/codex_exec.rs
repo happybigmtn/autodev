@@ -10,6 +10,7 @@ use crate::codex_stream;
 use crate::codex_stream::capture_pi_output;
 use crate::kimi_backend::{kimi_exec_args, parse_kimi_error, resolve_kimi_bin};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::quota_config::Provider;
 use crate::quota_exec;
 use crate::util::{atomic_write, opencode_agent_dir, timestamp_slug};
@@ -84,6 +85,7 @@ pub(crate) async fn run_codex_exec_with_env(
     worker_pid_path: Option<&Path>,
     model_context_window: Option<i64>,
 ) -> Result<std::process::ExitStatus> {
+    let full_prompt = with_autodev_prompt_ethos(full_prompt);
     let backend = select_shared_exec_backend(model, codex_bin);
     let (status, stderr_text) = match backend {
         SharedExecBackend::Codex { model, codex_bin } => {
@@ -126,7 +128,7 @@ pub(crate) async fn run_codex_exec_with_env(
             } else {
                 spawn_codex(
                     repo_root,
-                    full_prompt,
+                    &full_prompt,
                     &model,
                     reasoning_effort,
                     &codex_bin,
@@ -142,7 +144,7 @@ pub(crate) async fn run_codex_exec_with_env(
         SharedExecBackend::KimiCli { model, kimi_bin } => {
             spawn_kimi_cli(
                 repo_root,
-                full_prompt,
+                &full_prompt,
                 &model,
                 reasoning_effort,
                 &kimi_bin,
@@ -160,7 +162,7 @@ pub(crate) async fn run_codex_exec_with_env(
         } => {
             spawn_pi(
                 repo_root,
-                full_prompt,
+                &full_prompt,
                 &provider_label,
                 &model,
                 reasoning_effort,
