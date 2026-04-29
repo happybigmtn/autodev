@@ -1228,7 +1228,7 @@ async fn resolve_audit_findings_pass(
         .map(|lane| {
             let lane_root = finding_resolution_lane_worktree_dir(&worktree_root, &lane);
             let lane_repo_root = lane_root.join("repo");
-            let lane_target_dir = lane_root.join("cargo-target");
+            let lane_target_dir = target_root.join(slugify(&lane.name));
             reset_finding_resolution_lane_root(&lane_root)?;
             clone_finding_resolution_lane_repo(repo_root, &target_branch, &lane_repo_root)?;
             let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?
@@ -1479,10 +1479,11 @@ fn finding_resolution_lane_dir(run_dir: &Path, lane: &FindingResolutionLane) -> 
 }
 
 fn finding_resolution_target_root(repo_root: &Path, run_id: &str) -> PathBuf {
+    let _ = run_id;
     repo_root
         .join(".auto")
         .join("audit-resolve-targets")
-        .join(run_id)
+        .join("shared")
 }
 
 fn finding_resolution_worktree_root(repo_root: &Path, run_id: &str) -> PathBuf {
@@ -1825,7 +1826,7 @@ fn prune_child_dirs_by_name(
                 .with_context(|| format!("failed to prune {}", path.display()))?;
             continue;
         }
-        if keep_by_count || (is_current && !include_current) {
+        if name == "shared" || keep_by_count || (is_current && !include_current) {
             continue;
         }
         fs::remove_dir_all(&path).with_context(|| format!("failed to prune {}", path.display()))?;
@@ -2131,7 +2132,7 @@ fn build_finding_resolution_prompt(
          - Keep edits scoped to this lane's paths and direct dependencies.\n\
          - Do not mark implementation-plan rows complete and do not edit audit/MANIFEST.json.\n\
          - Run targeted validation when practical and summarize what changed.\n\
-         - Use the provided lane-local CARGO_TARGET_DIR. Do not override it.\n\
+         - Use the provided lane-scoped CARGO_TARGET_DIR. It is intentionally stable across resolve passes for this lane so Cargo can reuse build artifacts; do not override it.\n\
          - Run Cargo validations serially within this lane unless you deliberately give each concurrent command a distinct target directory. Do not start a second `cargo test`, `cargo check`, `cargo clippy`, or `cargo fmt` command while another Cargo command is still running in this lane's target dir; wait for the first command to finish, then run the next proof.\n\
          - Cargo accepts only one test filter per `cargo test` command. Split multiple exact tests into separate commands or use one module-level/common filter.\n\n",
     );
@@ -2145,7 +2146,8 @@ fn build_finding_resolution_prompt(
         args.resolve_validation_threads.max(1)
     ));
     body.push_str(
-        "- The lane PATH contains an `auto audit` Cargo guard wrapper that rejects multi-filter `cargo test` invocations before they waste compile time.\n\n",
+        "- The lane PATH contains an `auto audit` Cargo guard wrapper that rejects multi-filter `cargo test` invocations before they waste compile time.\n\
+         - This target directory may contain artifacts from earlier resolve passes for the same lane. That cache is expected; final proof still must be run with `cargo test`, `cargo check`, `cargo fmt`, or the repo guard from the current source tree.\n\n",
     );
     body.push_str("# Lane Scope\n\n");
     body.push_str(&format!("Lane: `{}`\n\n", lane.name));
