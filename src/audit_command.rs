@@ -35,7 +35,7 @@
 //! re-audited on next run; the manifest only flips to `audited` after a
 //! clean write.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -853,6 +853,36 @@ fn plan_audit_queue(
 
 fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
     let manifest_path = output_dir.join("MANIFEST.json");
+    let report = build_finding_verification_report(repo_root, output_dir)?;
+    write_finding_verification_report(output_dir, &report)?;
+
+    println!("auto audit finding verification");
+    println!("manifest:         {}", manifest_path.display());
+    println!("flagged findings: {}", report.total_flagged);
+    println!("resolved removed: {}", report.resolved_removed);
+    println!("needs re-audit:   {}", report.needs_reaudit);
+    println!("still open:       {}", report.still_open);
+    println!(
+        "report:           {}",
+        output_dir.join("FINDING-VERIFY.md").display()
+    );
+
+    if report.needs_reaudit > 0 || report.still_open > 0 {
+        bail!(
+            "audit findings are not fully closed: {} need re-audit, {} are still open",
+            report.needs_reaudit,
+            report.still_open
+        );
+    }
+
+    Ok(())
+}
+
+fn build_finding_verification_report(
+    repo_root: &Path,
+    output_dir: &Path,
+) -> Result<FindingVerificationReport> {
+    let manifest_path = output_dir.join("MANIFEST.json");
     if !manifest_path.exists() {
         bail!(
             "audit finding verification requires an existing manifest at {}",
@@ -864,7 +894,6 @@ fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let manifest: Manifest = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-
     let mut findings = Vec::new();
     for entry in manifest.files.iter().filter(audit_entry_requires_closure) {
         let path = repo_root.join(&entry.path);
@@ -923,28 +952,7 @@ fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
             .count(),
         findings,
     };
-    write_finding_verification_report(output_dir, &report)?;
-
-    println!("auto audit finding verification");
-    println!("manifest:         {}", manifest_path.display());
-    println!("flagged findings: {}", report.total_flagged);
-    println!("resolved removed: {}", report.resolved_removed);
-    println!("needs re-audit:   {}", report.needs_reaudit);
-    println!("still open:       {}", report.still_open);
-    println!(
-        "report:           {}",
-        output_dir.join("FINDING-VERIFY.md").display()
-    );
-
-    if report.needs_reaudit > 0 || report.still_open > 0 {
-        bail!(
-            "audit findings are not fully closed: {} need re-audit, {} are still open",
-            report.needs_reaudit,
-            report.still_open
-        );
-    }
-
-    Ok(())
+    Ok(report)
 }
 
 fn audit_entry_requires_closure(entry: &&ManifestEntry) -> bool {
@@ -1144,10 +1152,28 @@ async fn resolve_audit_findings_pass(
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let manifest: Manifest = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let verification_report = build_finding_verification_report(repo_root, output_dir)?;
+    write_finding_verification_report(output_dir, &verification_report)?;
+    let unresolved_paths = verification_report
+        .findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.result,
+                FindingVerificationResult::NeedsReaudit | FindingVerificationResult::StillOpen
+            )
+        })
+        .map(|finding| finding.path.clone())
+        .collect::<HashSet<_>>();
+    let resolved_before_lane_count = verification_report
+        .findings
+        .len()
+        .saturating_sub(unresolved_paths.len());
     let findings = manifest
         .files
         .iter()
         .filter(audit_entry_requires_closure)
+        .filter(|entry| unresolved_paths.contains(&entry.path))
         .filter(|entry| repo_root.join(&entry.path).exists())
         .cloned()
         .collect::<Vec<_>>();
@@ -1157,7 +1183,7 @@ async fn resolve_audit_findings_pass(
         .collect::<Vec<_>>();
 
     if findings.is_empty() {
-        println!("auto audit resolve findings: no existing flagged files to remediate");
+        println!("auto audit resolve findings: no existing unresolved flagged files to remediate");
         verify_audit_findings(repo_root, output_dir)?;
         return Ok(ResolvePassOutcome::Verified);
     }
@@ -1179,6 +1205,11 @@ async fn resolve_audit_findings_pass(
     println!("manifest: {}", manifest_path.display());
     println!("pass:     {resolve_pass}/{max_passes}");
     println!("lanes:    {} (max {})", lanes.len(), max_lanes);
+    if resolved_before_lane_count > 0 {
+        println!(
+            "preclosed: {resolved_before_lane_count} finding(s) already closed by removal or clean artifacts"
+        );
+    }
     println!("run dir:  {}", run_dir.display());
     println!("targets:  {}", target_root.display());
     println!("worktrees: {}", worktree_root.display());
