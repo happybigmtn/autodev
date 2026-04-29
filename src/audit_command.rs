@@ -1017,6 +1017,13 @@ async fn resolve_audit_findings(
 
     let max_passes = args.resolve_passes.max(1);
     for resolve_pass in 1..=max_passes {
+        if let Some(checkpoint) = auto_checkpoint_if_needed(
+            repo_root,
+            &target_branch,
+            &format!("audit finding resolution checkpoint pass {resolve_pass}"),
+        )? {
+            println!("checkpoint: committed resolve pass {resolve_pass} inputs at {checkpoint}");
+        }
         println!("auto audit resolve findings pass {resolve_pass}/{max_passes}");
         match resolve_audit_findings_pass(
             repo_root,
@@ -1030,6 +1037,17 @@ async fn resolve_audit_findings(
         {
             Ok(ResolvePassOutcome::Verified) => return Ok(()),
             Ok(ResolvePassOutcome::RetryNeeded { reason }) => {
+                if let Some(checkpoint) = auto_checkpoint_if_needed(
+                    repo_root,
+                    &target_branch,
+                    &format!(
+                        "audit finding resolution verification checkpoint pass {resolve_pass}"
+                    ),
+                )? {
+                    println!(
+                        "checkpoint: committed resolve pass {resolve_pass} verification output at {checkpoint}"
+                    );
+                }
                 if resolve_pass == max_passes {
                     bail!(
                         "audit findings are still not fully closed after {max_passes} resolve pass(es): {reason}"
