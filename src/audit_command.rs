@@ -2047,6 +2047,7 @@ fn build_finding_resolution_prompt(
          - Do not mark implementation-plan rows complete and do not edit audit/MANIFEST.json.\n\
          - Run targeted validation when practical and summarize what changed.\n\
          - Use the provided lane-local CARGO_TARGET_DIR. Do not override it.\n\
+         - Run Cargo validations serially within this lane unless you deliberately give each concurrent command a distinct target directory. Do not start a second `cargo test`, `cargo check`, `cargo clippy`, or `cargo fmt` command while another Cargo command is still running in this lane's target dir; wait for the first command to finish, then run the next proof.\n\
          - Cargo accepts only one test filter per `cargo test` command. Split multiple exact tests into separate commands or use one module-level/common filter.\n\n",
     );
     body.push_str("# Validation Environment\n\n");
