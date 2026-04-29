@@ -197,6 +197,9 @@ Spec contract for `{spec_path}`:
 Plan item contract for `{plan_path}`:
 - Add dependency-ordered unchecked items under `## Priority Work` or `## Follow-On Work`.
 - Preserve existing unfinished items and completed history.
+- Each item header MUST be exactly: `` - [ ] `<TASK-ID>` <Title> `` (task ID wrapped in backticks). The task ID must start with an uppercase letter, contain at least one digit, contain at least one hyphen, and use only `[A-Za-z0-9-]` characters.
+- Insert a blank line between the header and the first field line.
+- Field lines are 4-space-indented `<Field>: <value>` plain lines, NOT markdown bullets. Do not prefix field names with `- `.
 - Every new unfinished item must include these exact fields:
   - `Spec:`
   - `Why now:`

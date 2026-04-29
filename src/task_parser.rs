@@ -97,14 +97,69 @@ pub(crate) fn parse_task_header(line: &str) -> Option<(TaskStatus, String, Strin
         return None;
     };
 
-    let rest = rest.strip_prefix('`')?;
-    let tick = rest.find('`')?;
-    let id = rest[..tick].trim().to_string();
-    if id.is_empty() {
-        return None;
-    }
-    let title = rest[tick + 1..].trim().to_string();
+    // Two accepted ID forms:
+    //   1. Backticks (canonical):  `ID` Title
+    //   2. Bare ID (lenient):      ID Title  or  ID - Title
+    // The bare form is rejected unless the ID looks like a task identifier
+    // (starts uppercase, contains a digit, contains a hyphen, only [A-Za-z0-9-]).
+    // That keeps prose lines like "- [ ] Do the thing" from parsing as tasks.
+    let (id, title) = if let Some(rest_after_tick) = rest.strip_prefix('`') {
+        let tick = rest_after_tick.find('`')?;
+        let id = rest_after_tick[..tick].trim().to_string();
+        if id.is_empty() {
+            return None;
+        }
+        (id, rest_after_tick[tick + 1..].to_string())
+    } else {
+        let mut split = rest.splitn(2, char::is_whitespace);
+        let id_candidate = split.next().unwrap_or("").trim().to_string();
+        if !is_task_id_like(&id_candidate) {
+            return None;
+        }
+        let remainder = split.next().unwrap_or("").to_string();
+        (id_candidate, remainder)
+    };
+    let title = strip_optional_dash_separator(title.trim());
     Some((status, id, title))
+}
+
+fn is_task_id_like(candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    if !candidate
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return false;
+    }
+    if !candidate
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
+        return false;
+    }
+    if !candidate.chars().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    if !candidate.contains('-') {
+        return false;
+    }
+    true
+}
+
+fn strip_optional_dash_separator(title: &str) -> String {
+    let trimmed = title.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        rest.trim().to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("— ") {
+        rest.trim().to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("– ") {
+        rest.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn parse_task_dependencies(markdown: &str) -> Vec<String> {
@@ -350,7 +405,7 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tasks, TaskStatus};
+    use super::{is_task_id_like, parse_task_header, parse_tasks, TaskStatus};
 
     #[test]
     fn parses_all_plan_statuses_and_fields() {
@@ -440,6 +495,86 @@ mod tests {
         let tasks = parse_tasks(plan);
         assert!(tasks[0].dependencies.is_empty());
         assert_eq!(tasks[1].dependencies, vec!["AD-001", "AD-003"]);
+    }
+
+    #[test]
+    fn bare_id_header_is_accepted_when_id_is_task_shaped() {
+        // Auto-spec emits this shape; auto-parallel must accept it so the
+        // emitter and parser agree on a single planning surface.
+        let plan = r#"
+- [ ] SEC-20260429-01 - Constant-time watcher-link HMAC intake verification
+
+  Spec: `specs/290426-security-audit-remediation-2026-04-29.md`
+  Dependencies: none
+  Estimated scope: S
+"#;
+        let tasks = parse_tasks(plan);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "SEC-20260429-01");
+        assert_eq!(
+            tasks[0].title,
+            "Constant-time watcher-link HMAC intake verification"
+        );
+        assert_eq!(tasks[0].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn bare_id_without_dash_separator_is_accepted() {
+        let plan = r#"
+- [ ] TASK-007 Revalidate false-green guard
+  Dependencies: none
+"#;
+        let tasks = parse_tasks(plan);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "TASK-007");
+        assert_eq!(tasks[0].title, "Revalidate false-green guard");
+    }
+
+    #[test]
+    fn bare_prose_lines_are_not_parsed_as_tasks() {
+        // Ensure the bare-ID path does not false-match prose.
+        let plan = r#"
+- [ ] Do the thing later
+- [ ] TODO write a follow-up
+- [ ] something without identifier shape
+"#;
+        let tasks = parse_tasks(plan);
+        assert!(
+            tasks.is_empty(),
+            "prose-only lines must not produce tasks; got {tasks:#?}"
+        );
+    }
+
+    #[test]
+    fn parse_task_header_accepts_both_id_forms() {
+        let backticked = parse_task_header("- [ ] `SEC-20260429-01` Title here").unwrap();
+        assert_eq!(backticked.0, TaskStatus::Pending);
+        assert_eq!(backticked.1, "SEC-20260429-01");
+        assert_eq!(backticked.2, "Title here");
+
+        let bare = parse_task_header("- [ ] SEC-20260429-01 - Title here").unwrap();
+        assert_eq!(bare.0, TaskStatus::Pending);
+        assert_eq!(bare.1, "SEC-20260429-01");
+        assert_eq!(bare.2, "Title here");
+    }
+
+    #[test]
+    fn is_task_id_like_rejects_prose_and_accepts_real_ids() {
+        assert!(is_task_id_like("SEC-20260429-01"));
+        assert!(is_task_id_like("TASK-007"));
+        assert!(is_task_id_like("DESIGN-260426-01"));
+        assert!(is_task_id_like("AUD-AUTO-05"));
+        assert!(is_task_id_like("AD-001"));
+
+        assert!(!is_task_id_like("Do"));
+        assert!(!is_task_id_like("TODO")); // no digit, no hyphen
+        assert!(!is_task_id_like("task-007")); // starts lowercase
+        assert!(!is_task_id_like("123-foo")); // starts with digit
+        assert!(!is_task_id_like("ABC")); // no digit, no hyphen
+        assert!(!is_task_id_like("ABC-DEF")); // no digit
+        assert!(!is_task_id_like("FOO123")); // no hyphen
+        assert!(!is_task_id_like("FOO 123")); // contains space
+        assert!(!is_task_id_like(""));
     }
 
     #[test]
