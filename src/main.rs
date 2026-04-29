@@ -1116,6 +1116,11 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 2)]
     resolve_keep_runs: usize,
 
+    /// Maximum remediation/verification passes for --resolve-findings before
+    /// failing with the remaining open findings.
+    #[arg(long, default_value_t = 10)]
+    resolve_passes: usize,
+
     /// Disable pruning of completed finding-resolution Cargo target dirs.
     #[arg(long)]
     no_resolve_target_prune: bool,

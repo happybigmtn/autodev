@@ -1014,6 +1014,50 @@ async fn resolve_audit_findings(
         println!("checkpoint: {checkpoint}");
     }
 
+    let max_passes = args.resolve_passes.max(1);
+    for resolve_pass in 1..=max_passes {
+        println!("auto audit resolve findings pass {resolve_pass}/{max_passes}");
+        match resolve_audit_findings_pass(
+            repo_root,
+            output_dir,
+            args.clone(),
+            &target_branch,
+            resolve_pass,
+            max_passes,
+        )
+        .await
+        {
+            Ok(ResolvePassOutcome::Verified) => return Ok(()),
+            Ok(ResolvePassOutcome::RetryNeeded { reason }) => {
+                if resolve_pass == max_passes {
+                    bail!(
+                        "audit findings are still not fully closed after {max_passes} resolve pass(es): {reason}"
+                    );
+                }
+                eprintln!(
+                    "auto audit resolve findings pass {resolve_pass}/{max_passes} did not close all findings: {reason}"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    bail!("audit findings are still not fully closed after {max_passes} resolve pass(es)")
+}
+
+enum ResolvePassOutcome {
+    Verified,
+    RetryNeeded { reason: String },
+}
+
+async fn resolve_audit_findings_pass(
+    repo_root: &Path,
+    output_dir: &Path,
+    args: AuditArgs,
+    target_branch: &str,
+    resolve_pass: usize,
+    max_passes: usize,
+) -> Result<ResolvePassOutcome> {
     let manifest_path = output_dir.join("MANIFEST.json");
     if !manifest_path.exists() {
         bail!(
@@ -1041,12 +1085,13 @@ async fn resolve_audit_findings(
 
     if findings.is_empty() {
         println!("auto audit resolve findings: no existing flagged files to remediate");
-        return verify_audit_findings(repo_root, output_dir);
+        verify_audit_findings(repo_root, output_dir)?;
+        return Ok(ResolvePassOutcome::Verified);
     }
 
     let max_lanes = args.audit_threads.clamp(1, 8).min(findings.len());
     let lanes = build_finding_resolution_lanes(findings, max_lanes);
-    let run_id = crate::util::timestamp_slug();
+    let run_id = format!("{}-pass-{resolve_pass:02}", crate::util::timestamp_slug());
     let run_dir = output_dir.join("finding-resolution").join(&run_id);
     let target_root = finding_resolution_target_root(repo_root, &run_id);
     let worktree_root = finding_resolution_worktree_root(repo_root, &run_id);
@@ -1059,6 +1104,7 @@ async fn resolve_audit_findings(
 
     println!("auto audit resolve findings");
     println!("manifest: {}", manifest_path.display());
+    println!("pass:     {resolve_pass}/{max_passes}");
     println!("lanes:    {} (max {})", lanes.len(), max_lanes);
     println!("run dir:  {}", run_dir.display());
     println!("targets:  {}", target_root.display());
@@ -1211,24 +1257,42 @@ async fn resolve_audit_findings(
         &lane_statuses,
     )?;
     rerun_only_drifted_audit(repo_root, output_dir, &args, &finding_paths).await?;
-    verify_audit_findings(repo_root, output_dir)?;
-    write_finding_resolution_status(
-        output_dir,
-        &run_id,
-        "verified",
-        &run_dir,
-        &worktree_root,
-        &target_root,
-        &lane_statuses,
-    )?;
-    prune_finding_resolution_artifacts(
-        repo_root,
-        output_dir,
-        &run_id,
-        args.resolve_keep_runs,
-        !args.no_resolve_target_prune,
-        true,
-    )
+    match verify_audit_findings(repo_root, output_dir) {
+        Ok(()) => {
+            write_finding_resolution_status(
+                output_dir,
+                &run_id,
+                "verified",
+                &run_dir,
+                &worktree_root,
+                &target_root,
+                &lane_statuses,
+            )?;
+            prune_finding_resolution_artifacts(
+                repo_root,
+                output_dir,
+                &run_id,
+                args.resolve_keep_runs,
+                !args.no_resolve_target_prune,
+                true,
+            )?;
+            Ok(ResolvePassOutcome::Verified)
+        }
+        Err(err) => {
+            write_finding_resolution_status(
+                output_dir,
+                &run_id,
+                "verification-no-go",
+                &run_dir,
+                &worktree_root,
+                &target_root,
+                &lane_statuses,
+            )?;
+            Ok(ResolvePassOutcome::RetryNeeded {
+                reason: err.to_string(),
+            })
+        }
+    }
 }
 
 fn build_finding_resolution_lanes(
@@ -3480,6 +3544,7 @@ diff --git a/README.md b/README.md
             resolve_findings: false,
             resolve_validation_threads: 2,
             resolve_keep_runs: 2,
+            resolve_passes: 10,
             no_resolve_target_prune: false,
             allow_missing_resolve_roots: false,
             resume_mode: AuditResumeMode::Resume,

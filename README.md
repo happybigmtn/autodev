@@ -247,14 +247,18 @@ auto audit --everything \
 ```
 
 Use the legacy doctrine audit only when you specifically want per-file verdict
-resolution against an existing `audit/MANIFEST.json`:
+resolution against an existing `audit/MANIFEST.json`. The standalone closure
+command is `--resolve-findings`; it remediates flagged findings, re-audits
+changed files, verifies closure, and repeats until the verifier is clean or the
+bounded pass limit is exhausted:
 
 ```bash
 auto audit --resolve-findings \
   --model "$MODEL" \
   --reasoning-effort "$AUDIT_FIRST_PASS_EFFORT" \
   --escalation-model "$MODEL" \
-  --escalation-effort "$WORK_EFFORT"
+  --escalation-effort "$WORK_EFFORT" \
+  --resolve-passes 10
 ```
 
 #### 7. Ship Only After Evidence Is Durable
@@ -1306,16 +1310,23 @@ Defaults:
 - Doctrine prompt defaults to `audit/DOCTRINE.md`
 - Output directory defaults to `<repo>/audit`
 - Resume mode defaults to `resume`
-- The primary auditor defaults to Codex `gpt-5.5` with `high`
+- The primary auditor defaults to Codex `gpt-5.5` with `low`
 - Escalations default to Codex `gpt-5.5` with `high`
 - Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
 
 Closure verification:
 
-- After remediation, run `auto audit --resume-mode only-drifted` so changed files are re-audited
-  against the same manifest.
-- Then run `auto audit --verify-findings`. It fails with `NO-GO` until every flagged finding is
-  either re-audited out of the manifest's significant verdict set or removed from the current tree.
+- Prefer `auto audit --resolve-findings` for remediation closeout. It runs parallel
+  remediation lanes, re-audits only changed flagged files, runs `--verify-findings`, and repeats
+  up to `--resolve-passes` times, defaulting to 10.
+- Use `auto audit --resume-mode only-drifted` manually only when you have already made
+  remediation edits outside the resolver and need to refresh changed entries against the same
+  manifest.
+- `auto audit --verify-findings` fails with `NO-GO` until every flagged finding is either
+  re-audited out of the manifest's significant verdict set or removed from the current tree.
+  `StillOpen` means the last audited significant verdict is still current for that file;
+  `NeedsReaudit` means the file changed after the finding and must be re-audited before closure
+  can be trusted.
 
 #### `auto audit --everything`
 
