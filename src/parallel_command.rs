@@ -1520,6 +1520,17 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn run_parallel_inline(args: ParallelArgs) -> Result<()> {
+    let previous = env::var_os("AUTO_PARALLEL_TMUX_BOOTSTRAPPED");
+    env::set_var("AUTO_PARALLEL_TMUX_BOOTSTRAPPED", "1");
+    let result = run_parallel(args).await;
+    match previous {
+        Some(value) => env::set_var("AUTO_PARALLEL_TMUX_BOOTSTRAPPED", value),
+        None => env::remove_var("AUTO_PARALLEL_TMUX_BOOTSTRAPPED"),
+    }
+    result
+}
+
 fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
     let current_pid = std::process::id();
     command_stdout(Path::new("."), ["pgrep", "-af", "auto parallel"])

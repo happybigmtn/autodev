@@ -1257,7 +1257,14 @@ async fn resolve_audit_findings_pass(
         &target_root,
         &lane_statuses,
     )?;
-    rerun_only_drifted_audit(repo_root, output_dir, &args, &finding_paths).await?;
+    let reaudit_status = rerun_only_drifted_audit(repo_root, output_dir, &args, &finding_paths)
+        .await
+        .context("failed to launch drifted finding re-audit")?;
+    if let ReauditOutcome::NoGo { status } = &reaudit_status {
+        eprintln!(
+            "auto audit resolve findings: only-drifted re-audit exited with {status}; verifying findings and continuing the resolve loop if needed"
+        );
+    }
     match verify_audit_findings(repo_root, output_dir) {
         Ok(()) => {
             write_finding_resolution_status(
@@ -1294,6 +1301,11 @@ async fn resolve_audit_findings_pass(
             })
         }
     }
+}
+
+enum ReauditOutcome {
+    Success,
+    NoGo { status: String },
 }
 
 fn build_finding_resolution_lanes(
@@ -2085,7 +2097,7 @@ async fn rerun_only_drifted_audit(
     output_dir: &Path,
     args: &AuditArgs,
     focus_paths: &[String],
-) -> Result<()> {
+) -> Result<ReauditOutcome> {
     let exe = resolve_auto_executable()?;
     let mut command = TokioCommand::new(exe);
     command
@@ -2142,9 +2154,11 @@ async fn rerun_only_drifted_audit(
         .await
         .context("failed to launch only-drifted audit subprocess")?;
     if !status.success() {
-        bail!("only-drifted audit subprocess failed with status {status}");
+        return Ok(ReauditOutcome::NoGo {
+            status: status.to_string(),
+        });
     }
-    Ok(())
+    Ok(ReauditOutcome::Success)
 }
 
 fn slugify(text: &str) -> String {

@@ -46,6 +46,7 @@ struct SuperManifest {
     max_iterations: Option<usize>,
     execute: bool,
     design_enabled: bool,
+    design_resolve_passes: usize,
     stages: Vec<SuperStage>,
 }
 
@@ -90,6 +91,12 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             "stages:      corpus -> design perfection gate{} -> CEO functional review -> gen -> execution gate -> parallel",
             if args.skip_design { " (skipped)" } else { "" }
         );
+        if !args.skip_design && !args.no_execute {
+            println!(
+                "design fix:  up to {} resolve pass(es)",
+                args.design_resolve_passes.max(1)
+            );
+        }
         return Ok(());
     }
 
@@ -114,6 +121,11 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         max_iterations: args.max_iterations,
         execute: !args.no_execute,
         design_enabled: !args.skip_design,
+        design_resolve_passes: if args.no_execute || args.skip_design {
+            0
+        } else {
+            args.design_resolve_passes.max(1)
+        },
         stages: Vec::new(),
     };
     write_manifest(&super_root, &manifest)?;

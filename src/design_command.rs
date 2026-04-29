@@ -5,10 +5,11 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::codex_exec::run_codex_exec_max_context;
+use crate::parallel_command;
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
-use crate::{DesignArgs, SuperArgs};
+use crate::{DesignArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, SuperArgs};
 
 const DESIGN_ARTIFACTS: [&str; 6] = [
     "DESIGN-AUDIT.md",
@@ -29,6 +30,8 @@ struct DesignManifest {
     model: String,
     reasoning_effort: String,
     apply: bool,
+    resolve: bool,
+    resolve_passes: usize,
     skip_qa: bool,
     binary: String,
 }
@@ -36,6 +39,10 @@ struct DesignManifest {
 pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    if args.resolve {
+        return run_design_resolution(args, DesignRunKind::Resolve).await;
+    }
+
     let run_id = timestamp_slug();
     let output_dir = args
         .output_dir
@@ -62,6 +69,8 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
         model: args.model.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
         apply: args.apply,
+        resolve: false,
+        resolve_passes: 1,
         skip_qa: args.skip_qa,
         binary: binary_provenance_line(),
     };
@@ -125,12 +134,217 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<()> {
+    let repo_root = git_repo_root()?;
+    ensure_repo_layout(&repo_root)?;
+    let run_id = timestamp_slug();
+    let output_root = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| repo_root.join(".auto").join("design").join(&run_id));
+    let planning_root = args.planning_root.clone().or_else(|| {
+        repo_root
+            .join("genesis")
+            .exists()
+            .then(|| repo_root.join("genesis"))
+    });
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+
+    let max_passes = args.resolve_passes.max(1);
+    let manifest = DesignManifest {
+        run_id,
+        repo_root: repo_root.display().to_string(),
+        planning_root: planning_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        output_dir: output_root.display().to_string(),
+        prompt: args.prompt.clone(),
+        model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
+        apply: true,
+        resolve: true,
+        resolve_passes: max_passes,
+        skip_qa: args.skip_qa,
+        binary: binary_provenance_line(),
+    };
+    atomic_write(
+        &output_root.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest)?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            output_root.join("manifest.json").display()
+        )
+    })?;
+
+    println!("auto design --resolve");
+    println!("binary:      {}", binary_provenance_line());
+    println!("repo root:   {}", repo_root.display());
+    if let Some(planning_root) = &planning_root {
+        println!("planning:    {}", planning_root.display());
+    }
+    println!("output root: {}", output_root.display());
+    println!("model:       {}", args.model);
+    println!("effort:      {}", args.reasoning_effort);
+    println!("passes:      {max_passes}");
+    println!("workers:     {}", args.max_concurrent_workers.max(1));
+    println!(
+        "qa:          {}",
+        if args.skip_qa { "skipped" } else { "enabled" }
+    );
+
+    if args.dry_run {
+        let prompt = build_design_prompt(
+            &repo_root,
+            planning_root.as_deref(),
+            &output_root.join("pass-01"),
+            args.prompt.as_deref(),
+            true,
+            args.skip_qa,
+            kind,
+        );
+        println!("\n{prompt}");
+        return Ok(());
+    }
+
+    let mut last_report = None;
+    for pass in 1..=max_passes {
+        let pass_dir = output_root.join(format!("pass-{pass:02}"));
+        fs::create_dir_all(&pass_dir)
+            .with_context(|| format!("failed to create {}", pass_dir.display()))?;
+        println!("stage:       design resolve pass {pass}/{max_passes}");
+        let prompt = build_design_prompt(
+            &repo_root,
+            planning_root.as_deref(),
+            &pass_dir,
+            args.prompt.as_deref(),
+            true,
+            args.skip_qa,
+            kind,
+        );
+        let prompt_path = pass_dir.join("design-prompt.md");
+        atomic_write(&prompt_path, prompt.as_bytes())
+            .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+        run_design_codex_phase(
+            &repo_root,
+            &pass_dir,
+            &prompt,
+            &args.model,
+            &args.reasoning_effort,
+            &args.codex_bin,
+            &format!("auto-design-resolve-pass-{pass:02}"),
+        )
+        .await?;
+        verify_design_artifacts(&pass_dir)?;
+        last_report = Some(pass_dir.join("DESIGN-REPORT.md"));
+        write_design_resolution_status(&output_root, pass, max_passes, &pass_dir, "audited")?;
+        if design_report_is_go(&pass_dir)? {
+            write_design_resolution_status(&output_root, pass, max_passes, &pass_dir, "verified")?;
+            println!("status:      design resolve verified");
+            println!("pass dir:    {}", pass_dir.display());
+            return Ok(());
+        }
+        if pass == max_passes {
+            break;
+        }
+        println!("stage:       design implementation pass {pass}/{max_passes}");
+        run_design_parallel_pass(&args, &output_root, pass).await?;
+        write_design_resolution_status(
+            &output_root,
+            pass,
+            max_passes,
+            &pass_dir,
+            "implementation-pass-complete",
+        )?;
+    }
+
+    let report = last_report
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| output_root.display().to_string());
+    bail!("design resolve did not reach `Verdict: GO` after {max_passes} pass(es); latest report: {report}")
+}
+
+async fn run_design_parallel_pass(
+    args: &DesignArgs,
+    output_root: &Path,
+    pass: usize,
+) -> Result<()> {
+    parallel_command::run_parallel_inline(ParallelArgs {
+        action: None::<ParallelAction>,
+        max_iterations: args.max_iterations,
+        max_concurrent_workers: args.max_concurrent_workers.max(1),
+        cargo_build_jobs: None,
+        cargo_target: ParallelCargoTarget::Auto,
+        prompt_file: None,
+        model: args.worker_model.clone(),
+        reasoning_effort: args.worker_reasoning_effort.clone(),
+        branch: args.branch.clone(),
+        reference_repos: args.reference_repos.clone(),
+        include_siblings: false,
+        run_root: Some(output_root.join("parallel").join(format!("pass-{pass:02}"))),
+        codex_bin: args.codex_bin.clone(),
+        claude: false,
+        max_turns: None,
+        max_retries: 2,
+    })
+    .await
+}
+
+fn write_design_resolution_status(
+    output_root: &Path,
+    pass: usize,
+    max_passes: usize,
+    pass_dir: &Path,
+    status: &str,
+) -> Result<()> {
+    let markdown = format!(
+        "# Design Resolve Status\n\n- Status: `{status}`\n- Pass: `{pass}/{max_passes}`\n- Latest artifacts: `{}`\n- Latest report: `{}`\n",
+        pass_dir.display(),
+        pass_dir.join("DESIGN-REPORT.md").display()
+    );
+    atomic_write(
+        &output_root.join("DESIGN-RESOLVE-STATUS.md"),
+        markdown.as_bytes(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            output_root.join("DESIGN-RESOLVE-STATUS.md").display()
+        )
+    })
+}
+
 pub(crate) async fn run_super_design_module(
     args: &SuperArgs,
     repo_root: &Path,
     planning_root: &Path,
     super_root: &Path,
 ) -> Result<()> {
+    if !args.no_execute && args.design_resolve_passes > 1 {
+        let design_args = DesignArgs {
+            prompt: args.prompt.clone().or_else(|| args.focus.clone()),
+            planning_root: Some(planning_root.to_path_buf()),
+            output_dir: Some(super_root.join("design")),
+            apply: true,
+            resolve: true,
+            resolve_passes: args.design_resolve_passes,
+            max_concurrent_workers: args.max_concurrent_workers.max(1),
+            max_iterations: args.max_iterations,
+            worker_model: args.worker_model.clone(),
+            worker_reasoning_effort: args.worker_reasoning_effort.clone(),
+            branch: args.branch.clone(),
+            reference_repos: args.reference_repos.clone(),
+            skip_qa: false,
+            model: args.model.clone(),
+            reasoning_effort: args.reasoning_effort.clone(),
+            codex_bin: args.codex_bin.clone(),
+            dry_run: false,
+        };
+        return run_design_resolution(design_args, DesignRunKind::SuperResolve).await;
+    }
+
     let design_root = super_root.join("design");
     fs::create_dir_all(&design_root)
         .with_context(|| format!("failed to create {}", design_root.display()))?;
@@ -196,7 +410,9 @@ async fn run_design_codex_phase(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum DesignRunKind {
     Standalone,
+    Resolve,
     Super,
+    SuperResolve,
 }
 
 fn build_design_prompt(
@@ -226,8 +442,14 @@ fn build_design_prompt(
             DesignRunKind::Standalone => {
                 "- You may make bounded edits to root `DESIGN.md`, design-relevant `specs/*.md`, and `IMPLEMENTATION_PLAN.md` when they are necessary to encode design/runtime truth. Do not edit application source code."
             }
+            DesignRunKind::Resolve => {
+                "- You may make bounded edits to root `DESIGN.md`, design-relevant `specs/*.md`, and `IMPLEMENTATION_PLAN.md` when they are necessary to encode design/runtime truth. Do not edit application source code in this design pass; unresolved source/runtime work must become executable implementation-plan tasks for the following `auto parallel` pass."
+            }
             DesignRunKind::Super => {
                 "- You may amend root `DESIGN.md` and the planning corpus design files so `auto gen` inherits the design contract. Do not edit source code, root specs, or root `IMPLEMENTATION_PLAN.md` in this pre-generation super module."
+            }
+            DesignRunKind::SuperResolve => {
+                "- You may make bounded edits to root `DESIGN.md`, design-relevant `specs/*.md`, planning corpus design files, and `IMPLEMENTATION_PLAN.md` when needed to encode design/runtime truth. Do not edit application source code in this design pass; unresolved source/runtime work must become executable implementation-plan tasks for the following `auto parallel` pass."
             }
         }
     } else {
@@ -240,8 +462,14 @@ fn build_design_prompt(
     };
     let stage_clause = match kind {
         DesignRunKind::Standalone => "You are running standalone `auto design`.",
+        DesignRunKind::Resolve => {
+            "You are running `auto design --resolve`: diagnose design/runtime drift, encode durable doctrine and queue-ready implementation tasks, then let implementation lanes repair source code before you re-verify."
+        }
         DesignRunKind::Super => {
             "You are the `auto super` design perfection gate running after corpus and before generation. Design is first-class and blocking: do not subordinate, soften, or defer design/runtime integrity findings into a later generic review."
+        }
+        DesignRunKind::SuperResolve => {
+            "You are the `auto super` design repair gate running after corpus and before generation. Design is first-class and blocking: diagnose design/runtime drift, encode executable repair work, let implementation lanes fix it, and only allow the CEO production campaign to continue after `Verdict: GO`."
         }
     };
 
@@ -308,7 +536,9 @@ Write these non-empty artifacts under `{output_dir}`:
 
 If `{apply_status}`:
 - Update `DESIGN.md` only with durable doctrine grounded in the live product and existing frontend.
-- In standalone mode, add or amend plan/spec items only for real unresolved work. In super mode, prefer amending the planning corpus so `auto gen` emits the queue.
+- In standalone mode, add or amend plan/spec items only for real unresolved work. In super mode, prefer amending the planning corpus so `auto gen` emits the queue unless this is a resolve pass.
+- In resolve mode, every unresolved NO-GO issue that requires source/runtime/UI changes must also be inserted into root `IMPLEMENTATION_PLAN.md` as an unchecked, dependency-ready task unless it has a concrete dependency. Use stable `DESIGN-*` task IDs, machine-readable `Dependencies:`, narrow `Owns:`, runtime owner, UI consumer, generated artifact, fixture boundary, and executable verification fields so `auto parallel` can pick it up immediately.
+- In resolve mode, do not leave the only actionable repair work inside `DESIGN-PLAN-ITEMS.md`; that file is an audit artifact, while `IMPLEMENTATION_PLAN.md` is the executor queue.
 - Do not mark any implementation item complete.
 
 Final line of `DESIGN-REPORT.md` must be exactly one of:
@@ -353,16 +583,21 @@ fn verify_design_artifacts(output_dir: &Path) -> Result<()> {
 }
 
 fn require_design_go(output_dir: &Path) -> Result<()> {
+    if design_report_is_go(output_dir)? {
+        return Ok(());
+    }
+    let report_path = output_dir.join("DESIGN-REPORT.md");
+    bail!(
+        "design perfection gate did not approve downstream generation; expected `Verdict: GO` in {}",
+        report_path.display()
+    );
+}
+
+fn design_report_is_go(output_dir: &Path) -> Result<bool> {
     let report_path = output_dir.join("DESIGN-REPORT.md");
     let report = fs::read_to_string(&report_path)
         .with_context(|| format!("failed to read {}", report_path.display()))?;
-    if !report.lines().any(|line| line.trim() == "Verdict: GO") {
-        bail!(
-            "design perfection gate did not approve downstream generation; expected `Verdict: GO` in {}",
-            report_path.display()
-        );
-    }
-    Ok(())
+    Ok(report.lines().any(|line| line.trim() == "Verdict: GO"))
 }
 
 fn require_nonempty_file(path: &Path) -> Result<()> {

@@ -566,6 +566,42 @@ pub(crate) struct DesignArgs {
     #[arg(long)]
     apply: bool,
 
+    /// Resolve design/runtime findings by adding queue-ready plan items, running auto parallel, and re-verifying until GO.
+    #[arg(long)]
+    resolve: bool,
+
+    /// Maximum design audit/implementation/reverification passes for --resolve.
+    #[arg(long, default_value_t = 3)]
+    resolve_passes: usize,
+
+    /// Maximum concurrent implementation lanes when --resolve launches auto parallel.
+    #[arg(
+        long = "threads",
+        visible_alias = "max-concurrent-workers",
+        default_value_t = 5
+    )]
+    max_concurrent_workers: usize,
+
+    /// Stop each --resolve auto parallel pass after this many successful lands. Default is unlimited.
+    #[arg(long)]
+    max_iterations: Option<usize>,
+
+    /// Model used by implementation workers during --resolve.
+    #[arg(long, default_value = "gpt-5.5")]
+    worker_model: String,
+
+    /// Reasoning effort used by implementation workers during --resolve.
+    #[arg(long, default_value = "high")]
+    worker_reasoning_effort: String,
+
+    /// Branch that --resolve auto parallel is allowed to run on. Defaults to the repo's primary branch.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Additional repository roots implementation workers may inspect as read-only context during --resolve.
+    #[arg(long = "reference-repo")]
+    reference_repos: Vec<PathBuf>,
+
     /// Skip browser/runtime QA attempts and produce the design + contract audit only
     #[arg(long)]
     skip_qa: bool,
@@ -667,6 +703,10 @@ pub(crate) struct SuperArgs {
     /// Skip the design perfection gate before functional reviews and generation
     #[arg(long)]
     skip_design: bool,
+
+    /// Maximum design repair passes before auto super gives up on design/runtime integrity.
+    #[arg(long, default_value_t = 3)]
+    design_resolve_passes: usize,
 
     /// Preview the planned super workflow without invoking models or launching workers
     #[arg(long)]

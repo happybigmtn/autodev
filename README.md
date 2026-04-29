@@ -624,6 +624,8 @@ What it writes:
 - `.auto/design/<run-id>/FRONTEND-QA.md`
 - `.auto/design/<run-id>/DESIGN-PLAN-ITEMS.md`
 - `.auto/design/<run-id>/DESIGN-REPORT.md`
+- `.auto/design/<run-id>/DESIGN-RESOLVE-STATUS.md` when `--resolve` is used
+- `.auto/design/<run-id>/parallel/` when `--resolve` launches implementation lanes
 
 What it enforces:
 
@@ -634,11 +636,14 @@ What it enforces:
 - Every design improvement names the runtime owner, API/schema or generator impact, UI consumer,
   and proof that would catch drift returning
 - `DESIGN-REPORT.md` must end with `Verdict: GO` or `Verdict: NO-GO`
+- `--resolve` must promote actionable NO-GO findings into root `IMPLEMENTATION_PLAN.md`; the
+  artifact-only `DESIGN-PLAN-ITEMS.md` is not enough for execution
 
 Example:
 
 ```bash
 auto design "make the console production-ready without drifting from engine state" --apply
+auto design "make the console production-ready without drifting from engine state" --resolve --threads 8
 ```
 
 ### `auto super`
@@ -681,7 +686,9 @@ What it actually does:
 - Builds a CEO 14-day production-race focus brief from the positional prompt and optional `--focus`
 - Runs `auto corpus` with GPT-5.5 `xhigh` and max Codex context
 - Runs a design perfection gate that reads `DESIGN.md`, frontend code, runtime owners, generated
-  bindings, and QA surfaces, then blocks on `Verdict: GO`
+  bindings, and QA surfaces. By default, when execution is enabled, it can repair NO-GO design
+  feedback by inserting executable design/runtime tasks into `IMPLEMENTATION_PLAN.md`, launching
+  `auto parallel`, and re-running the design gate up to `--design-resolve-passes`.
 - Runs a CEO functional review board across Product, Design/Frontend, Architecture, Runtime/Engine,
   Security/Trust, Reliability/Ops, QA/Test, Data/Contracts, Performance, DX/Agent Workflow, and
   Release perspectives
@@ -706,6 +713,8 @@ Useful flags:
 - `--no-execute` stops after corpus, generation, and gates without launching workers
 - `--skip-design` skips the design perfection gate; use only when an equivalent design/runtime
   review is already current and file-backed
+- `--design-resolve-passes <n>` controls how many design audit/parallel/reverify rounds can run
+  before the CEO campaign gives up on design/runtime integrity
 - `--skip-super-review` keeps only the normal corpus/gen review controls and deterministic gate
 - `--threads <n>` controls parallel worker lanes
 - `--max-iterations <n>` limits successful parallel lands
@@ -1399,7 +1408,9 @@ Closure verification:
 
 - Prefer `auto audit --resolve-findings` for remediation closeout. It runs parallel
   remediation lanes, re-audits only changed flagged files, runs `--verify-findings`, and repeats
-  up to `--resolve-passes` times, defaulting to 10.
+  up to `--resolve-passes` times, defaulting to 10. If the drift-only re-audit exits non-zero
+  because findings remain, the resolver records that as retry-needed and continues the next pass
+  instead of stopping the whole closeout early.
 - Use `auto audit --resume-mode only-drifted` manually only when you have already made
   remediation edits outside the resolver and need to refresh changed entries against the same
   manifest.
