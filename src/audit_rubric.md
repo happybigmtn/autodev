@@ -69,6 +69,12 @@ verdict warrants a second-opinion pass by a stronger reviewer.
 - Patches must be minimal. If you find yourself writing a 300-line diff,
   downgrade to `DRIFT-LARGE` or `REFACTOR` and write a worklist entry
   instead.
+- Patches must be stable after commit. Do not fix stale "current HEAD",
+  timestamp, run id, local checkout, or other volatile proof drift by
+  substituting the value from this audit run; that creates a self-invalidating
+  patch as soon as the runner commits it. Replace volatile proof with a stable
+  release identity, a command to run, or wording that distinguishes selected
+  release evidence from the current checkout without embedding a moving value.
 - Do NOT modify files other than the one under audit without explicit
   doctrine authorization.
 - Do NOT mix fixing behaviour with formatting churn in the same patch.

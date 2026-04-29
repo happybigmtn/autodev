@@ -2024,6 +2024,7 @@ fn build_finding_resolution_prompt(
          Required behavior:\n\
          - For RETIRE findings, delete the obsolete file/code if it is truly unused, or simplify it until the retirement finding is no longer valid.\n\
          - For DRIFT-LARGE, DRIFT-SMALL, REFACTOR, ApplyFailed, or Escalated findings, make the smallest code/docs/spec changes needed for the file to pass re-audit.\n\
+         - Do not resolve stale current-HEAD, timestamp, run-id, local-checkout, or other volatile proof drift by replacing it with this lane's current value; that self-invalidates after the lane commits. Instead, remove the moving value, point to a stable release identity, or require the command to be run at review time.\n\
          - Keep edits scoped to this lane's paths and direct dependencies.\n\
          - Do not mark implementation-plan rows complete and do not edit audit/MANIFEST.json.\n\
          - Run targeted validation when practical and summarize what changed.\n\
