@@ -164,6 +164,7 @@ struct FindingVerificationReport {
     manifest_path: String,
     total_flagged: usize,
     resolved_removed: usize,
+    resolved_clean_artifact: usize,
     still_open: usize,
     needs_reaudit: usize,
     findings: Vec<FindingVerificationEntry>,
@@ -183,6 +184,7 @@ struct FindingVerificationEntry {
 #[serde(rename_all = "snake_case")]
 enum FindingVerificationResult {
     ResolvedRemoved,
+    ResolvedCleanArtifact,
     NeedsReaudit,
     StillOpen,
 }
@@ -878,6 +880,9 @@ fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
             Some(current_hash) if entry.content_hash.as_deref() != Some(current_hash) => {
                 FindingVerificationResult::NeedsReaudit
             }
+            Some(_) if clean_artifact_verdict(output_dir, &entry.path)? => {
+                FindingVerificationResult::ResolvedCleanArtifact
+            }
             Some(_) => FindingVerificationResult::StillOpen,
         };
         findings.push(FindingVerificationEntry {
@@ -901,6 +906,10 @@ fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
         resolved_removed: findings
             .iter()
             .filter(|finding| finding.result == FindingVerificationResult::ResolvedRemoved)
+            .count(),
+        resolved_clean_artifact: findings
+            .iter()
+            .filter(|finding| finding.result == FindingVerificationResult::ResolvedCleanArtifact)
             .count(),
         needs_reaudit: findings
             .iter()
@@ -937,6 +946,10 @@ fn verify_audit_findings(repo_root: &Path, output_dir: &Path) -> Result<()> {
 }
 
 fn audit_entry_requires_closure(entry: &&ManifestEntry) -> bool {
+    manifest_entry_requires_closure(*entry)
+}
+
+fn manifest_entry_requires_closure(entry: &ManifestEntry) -> bool {
     matches!(
         entry.verdict.as_deref(),
         Some("DRIFT-LARGE" | "DRIFT-SMALL" | "REFACTOR" | "RETIRE")
@@ -944,6 +957,18 @@ fn audit_entry_requires_closure(entry: &&ManifestEntry) -> bool {
         entry.status,
         EntryStatus::ApplyFailed | EntryStatus::Escalated
     )
+}
+
+fn clean_artifact_verdict(output_dir: &Path, rel_path: &str) -> Result<bool> {
+    let verdict_path = file_artifact_dir(output_dir, rel_path).join("verdict.json");
+    if !verdict_path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(&verdict_path)
+        .with_context(|| format!("failed to read {}", verdict_path.display()))?;
+    let verdict: FileVerdict = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", verdict_path.display()))?;
+    Ok(verdict.verdict == "CLEAN")
 }
 
 fn write_finding_verification_report(
@@ -962,6 +987,10 @@ fn write_finding_verification_report(
         "- Resolved by removal: `{}`\n",
         report.resolved_removed
     ));
+    markdown.push_str(&format!(
+        "- Resolved by clean artifact: `{}`\n",
+        report.resolved_clean_artifact
+    ));
     markdown.push_str(&format!("- Needs re-audit: `{}`\n", report.needs_reaudit));
     markdown.push_str(&format!("- Still open: `{}`\n\n", report.still_open));
 
@@ -975,7 +1004,11 @@ fn write_finding_verification_report(
         markdown.push_str("| Result | Verdict | Status | Path |\n");
         markdown.push_str("|---|---|---|---|\n");
         for finding in &report.findings {
-            if finding.result == FindingVerificationResult::ResolvedRemoved {
+            if matches!(
+                finding.result,
+                FindingVerificationResult::ResolvedRemoved
+                    | FindingVerificationResult::ResolvedCleanArtifact
+            ) {
                 continue;
             }
             markdown.push_str(&format!(
@@ -2936,9 +2969,10 @@ mod tests {
     use crate::{AuditArgs, AuditResumeMode};
 
     use super::{
-        apply_verdict, build_file_prompt, commit_scoped, enumerate_tracked_files, glob_match,
-        matches_any, plan_audit_queue, run_auditor, sha256_hex, verify_audit_findings, EntryStatus,
-        FileVerdict, Manifest, ManifestEntry, DEFAULT_EXCLUDE_GLOBS,
+        apply_verdict, build_file_prompt, commit_scoped, enumerate_tracked_files,
+        file_artifact_dir, glob_match, matches_any, plan_audit_queue, run_auditor, sha256_hex,
+        verify_audit_findings, EntryStatus, FileVerdict, Manifest, ManifestEntry,
+        DEFAULT_EXCLUDE_GLOBS,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -3211,6 +3245,61 @@ mod tests {
         verify_audit_findings(repo.path(), &audit_dir).unwrap();
         let report = fs::read_to_string(audit_dir.join("FINDING-VERIFY.md")).unwrap();
         assert!(report.contains("Verdict: GO"), "{report}");
+    }
+
+    #[test]
+    fn verify_audit_findings_accepts_clean_artifact_for_stale_manifest_verdict() {
+        let repo = TestTempDir::new("verify-findings-clean-artifact");
+        let audit_dir = repo.path().join("audit");
+        fs::create_dir_all(&audit_dir).unwrap();
+        fs::write(repo.path().join("a.rs"), "fn fixed() {}\n").unwrap();
+        let manifest = Manifest {
+            started_at: "2026-04-28T00:00:00Z".to_string(),
+            repo_head: "HEAD".to_string(),
+            doctrine_hash: "doctrine".to_string(),
+            rubric_hash: "rubric".to_string(),
+            files: vec![ManifestEntry {
+                path: "a.rs".to_string(),
+                status: EntryStatus::Audited,
+                content_hash: Some(sha256_hex(b"fn fixed() {}\n")),
+                audited_doctrine_hash: Some("doctrine".to_string()),
+                audited_rubric_hash: Some("rubric".to_string()),
+                verdict: Some("DRIFT-SMALL".to_string()),
+                audited_at: Some("2026-04-28T00:00:00Z".to_string()),
+                commit: None,
+            }],
+        };
+        fs::write(
+            audit_dir.join("MANIFEST.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let artifact_dir = file_artifact_dir(&audit_dir, "a.rs");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        fs::write(
+            artifact_dir.join("verdict.json"),
+            serde_json::json!({
+                "verdict": "CLEAN",
+                "rationale": "re-audited clean",
+                "touched_paths": [],
+                "escalate": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        verify_audit_findings(repo.path(), &audit_dir).unwrap();
+        let report = fs::read_to_string(audit_dir.join("FINDING-VERIFY.md")).unwrap();
+        assert!(report.contains("Verdict: GO"), "{report}");
+        assert!(
+            report.contains("Resolved by clean artifact: `1`"),
+            "{report}"
+        );
+        let report_json = fs::read_to_string(audit_dir.join("FINDING-VERIFY.json")).unwrap();
+        assert!(
+            report_json.contains("resolved_clean_artifact"),
+            "{report_json}"
+        );
     }
 
     #[test]
