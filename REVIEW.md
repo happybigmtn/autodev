@@ -66,3 +66,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-007.json`
 - Completion artifacts: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`, `WORKLIST.md`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `DESIGN-006`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `scripts/verification_receipt.py`, `src/completion_artifacts.rs`, `src/ship_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-006.json` is missing command(s): `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_stale_commit_receipt`, `cargo test ship_command::tests::ship_gate_rejects_stale_completion_receipt`, `scripts/run-task-verification.sh DESIGN-006 cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`
+- Completion artifacts: `scripts/verification_receipt.py`, `src/completion_artifacts.rs`, `.auto/symphony/verification-receipts/DESIGN-006.json`
+- Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-006.json` is missing command(s): `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_stale_commit_receipt`, `cargo test ship_command::tests::ship_gate_rejects_stale_completion_receipt`, `scripts/run-task-verification.sh DESIGN-006 cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`
