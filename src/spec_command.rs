@@ -5,6 +5,9 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 
 use crate::codex_exec::run_codex_exec_max_context;
+use crate::task_parser::{
+    parse_task_header, parse_tasks, task_field_body_until_any, TaskStatus, TASK_FIELD_BOUNDARIES,
+};
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
 use crate::SpecArgs;
 
@@ -200,6 +203,7 @@ Plan item contract for `{plan_path}`:
 - Each item header MUST be exactly: `` - [ ] `<TASK-ID>` <Title> `` (task ID wrapped in backticks). The task ID must start with an uppercase letter, contain at least one digit, contain at least one hyphen, and use only `[A-Za-z0-9-]` characters.
 - Insert a blank line between the header and the first field line.
 - Field lines are 4-space-indented `<Field>: <value>` plain lines, NOT markdown bullets. Do not prefix field names with `- `.
+- Keep fields in the exact order listed below so shared parsers stop each field at the same boundary.
 - Every new unfinished item must include these exact fields:
   - `Spec:`
   - `Why now:`
@@ -232,7 +236,11 @@ Plan item contract for `{plan_path}`:
 - `Contract generation:` names the generation/check command or `none -- no generated contract`.
 - `Cross-surface tests:` names a runtime-to-UI/readback proof when UI is affected, or `none -- no UI/runtime boundary`.
 - `Review/closeout:` must describe independent proof for the original requirement, not just `cargo check`.
+- `Dependencies:` is scheduler input, not prose. It must be exactly `none` or only comma-separated/backticked task IDs already present in `{plan_path}` (for example ``Dependencies: `TASK-001`, `TASK-002` `` or one `- `TASK-ID`` per line). Do not include parentheticals, wave notes, "parallel with", "after", "blocked by", "depends on", or explanatory text in this field.
 - `Estimated scope:` must be `XS`, `S`, or `M`; split larger work.
+- `Verification:` and `Required tests:` must contain scoped executable commands or explicit non-executable proof. Do not let metadata fields appear inside them.
+- `Completion artifacts:` must be `none` or concrete repo-relative proof/artifact paths.
+- Every new task must be parseable by the same shared task parser used by `auto parallel`; do not rely on prose-only gates, compact follow-on rows, or markdown tables.
 
 Process rules to encode in the spec and task split:
 - Runtime owns facts; UI renders facts.
@@ -279,47 +287,265 @@ fn verify_plan_output(plan_path: &Path, spec_path: &Path) -> Result<()> {
         .display()
         .to_string();
     let absolute_spec_ref = spec_path.display().to_string();
-    let Some(spec_ref_index) = text
-        .find(&spec_ref)
-        .or_else(|| text.find(&absolute_spec_ref))
-    else {
+    if !text.contains(&spec_ref) && !text.contains(&absolute_spec_ref) {
         bail!(
             "auto spec plan output {} must reference {}",
             plan_path.display(),
             spec_path.display()
         );
-    };
-    let plan_item = plan_item_around(&text, spec_ref_index);
+    }
+    let tasks = parse_tasks(&text);
+    let all_task_ids = tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let spec_tasks = tasks
+        .iter()
+        .filter(|task| {
+            task.markdown.contains(&spec_ref) || task.markdown.contains(&absolute_spec_ref)
+        })
+        .collect::<Vec<_>>();
+    if spec_tasks.is_empty() {
+        bail!(
+            "auto spec plan output {} references {} but no parseable task owns that reference",
+            plan_path.display(),
+            spec_path.display()
+        );
+    }
+    for task in spec_tasks {
+        verify_auto_spec_plan_task(
+            task,
+            &all_task_ids,
+            plan_path,
+            spec_path,
+            &spec_ref,
+            &absolute_spec_ref,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_auto_spec_plan_task(
+    task: &crate::task_parser::PlanTask,
+    all_task_ids: &std::collections::BTreeSet<&str>,
+    plan_path: &Path,
+    spec_path: &Path,
+    spec_ref: &str,
+    absolute_spec_ref: &str,
+) -> Result<()> {
+    let header = task.markdown.lines().next().unwrap_or_default();
+    if !header.starts_with("- [ ] `") {
+        bail!(
+            "auto spec task `{}` in {} must use canonical unchecked header `- [ ] `TASK-ID` Title`",
+            task.id,
+            plan_path.display()
+        );
+    }
+    let (status, header_id, title) = parse_task_header(header)
+        .with_context(|| format!("auto spec task `{}` header did not parse", task.id))?;
+    if status != TaskStatus::Pending || header_id != task.id || title.trim().is_empty() {
+        bail!(
+            "auto spec task `{}` in {} must be pending and have a non-empty title",
+            task.id,
+            plan_path.display()
+        );
+    }
+
     for field in PLAN_REQUIRED_FIELDS {
-        if !plan_item_contains_field(plan_item, field) {
+        let body = task_field_body(task, field)?;
+        if body.trim().is_empty() {
             bail!(
-                "auto spec plan item for {} is missing required field `{field}`",
+                "auto spec task `{}` in {} has empty required field `{field}`",
+                task.id,
                 plan_path.display()
+            );
+        }
+    }
+
+    let spec_value = first_field_line(task, "Spec:")?;
+    if !spec_value.contains(spec_ref) && !spec_value.contains(absolute_spec_ref) {
+        bail!(
+            "auto spec task `{}` `Spec:` field must point at {}; got `{spec_value}`",
+            task.id,
+            spec_path.display()
+        );
+    }
+
+    verify_scheduler_dependencies(task, all_task_ids)?;
+    verify_estimated_scope(task)?;
+    verify_completion_artifacts(task)?;
+    verify_field_did_not_swallow_metadata(task, "Verification:")?;
+    verify_field_did_not_swallow_metadata(task, "Required tests:")?;
+    Ok(())
+}
+
+fn task_field_body(task: &crate::task_parser::PlanTask, field: &str) -> Result<String> {
+    task_field_body_until_any(&task.markdown, field, TASK_FIELD_BOUNDARIES)
+        .with_context(|| format!("task `{}` missing `{field}`", task.id))
+}
+
+fn first_field_line(task: &crate::task_parser::PlanTask, field: &str) -> Result<String> {
+    let body = task_field_body(task, field)?;
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("task `{}` has no value for `{field}`", task.id))
+}
+
+fn verify_scheduler_dependencies(
+    task: &crate::task_parser::PlanTask,
+    all_task_ids: &std::collections::BTreeSet<&str>,
+) -> Result<()> {
+    let body = task_field_body(task, "Dependencies:")?;
+    let meaningful_lines = body
+        .lines()
+        .map(strip_plan_bullet)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if meaningful_lines.is_empty() {
+        bail!("auto spec task `{}` has empty `Dependencies:`", task.id);
+    }
+
+    let joined = meaningful_lines.join(" ");
+    if joined.eq_ignore_ascii_case("none") {
+        if !task.dependencies.is_empty() {
+            bail!(
+                "auto spec task `{}` says `Dependencies: none` but parser found {:?}",
+                task.id,
+                task.dependencies
+            );
+        }
+        return Ok(());
+    }
+    reject_dependency_prose(task, &joined)?;
+
+    let mut explicit = Vec::new();
+    for line in meaningful_lines {
+        for part in line.split(',') {
+            let token = part.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some(unwrapped) = token
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+            else {
+                bail!(
+                    "auto spec task `{}` `Dependencies:` must contain only backticked task IDs or `none`; got `{token}`",
+                    task.id
+                );
+            };
+            explicit.push(unwrapped.to_string());
+        }
+    }
+    explicit.sort();
+    explicit.dedup();
+    let mut parsed = task.dependencies.clone();
+    parsed.sort();
+    if explicit != parsed {
+        bail!(
+            "auto spec task `{}` dependencies are not parser-stable; explicit {:?}, parsed {:?}",
+            task.id,
+            explicit,
+            parsed
+        );
+    }
+    for dependency in &task.dependencies {
+        if dependency == &task.id {
+            bail!("auto spec task `{}` cannot depend on itself", task.id);
+        }
+        if !all_task_ids.contains(dependency.as_str()) {
+            bail!(
+                "auto spec task `{}` depends on `{dependency}`, which is not a parseable task in the plan",
+                task.id
             );
         }
     }
     Ok(())
 }
 
-fn plan_item_around(markdown: &str, index: usize) -> &str {
-    let start = markdown[..index]
-        .rfind("\n- [")
-        .map(|offset| offset + 1)
-        .unwrap_or(0);
-    let end = markdown[index..]
-        .find("\n- [")
-        .map(|offset| index + offset)
-        .unwrap_or(markdown.len());
-    &markdown[start..end]
+fn reject_dependency_prose(task: &crate::task_parser::PlanTask, text: &str) -> Result<()> {
+    let lower = text.to_ascii_lowercase();
+    for phrase in [
+        "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external", "(", ")",
+        ".", ";", ":",
+    ] {
+        if lower.contains(phrase) {
+            bail!(
+                "auto spec task `{}` `Dependencies:` must be machine-readable IDs only; remove prose phrase `{phrase}`",
+                task.id
+            );
+        }
+    }
+    Ok(())
 }
 
-fn plan_item_contains_field(markdown: &str, field: &str) -> bool {
-    if markdown.contains(field) {
-        return true;
+fn verify_estimated_scope(task: &crate::task_parser::PlanTask) -> Result<()> {
+    let scope = first_field_line(task, "Estimated scope:")?;
+    if !matches!(scope.as_str(), "XS" | "S" | "M") {
+        bail!(
+            "auto spec task `{}` must use `Estimated scope: XS`, `S`, or `M`; got `{scope}`",
+            task.id
+        );
     }
-    let without_colon = field.trim_end_matches(':');
-    let bold_field = format!("**{without_colon}:**");
-    markdown.contains(&bold_field)
+    Ok(())
+}
+
+fn verify_completion_artifacts(task: &crate::task_parser::PlanTask) -> Result<()> {
+    let body = task_field_body(task, "Completion artifacts:")?;
+    let first = body
+        .lines()
+        .map(strip_plan_bullet)
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if first == "none" {
+        return Ok(());
+    }
+    if task.completion_artifacts.is_empty() {
+        bail!(
+            "auto spec task `{}` `Completion artifacts:` must be `none` or concrete repo-relative paths",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+fn verify_field_did_not_swallow_metadata(
+    task: &crate::task_parser::PlanTask,
+    field: &str,
+) -> Result<()> {
+    let body = task_field_body(task, field)?;
+    for boundary in TASK_FIELD_BOUNDARIES
+        .iter()
+        .filter(|boundary| **boundary != field)
+    {
+        if body
+            .lines()
+            .map(strip_plan_bullet)
+            .map(str::trim)
+            .any(|line| line.starts_with(boundary))
+        {
+            bail!(
+                "auto spec task `{}` `{field}` body swallowed metadata boundary `{boundary}`",
+                task.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn strip_plan_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(bullet) {
+            return rest;
+        }
+    }
+    trimmed
 }
 
 fn section_has_body(markdown: &str, header: &str) -> bool {
@@ -333,4 +559,135 @@ fn section_has_body(markdown: &str, header: &str) -> bool {
         .map(|offset| body_start + offset)
         .unwrap_or(markdown.len());
     !markdown[body_start..body_end].trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_plan_output;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("autodev-spec-{name}-{unique}"));
+        fs::create_dir_all(root.join("specs")).expect("create temp specs");
+        root
+    }
+
+    fn valid_plan(spec_ref: &str, dependency_line: &str) -> String {
+        format!(
+            r#"# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `SPEC-001` Runtime foundation
+
+    Spec: `{spec_ref}`
+    Why now: downstream UI depends on runtime truth.
+    Codebase evidence: `src/runtime.rs` owns the current fact model.
+    Source of truth: `src/runtime.rs`
+    Runtime owner: `src/runtime.rs`
+    UI consumers: `web/src/App.tsx`
+    Generated artifacts: none
+    Fixture boundary: production code cannot import fixture/demo/sample data.
+    Retired surfaces: none
+    Owns: `src/runtime.rs`
+    Integration touchpoints: `web/src/App.tsx`
+    Scope boundary: runtime contract only.
+    Acceptance criteria: API returns canonical facts without UI fallback truth.
+    Verification: `cargo test -p app runtime_foundation`
+    Required tests: `cargo test -p app runtime_foundation`
+    Contract generation: none -- no generated contract
+    Cross-surface tests: `npm test -- runtime-readback`
+    Review/closeout: reviewer checks runtime-to-UI readback proof.
+    Completion artifacts: `docs/proof/runtime-foundation.md`
+    Dependencies: none
+    Estimated scope: S
+    Completion signal: proof recorded and tests pass.
+
+- [ ] `SPEC-002` UI readback
+
+    Spec: `{spec_ref}`
+    Why now: UI must render runtime-owned facts.
+    Codebase evidence: `web/src/App.tsx` currently renders the surface.
+    Source of truth: `src/runtime.rs`
+    Runtime owner: `src/runtime.rs`
+    UI consumers: `web/src/App.tsx`
+    Generated artifacts: none
+    Fixture boundary: production code cannot import fixture/demo/sample data.
+    Retired surfaces: none
+    Owns: `web/src/App.tsx`
+    Integration touchpoints: `src/runtime.rs`
+    Scope boundary: UI readback only.
+    Acceptance criteria: UI displays runtime payload without local catalogs.
+    Verification: `npm test -- runtime-readback`
+    Required tests: `npm test -- runtime-readback`
+    Contract generation: none -- no generated contract
+    Cross-surface tests: `npm test -- runtime-readback`
+    Review/closeout: reviewer checks no duplicated truth in UI.
+    Completion artifacts: `docs/proof/ui-readback.md`
+    Dependencies: {dependency_line}
+    Estimated scope: M
+    Completion signal: proof recorded and tests pass.
+"#
+        )
+    }
+
+    #[test]
+    fn auto_spec_plan_validation_accepts_parallel_ready_tasks() {
+        let root = temp_root("valid");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(
+            &plan_path,
+            valid_plan("specs/300426-runtime-ui.md", "`SPEC-001`"),
+        )
+        .expect("write plan");
+
+        verify_plan_output(&plan_path, &spec_path).expect("parallel-ready plan validates");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_plan_validation_rejects_prose_dependencies() {
+        let root = temp_root("dependency-prose");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(
+            &plan_path,
+            valid_plan(
+                "specs/300426-runtime-ui.md",
+                "`SPEC-001` (parallel with `SPEC-999`)",
+            ),
+        )
+        .expect("write plan");
+
+        let error = verify_plan_output(&plan_path, &spec_path).expect_err("prose rejected");
+        assert!(error
+            .to_string()
+            .contains("Dependencies:` must be machine-readable IDs only"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_plan_validation_requires_canonical_headers() {
+        let root = temp_root("canonical-header");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        let plan = valid_plan("specs/300426-runtime-ui.md", "`SPEC-001`").replace(
+            "- [ ] `SPEC-002` UI readback",
+            "- [ ] SPEC-002 - UI readback",
+        );
+        fs::write(&plan_path, plan).expect("write plan");
+
+        let error = verify_plan_output(&plan_path, &spec_path).expect_err("header rejected");
+        assert!(error
+            .to_string()
+            .contains("must use canonical unchecked header"));
+        let _ = fs::remove_dir_all(root);
+    }
 }

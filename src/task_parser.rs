@@ -257,12 +257,21 @@ pub(crate) const TASK_FIELD_BOUNDARIES: &[&str] = &[
     "Spec:",
     "Why now:",
     "Codebase evidence:",
+    "Source of truth:",
+    "Runtime owner:",
+    "UI consumers:",
+    "Generated artifacts:",
+    "Fixture boundary:",
+    "Retired surfaces:",
     "Owns:",
     "Integration touchpoints:",
     "Scope boundary:",
     "Acceptance criteria:",
     "Verification:",
     "Required tests:",
+    "Contract generation:",
+    "Cross-surface tests:",
+    "Review/closeout:",
     "Completion artifacts:",
     "Dependencies:",
     "Estimated scope:",
@@ -495,6 +504,35 @@ mod tests {
         let tasks = parse_tasks(plan);
         assert!(tasks[0].dependencies.is_empty());
         assert_eq!(tasks[1].dependencies, vec!["AD-001", "AD-003"]);
+    }
+
+    #[test]
+    fn newer_auto_spec_fields_bound_verification_and_dependencies() {
+        let plan = r#"
+- [ ] `AD-101` Contract-aligned surface
+
+  Spec: `specs/300426-contract.md`
+  Verification:
+  - `cargo test -p runtime contract_readback`
+  Required tests: runtime contract test
+  Contract generation: `cargo run -p xtask -- codegen`
+  Cross-surface tests: `npm test -- ui-readback`
+  Review/closeout: reviewer checks runtime-to-UI proof
+  Completion artifacts: `docs/proof.md`
+  Dependencies:
+  - `AD-100`
+  Estimated scope: S
+  Completion signal: merged proof
+"#;
+
+        let tasks = parse_tasks(plan);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].verification_text.as_deref(),
+            Some("  - `cargo test -p runtime contract_readback`")
+        );
+        assert_eq!(tasks[0].completion_artifacts, vec!["docs/proof.md"]);
+        assert_eq!(tasks[0].dependencies, vec!["AD-100"]);
     }
 
     #[test]
