@@ -1143,7 +1143,9 @@ mod tests {
     use super::{
         assess_task_completion_gap, declared_completion_artifacts, ensure_host_review_handoff,
         inspect_task_completion_evidence, review_contains_task, verification_plan,
-        CompletionGapKind, TaskCompletionEvidence,
+        verification_receipt_freshness_problem, CompletionGapKind, TaskCompletionEvidence,
+        VerificationDirtyState, VerificationReceipt, VerificationReceiptArtifact,
+        VerificationReceiptCommand,
     };
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1622,6 +1624,122 @@ Dependencies: none
             .missing_reasons()
             .join("\n")
             .contains("stale verification receipt"));
+    }
+
+    #[test]
+    fn verification_receipt_freshness_requires_current_tree_metadata() {
+        let root = temp_dir("current-tree-metadata-receipt");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::create_dir_all(root.join("docs/ops")).expect("failed to create docs dir");
+        fs::write(root.join("docs/ops/proof.md"), "receipt proof\n")
+            .expect("failed to write proof");
+        let receipt_path = root.join(".auto/symphony/verification-receipts/SAT-003.json");
+        fs::write(&receipt_path, "{}\n").expect("failed to write receipt placeholder");
+
+        let commit = super::current_git_commit(&root).expect("git commit should be readable");
+        let dirty_fingerprint = super::current_dirty_state_fingerprint(&root)
+            .expect("dirty-state fingerprint should be readable");
+        let plan_hash = super::current_plan_hash(&root).expect("plan hash should be readable");
+        let artifact_hash = super::artifact_hash(&root.join("docs/ops/proof.md"))
+            .expect("artifact hash should be readable");
+        let expected_command =
+            "cargo test completion_artifacts::tests::metadata_receipt".to_string();
+        let expected_argv = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "completion_artifacts::tests::metadata_receipt".to_string(),
+        ];
+        let base_receipt = VerificationReceipt {
+            commit: Some(commit.clone()),
+            dirty_state: Some(VerificationDirtyState {
+                fingerprint: Some(dirty_fingerprint.clone()),
+            }),
+            plan_hash: Some(plan_hash.clone()),
+            declared_artifacts: vec![VerificationReceiptArtifact {
+                path: "docs/ops/proof.md".to_string(),
+                sha256: Some(artifact_hash.clone()),
+            }],
+            commands: vec![VerificationReceiptCommand {
+                command: expected_command.clone(),
+                expected_argv: Some(expected_argv),
+                exit_code: Some(0),
+                status: Some("passed".to_string()),
+                ..VerificationReceiptCommand::default()
+            }],
+        };
+        let expected_commands = std::slice::from_ref(&expected_command);
+        let declared_artifacts = vec!["docs/ops/proof.md".to_string()];
+
+        assert_eq!(
+            verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &base_receipt,
+                expected_commands,
+                &declared_artifacts,
+            ),
+            None
+        );
+
+        let cases = [
+            (
+                {
+                    let mut receipt = base_receipt.clone();
+                    receipt.commit = None;
+                    receipt
+                },
+                "missing current commit metadata",
+            ),
+            (
+                {
+                    let mut receipt = base_receipt.clone();
+                    receipt.dirty_state = None;
+                    receipt
+                },
+                "missing dirty-state fingerprint",
+            ),
+            (
+                {
+                    let mut receipt = base_receipt.clone();
+                    receipt.plan_hash = None;
+                    receipt
+                },
+                "missing plan hash",
+            ),
+            (
+                {
+                    let mut receipt = base_receipt.clone();
+                    receipt.declared_artifacts[0].sha256 = None;
+                    receipt
+                },
+                "missing declared artifact `docs/ops/proof.md` hash",
+            ),
+            (
+                {
+                    let mut receipt = base_receipt.clone();
+                    receipt.commands[0].expected_argv = None;
+                    receipt
+                },
+                "missing matching expected argv metadata",
+            ),
+        ];
+
+        for (receipt, expected_problem) in cases {
+            let problem = verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &receipt,
+                expected_commands,
+                &declared_artifacts,
+            )
+            .expect("receipt should be stale");
+            assert!(
+                problem.contains(expected_problem),
+                "expected `{problem}` to contain `{expected_problem}`"
+            );
+        }
     }
 
     #[test]
