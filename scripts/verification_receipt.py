@@ -30,10 +30,12 @@ def repo_root() -> Path:
 
 
 def receipt_root(root: Path) -> Path:
-    if root.name == "repo" and root.parent.parent.name == "lanes":
-        for ancestor in root.parents:
-            if ancestor.name == ".auto":
-                return ancestor / "symphony" / "verification-receipts"
+    if root.name == "repo":
+        ancestors = list(root.parents)
+        if any(parent.name == "lanes" for parent in ancestors):
+            for parent in ancestors:
+                if parent.name == ".auto":
+                    return parent / "symphony" / "verification-receipts"
     return root / ".auto" / "symphony" / "verification-receipts"
 
 

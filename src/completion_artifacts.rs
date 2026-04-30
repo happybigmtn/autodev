@@ -443,18 +443,15 @@ fn verification_receipt_path(repo_root: &Path, task_id: &str) -> PathBuf {
 
 fn verification_receipt_root(repo_root: &Path) -> PathBuf {
     if repo_root.file_name().and_then(|name| name.to_str()) == Some("repo") {
-        let is_lane_repo = repo_root
-            .parent()
-            .and_then(|lane_dir| lane_dir.parent())
-            .filter(|lanes_dir| {
-                lanes_dir.file_name().and_then(|name| name.to_str()) == Some("lanes")
-            })
-            .is_some();
-        if is_lane_repo {
-            for ancestor in repo_root.ancestors() {
-                if ancestor.file_name().and_then(|name| name.to_str()) == Some(".auto") {
-                    return ancestor.join("symphony/verification-receipts");
-                }
+        let ancestors = repo_root.ancestors().collect::<Vec<_>>();
+        if ancestors
+            .iter()
+            .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("lanes"))
+        {
+            if let Some(auto_root) = ancestors.iter().find(|ancestor| {
+                ancestor.file_name().and_then(|name| name.to_str()) == Some(".auto")
+            }) {
+                return auto_root.join("symphony/verification-receipts");
             }
         }
     }
