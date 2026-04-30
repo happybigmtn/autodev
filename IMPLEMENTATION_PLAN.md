@@ -756,7 +756,7 @@
 
 ## Completed / Already Satisfied
 
-- [~] `SAT-001` Report-only write-boundary helpers already exist for QA-only, health, and design surfaces.
+- [x] `SAT-001` Report-only write-boundary helpers already exist for QA-only, health, and design surfaces.
   Evidence: `src/qa_only_command.rs` owns `report_only_dirty_state_report`; `src/health_command.rs` imports `require_nonempty_report` and dirty-state helpers; `src/design_command.rs` has `design_report_only_rejects_disallowed_dirty_state`.
 
 - [~] `SAT-002` Rich plan-task required fields already have a shared catalog.
