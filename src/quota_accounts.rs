@@ -18,7 +18,7 @@ pub(crate) fn run_accounts_add(name: &str, provider: &str) -> Result<()> {
 
     config.add_account(entry)?;
 
-    let profile_dir = QuotaConfig::profile_dir(provider, name);
+    let profile_dir = QuotaConfig::profile_dir(provider, name)?;
     eprintln!(
         "Copying current {} credentials into profile '{name}'...",
         provider.label()
@@ -51,7 +51,7 @@ pub(crate) fn run_accounts_list() -> Result<()> {
     println!("{}", dim.apply_to("─".repeat(50)));
 
     for account in &config.accounts {
-        let profile_dir = QuotaConfig::profile_dir(account.provider, &account.name);
+        let profile_dir = QuotaConfig::profile_dir(account.provider, &account.name)?;
         let exists = if profile_dir.exists() {
             "ok"
         } else {
@@ -83,7 +83,7 @@ pub(crate) fn run_accounts_remove(name: &str, force: bool) -> Result<()> {
     }
 
     let removed = config.remove_account(name)?;
-    let profile_dir = QuotaConfig::profile_dir(removed.provider, name);
+    let profile_dir = QuotaConfig::profile_dir(removed.provider, name)?;
     if profile_dir.exists() {
         fs::remove_dir_all(&profile_dir)?;
     }
@@ -98,7 +98,7 @@ pub(crate) fn run_accounts_capture(name: &str) -> Result<()> {
         .find_account(name)
         .ok_or_else(|| anyhow::anyhow!("account '{name}' not found"))?;
 
-    let profile_dir = QuotaConfig::profile_dir(account.provider, name);
+    let profile_dir = QuotaConfig::profile_dir(account.provider, name)?;
     eprintln!(
         "Capturing current {} credentials into profile '{name}'...",
         account.provider.label()

@@ -29,7 +29,7 @@ pub(crate) async fn score_accounts(
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
         Vec::with_capacity(candidates.len());
     for entry in candidates {
-        let profile_dir = QuotaConfig::profile_dir(provider, &entry.name);
+        let profile_dir = QuotaConfig::profile_dir(provider, &entry.name)?;
         match quota_usage::fetch_usage(provider, &profile_dir).await {
             Ok(usage) => scored.push((entry, Some(usage))),
             Err(e) => {
@@ -408,7 +408,7 @@ mod tests {
         let a = make_account("healthy", Provider::Claude);
         let b = make_account("cooling", Provider::Claude);
         let mut state = QuotaState::default();
-        state.mark_exhausted("cooling", chrono::Utc::now());
+        state.mark_exhausted("cooling", chrono::Utc::now()).unwrap();
 
         let scored = vec![(&a, Some(make_usage(50, 600, 50, 3600))), (&b, None)];
         let available = selectable_scored_candidates(&scored, &state);
@@ -490,7 +490,9 @@ mod tests {
             selected_claude_account: None,
         };
         let mut state = QuotaState::default();
-        state.mark_selected("busy-healthy", chrono::Utc::now());
+        state
+            .mark_selected("busy-healthy", chrono::Utc::now())
+            .unwrap();
 
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
             (&config.accounts[0], Some(make_usage(5, 600, 15, 3600))),
@@ -555,8 +557,8 @@ mod tests {
         let t2 = chrono::DateTime::parse_from_rfc3339("2026-04-07T11:00:00Z")
             .unwrap()
             .to_utc();
-        state.mark_used("alpha", t2); // more recent
-        state.mark_used("beta", t1); // less recent
+        state.mark_used("alpha", t2).unwrap(); // more recent
+        state.mark_used("beta", t1).unwrap(); // less recent
 
         // Same weekly reset time, both above floor
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
@@ -647,7 +649,7 @@ mod tests {
         let b = make_account("other", Provider::Claude);
         let now = chrono::Utc::now();
         let mut state = QuotaState::default();
-        state.mark_selected("preferred", now);
+        state.mark_selected("preferred", now).unwrap();
 
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
             (&a, Some(make_usage(50, 600, 50, 3600))),

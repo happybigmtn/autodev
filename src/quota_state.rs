@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::quota_config::QuotaConfig;
+use crate::quota_config::{validate_account_name, QuotaConfig};
 use crate::util::write_0o600_if_unix;
 
 /// How long an exhausted account stays unavailable before auto-retrying.
@@ -56,33 +56,43 @@ impl QuotaState {
         self.accounts.get(name).cloned().unwrap_or_default()
     }
 
-    pub(crate) fn mark_exhausted(&mut self, name: &str, now: DateTime<Utc>) {
+    pub(crate) fn mark_exhausted(&mut self, name: &str, now: DateTime<Utc>) -> Result<()> {
+        validate_account_name(name)?;
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.exhausted = true;
         state.exhausted_at = Some(now);
+        Ok(())
     }
 
-    pub(crate) fn mark_used(&mut self, name: &str, now: DateTime<Utc>) {
+    pub(crate) fn mark_used(&mut self, name: &str, now: DateTime<Utc>) -> Result<()> {
+        validate_account_name(name)?;
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.last_used = Some(now);
+        Ok(())
     }
 
-    pub(crate) fn mark_selected(&mut self, name: &str, now: DateTime<Utc>) {
+    pub(crate) fn mark_selected(&mut self, name: &str, now: DateTime<Utc>) -> Result<()> {
+        validate_account_name(name)?;
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.last_used = Some(now);
         state.active_leases = state.active_leases.saturating_add(1);
+        Ok(())
     }
 
-    pub(crate) fn mark_success(&mut self, name: &str, now: DateTime<Utc>) {
+    pub(crate) fn mark_success(&mut self, name: &str, now: DateTime<Utc>) -> Result<()> {
+        validate_account_name(name)?;
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.exhausted = false;
         state.exhausted_at = None;
         state.last_success = Some(now);
+        Ok(())
     }
 
-    pub(crate) fn release_lease(&mut self, name: &str) {
+    pub(crate) fn release_lease(&mut self, name: &str) -> Result<()> {
+        validate_account_name(name)?;
         let state = self.accounts.entry(name.to_owned()).or_default();
         state.active_leases = state.active_leases.saturating_sub(1);
+        Ok(())
     }
 
     /// Clear exhausted flag on accounts that have cooled down.
@@ -101,12 +111,14 @@ impl QuotaState {
     }
 
     /// Manually reset an account's exhausted status.
-    pub(crate) fn reset_account(&mut self, name: &str) {
+    pub(crate) fn reset_account(&mut self, name: &str) -> Result<()> {
+        validate_account_name(name)?;
         if let Some(state) = self.accounts.get_mut(name) {
             state.exhausted = false;
             state.exhausted_at = None;
             state.active_leases = 0;
         }
+        Ok(())
     }
 
     /// Reset all accounts' exhausted status.
@@ -190,7 +202,7 @@ mod tests {
             .to_utc();
 
         let mut state = QuotaState::default();
-        state.mark_exhausted("test", exhausted_time);
+        state.mark_exhausted("test", exhausted_time).unwrap();
         assert!(state.get("test").exhausted);
 
         state.refresh_cooldowns(after_cooldown);
@@ -207,7 +219,7 @@ mod tests {
             .to_utc();
 
         let mut state = QuotaState::default();
-        state.mark_exhausted("test", exhausted_time);
+        state.mark_exhausted("test", exhausted_time).unwrap();
 
         state.refresh_cooldowns(still_cooling);
         assert!(state.get("test").exhausted);
@@ -217,10 +229,10 @@ mod tests {
     fn manual_reset_clears_immediately() {
         let now = Utc::now();
         let mut state = QuotaState::default();
-        state.mark_exhausted("test", now);
+        state.mark_exhausted("test", now).unwrap();
         assert!(state.get("test").exhausted);
 
-        state.reset_account("test");
+        state.reset_account("test").unwrap();
         assert!(!state.get("test").exhausted);
     }
 
@@ -228,8 +240,8 @@ mod tests {
     fn reset_all_clears_everything() {
         let now = Utc::now();
         let mut state = QuotaState::default();
-        state.mark_exhausted("a", now);
-        state.mark_exhausted("b", now);
+        state.mark_exhausted("a", now).unwrap();
+        state.mark_exhausted("b", now).unwrap();
 
         state.reset_all();
         assert!(!state.get("a").exhausted);
@@ -240,10 +252,10 @@ mod tests {
     fn mark_success_clears_exhaustion_state() {
         let now = Utc::now();
         let mut state = QuotaState::default();
-        state.mark_exhausted("test", now);
+        state.mark_exhausted("test", now).unwrap();
         assert!(state.get("test").exhausted);
 
-        state.mark_success("test", now);
+        state.mark_success("test", now).unwrap();
 
         let account = state.get("test");
         assert!(!account.exhausted);
@@ -256,16 +268,16 @@ mod tests {
         let now = Utc::now();
         let mut state = QuotaState::default();
 
-        state.mark_selected("test", now);
-        state.mark_selected("test", now);
+        state.mark_selected("test", now).unwrap();
+        state.mark_selected("test", now).unwrap();
         assert_eq!(state.get("test").active_leases, 2);
         assert_eq!(state.get("test").last_used, Some(now));
 
-        state.release_lease("test");
+        state.release_lease("test").unwrap();
         assert_eq!(state.get("test").active_leases, 1);
 
-        state.release_lease("test");
-        state.release_lease("test");
+        state.release_lease("test").unwrap();
+        state.release_lease("test").unwrap();
         assert_eq!(state.get("test").active_leases, 0);
     }
 
@@ -275,7 +287,7 @@ mod tests {
         let _config_home = TempConfigHome::new("quota-state-save");
         let now = Utc::now();
         let mut state = QuotaState::default();
-        state.mark_exhausted("test", now);
+        state.mark_exhausted("test", now).unwrap();
 
         state.save().expect("state save should succeed");
 

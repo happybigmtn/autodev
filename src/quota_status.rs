@@ -26,7 +26,7 @@ pub(crate) async fn run_status() -> Result<()> {
             println!();
         }
 
-        let profile_dir = QuotaConfig::profile_dir(account.provider, &account.name);
+        let profile_dir = QuotaConfig::profile_dir(account.provider, &account.name)?;
         let usage_result = quota_usage::fetch_usage(account.provider, &profile_dir).await;
 
         match usage_result {
@@ -86,7 +86,7 @@ pub(crate) fn run_reset(name: Option<&str>) -> Result<()> {
     let mut state = QuotaState::load()?;
     match name {
         Some(name) => {
-            state.reset_account(name);
+            state.reset_account(name)?;
             state.save()?;
             eprintln!("Account '{name}' reset to available.");
         }

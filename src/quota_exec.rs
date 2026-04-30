@@ -309,7 +309,7 @@ fn reserve_account_and_swap<'a>(
 
     let selected = quota_selector::select_account_from_scores(config, &state, provider, scored)?;
     let account_name = selected.entry.name.clone();
-    let profile_dir = QuotaConfig::profile_dir(provider, &account_name);
+    let profile_dir = QuotaConfig::profile_dir(provider, &account_name)?;
 
     if !profile_dir.exists() {
         anyhow::bail!(
@@ -319,13 +319,13 @@ fn reserve_account_and_swap<'a>(
         );
     }
 
-    state.mark_selected(&account_name, Utc::now());
+    state.mark_selected(&account_name, Utc::now())?;
     state.save()?;
 
     match swap_credentials(provider, &profile_dir) {
         Ok(guard) => Ok((account_name, guard)),
         Err(error) => {
-            state.release_lease(&account_name);
+            state.release_lease(&account_name)?;
             state.save()?;
             Err(error)
         }
@@ -336,7 +336,7 @@ fn restore_and_update_state(
     provider: Provider,
     account_name: &str,
     restore_guard: &mut AuthRestoreGuard,
-    update_state: impl FnOnce(&mut QuotaState, chrono::DateTime<Utc>),
+    update_state: impl FnOnce(&mut QuotaState, chrono::DateTime<Utc>) -> Result<()>,
 ) -> Result<()> {
     let mut lock = acquire_provider_lock(provider)?;
     let _write = lock.write().map_err(|e| {
@@ -349,8 +349,8 @@ fn restore_and_update_state(
     let state_result = (|| -> Result<()> {
         let mut state = QuotaState::load()?;
         state.refresh_cooldowns(now);
-        state.release_lease(account_name);
-        update_state(&mut state, now);
+        state.release_lease(account_name)?;
+        update_state(&mut state, now)?;
         state.save()
     })();
 
@@ -388,17 +388,18 @@ where
             Ok((status, stderr_text)) => {
                 let verdict = quota_patterns::check_stderr(provider, &stderr_text);
                 restore_and_update_state(provider, &account_name, &mut guard, |state, now| {
-                    state.mark_used(&account_name, now);
+                    state.mark_used(&account_name, now)?;
                     match verdict {
                         QuotaVerdict::Exhausted | QuotaVerdict::Unavailable => {
-                            state.mark_exhausted(&account_name, now)
+                            state.mark_exhausted(&account_name, now)?;
                         }
                         QuotaVerdict::Ok | QuotaVerdict::OtherError => {
                             if status.success() {
-                                state.mark_success(&account_name, now);
+                                state.mark_success(&account_name, now)?;
                             }
                         }
                     }
+                    Ok(())
                 })?;
 
                 match verdict {
@@ -430,7 +431,9 @@ where
                 });
             }
             Err(e) => {
-                restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {})?;
+                restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {
+                    Ok(())
+                })?;
                 return Err(e);
             }
         }
@@ -505,10 +508,11 @@ pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Resul
         .with_context(|| format!("failed to launch {bin}"))?;
 
     restore_and_update_state(provider, &account_name, &mut restore_guard, |state, now| {
-        state.mark_used(&account_name, now);
+        state.mark_used(&account_name, now)?;
         if status.success() {
-            state.mark_success(&account_name, now);
+            state.mark_success(&account_name, now)?;
         }
+        Ok(())
     })?;
 
     Ok(status.code().unwrap_or(1))
@@ -550,7 +554,7 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
         accounts[choice - 1].name.clone()
     };
 
-    let profile_dir = QuotaConfig::profile_dir(provider, &selected_name);
+    let profile_dir = QuotaConfig::profile_dir(provider, &selected_name)?;
 
     if !profile_dir.exists() {
         anyhow::bail!(
@@ -571,8 +575,8 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 
     let mut state = QuotaState::load()?;
     state.refresh_cooldowns(Utc::now());
-    state.reset_account(&selected_name);
-    state.mark_used(&selected_name, Utc::now());
+    state.reset_account(&selected_name)?;
+    state.mark_used(&selected_name, Utc::now())?;
     state.save()?;
 
     eprintln!(

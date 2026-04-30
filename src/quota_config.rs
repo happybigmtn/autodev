@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -82,8 +82,12 @@ impl QuotaConfig {
         Self::config_dir().join(PROFILES_DIR)
     }
 
-    pub(crate) fn profile_dir(provider: Provider, name: &str) -> PathBuf {
-        Self::profiles_dir().join(format!("{}-{name}", provider.label()))
+    pub(crate) fn profile_dir(provider: Provider, name: &str) -> Result<PathBuf> {
+        validate_account_name(name)?;
+        let profiles_dir = Self::profiles_dir();
+        let profile_dir = profiles_dir.join(format!("{}-{name}", provider.label()));
+        ensure_profile_path_contained(&profiles_dir, &profile_dir)?;
+        Ok(profile_dir)
     }
 
     pub(crate) fn load() -> Result<Self> {
@@ -105,6 +109,7 @@ impl QuotaConfig {
     }
 
     pub(crate) fn save(&self) -> Result<()> {
+        self.validate_account_names()?;
         let path = Self::config_path();
         let dir = Self::config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -131,6 +136,7 @@ impl QuotaConfig {
     }
 
     pub(crate) fn set_selected_account(&mut self, provider: Provider, name: &str) -> Result<()> {
+        validate_account_name(name)?;
         if !self
             .accounts
             .iter()
@@ -157,6 +163,7 @@ impl QuotaConfig {
     }
 
     pub(crate) fn add_account(&mut self, entry: AccountEntry) -> Result<()> {
+        validate_account_name(&entry.name)?;
         if self.accounts.iter().any(|a| a.name == entry.name) {
             bail!("account '{}' already exists", entry.name);
         }
@@ -170,6 +177,7 @@ impl QuotaConfig {
     }
 
     pub(crate) fn remove_account(&mut self, name: &str) -> Result<AccountEntry> {
+        validate_account_name(name)?;
         let idx = self
             .accounts
             .iter()
@@ -179,9 +187,23 @@ impl QuotaConfig {
         self.clear_selected_account_if_matches(removed.provider, name);
         Ok(removed)
     }
+
+    fn validate_account_names(&self) -> Result<()> {
+        for account in &self.accounts {
+            validate_account_name(&account.name)?;
+        }
+        if let Some(name) = self.selected_codex_account.as_deref() {
+            validate_account_name(name)?;
+        }
+        if let Some(name) = self.selected_claude_account.as_deref() {
+            validate_account_name(name)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Result<()> {
+    ensure_profile_path_contained(&QuotaConfig::profiles_dir(), profile_dir)?;
     let staged_profile_dir = staged_profile_dir(profile_dir)?;
     if staged_profile_dir.exists() {
         remove_profile_dir(&staged_profile_dir)?;
@@ -229,6 +251,75 @@ pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Re
     }
 
     replace_profile_dir(profile_dir, &staged_profile_dir)
+}
+
+pub(crate) fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("quota account name cannot be empty");
+    }
+    let bytes = name.as_bytes();
+    let starts_and_ends_with_alnum = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric);
+    let slug_chars = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+
+    if !starts_and_ends_with_alnum || !slug_chars {
+        bail!(
+            "invalid quota account name '{name}': use lowercase ASCII letters, digits, and '-' separators; start and end with a letter or digit"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_profile_path_contained(profiles_dir: &Path, profile_dir: &Path) -> Result<()> {
+    let logical_root = normalize_logical_path(profiles_dir)?;
+    let logical_profile = normalize_logical_path(profile_dir)?;
+    if !logical_profile.starts_with(&logical_root) {
+        bail!(
+            "quota profile path {} escapes profile root {}",
+            profile_dir.display(),
+            profiles_dir.display()
+        );
+    }
+
+    if let Ok(canonical_root) = fs::canonicalize(profiles_dir) {
+        let canonical_profile = match fs::canonicalize(profile_dir) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let filename = profile_dir
+                    .file_name()
+                    .with_context(|| format!("{} has no file name", profile_dir.display()))?;
+                canonical_root.join(filename)
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to canonicalize {}", profile_dir.display()))
+            }
+        };
+        if !canonical_profile.starts_with(&canonical_root) {
+            bail!(
+                "quota profile path {} resolves outside profile root {}",
+                profile_dir.display(),
+                profiles_dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_logical_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => bail!("path {} contains parent traversal", path.display()),
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 fn staged_profile_dir(profile_dir: &Path) -> Result<PathBuf> {
@@ -575,6 +666,81 @@ mod tests {
         assert_eq!(codex_accounts.len(), 2);
         let claude_accounts = config.accounts_for_provider(Provider::Claude);
         assert_eq!(claude_accounts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_account_names_fail_before_profile_mutation() {
+        let _home = TempConfigHome::new("quota-config-unsafe-names");
+        let unsafe_names = [
+            "",
+            "../x",
+            "/abs",
+            "codex/work",
+            "bad.name",
+            "bad_name",
+            "UPPER",
+            "-leading",
+            "trailing-",
+        ];
+
+        for name in unsafe_names {
+            assert!(
+                validate_account_name(name).is_err(),
+                "{name:?} should fail slug validation"
+            );
+            assert!(
+                QuotaConfig::profile_dir(Provider::Codex, name).is_err(),
+                "{name:?} should not produce a profile path"
+            );
+
+            let mut config = QuotaConfig::default();
+            let entry = AccountEntry {
+                name: name.to_owned(),
+                provider: Provider::Codex,
+            };
+            assert!(
+                config.add_account(entry).is_err(),
+                "{name:?} should not enter quota config"
+            );
+            assert!(config.accounts.is_empty());
+            assert!(config.selected_codex_account.is_none());
+
+            let mut state = crate::quota_state::QuotaState::default();
+            assert!(
+                state.mark_selected(name, chrono::Utc::now()).is_err(),
+                "{name:?} should not enter quota state"
+            );
+            assert!(state.accounts.is_empty());
+        }
+
+        assert!(!QuotaConfig::config_path().exists());
+        assert!(!QuotaConfig::profiles_dir().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_dir_stays_under_profiles_root() {
+        let home = TempConfigHome::new("quota-config-profile-containment");
+
+        let profile_dir = QuotaConfig::profile_dir(Provider::Codex, "work-1")
+            .expect("safe slug should produce a profile path");
+        assert!(profile_dir.starts_with(QuotaConfig::profiles_dir()));
+        assert_eq!(
+            profile_dir.file_name().and_then(|name| name.to_str()),
+            Some("codex-work-1")
+        );
+
+        fs::create_dir_all(QuotaConfig::profiles_dir()).expect("failed to create profile root");
+        let outside = home.root.join("outside-profile");
+        fs::create_dir_all(&outside).expect("failed to create outside profile dir");
+        std::os::unix::fs::symlink(&outside, QuotaConfig::profiles_dir().join("codex-escape"))
+            .expect("failed to create escaping profile symlink");
+
+        let error = QuotaConfig::profile_dir(Provider::Codex, "escape")
+            .expect_err("symlinked profile must not resolve outside profile root")
+            .to_string();
+        assert!(error.contains("resolves outside profile root"));
     }
 
     #[cfg(unix)]
