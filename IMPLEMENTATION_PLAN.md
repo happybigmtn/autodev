@@ -2,7 +2,7 @@
 
 ## Priority Work
 
-- [ ] `QSEC-001` Validate quota account slugs and profile containment
+- [~] `QSEC-001` Validate quota account slugs and profile containment
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: Raw quota account names still flow into profile paths before any slug or containment policy runs, so credential capture can touch paths outside the intended profile root before the config write fails.
