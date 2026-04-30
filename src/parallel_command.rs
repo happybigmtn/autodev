@@ -1396,6 +1396,7 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     println!("repo root:   {}", repo_root.display());
     println!("branch:      {}", current_branch);
     println!("run root:    {}", run_root.display());
+    let mut tmux_worker_running = false;
     match tmux_session_exists(&session_name) {
         Ok(true) => {
             println!("tmux:        {session_name} running");
@@ -1408,14 +1409,19 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             ]) {
                 Ok(windows) => {
                     for line in windows.lines().filter(|line| !line.trim().is_empty()) {
+                        tmux_worker_running |= tmux_status_line_has_live_worker(line);
                         println!("  {line}");
                     }
                 }
                 Err(err) => println!("  warning: failed to inspect tmux windows: {err:#}"),
             }
         }
-        Ok(false) => println!("tmux:        {session_name} not running"),
-        Err(err) => println!("tmux:        unknown ({err:#})"),
+        Ok(false) => {
+            println!("tmux:        {session_name} not running");
+        }
+        Err(err) => {
+            println!("tmux:        unknown ({err:#})");
+        }
     }
 
     let host_processes = parallel_host_processes_for_repo(&repo_root);
@@ -1423,10 +1429,11 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         println!("host pids:   none detected");
     } else {
         println!("host pids:");
-        for line in host_processes {
+        for line in &host_processes {
             println!("  {line}");
         }
     }
+    let no_live_parallel_host = host_processes.is_empty() && !tmux_worker_running;
 
     let lanes_root = run_root.join("lanes");
     let mut lanes = if !lanes_root.exists() {
@@ -1449,6 +1456,7 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     let recent_host_warnings = recent_parallel_host_warnings(&run_root, 200);
     let stop_state = last_parallel_stop_state(&run_root);
     let mut active_recovery_lanes = Vec::new();
+    let mut stale_recovery_lanes = Vec::new();
     let mut active_task_ids = BTreeSet::new();
 
     println!("lanes:");
@@ -1473,7 +1481,11 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         let recovery_active = lane_repo_has_active_cherry_pick(&repo_root)
             || lane_repo_has_rebase_recovery(&repo_root);
         if recovery_active {
-            active_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
+            if no_live_parallel_host && !worker_running {
+                stale_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
+            } else {
+                active_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
+            }
         }
         let repo_status = lane_repo_status_summary(&repo_root);
         let (log_age, log_line) = latest_lane_log_line(&lane_root);
@@ -1481,6 +1493,16 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         println!(
             "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
         );
+        if recovery_active && no_live_parallel_host && !worker_running {
+            println!(
+                "    recovery: stale recovery (no host pid or tmux session); not active progress"
+            );
+            println!("    recovery artifact: {}", repo_root.display());
+            println!(
+                "    reset command: rm -rf {} # after preserving task-owned work",
+                shell_quote(&lane_root.display().to_string())
+            );
+        }
         if let Some(line) = log_line {
             println!("    {line}");
         }
@@ -1518,6 +1540,7 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             &preflight_warnings,
             &recent_host_warnings,
             &active_recovery_lanes,
+            &stale_recovery_lanes,
         )
     );
     Ok(())
@@ -1560,6 +1583,17 @@ fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
         .filter(|line| process_line_cwd_matches_repo(line, repo_root))
         .map(str::to_string)
         .collect()
+}
+
+fn tmux_status_line_has_live_worker(line: &str) -> bool {
+    if !line.contains(":dead=0:") {
+        return false;
+    }
+    let command = line
+        .rsplit_once(":cmd=")
+        .map(|(_, command)| command.trim())
+        .unwrap_or_default();
+    !matches!(command, "" | "bash" | "sh" | "zsh" | "fish")
 }
 
 fn process_line_cwd_matches_repo(line: &str, repo_root: &Path) -> bool {
@@ -1614,17 +1648,24 @@ fn preflight_warning_names(run_root: &Path) -> Vec<String> {
 }
 
 fn recent_parallel_host_warnings(run_root: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(log_text) = read_recent_log_text(&run_root.join("live.log"), max_lines) else {
+    let log_path = run_root.join("live.log");
+    let Ok(log_text) = read_recent_log_text(&log_path, max_lines) else {
         return Vec::new();
     };
+    let source_age = log_path
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map(format_system_time_age)
+        .unwrap_or_else(|_| "unknown age".to_string());
     let mut warnings = Vec::new();
     for line in log_text.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("warning:") {
             continue;
         }
-        if !warnings.iter().any(|existing| existing == trimmed) {
-            warnings.push(trimmed.to_string());
+        let warning = format!("live.log {source_age}: {trimmed}");
+        if !warnings.iter().any(|existing| existing == &warning) {
+            warnings.push(warning);
         }
     }
     warnings
@@ -1634,6 +1675,7 @@ fn render_parallel_health_summary(
     preflight_warnings: &[String],
     recent_host_warnings: &[String],
     active_recovery_lanes: &[String],
+    stale_recovery_lanes: &[String],
 ) -> String {
     let mut issues = Vec::new();
     if !preflight_warnings.is_empty() {
@@ -1652,6 +1694,12 @@ fn render_parallel_health_summary(
         issues.push(format!(
             "active recovery lanes: {}",
             active_recovery_lanes.join(", ")
+        ));
+    }
+    if !stale_recovery_lanes.is_empty() {
+        issues.push(format!(
+            "stale recovery lanes: {}",
+            stale_recovery_lanes.join(", ")
         ));
     }
     if issues.is_empty() {
@@ -6180,11 +6228,12 @@ mod tests {
         render_parallel_health_summary, repo_forbids_legacy_review_trackers,
         reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
         salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
-        try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
-        ActiveLaneAssignment, CherryPickFailurePolicy, LaneLandingRecoveryPrep, LaneRepoProgress,
-        LaneResumeCandidate, LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus,
-        ParallelBlockerKind, ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
-        ParallelUnblockCandidateKind, PartialFollowUpDisposition,
+        tmux_status_line_has_live_worker, try_checkpoint_parallel_host_queue_changes,
+        update_task_completion_in_plan_text, ActiveLaneAssignment, CherryPickFailurePolicy,
+        LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LinearAutoSyncState,
+        LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind, ParallelEventLogger,
+        ParallelPreflightNeeds, ParallelStartupPrep, ParallelUnblockCandidateKind,
+        PartialFollowUpDisposition,
     };
 
     #[test]
@@ -6234,6 +6283,18 @@ mod tests {
         assert!(command.contains("host.stderr.log"));
         assert!(command.contains("tee -a"));
         assert!(command.contains("exec bash"));
+    }
+
+    #[test]
+    fn tmux_status_worker_detection_ignores_parked_shells() {
+        assert!(tmux_status_line_has_live_worker("0:host:dead=0:cmd=auto"));
+        assert!(tmux_status_line_has_live_worker(
+            "1:lane-1:dead=0:cmd=codex"
+        ));
+        assert!(!tmux_status_line_has_live_worker("0:host:dead=0:cmd=bash"));
+        assert!(!tmux_status_line_has_live_worker(
+            "1:lane-1:dead=1:cmd=auto"
+        ));
     }
 
     #[test]
@@ -6653,23 +6714,26 @@ mod tests {
             &preflight,
             &host_warnings,
             &["lane-1 TASK-1".to_string(), "lane-3 TASK-3".to_string()],
+            &["lane-2 TASK-2".to_string()],
         );
         assert_eq!(
             preflight,
             vec!["agent-browser".to_string(), "docker compose".to_string()]
         );
         assert_eq!(
-            host_warnings,
-            vec![
-                "warning: failed syncing host-owned queue state".to_string(),
-                "warning: lane-1 something else".to_string()
-            ]
+            host_warnings.len(),
+            2,
+            "host warnings should be de-duplicated with source freshness"
         );
+        assert!(host_warnings[0].contains("live.log"));
+        assert!(host_warnings[0].contains("ago"));
+        assert!(host_warnings[0].contains("warning: failed syncing host-owned queue state"));
+        assert!(host_warnings[1].contains("warning: lane-1 something else"));
         assert!(summary.contains("degraded"));
         assert!(summary.contains("preflight warnings: agent-browser, docker compose"));
-        assert!(summary
-            .contains("recent host warnings: warning: failed syncing host-owned queue state"));
+        assert!(summary.contains("recent host warnings: live.log"));
         assert!(summary.contains("active recovery lanes: lane-1 TASK-1, lane-3 TASK-3"));
+        assert!(summary.contains("stale recovery lanes: lane-2 TASK-2"));
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
