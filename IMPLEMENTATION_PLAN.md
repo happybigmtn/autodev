@@ -102,7 +102,7 @@
   Estimated scope: S
   Completion signal: design NO-GO always leaves executor-visible repair work or an explicit dependency blocker.
 
-- [ ] `AD-014` Symphony and receipt evidence checkpoint
+- [x] `AD-014` Symphony and receipt evidence checkpoint
 
   Spec: `specs/230426-symphony-workflow-and-linear-sync.md`
   Why now: Workflow rendering and completion evidence both affect unattended execution safety; future Linear sync or external Symphony runtime changes should wait until these local deterministic proofs are recorded.
