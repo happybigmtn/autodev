@@ -27,7 +27,7 @@
   Estimated scope: S
   Completion signal: CLI help, doctor output, CI smoke, and root design doctrine agree on the operator surface.
 
-- [ ] `DESIGN-002` Report-only and final-status output contract enforcement
+- [x] `DESIGN-002` Report-only and final-status output contract enforcement
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: The design system depends on operators knowing what each command read, wrote, proved, and should do next; today this is partly prompt discipline and partly command-specific behavior, so report-only and dry-run surfaces can still look safer or more complete than runtime enforcement proves.
