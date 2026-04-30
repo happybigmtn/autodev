@@ -756,20 +756,20 @@
 
 ## Completed / Already Satisfied
 
-- [x] `SAT-001` Report-only write-boundary helpers already exist for QA-only, health, and design surfaces.
+- [~] `SAT-001` Report-only write-boundary helpers already exist for QA-only, health, and design surfaces.
   Evidence: `src/qa_only_command.rs` owns `report_only_dirty_state_report`; `src/health_command.rs` imports `require_nonempty_report` and dirty-state helpers; `src/design_command.rs` has `design_report_only_rejects_disallowed_dirty_state`.
 
-- [x] `SAT-002` Rich plan-task required fields already have a shared catalog.
+- [~] `SAT-002` Rich plan-task required fields already have a shared catalog.
   Evidence: `src/task_parser.rs` defines `PLAN_TASK_REQUIRED_FIELDS`, `PLAN_TASK_PROCESS_FIELDS`, and `TASK_FIELD_BOUNDARIES`; `src/generation.rs`, `src/spec_command.rs`, and `src/super_command.rs` consume those fields.
 
-- [x] `SAT-003` Verification receipt freshness already records important current-tree metadata.
+- [~] `SAT-003` Verification receipt freshness already records important current-tree metadata.
   Evidence: `src/completion_artifacts.rs` checks commit, dirty-state fingerprint, plan hash, expected argv, failed commands, superseded failures, zero-test summaries, and declared artifact hashes; `src/ship_command.rs` has matching release-gate checks that `EVID-002` will consolidate.
 
-- [x] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
+- [~] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
   Evidence: `src/doctor_command.rs` prints required checks, capabilities, and a no-model/network guarantee; `.github/workflows/ci.yml` smokes the installed binary help surfaces.
 
-- [x] `SAT-005` Professional audit status and file-quality gates already exist.
+- [~] `SAT-005` Professional audit status and file-quality gates already exist.
   Evidence: `src/audit_everything.rs` owns `.auto/audit-everything`, `RUN-STATUS.md`, pause/unpause/status controls, final-review evidence classification, file-quality accept score `9.0`, and target score `10.0`.
 
-- [x] `SAT-006` The planning corpus remains subordinate to root queue truth.
+- [~] `SAT-006` The planning corpus remains subordinate to root queue truth.
   Evidence: `gen-20260430-184141/specs/` contains ten generated specs and `gen-20260430-184141/corpus/**` contains the copied corpus, while the reviewed root `IMPLEMENTATION_PLAN.md` now contains the active promoted worker queue and references `gen-*` only as provenance or promotion evidence.
