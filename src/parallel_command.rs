@@ -94,7 +94,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
             target_branch.as_str(),
         );
         let session_name = parallel_tmux_session_name(&repo_root);
-        match launch_parallel_tmux_session(&session_name, &run_root)? {
+        match launch_parallel_tmux_session(&session_name, &run_root, &args)? {
             TmuxLaunchStatus::Launched => {
                 println!("auto parallel launched tmux session `{session_name}`");
             }
@@ -3784,12 +3784,16 @@ fn parallel_host_stderr_log_path(run_root: &Path) -> PathBuf {
     run_root.join("host.stderr.log")
 }
 
-fn launch_parallel_tmux_session(session_name: &str, run_root: &Path) -> Result<TmuxLaunchStatus> {
+fn launch_parallel_tmux_session(
+    session_name: &str,
+    run_root: &Path,
+    args: &ParallelArgs,
+) -> Result<TmuxLaunchStatus> {
     if tmux_session_exists(session_name)? {
         return Ok(TmuxLaunchStatus::AlreadyRunning);
     }
 
-    let command = parallel_tmux_command(run_root)?;
+    let command = parallel_tmux_command(run_root, args)?;
     let working_dir = env::current_dir()
         .context("failed to resolve current directory")?
         .display()
@@ -3840,7 +3844,7 @@ fn parallel_tmux_session_name(repo_root: &Path) -> String {
     format!("{slug}-parallel")
 }
 
-fn parallel_tmux_command(run_root: &Path) -> Result<String> {
+fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Result<String> {
     let executable = env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
@@ -3849,8 +3853,52 @@ fn parallel_tmux_command(run_root: &Path) -> Result<String> {
     let mut parts = vec![
         "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
         shell_quote(&executable),
+        "parallel".to_string(),
     ];
-    parts.extend(env::args().skip(1).map(|arg| shell_quote(&arg)));
+    push_optional_usize_arg(&mut parts, "--max-iterations", args.max_iterations);
+    parts.push("--threads".to_string());
+    parts.push(args.max_concurrent_workers.to_string());
+    push_optional_usize_arg(&mut parts, "--cargo-build-jobs", args.cargo_build_jobs);
+    parts.push("--cargo-target".to_string());
+    parts.push(
+        match args.cargo_target {
+            ParallelCargoTarget::Auto => "auto",
+            ParallelCargoTarget::Shared => "shared",
+            ParallelCargoTarget::Lane => "lane",
+            ParallelCargoTarget::None => "none",
+        }
+        .to_string(),
+    );
+    push_optional_path_arg(&mut parts, "--prompt-file", args.prompt_file.as_deref());
+    parts.push("--model".to_string());
+    parts.push(shell_quote(&args.model));
+    parts.push("--reasoning-effort".to_string());
+    parts.push(shell_quote(&args.reasoning_effort));
+    push_optional_str_arg(&mut parts, "--branch", args.branch.as_deref());
+    for reference_repo in &args.reference_repos {
+        parts.push("--reference-repo".to_string());
+        parts.push(shell_quote(&reference_repo.display().to_string()));
+    }
+    if args.include_siblings {
+        parts.push("--include-siblings".to_string());
+    }
+    push_optional_path_arg(&mut parts, "--run-root", args.run_root.as_deref());
+    parts.push("--codex-bin".to_string());
+    parts.push(shell_quote(&args.codex_bin.display().to_string()));
+    if args.claude {
+        parts.push("--claude".to_string());
+    }
+    push_optional_usize_arg(&mut parts, "--max-turns", args.max_turns);
+    parts.push("--max-retries".to_string());
+    parts.push(args.max_retries.to_string());
+    if let Some(action) = args.action {
+        parts.push(
+            match action {
+                ParallelAction::Status => "status",
+            }
+            .to_string(),
+        );
+    }
     let host_command = parts.join(" ");
     let stdout_log_path = parallel_host_stdout_log_path(run_root);
     let stderr_log_path = parallel_host_stderr_log_path(run_root);
@@ -3867,6 +3915,27 @@ fn parallel_tmux_command(run_root: &Path) -> Result<String> {
         stderr_label = shell_quote(&stderr_log_path.display().to_string()),
     );
     Ok(format!("bash -lc {}", shell_quote(&script)))
+}
+
+fn push_optional_usize_arg(parts: &mut Vec<String>, flag: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        parts.push(flag.to_string());
+        parts.push(value.to_string());
+    }
+}
+
+fn push_optional_str_arg(parts: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        parts.push(flag.to_string());
+        parts.push(shell_quote(value));
+    }
+}
+
+fn push_optional_path_arg(parts: &mut Vec<String>, flag: &str, value: Option<&Path>) {
+    if let Some(value) = value {
+        parts.push(flag.to_string());
+        parts.push(shell_quote(&value.display().to_string()));
+    }
 }
 
 fn rebuild_active_tasks(
@@ -6205,7 +6274,7 @@ mod tests {
 
     use anyhow::anyhow;
 
-    use crate::{ParallelArgs, ParallelCargoTarget};
+    use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget};
 
     use super::{
         audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
@@ -6276,13 +6345,65 @@ mod tests {
 
     #[test]
     fn parallel_tmux_command_persists_host_logs_and_keeps_shell_open() {
-        let command = parallel_tmux_command(&PathBuf::from("/tmp/auto-parallel"))
+        let args = ParallelArgs {
+            action: None,
+            max_iterations: Some(3),
+            max_concurrent_workers: 8,
+            cargo_build_jobs: Some(2),
+            cargo_target: ParallelCargoTarget::Lane,
+            prompt_file: Some(PathBuf::from("/tmp/prompt.md")),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: Some("main".to_string()),
+            reference_repos: vec![PathBuf::from("/tmp/reference repo")],
+            include_siblings: true,
+            run_root: Some(PathBuf::from("/tmp/auto-parallel")),
+            codex_bin: PathBuf::from("codex"),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        };
+        let command = parallel_tmux_command(&PathBuf::from("/tmp/auto-parallel"), &args)
             .expect("tmux command should render");
 
         assert!(command.contains("host.stdout.log"));
         assert!(command.contains("host.stderr.log"));
         assert!(command.contains("tee -a"));
         assert!(command.contains("exec bash"));
+        assert!(command.contains(" parallel "));
+        assert!(command.contains("--threads 8"));
+        assert!(command.contains("--max-iterations 3"));
+        assert!(command.contains("--cargo-target lane"));
+        assert!(command.contains("--reference-repo"));
+        assert!(command.contains("--include-siblings"));
+        assert!(!command.contains(" super "));
+    }
+
+    #[test]
+    fn parallel_tmux_command_renders_status_action_when_requested() {
+        let args = ParallelArgs {
+            action: Some(ParallelAction::Status),
+            max_iterations: None,
+            max_concurrent_workers: 2,
+            cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::Auto,
+            prompt_file: None,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: None,
+            reference_repos: Vec::new(),
+            include_siblings: false,
+            run_root: None,
+            codex_bin: PathBuf::from("codex"),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        };
+        let command = parallel_tmux_command(&PathBuf::from("/tmp/auto-parallel"), &args)
+            .expect("tmux command should render");
+
+        assert!(command.contains(" parallel "));
+        assert!(command.contains(" status"));
     }
 
     #[test]
