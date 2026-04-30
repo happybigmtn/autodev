@@ -573,6 +573,8 @@ pub(crate) struct DesignArgs {
     resolve: bool,
 
     /// Maximum design audit/implementation/reverification passes for --resolve.
+    /// In auto super, final NO-GO reports with dependency-ready repair tasks may
+    /// receive bounded extra repair continuations instead of failing immediately.
     #[arg(long, default_value_t = 3)]
     resolve_passes: usize,
 
@@ -706,7 +708,7 @@ pub(crate) struct SuperArgs {
     #[arg(long)]
     skip_design: bool,
 
-    /// Maximum design repair passes before auto super gives up on design/runtime integrity.
+    /// Maximum design repair passes before auto super starts bounded final NO-GO recovery.
     #[arg(long, default_value_t = 3)]
     design_resolve_passes: usize,
 

@@ -10,7 +10,7 @@ use crate::qa_only_command::{
     allowed_report_only_dirty_paths, collect_dirty_state, print_final_status_block,
     report_only_dirty_state_report,
 };
-use crate::task_parser::parse_tasks;
+use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
@@ -256,7 +256,13 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
     }
 
     let mut last_report = None;
-    for pass in 1..=max_passes {
+    let mut pass = 1usize;
+    let mut recovery_extensions = 0usize;
+    let max_recovery_extensions = match kind {
+        DesignRunKind::SuperResolve => max_passes,
+        _ => 0,
+    };
+    while pass <= max_passes + max_recovery_extensions {
         let pass_dir = output_root.join(format!("pass-{pass:02}"));
         fs::create_dir_all(&pass_dir)
             .with_context(|| format!("failed to create {}", pass_dir.display()))?;
@@ -304,17 +310,36 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             );
             return Ok(());
         }
-        if pass == max_passes {
-            if let Some(promoted) = preserve_final_no_go_design_plan_items(
+        if pass >= max_passes {
+            let promoted = preserve_final_no_go_design_plan_items(
                 &repo_root,
                 &output_root,
                 pass,
                 max_passes,
                 &pass_dir,
-            )? {
+            )?;
+            if let Some(promoted) = promoted {
                 println!(
                     "status:      promoted {promoted} design task(s) into IMPLEMENTATION_PLAN.md"
                 );
+            }
+            if recovery_extensions < max_recovery_extensions
+                && root_queue_has_dependency_ready_repair_tasks(&repo_root)?
+            {
+                recovery_extensions += 1;
+                println!(
+                    "stage:       final NO-GO repair implementation {recovery_extensions}/{max_recovery_extensions}"
+                );
+                run_design_parallel_pass(&args, &output_root, pass).await?;
+                write_design_resolution_status(
+                    &output_root,
+                    pass,
+                    max_passes,
+                    &pass_dir,
+                    "final-no-go-repair-pass-complete",
+                )?;
+                pass += 1;
+                continue;
             }
             break;
         }
@@ -330,12 +355,35 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             &pass_dir,
             "implementation-pass-complete",
         )?;
+        pass += 1;
     }
 
     let report = last_report
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| output_root.display().to_string());
     bail!("design resolve did not reach `Verdict: GO` after {max_passes} pass(es); latest report: {report}")
+}
+
+fn root_queue_has_dependency_ready_repair_tasks(repo_root: &Path) -> Result<bool> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(false);
+    }
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let tasks = parse_tasks(&plan);
+    let completed = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Done)
+        .map(|task| task.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(tasks.iter().any(|task| {
+        matches!(task.status, TaskStatus::Pending | TaskStatus::Partial)
+            && task
+                .dependencies
+                .iter()
+                .all(|dependency| completed.contains(dependency.as_str()))
+    }))
 }
 
 fn enforce_design_report_only_write_boundary(
@@ -1016,6 +1064,30 @@ mod tests {
             preserve_final_no_go_design_plan_items(&root, &output_root, 1, 1, &pass_dir).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn final_no_go_existing_root_repair_task_is_recoverable() {
+        let root = temp_dir("design-final-no-go-existing-repair");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [x] `DESIGN-001` Done\n    Dependencies: none\n\n- [ ] `DESIGN-008` Active ledger reconciliation before generation\n    Dependencies: `DESIGN-001`\n\n## Follow-On Work\n\n",
+        )
+        .unwrap();
+
+        assert!(super::root_queue_has_dependency_ready_repair_tasks(&root).unwrap());
+    }
+
+    #[test]
+    fn final_no_go_blocked_root_repair_task_is_not_recoverable() {
+        let root = temp_dir("design-final-no-go-blocked-repair");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n- [ ] `DESIGN-008` Active ledger reconciliation before generation\n    Dependencies: `DESIGN-007`\n\n## Follow-On Work\n\n",
+        )
+        .unwrap();
+
+        assert!(!super::root_queue_has_dependency_ready_repair_tasks(&root).unwrap());
     }
 
     fn temp_dir(label: &str) -> PathBuf {

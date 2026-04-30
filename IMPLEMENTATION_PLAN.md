@@ -127,11 +127,11 @@
   Estimated scope: XS
   Completion signal: Review handoff records local green proof or specific blockers for workflow rendering and receipt evidence.
 
-- [~] `TASK-016` Tag `v0.2.0` once the priority + first follow-on cluster is verified clean
+- [x] `TASK-016` Tag `v0.2.0` once the priority + first follow-on cluster is verified clean
 
     Spec: `specs/220426-release-ship.md`
-    Why now: the release ledger is visible operator UI. `v0.2.0` exists and `Cargo.toml` is already `0.2.0`, but root `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, the tag annotation, and receipts do not present one consistent completion story.
-    Codebase evidence: `Cargo.toml:3` reads `version = "0.2.0"`; `git tag -l v0.2.0` resolves; `.auto/symphony/verification-receipts/TASK-016.json` exists; `COMPLETED.md` is empty; this row was still partial and previously described `Cargo.toml` with an obsolete pre-release version.
+    Why now: the release ledger is visible operator UI. `v0.2.0` exists, `Cargo.toml` is already `0.2.0`, and the root ledgers now present one consistent completion story before the next `auto super` stage resumes.
+    Codebase evidence: `Cargo.toml:3` reads `version = "0.2.0"`; `git tag -l v0.2.0` resolves; `.auto/symphony/verification-receipts/TASK-016.json` exists; `COMPLETED.md` documents that `ARCHIVED.md` is the durable reviewed-completion ledger.
     Source of truth: `Cargo.toml`, `Cargo.lock`, `COMPLETED.md`, `refs/tags/v0.2.0`, `.auto/symphony/verification-receipts/TASK-016.json`, `REVIEW.md`, `ARCHIVED.md`
     Runtime owner: `src/ship_command.rs`, `src/completion_artifacts.rs`, `build.rs`, `src/util.rs`
     UI consumers: `auto --version`, `auto ship` release gate output, release ledger docs, `auto parallel status`, `REVIEW.md`
@@ -227,11 +227,11 @@
   Estimated scope: M
   Completion signal: generated worker proof commands are runnable one at a time and receipts can distinguish corrected proof from failed history.
 
-- [ ] `DESIGN-008` Active ledger reconciliation before generation
+- [x] `DESIGN-008` Active ledger reconciliation before generation
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
-  Why now: The pass-03 design gate found the pass-02 runtime fixes mostly present, but the operator ledgers still contradict each other. `TASK-016` is partial in `IMPLEMENTATION_PLAN.md`, passed in `ARCHIVED.md`, and stale lane recovery in `.auto/parallel`; `REVIEW.md` still lists completed `DESIGN-*` items with blockers even though receipts and regression tests now exist. `auto gen` or `auto parallel` would amplify false queue truth if this is not reconciled first.
-  Codebase evidence: `cargo run --quiet -- parallel status` labels lane-2 `TASK-016` as stale recovery and not active progress; `.auto/symphony/verification-receipts/DESIGN-001.json` through `DESIGN-007.json` exist; `ARCHIVED.md` says `TASK-016` passed; `REVIEW.md` still contains blocker entries for `DESIGN-001`, `DESIGN-003`, `DESIGN-006`, and other completed design rows.
+  Why now: The pass-03 design gate found the pass-02 runtime fixes mostly present, but the operator ledgers contradicted each other. This row reconciled the active queue, review queue, archive ledger, completion note, receipts, tag, and stale parallel residue before the next `auto super` stage resumes.
+  Codebase evidence: `.auto/symphony/verification-receipts/DESIGN-001.json` through `DESIGN-007.json` exist; `ARCHIVED.md` says `TASK-016` passed; `REVIEW.md` is back to an empty awaiting-review queue; `COMPLETED.md` documents the archive-ledger convention and release baseline; stale `.auto/parallel` lane residue was cleared.
   Source of truth: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `.auto/symphony/verification-receipts/*.json`, `refs/tags/v0.2.0`, `.auto/parallel/*`
   Runtime owner: `src/review_command.rs`, `src/parallel_command.rs`, `src/completion_artifacts.rs`, `src/ship_command.rs`
   UI consumers: active queue, review/archive ledgers, `auto parallel status`, `auto review` handoff, `auto ship` release gate, generation prompts
