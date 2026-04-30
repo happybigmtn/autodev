@@ -380,48 +380,56 @@ fn find_on_path(tool: &str) -> Option<PathBuf> {
 }
 
 fn print_doctor_report(report: &DoctorReport) {
-    println!("required:");
+    print!("{}", render_doctor_report(report));
+}
+
+fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut output = String::new();
+
+    output.push_str("required:\n");
     for check in &report.required {
         let status = if check.passed { "ok" } else { "fail" };
-        println!("- [{status}] {}: {}", check.name, check.detail);
+        output.push_str(&format!("- [{status}] {}: {}\n", check.name, check.detail));
         if let Some(action) = &check.action {
-            println!("  next: {action}");
+            output.push_str(&format!("  next: {action}\n"));
         }
     }
 
-    println!();
-    println!("capabilities:");
+    output.push('\n');
+    output.push_str("capabilities:\n");
     for check in &report.capabilities {
         match &check.found {
-            Some(path) => println!(
-                "- [ok] {}: found at {}; enables {}",
+            Some(path) => output.push_str(&format!(
+                "- [ok] {}: found at {}; enables {}\n",
                 check.tool,
                 path.display(),
                 check.workflows
-            ),
-            None => println!(
-                "- [warn] {}: not found on PATH; unavailable until installed/authenticated: {}",
+            )),
+            None => output.push_str(&format!(
+                "- [warn] {}: not found on PATH; unavailable until installed/authenticated: {}\n",
                 check.tool, check.workflows
-            ),
+            )),
         }
     }
 
-    println!();
-    println!("model/network:");
-    println!("- [ok] no model providers, network APIs, Linear, GitHub, Symphony, Docker, browser automation, or tmux sessions were invoked");
+    output.push('\n');
+    output.push_str("model/network:\n");
+    output.push_str("- [ok] no model providers, network APIs, Linear, GitHub, Symphony, Docker, browser automation, or tmux sessions were invoked\n");
 
-    println!();
-    println!("next steps:");
+    output.push('\n');
+    output.push_str("next steps:\n");
     if report.required_failed() {
-        println!("- fix the failed required checks above, then rerun auto doctor");
-        println!("doctor failed");
+        output.push_str("- fix the failed required checks above, then rerun auto doctor\n");
+        output.push_str("doctor failed\n");
     } else {
-        println!("- run cargo test for local regression proof");
-        println!(
-            "- run model-backed commands such as auto health only after credentials are configured"
+        output.push_str("- run cargo test for local regression proof\n");
+        output.push_str(
+            "- run model-backed commands such as auto health only after credentials are configured\n",
         );
-        println!("doctor ok");
+        output.push_str("doctor ok\n");
     }
+
+    output
 }
 
 fn compact_probe_output(probe: &CommandProbe) -> String {
@@ -460,7 +468,8 @@ mod tests {
 
     use super::{
         build_optional_tool_checks, check_help_surfaces_with, check_repo_checkout,
-        format_auto_args, CommandProbe, HELP_SURFACES,
+        check_version_probe, format_auto_args, render_doctor_report, CapabilityCheck, CommandProbe,
+        DoctorReport, RequiredCheck, HELP_SURFACES,
     };
 
     #[test]
@@ -520,6 +529,44 @@ mod tests {
         );
         assert_eq!(checks.len(), HELP_SURFACES.len());
         assert!(checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn doctor_renders_no_model_first_run_contract() {
+        let version = check_version_probe(&CommandProbe {
+            success: true,
+            stdout: format!(
+                "auto {}\ncommit: abc123\ndirty: false\nprofile: debug\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+            stderr: String::new(),
+            launch_error: None,
+        });
+        let report = DoctorReport {
+            required: vec![
+                RequiredCheck {
+                    name: "repo layout".to_string(),
+                    passed: true,
+                    detail: "found Cargo.toml, src/main.rs, README.md, AGENTS.md".to_string(),
+                    action: None,
+                },
+                version,
+            ],
+            capabilities: vec![CapabilityCheck {
+                tool: "codex",
+                found: None,
+                workflows: "model-backed flows",
+            }],
+        };
+
+        let rendered = render_doctor_report(&report);
+
+        assert!(rendered.contains("- [ok] repo layout: found Cargo.toml"));
+        assert!(rendered.contains("- [ok] binary provenance: auto"));
+        assert!(rendered.contains("- [warn] codex: not found on PATH"));
+        assert!(rendered.contains("no model providers, network APIs, Linear, GitHub"));
+        assert!(rendered.contains("Docker, browser automation, or tmux sessions were invoked"));
+        assert!(rendered.contains("doctor ok"));
     }
 
     #[test]
