@@ -1,10 +1,12 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use shlex::split as shell_split;
 
 use crate::codex_exec::run_codex_exec;
 use crate::util::{
@@ -90,21 +92,48 @@ impl ShipGateReport {
 #[derive(Debug, Deserialize)]
 struct VerificationReceipt {
     #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    dirty_state: Option<VerificationDirtyState>,
+    #[serde(default)]
+    plan_hash: Option<String>,
+    #[serde(default)]
+    declared_artifacts: Vec<VerificationReceiptArtifact>,
+    #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
 }
 
 #[derive(Debug, Deserialize)]
+struct VerificationDirtyState {
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerificationReceiptArtifact {
+    path: String,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct VerificationReceiptCommand {
     command: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    expected_argv: Option<Vec<String>>,
     #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     runner_summary: Option<RunnerSummary>,
+    #[serde(default, skip)]
+    freshness_problem: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct RunnerSummary {
     #[serde(default)]
     tests_run: Option<u64>,
@@ -120,6 +149,7 @@ fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> Ship
         &receipts,
         command_is_cargo_fmt,
         "missing validation receipt: `cargo fmt --check`",
+        "stale validation receipt: `cargo fmt --check`",
         "red validation receipt: `cargo fmt --check`",
         &mut blockers,
     );
@@ -127,6 +157,7 @@ fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> Ship
         &receipts,
         command_is_cargo_clippy,
         "missing validation receipt: `cargo clippy --all-targets --all-features -- -D warnings`",
+        "stale validation receipt: `cargo clippy --all-targets --all-features -- -D warnings`",
         "red validation receipt: `cargo clippy --all-targets --all-features -- -D warnings`",
         &mut blockers,
     );
@@ -134,6 +165,7 @@ fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> Ship
         &receipts,
         command_is_broad_cargo_test,
         "missing validation receipt: `cargo test`",
+        "stale validation receipt: `cargo test`",
         "red validation receipt: `cargo test`",
         &mut blockers,
     );
@@ -141,6 +173,7 @@ fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> Ship
         &receipts,
         command_is_cargo_install_auto,
         "missing installed-binary proof: no passing receipt for `cargo install --path . --root ...`",
+        "stale installed-binary proof: `cargo install --path . --root ...`",
         "red installed-binary proof: `cargo install --path . --root ...`",
         &mut blockers,
     );
@@ -148,6 +181,7 @@ fn evaluate_ship_gate(repo_root: &Path, branch: &str, base_branch: &str) -> Ship
         &receipts,
         command_is_auto_version,
         "missing installed-binary proof: no passing receipt for PATH-resolved `auto --version`",
+        "stale installed-binary proof: PATH-resolved `auto --version`",
         "red installed-binary proof: PATH-resolved `auto --version`",
         &mut blockers,
     );
@@ -164,6 +198,7 @@ fn require_receipt(
     receipts: &[VerificationReceiptCommand],
     matches: fn(&str) -> bool,
     missing_message: &str,
+    stale_message: &str,
     red_message: &str,
     blockers: &mut Vec<String>,
 ) {
@@ -173,12 +208,20 @@ fn require_receipt(
         .collect::<Vec<_>>();
     if matching.is_empty() {
         blockers.push(missing_message.to_string());
+    } else if let Some(problem) = matching
+        .iter()
+        .find_map(|receipt| receipt.freshness_problem.as_deref())
+    {
+        blockers.push(format!("{stale_message}: {problem}"));
     } else if !matching.iter().any(|receipt| receipt_passed(receipt)) {
         blockers.push(red_message.to_string());
     }
 }
 
 fn receipt_passed(receipt: &VerificationReceiptCommand) -> bool {
+    if receipt.freshness_problem.is_some() {
+        return false;
+    }
     let status_passed = match receipt.status.as_deref() {
         Some("passed") => receipt.exit_code.unwrap_or(0) == 0,
         Some(_) => false,
@@ -203,10 +246,280 @@ fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptComman
 
     entries
         .filter_map(|entry| entry.ok())
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .filter_map(|text| serde_json::from_str::<VerificationReceipt>(&text).ok())
-        .flat_map(|receipt| receipt.commands)
+        .flat_map(|entry| {
+            let path = entry.path();
+            let Some(receipt) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<VerificationReceipt>(&text).ok())
+            else {
+                return Vec::new();
+            };
+            let freshness_problem = verification_receipt_freshness_problem(
+                repo_root,
+                &path,
+                &receipt,
+                &receipt
+                    .commands
+                    .iter()
+                    .map(|command| command.command.clone())
+                    .collect::<Vec<_>>(),
+                &[],
+            );
+            receipt
+                .commands
+                .into_iter()
+                .map(|mut command| {
+                    command.freshness_problem = freshness_problem.clone();
+                    command
+                })
+                .collect::<Vec<_>>()
+        })
         .collect()
+}
+
+fn verification_receipt_freshness_problem(
+    repo_root: &Path,
+    verification_receipt_path: &Path,
+    receipt: &VerificationReceipt,
+    expected_commands: &[String],
+    declared_artifacts: &[String],
+) -> Option<String> {
+    let current_commit = current_git_commit(repo_root);
+    let current_dirty_fingerprint = current_dirty_state_fingerprint(repo_root);
+    let current_plan_hash = current_plan_hash(repo_root);
+    let requires_current_metadata = current_commit.is_some()
+        || current_dirty_fingerprint.is_some()
+        || current_plan_hash.is_some();
+
+    if let Some(current) = current_commit {
+        match receipt.commit.as_deref() {
+            Some(recorded) if recorded == current => {}
+            Some(recorded) => {
+                return Some(format!(
+                    "commit mismatch, recorded `{recorded}` but current HEAD is `{current}`"
+                ))
+            }
+            None => return Some("missing current commit metadata".to_string()),
+        }
+    }
+
+    if let Some(current) = current_dirty_fingerprint {
+        match receipt
+            .dirty_state
+            .as_ref()
+            .and_then(|state| state.fingerprint.as_deref())
+        {
+            Some(recorded) if recorded == current => {}
+            Some(recorded) => {
+                return Some(format!(
+                    "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
+                ))
+            }
+            None => return Some("missing dirty-state fingerprint".to_string()),
+        }
+    }
+
+    if let Some(current) = current_plan_hash {
+        match receipt.plan_hash.as_deref() {
+            Some(recorded) if recorded == current => {}
+            Some(recorded) => {
+                return Some(format!(
+                    "plan hash mismatch, recorded `{recorded}` but current IMPLEMENTATION_PLAN.md hash is `{current}`"
+                ))
+            }
+            None => return Some("missing plan hash".to_string()),
+        }
+    }
+
+    for (path, current_hash) in
+        current_declared_artifact_hashes(repo_root, verification_receipt_path, declared_artifacts)
+    {
+        match receipt
+            .declared_artifacts
+            .iter()
+            .find(|artifact| artifact.path == path)
+            .and_then(|artifact| artifact.sha256.as_deref())
+        {
+            Some(recorded) if recorded == current_hash => {}
+            Some(recorded) => {
+                return Some(format!(
+                    "declared artifact `{path}` hash mismatch, recorded `{recorded}` but current hash is `{current_hash}`"
+                ))
+            }
+            None => return Some(format!("missing declared artifact `{path}` hash")),
+        }
+    }
+
+    if requires_current_metadata {
+        for expected_command in expected_commands {
+            if let Some(problem) = verification_command_argv_problem(receipt, expected_command) {
+                return Some(problem);
+            }
+        }
+    }
+
+    None
+}
+
+fn verification_command_argv_problem(
+    receipt: &VerificationReceipt,
+    expected_command: &str,
+) -> Option<String> {
+    let expected_argv = shell_split(expected_command)?;
+    let matching = receipt
+        .commands
+        .iter()
+        .filter(|entry| verification_receipt_command_matches(entry, expected_command))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return None;
+    }
+    if matching
+        .iter()
+        .any(|entry| entry.expected_argv.as_ref() == Some(&expected_argv))
+    {
+        return None;
+    }
+    Some(format!(
+        "command `{expected_command}` is missing matching expected argv metadata"
+    ))
+}
+
+fn verification_receipt_command_matches(
+    entry: &VerificationReceiptCommand,
+    expected_command: &str,
+) -> bool {
+    if entry.command == expected_command {
+        return true;
+    }
+    if entry.argv.is_empty() {
+        return false;
+    }
+    shell_split(expected_command)
+        .map(|expected_argv| expected_argv == entry.argv)
+        .unwrap_or(false)
+}
+
+fn current_git_commit(repo_root: &Path) -> Option<String> {
+    command_stdout(repo_root, ["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
+}
+
+fn current_dirty_state_fingerprint(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "-z"])
+        .output()
+        .ok()?;
+    output.status.success().then(|| sha256_hex(&output.stdout))
+}
+
+fn current_plan_hash(repo_root: &Path) -> Option<String> {
+    fs::read(repo_root.join("IMPLEMENTATION_PLAN.md"))
+        .ok()
+        .map(|bytes| sha256_hex(&bytes))
+}
+
+fn command_stdout<const N: usize>(repo_root: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn current_declared_artifact_hashes(
+    repo_root: &Path,
+    verification_receipt_path: &Path,
+    declared_artifacts: &[String],
+) -> Vec<(String, String)> {
+    declared_artifacts
+        .iter()
+        .filter_map(|relative| {
+            let path = declared_artifact_path(repo_root, relative)?;
+            if same_path(&path, verification_receipt_path) {
+                return None;
+            }
+            artifact_hash(&path).map(|hash| (relative.clone(), hash))
+        })
+        .collect()
+}
+
+fn declared_artifact_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
+    let direct = repo_root.join(relative);
+    if direct.exists() {
+        return Some(direct);
+    }
+    relative
+        .strip_prefix(".auto/symphony/verification-receipts/")
+        .map(|file_name| {
+            repo_root
+                .join(".auto/symphony/verification-receipts")
+                .join(file_name)
+        })
+        .filter(|path| path.exists())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn artifact_hash(path: &Path) -> Option<String> {
+    if path.is_file() {
+        return fs::read(path).ok().map(|bytes| sha256_hex(&bytes));
+    }
+    if !path.is_dir() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    collect_artifact_dir_entries(path, path, &mut entries).ok()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, hash) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update([0]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_artifact_dir_entries(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<(String, String)>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_artifact_dir_entries(root, &path, entries)?;
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let hash = sha256_hex(&fs::read(&path)?);
+            entries.push((relative, hash));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn normalized_command(command: &str) -> String {
@@ -850,6 +1163,51 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("`HEALTH.md` is stale")));
+    }
+
+    #[test]
+    fn ship_gate_rejects_stale_completion_receipt() {
+        let repo = test_dir("stale-completion-receipt");
+        init_git_repo(&repo);
+        let stale_commit = git_stdout(&repo, ["rev-parse", "HEAD"])
+            .expect("git rev-parse failed")
+            .trim()
+            .to_string();
+        fs::write(repo.join("release.txt"), "new release content\n")
+            .expect("failed to write release file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "release.txt"])
+            .output()
+            .expect("git add failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "release change"])
+            .output()
+            .expect("git commit failed");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_receipt_json(
+            &repo,
+            &format!(
+                r#"{{"commit":"{stale_commit}","commands":[
+{{"command":"cargo fmt --check","expected_argv":["cargo","fmt","--check"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo clippy --all-targets --all-features -- -D warnings","expected_argv":["cargo","clippy","--all-targets","--all-features","--","-D","warnings"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo test","expected_argv":["cargo","test"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo install --path . --root /tmp/autodev-install-proof","expected_argv":["cargo","install","--path",".","--root","/tmp/autodev-install-proof"],"exit_code":0,"status":"passed"}},
+{{"command":"auto --version","expected_argv":["auto","--version"],"exit_code":0,"status":"passed"}}
+]}}"#
+            ),
+        );
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(report.is_blocked());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("stale validation receipt")));
     }
 
     #[test]

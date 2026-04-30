@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import shlex
@@ -57,9 +58,152 @@ def write_receipt(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def git_output(root: Path, args: list[str], *, text: bool = True) -> str | bytes | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=False,
+        capture_output=True,
+        text=text,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def current_commit(root: Path) -> str | None:
+    output = git_output(root, ["rev-parse", "HEAD"])
+    return output.strip() if isinstance(output, str) and output.strip() else None
+
+
+def dirty_state(root: Path) -> dict | None:
+    output = git_output(root, ["status", "--porcelain=v1", "-z"], text=False)
+    if not isinstance(output, bytes):
+        return None
+    entries = [
+        entry.decode("utf-8", errors="replace")
+        for entry in output.split(b"\0")
+        if entry
+    ]
+    return {
+        "status": "clean" if not entries else "dirty",
+        "fingerprint": sha256_bytes(output),
+        "entries": entries,
+    }
+
+
+def plan_hash(root: Path) -> str | None:
+    path = root / "IMPLEMENTATION_PLAN.md"
+    if not path.exists():
+        return None
+    return file_sha256(path)
+
+
+def declared_completion_artifacts(root: Path, task_id: str) -> list[str]:
+    plan_path = root / "IMPLEMENTATION_PLAN.md"
+    if not plan_path.exists():
+        return []
+    lines = plan_path.read_text(encoding="utf-8").splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.search(rf"`{re.escape(task_id)}`", line)
+        ),
+        None,
+    )
+    if start is None:
+        return []
+    block: list[str] = []
+    for line in lines[start + 1 :]:
+        if re.match(r"\s*-\s+\[[ x~!]\]\s+`[^`]+`", line):
+            break
+        block.append(line)
+    artifacts: list[str] = []
+    collecting = False
+    for line in block:
+        if line.strip().startswith("Completion artifacts:"):
+            collecting = True
+            remainder = line.split("Completion artifacts:", 1)[1]
+            artifacts.extend(artifact_paths_from_line(remainder))
+            continue
+        if collecting and re.match(r"\s*[A-Z][A-Za-z /-]*:", line):
+            break
+        if collecting:
+            artifacts.extend(artifact_paths_from_line(line))
+    return sorted(set(artifact for artifact in artifacts if artifact != "none"))
+
+
+def artifact_paths_from_line(line: str) -> list[str]:
+    fragments = re.findall(r"`([^`]+)`", line)
+    if not fragments:
+        fragments = re.split(r"[\s,;]+", line)
+    paths: list[str] = []
+    for fragment in fragments:
+        candidate = fragment.strip().strip("`").strip(".,;")
+        if not candidate or candidate == "none":
+            continue
+        if "/" in candidate or candidate.endswith((".md", ".rs", ".json", ".toml", ".lock")):
+            paths.append(candidate)
+    return paths
+
+
+def declared_artifact_path(root: Path, receipt_file: Path, relative: str) -> Path | None:
+    direct = root / relative
+    if direct.exists():
+        return direct
+    prefix = ".auto/symphony/verification-receipts/"
+    if relative.startswith(prefix):
+        candidate = receipt_file.parent / relative[len(prefix) :]
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def artifact_hash(path: Path) -> str | None:
+    if path.is_file():
+        return file_sha256(path)
+    if not path.is_dir():
+        return None
+    hasher = hashlib.sha256()
+    for child in sorted(p for p in path.rglob("*") if p.is_file()):
+        relative = child.relative_to(path).as_posix()
+        hasher.update(relative.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(file_sha256(child).encode("ascii"))
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def declared_artifact_hashes(root: Path, receipt_file: Path, task_id: str) -> list[dict]:
+    artifacts = []
+    for relative in declared_completion_artifacts(root, task_id):
+        path = declared_artifact_path(root, receipt_file, relative)
+        if path is None:
+            continue
+        artifact = {"path": relative}
+        try:
+            if path.resolve() == receipt_file.resolve():
+                artifact["sha256"] = None
+                artifact["reason"] = "receipt-self"
+            else:
+                artifact["sha256"] = artifact_hash(path)
+        except FileNotFoundError:
+            continue
+        artifacts.append(artifact)
+    return artifacts
+
+
 def stream_summary(path: str | None, stream_name: str) -> dict:
     raw = b""
-    if path:
+    if path and Path(path).exists():
         raw = Path(path).read_bytes()
     text = raw.decode("utf-8", errors="replace")
     redacted = redact_output(text)
@@ -193,9 +337,14 @@ def record(args: argparse.Namespace) -> None:
 
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
     captured_output = output_summary(args.stdout_file, args.stderr_file)
+    try:
+        expected_argv = shlex.split(command)
+    except ValueError:
+        expected_argv = []
     command_entry = {
         "command": command,
         "argv": args.argv,
+        "expected_argv": expected_argv,
         "exit_code": args.exit_code,
         "output_summary": captured_output,
         "recorded_at": timestamp,
@@ -212,6 +361,10 @@ def record(args: argparse.Namespace) -> None:
     payload = {
         "task_id": task_id,
         "plan_path": "IMPLEMENTATION_PLAN.md",
+        "plan_hash": plan_hash(root),
+        "commit": current_commit(root),
+        "dirty_state": dirty_state(root),
+        "declared_artifacts": declared_artifact_hashes(root, path, task_id),
         "recorded_at": timestamp,
         "commands": [entries[key] for key in sorted(entries)],
     }
