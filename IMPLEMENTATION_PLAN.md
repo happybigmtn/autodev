@@ -52,7 +52,7 @@
   Estimated scope: M
   Completion signal: report-only and dry-run surfaces no longer rely on prompt-only honesty.
 
-- [~] `DESIGN-003` Super, generation, and task contract parity
+- [x] `DESIGN-003` Super, generation, and task contract parity
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: `auto gen` validates rich runtime/UI/generated/fixture fields, but `auto super` deterministic gating currently checks a smaller legacy field set; this can let design/runtime drift reach workers after the design gate has said GO.
