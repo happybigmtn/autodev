@@ -762,7 +762,7 @@
 - [x] `SAT-002` Rich plan-task required fields already have a shared catalog.
   Evidence: `src/task_parser.rs` defines `PLAN_TASK_REQUIRED_FIELDS`, `PLAN_TASK_PROCESS_FIELDS`, and `TASK_FIELD_BOUNDARIES`; `src/generation.rs`, `src/spec_command.rs`, and `src/super_command.rs` consume those fields.
 
-- [~] `SAT-003` Verification receipt freshness already records important current-tree metadata.
+- [x] `SAT-003` Verification receipt freshness already records important current-tree metadata.
   Evidence: `src/completion_artifacts.rs` checks commit, dirty-state fingerprint, plan hash, expected argv, failed commands, superseded failures, zero-test summaries, and declared artifact hashes; `src/ship_command.rs` has matching release-gate checks that `EVID-002` will consolidate.
 
 - [~] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
