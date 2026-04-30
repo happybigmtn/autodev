@@ -765,7 +765,7 @@
 - [x] `SAT-003` Verification receipt freshness already records important current-tree metadata.
   Evidence: `src/completion_artifacts.rs` checks commit, dirty-state fingerprint, plan hash, expected argv, failed commands, superseded failures, zero-test summaries, and declared artifact hashes; `src/ship_command.rs` has matching release-gate checks that `EVID-002` will consolidate.
 
-- [~] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
+- [x] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
   Evidence: `src/doctor_command.rs` prints required checks, capabilities, and a no-model/network guarantee; `.github/workflows/ci.yml` smokes the installed binary help surfaces.
 
 - [x] `SAT-005` Professional audit status and file-quality gates already exist.
