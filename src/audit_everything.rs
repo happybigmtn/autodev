@@ -5324,6 +5324,87 @@ mod tests {
     }
 
     #[test]
+    fn professional_audit_status_and_file_quality_contract_is_runtime_owned() {
+        assert_eq!(PROFESSIONAL_AUDIT_DIR, ".auto/audit-everything");
+        assert_eq!(LATEST_RUN_FILE, "latest-run");
+        assert_eq!(PAUSE_REQUEST_FILE, "PAUSE");
+        assert_eq!(FILE_QUALITY_ACCEPT_SCORE, 9.0);
+        assert_eq!(FILE_QUALITY_TARGET_SCORE, 10.0);
+        assert!(FILE_QUALITY_TARGET_SCORE > FILE_QUALITY_ACCEPT_SCORE);
+
+        let dir = std::env::temp_dir().join(format!(
+            "auto-audit-status-quality-contract-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("worktree/audit/everything/test-run");
+        fs::create_dir_all(&report_root).expect("failed to create report root");
+        let paths = RunPaths {
+            host_root: dir.clone(),
+            manifest_path: dir
+                .join(PROFESSIONAL_AUDIT_DIR)
+                .join("test-run/MANIFEST.json"),
+            latest_path: dir.join(PROFESSIONAL_AUDIT_DIR).join(LATEST_RUN_FILE),
+            worktree_root: dir.join("worktree"),
+            report_root,
+            pause_path: dir
+                .join(PROFESSIONAL_AUDIT_DIR)
+                .join("test-run")
+                .join(PAUSE_REQUEST_FILE),
+            in_place: false,
+        };
+        let mut manifest = manifest_with_groups(vec![group_for_test("src", &["src/lib.rs"])]);
+        manifest.files = vec![FileState {
+            path: "src/lib.rs".to_string(),
+            group: "src".to_string(),
+            content_hash: "hash-a".to_string(),
+            artifact_dir: "artifact-a".to_string(),
+            status: StageStatus::Complete,
+        }];
+        manifest.final_review.status = StageStatus::Complete;
+        manifest.file_quality.status = StageStatus::Complete;
+        manifest.file_quality.note = Some("all tracked files rerated at least 9/10".to_string());
+        manifest.file_quality_passes = vec![FileQualityPassState {
+            pass_index: 1,
+            status: StageStatus::Complete,
+            artifact_dir: file_quality_pass_path(&paths, 1).display().to_string(),
+            ratings: vec![FileQualityRatingState {
+                path: "src/lib.rs".to_string(),
+                score_out_of_10: Some(FILE_QUALITY_ACCEPT_SCORE),
+                status: StageStatus::Complete,
+                artifact_dir: file_quality_file_path(&paths, 1, &manifest.files[0])
+                    .display()
+                    .to_string(),
+                note: None,
+            }],
+            note: Some("accepted at the merge floor while target remains 10/10".to_string()),
+        }];
+        manifest.final_status.status = StageStatus::Complete;
+        manifest.final_status.note = Some("refreshed after merge completion".to_string());
+
+        require_file_quality_acceptance(&manifest)
+            .expect("9/10 ratings satisfy the runtime acceptance gate");
+        manifest.file_quality_passes[0].ratings[0].score_out_of_10 =
+            Some(FILE_QUALITY_ACCEPT_SCORE - 0.1);
+        let below_floor = require_file_quality_acceptance(&manifest).unwrap_err();
+        assert!(format!("{below_floor:#}").contains("below 9"));
+        manifest.file_quality_passes[0].ratings[0].score_out_of_10 =
+            Some(FILE_QUALITY_ACCEPT_SCORE);
+
+        write_run_status_markdown(&paths, &manifest).expect("failed to write run status");
+        let status = fs::read_to_string(run_status_markdown_path(&paths))
+            .expect("failed to read run status");
+        assert!(status.contains("- Final review: Complete"));
+        assert!(status.contains("- File quality: Complete"));
+        assert!(status.contains("all tracked files rerated at least 9/10"));
+        assert!(status.contains("- Final status refresh: Complete"));
+        assert!(status.contains("Evidence Class Checklist"));
+        assert!(status.contains("File quality reratings:"));
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
     fn remediation_graph_orders_docs_and_tests_after_sources() {
         let manifest = manifest_with_groups(vec![
             group_for_test("crates/core", &["crates/core/src/lib.rs"]),
