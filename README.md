@@ -1735,14 +1735,15 @@ auto doctor
 ```
 
 `auto doctor` checks the current git checkout, embedded version metadata, and parseable help for
-`auto --help`, `auto corpus --help`, `auto gen --help`, `auto parallel --help`,
-`auto quota --help`, and `auto symphony --help`. In the `autodev` source checkout it also checks
-the strict `Cargo.toml` package and `auto` binary declaration. In other project checkouts it
-requires repo-local agent instructions such as `AGENTS.md`, `CLAUDE.md`, or
-`.github/copilot-instructions.md` so model-backed work starts from explicit local guidance. It does
-not call Codex, Claude, PI, GitHub, Linear, Symphony, Docker, browser automation, tmux, network
-endpoints, or model providers. Missing `codex`, `claude`, `pi`, and `gh` are capability warnings
-for later workflows, not first-run failures.
+`auto --help`, `auto corpus --help`, `auto gen --help`, `auto design --help`,
+`auto super --help`, `auto parallel --help`, `auto quota --help`, and
+`auto symphony --help`. In the `autodev` source checkout it also checks the strict `Cargo.toml`
+package and `auto` binary declaration. In other project checkouts it requires repo-local agent
+instructions such as `AGENTS.md`, `CLAUDE.md`, or `.github/copilot-instructions.md` so model-backed
+work starts from explicit local guidance. It does not call Codex, Claude, PI, GitHub, Linear,
+Symphony, Docker, browser automation, tmux, network endpoints, or model providers. Missing
+`codex`, `claude`, `pi`, and `gh` are capability warnings for later workflows, not first-run
+failures.
 
 CI proves the installed binary through the same surface from a temporary install root:
 
@@ -1755,6 +1756,7 @@ auto --help
 auto corpus --help
 auto gen --help
 auto design --help
+auto super --help
 auto parallel --help
 auto quota --help
 auto symphony --help

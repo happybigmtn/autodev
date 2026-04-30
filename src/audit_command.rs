@@ -665,6 +665,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_audit_worker(
     join_set: &mut JoinSet<Result<AuditWorkerResult>>,
     repo_root: Arc<PathBuf>,
@@ -684,6 +685,7 @@ fn spawn_audit_worker(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_audit_worker(
     repo_root: Arc<PathBuf>,
     output_dir: Arc<PathBuf>,
@@ -956,7 +958,7 @@ fn build_finding_verification_report(
 }
 
 fn audit_entry_requires_closure(entry: &&ManifestEntry) -> bool {
-    manifest_entry_requires_closure(*entry)
+    manifest_entry_requires_closure(entry)
 }
 
 fn manifest_entry_requires_closure(entry: &ManifestEntry) -> bool {
@@ -1230,7 +1232,7 @@ async fn resolve_audit_findings_pass(
             let lane_repo_root = lane_root.join("repo");
             let lane_target_dir = target_root.join(slugify(&lane.name));
             reset_finding_resolution_lane_root(&lane_root)?;
-            clone_finding_resolution_lane_repo(repo_root, &target_branch, &lane_repo_root)?;
+            clone_finding_resolution_lane_repo(repo_root, target_branch, &lane_repo_root)?;
             let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?
                 .trim()
                 .to_string();
@@ -1312,7 +1314,7 @@ async fn resolve_audit_findings_pass(
                     &lane_statuses,
                 )?;
                 let landed_commit =
-                    land_finding_resolution_lane_result(repo_root, &target_branch, &outcome)
+                    land_finding_resolution_lane_result(repo_root, target_branch, &outcome)
                         .with_context(|| format!("failed landing lane {}", outcome.lane_id + 1))?;
                 if let Some(status) = lane_statuses
                     .iter_mut()

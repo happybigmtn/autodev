@@ -1463,7 +1463,7 @@ async fn run_file_quality_deliverables(
         ratings.len(),
         workers
     );
-    let mut pending = ratings.to_vec().into_iter();
+    let mut pending = ratings.iter().cloned();
     let mut join_set = JoinSet::new();
     let mut active = 0usize;
     for _ in 0..workers {

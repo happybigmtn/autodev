@@ -59,6 +59,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Review the repo and author a fresh planning corpus under genesis/
     Corpus(CorpusArgs),
@@ -1711,6 +1712,27 @@ mod tests {
         };
         assert!(help.contains("Usage: auto design"));
         assert!(help.contains("--skip-qa"));
+    }
+
+    #[test]
+    fn super_command_is_parseable() {
+        let cli = Cli::try_parse_from(["auto", "super", "make this repo production grade"])
+            .expect("cli parse");
+        let Command::Super(args) = cli.command else {
+            panic!("expected super command");
+        };
+        assert_eq!(
+            args.prompt.as_deref(),
+            Some("make this repo production grade")
+        );
+
+        let help = match Cli::try_parse_from(["auto", "super", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected help output"),
+        };
+        assert!(help.contains("Usage: auto super"));
+        assert!(help.contains("--skip-design"));
+        assert!(help.contains("--design-resolve-passes"));
     }
 
     #[test]

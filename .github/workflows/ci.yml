@@ -45,6 +45,8 @@ jobs:
           auto --help
           auto corpus --help
           auto gen --help
+          auto design --help
+          auto super --help
           auto parallel --help
           auto quota --help
           auto symphony --help

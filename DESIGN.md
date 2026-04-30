@@ -84,3 +84,9 @@ Keep stdout concise and move full explanations into durable files. Prefer artifa
 Real product UI: `auto` command help, stdout, generated prompts, root plans, reports, receipts, `.auto/*` manifests, and release gates.
 
 Non-authoritative preview: any mock page, screenshot, proposal, or design sketch not wired to runtime-owned facts. These previews can inform direction, but they cannot close a task or satisfy design QA.
+
+## Operator Smoke Surfaces
+
+`auto doctor` is the no-model first-run preflight. It proves required checkout, binary provenance, and high-value help surfaces, including `auto design --help` and `auto super --help`, without invoking model providers, network services, tmux, browser automation, Linear, GitHub, or Symphony.
+
+Tooling such as Codex, Claude, PI, and GitHub CLI belongs in the doctor capabilities section because those binaries are workflow-specific readiness, not baseline preflight truth.
