@@ -9,6 +9,7 @@ use crate::claude_exec::{describe_claude_harness, run_claude_with_futility};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
 use crate::completion_artifacts::review_contains_task;
+use crate::qa_only_command::print_final_status_block;
 use crate::task_parser::{parse_task_header as parse_shared_task_header, TaskStatus};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
@@ -107,6 +108,12 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!("auto review");
         println!("repo root:   {}", repo_root.display());
         println!("status:      no reviewable items in REVIEW.md");
+        print_final_status_block(
+            "no reviewable items",
+            &[review_path.display().to_string()],
+            "none",
+            "continue with implementation or run auto review after new REVIEW.md items appear",
+        );
         return Ok(());
     }
 
@@ -427,6 +434,24 @@ pub(crate) async fn run_review(args: ReviewArgs) -> Result<()> {
         println!("================ REVIEW {} ================", iteration);
     }
 
+    let still_reviewable = has_reviewable_items(&review_path)?;
+    print_final_status_block(
+        "review loop stopped",
+        &[
+            review_path.display().to_string(),
+            run_root.display().to_string(),
+        ],
+        if still_reviewable {
+            "remaining reviewable items in REVIEW.md"
+        } else {
+            "none"
+        },
+        if still_reviewable {
+            "rerun auto review after addressing blockers or increasing iteration budget"
+        } else {
+            "continue with the next implementation, QA, or ship workflow"
+        },
+    );
     Ok(())
 }
 

@@ -120,7 +120,7 @@ pub(crate) async fn run_qa_only(args: QaOnlyArgs) -> Result<()> {
     let dirty_report =
         qa_only_dirty_state_report(&repo_root, &baseline_dirty_state, &allowed_dirty_paths)?;
     if dirty_report.has_violations() {
-        bail!("{}", dirty_report.render());
+        bail!("{}", dirty_report.render_qa_only());
     }
     if dirty_report.has_preexisting_dirty_state() {
         eprintln!("{}", dirty_report.render_preexisting());
@@ -137,38 +137,48 @@ pub(crate) async fn run_qa_only(args: QaOnlyArgs) -> Result<()> {
         );
     }
 
+    require_nonempty_report(&repo_root.join("QA.md"), "QA.md")?;
+    print_final_status_block(
+        "qa-only report complete",
+        &[
+            repo_root.join("QA.md").display().to_string(),
+            prompt_path.display().to_string(),
+            stderr_log_path.display().to_string(),
+        ],
+        "none",
+        "review QA.md findings, then run auto review or auto health when ready",
+    );
     println!();
     println!("qa-only run complete");
     Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct DirtyEntry {
+pub(crate) struct DirtyEntry {
     status: String,
     path: String,
     fingerprint: String,
 }
 
 #[derive(Debug, Default)]
-struct QaOnlyDirtyStateReport {
+pub(crate) struct ReportOnlyDirtyStateReport {
     preexisting: Vec<DirtyEntry>,
     violations: Vec<DirtyEntry>,
 }
 
-impl QaOnlyDirtyStateReport {
-    fn has_violations(&self) -> bool {
+impl ReportOnlyDirtyStateReport {
+    pub(crate) fn has_violations(&self) -> bool {
         !self.violations.is_empty()
     }
 
-    fn has_preexisting_dirty_state(&self) -> bool {
+    pub(crate) fn has_preexisting_dirty_state(&self) -> bool {
         !self.preexisting.is_empty()
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self, command_name: &str, allowed_description: &str) -> String {
         let mut lines = vec![
-            "auto qa-only report-only dirty-state violation".to_string(),
-            "The QA-only worker changed files outside `QA.md` and allowed qa-only logs."
-                .to_string(),
+            format!("{command_name} report-only write boundary violation"),
+            format!("The worker changed files outside {allowed_description}."),
             String::new(),
             "New or changed non-report files:".to_string(),
         ];
@@ -184,11 +194,15 @@ impl QaOnlyDirtyStateReport {
         lines.join("\n")
     }
 
-    fn render_preexisting(&self) -> String {
+    fn render_qa_only(&self) -> String {
+        self.render("auto qa-only", "`QA.md` and allowed qa-only logs")
+    }
+
+    pub(crate) fn render_preexisting(&self) -> String {
         if self.preexisting.is_empty() {
-            return "Pre-existing dirty state before qa-only: none".to_string();
+            return "Pre-existing dirty state before report-only run: none".to_string();
         }
-        let mut lines = vec!["Pre-existing dirty state before qa-only:".to_string()];
+        let mut lines = vec!["Pre-existing dirty state before report-only run:".to_string()];
         lines.extend(
             self.preexisting
                 .iter()
@@ -202,40 +216,48 @@ fn qa_only_dirty_state_report(
     repo_root: &Path,
     baseline: &[DirtyEntry],
     allowed_paths: &[String],
-) -> Result<QaOnlyDirtyStateReport> {
+) -> Result<ReportOnlyDirtyStateReport> {
+    report_only_dirty_state_report(repo_root, baseline, allowed_paths)
+}
+
+pub(crate) fn report_only_dirty_state_report(
+    repo_root: &Path,
+    baseline: &[DirtyEntry],
+    allowed_paths: &[String],
+) -> Result<ReportOnlyDirtyStateReport> {
     let current = collect_dirty_state(repo_root)?;
-    Ok(build_qa_only_dirty_state_report(
+    Ok(build_report_only_dirty_state_report(
         baseline,
         &current,
         allowed_paths,
     ))
 }
 
-fn build_qa_only_dirty_state_report(
+fn build_report_only_dirty_state_report(
     baseline: &[DirtyEntry],
     current: &[DirtyEntry],
     allowed_paths: &[String],
-) -> QaOnlyDirtyStateReport {
+) -> ReportOnlyDirtyStateReport {
     let baseline_non_report = baseline
         .iter()
-        .filter(|entry| !is_allowed_qa_only_dirty_path(&entry.path, allowed_paths))
+        .filter(|entry| !is_allowed_report_only_dirty_path(&entry.path, allowed_paths))
         .cloned()
         .collect::<Vec<_>>();
     let baseline_entries = baseline_non_report.iter().cloned().collect::<HashSet<_>>();
     let violations = current
         .iter()
-        .filter(|entry| !is_allowed_qa_only_dirty_path(&entry.path, allowed_paths))
+        .filter(|entry| !is_allowed_report_only_dirty_path(&entry.path, allowed_paths))
         .filter(|entry| !baseline_entries.contains(*entry))
         .cloned()
         .collect::<Vec<_>>();
 
-    QaOnlyDirtyStateReport {
+    ReportOnlyDirtyStateReport {
         preexisting: baseline_non_report,
         violations,
     }
 }
 
-fn collect_dirty_state(repo_root: &Path) -> Result<Vec<DirtyEntry>> {
+pub(crate) fn collect_dirty_state(repo_root: &Path) -> Result<Vec<DirtyEntry>> {
     let status = git_stdout(
         repo_root,
         [
@@ -295,10 +317,19 @@ fn sha256_hex(input: &[u8]) -> Result<String> {
 }
 
 fn allowed_qa_only_dirty_paths(repo_root: &Path, run_root: &Path) -> Vec<String> {
+    allowed_report_only_dirty_paths(repo_root, run_root, "QA.md", ".auto/qa-only")
+}
+
+pub(crate) fn allowed_report_only_dirty_paths(
+    repo_root: &Path,
+    run_root: &Path,
+    report_path: &str,
+    default_run_root: &str,
+) -> Vec<String> {
     let mut allowed = vec![
-        "QA.md".to_string(),
+        report_path.to_string(),
         ".auto/logs".to_string(),
-        ".auto/qa-only".to_string(),
+        default_run_root.to_string(),
     ];
     if let Some(run_root) = repo_relative_path(repo_root, run_root) {
         if !allowed.iter().any(|path| path == &run_root) {
@@ -308,7 +339,7 @@ fn allowed_qa_only_dirty_paths(repo_root: &Path, run_root: &Path) -> Vec<String>
     allowed
 }
 
-fn repo_relative_path(repo_root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn repo_relative_path(repo_root: &Path, path: &Path) -> Option<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -320,7 +351,7 @@ fn repo_relative_path(repo_root: &Path, path: &Path) -> Option<String> {
         .and_then(normalize_path)
 }
 
-fn is_allowed_qa_only_dirty_path(path: &str, allowed_paths: &[String]) -> bool {
+fn is_allowed_report_only_dirty_path(path: &str, allowed_paths: &[String]) -> bool {
     allowed_paths
         .iter()
         .any(|allowed| path == allowed || path.starts_with(&format!("{allowed}/")))
@@ -338,6 +369,60 @@ fn normalize_path(path: impl AsRef<Path>) -> Option<String> {
     } else {
         Some(normalized)
     }
+}
+
+pub(crate) fn require_nonempty_report(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "required {label} report artifact missing: {}",
+            path.display()
+        )
+    })?;
+    if metadata.len() == 0 {
+        bail!(
+            "required {label} report artifact is empty: {}",
+            path.display()
+        );
+    }
+    if fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .trim()
+        .is_empty()
+    {
+        bail!(
+            "required {label} report artifact has no content: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn format_final_status_block(
+    status: &str,
+    files_written: &[String],
+    blockers: &str,
+    next_step: &str,
+) -> String {
+    let files = if files_written.is_empty() {
+        "none".to_string()
+    } else {
+        files_written.join(", ")
+    };
+    format!(
+        "status:      {status}\nfiles written: {files}\nblockers:    {blockers}\nnext step:   {next_step}"
+    )
+}
+
+pub(crate) fn print_final_status_block(
+    status: &str,
+    files_written: &[String],
+    blockers: &str,
+    next_step: &str,
+) {
+    println!(
+        "{}",
+        format_final_status_block(status, files_written, blockers, next_step)
+    );
 }
 
 #[cfg(test)]
@@ -421,8 +506,8 @@ mod tests {
                 .expect("dirty state report should build");
 
         assert!(report.has_violations());
-        let rendered = report.render();
-        assert!(rendered.contains("report-only dirty-state violation"));
+        let rendered = report.render_qa_only();
+        assert!(rendered.contains("report-only write boundary violation"));
         assert!(rendered.contains("New or changed non-report files:"));
         assert!(rendered.contains("src/lib.rs"));
     }
@@ -447,7 +532,7 @@ mod tests {
             qa_only_dirty_state_report(repo.path(), &baseline, &allowed_paths(repo.path()))
                 .expect("dirty state report should build");
 
-        assert!(!report.has_violations(), "{}", report.render());
+        assert!(!report.has_violations(), "{}", report.render_qa_only());
         assert!(!report.has_preexisting_dirty_state());
     }
 
@@ -468,10 +553,10 @@ mod tests {
 
         assert!(report.has_violations());
         assert!(report.has_preexisting_dirty_state());
-        let rendered = report.render();
+        let rendered = report.render_qa_only();
         assert!(rendered.contains("New or changed non-report files:"));
         assert!(rendered.contains("src/main.rs"));
-        assert!(rendered.contains("Pre-existing dirty state before qa-only:"));
+        assert!(rendered.contains("Pre-existing dirty state before report-only run:"));
         assert!(rendered.contains("README.md"));
     }
 
@@ -491,7 +576,26 @@ mod tests {
             qa_only_dirty_state_report(repo.path(), &baseline, &allowed_paths(repo.path()))
                 .expect("dirty state report should build");
 
-        assert!(report.has_violations(), "{}", report.render());
-        assert!(report.render().contains("source file.rs"));
+        assert!(report.has_violations(), "{}", report.render_qa_only());
+        assert!(report.render_qa_only().contains("source file.rs"));
+    }
+
+    #[test]
+    fn final_status_block_names_operator_contract_fields() {
+        let block = format_final_status_block(
+            "qa-only report complete",
+            &[
+                "QA.md".to_string(),
+                ".auto/logs/qa-only-prompt.md".to_string(),
+            ],
+            "none",
+            "review QA.md findings",
+        );
+
+        assert!(block.contains("status:"));
+        assert!(block.contains("files written:"));
+        assert!(block.contains("blockers:"));
+        assert!(block.contains("next step:"));
+        assert!(block.contains("QA.md"));
     }
 }

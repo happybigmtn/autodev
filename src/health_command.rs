@@ -3,6 +3,10 @@ use std::fs;
 use anyhow::{bail, Context, Result};
 
 use crate::codex_exec::run_codex_exec;
+use crate::qa_only_command::{
+    allowed_report_only_dirty_paths, collect_dirty_state, print_final_status_block,
+    report_only_dirty_state_report, require_nonempty_report,
+};
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, git_stdout, timestamp_slug};
 use crate::HealthArgs;
 
@@ -40,6 +44,7 @@ const DEFAULT_HEALTH_PROMPT: &str = r#"0a. Study `AGENTS.md` for repo-specific b
 pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
+    let baseline_dirty_state = collect_dirty_state(&repo_root)?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
     let current_branch = current_branch.trim().to_string();
@@ -63,6 +68,8 @@ pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
     let run_root = args
         .run_root
         .unwrap_or_else(|| repo_root.join(".auto").join("health"));
+    let allowed_dirty_paths =
+        allowed_report_only_dirty_paths(&repo_root, &run_root, "HEALTH.md", ".auto/health");
     fs::create_dir_all(&run_root)
         .with_context(|| format!("failed to create {}", run_root.display()))?;
     let stderr_log_path = run_root.join("codex.stderr.log");
@@ -92,6 +99,17 @@ pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
         "auto health",
     )
     .await?;
+    let dirty_report =
+        report_only_dirty_state_report(&repo_root, &baseline_dirty_state, &allowed_dirty_paths)?;
+    if dirty_report.has_violations() {
+        bail!(
+            "{}",
+            dirty_report.render("auto health", "`HEALTH.md` and allowed health logs")
+        );
+    }
+    if dirty_report.has_preexisting_dirty_state() {
+        eprintln!("{}", dirty_report.render_preexisting());
+    }
     if !exit_status.success() {
         bail!(
             "Codex exited with status {}; see {}",
@@ -103,7 +121,136 @@ pub(crate) async fn run_health(args: HealthArgs) -> Result<()> {
         );
     }
 
+    require_nonempty_report(&repo_root.join("HEALTH.md"), "HEALTH.md")?;
+    print_final_status_block(
+        "health report complete",
+        &[
+            repo_root.join("HEALTH.md").display().to_string(),
+            prompt_path.display().to_string(),
+            stderr_log_path.display().to_string(),
+        ],
+        "none",
+        "review HEALTH.md, then address blockers or run auto qa-only for runtime QA",
+    );
     println!();
     println!("health run complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::qa_only_command::{
+        format_final_status_block, report_only_dirty_state_report, require_nonempty_report,
+    };
+
+    use super::*;
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "autodev-health-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn run_git_in<'a>(repo: &std::path::Path, args: impl IntoIterator<Item = &'a str>) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to launch git");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(name: &str) -> TestTempDir {
+        let repo = TestTempDir::new(name);
+        run_git_in(repo.path(), ["init"]);
+        run_git_in(repo.path(), ["config", "user.name", "autodev tests"]);
+        run_git_in(repo.path(), ["config", "user.email", "autodev@example.com"]);
+        fs::write(repo.path().join("README.md"), "# temp\n").expect("failed to write README");
+        run_git_in(repo.path(), ["add", "README.md"]);
+        run_git_in(repo.path(), ["commit", "-m", "init"]);
+        repo
+    }
+
+    #[test]
+    fn health_requires_non_empty_report() {
+        let temp = TestTempDir::new("requires-report");
+        let health_path = temp.path().join("HEALTH.md");
+
+        assert!(require_nonempty_report(&health_path, "HEALTH.md").is_err());
+        fs::write(&health_path, "\n\n").expect("failed to write empty health report");
+        assert!(require_nonempty_report(&health_path, "HEALTH.md").is_err());
+        fs::write(&health_path, "# Health\n\n- Status: checked\n")
+            .expect("failed to write health report");
+        require_nonempty_report(&health_path, "HEALTH.md").expect("health report should pass");
+    }
+
+    #[test]
+    fn health_report_only_rejects_disallowed_dirty_state() {
+        let repo = init_repo("rejects-dirty");
+        let baseline = collect_dirty_state(repo.path()).expect("baseline should work");
+        fs::write(repo.path().join("src.rs"), "pub fn changed() {}\n")
+            .expect("failed to write source");
+
+        let allowed = allowed_report_only_dirty_paths(
+            repo.path(),
+            &repo.path().join(".auto/health"),
+            "HEALTH.md",
+            ".auto/health",
+        );
+        let report =
+            report_only_dirty_state_report(repo.path(), &baseline, &allowed).expect("report");
+
+        assert!(report.has_violations());
+        assert!(report
+            .render("auto health", "`HEALTH.md` and allowed health logs")
+            .contains("write boundary violation"));
+    }
+
+    #[test]
+    fn health_final_status_block_names_operator_contract_fields() {
+        let block = format_final_status_block(
+            "health report complete",
+            &["HEALTH.md".to_string()],
+            "none",
+            "review HEALTH.md",
+        );
+
+        assert!(block.contains("status:"));
+        assert!(block.contains("files written:"));
+        assert!(block.contains("blockers:"));
+        assert!(block.contains("next step:"));
+        assert!(block.contains("HEALTH.md"));
+    }
 }

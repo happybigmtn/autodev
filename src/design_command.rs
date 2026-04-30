@@ -6,6 +6,10 @@ use serde::Serialize;
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::parallel_command;
+use crate::qa_only_command::{
+    allowed_report_only_dirty_paths, collect_dirty_state, print_final_status_block,
+    report_only_dirty_state_report,
+};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
@@ -116,10 +120,24 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
 
     if args.dry_run {
         println!("\n{prompt}");
+        print_final_status_block(
+            "design dry-run prompt rendered",
+            &[
+                output_dir.join("manifest.json").display().to_string(),
+                prompt_path.display().to_string(),
+            ],
+            "design worker not invoked",
+            "run auto design without --dry-run to produce DESIGN-REPORT.md",
+        );
         return Ok(());
     }
 
-    run_design_codex_phase(
+    let report_only_baseline = if args.apply {
+        None
+    } else {
+        Some(collect_dirty_state(&repo_root)?)
+    };
+    let phase_result = run_design_codex_phase(
         &repo_root,
         &output_dir,
         &prompt,
@@ -128,9 +146,30 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
         &args.codex_bin,
         "auto-design",
     )
-    .await?;
+    .await;
+    if let Some(baseline) = &report_only_baseline {
+        enforce_design_report_only_write_boundary(&repo_root, &output_dir, baseline)?;
+    }
+    phase_result?;
     verify_design_artifacts(&output_dir)?;
     println!("status:      design artifacts verified");
+    print_final_status_block(
+        "design artifacts verified",
+        &DESIGN_ARTIFACTS
+            .iter()
+            .map(|artifact| output_dir.join(artifact).display().to_string())
+            .chain([
+                output_dir.join("manifest.json").display().to_string(),
+                prompt_path.display().to_string(),
+                output_dir
+                    .join("auto-design-stderr.log")
+                    .display()
+                    .to_string(),
+            ])
+            .collect::<Vec<_>>(),
+        "none",
+        "review DESIGN-REPORT.md verdict before running auto gen, auto parallel, or auto design --resolve",
+    );
     Ok(())
 }
 
@@ -206,6 +245,12 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             kind,
         );
         println!("\n{prompt}");
+        print_final_status_block(
+            "design resolve dry-run prompt rendered",
+            &[output_root.join("manifest.json").display().to_string()],
+            "design worker not invoked",
+            "run auto design --resolve without --dry-run to produce DESIGN-REPORT.md",
+        );
         return Ok(());
     }
 
@@ -244,6 +289,18 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             write_design_resolution_status(&output_root, pass, max_passes, &pass_dir, "verified")?;
             println!("status:      design resolve verified");
             println!("pass dir:    {}", pass_dir.display());
+            print_final_status_block(
+                "design resolve verified",
+                &[
+                    pass_dir.join("DESIGN-REPORT.md").display().to_string(),
+                    output_root
+                        .join("DESIGN-RESOLVE-STATUS.md")
+                        .display()
+                        .to_string(),
+                ],
+                "none",
+                "continue the production campaign or run auto gen with the promoted design contract",
+            );
             return Ok(());
         }
         if pass == max_passes {
@@ -267,6 +324,26 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| output_root.display().to_string());
     bail!("design resolve did not reach `Verdict: GO` after {max_passes} pass(es); latest report: {report}")
+}
+
+fn enforce_design_report_only_write_boundary(
+    repo_root: &Path,
+    output_dir: &Path,
+    baseline: &[crate::qa_only_command::DirtyEntry],
+) -> Result<()> {
+    let allowed_paths =
+        allowed_report_only_dirty_paths(repo_root, output_dir, ".auto/design", ".auto/design");
+    let dirty_report = report_only_dirty_state_report(repo_root, baseline, &allowed_paths)?;
+    if dirty_report.has_violations() {
+        bail!(
+            "{}",
+            dirty_report.render("auto design", "the design output directory")
+        );
+    }
+    if dirty_report.has_preexisting_dirty_state() {
+        eprintln!("{}", dirty_report.render_preexisting());
+    }
+    Ok(())
 }
 
 async fn run_design_parallel_pass(
@@ -704,9 +781,13 @@ fn require_nonempty_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_design_prompt, promote_design_plan_items_to_root_queue, DesignRunKind};
+    use super::{
+        build_design_prompt, enforce_design_report_only_write_boundary,
+        promote_design_plan_items_to_root_queue, DesignRunKind,
+    };
+    use crate::qa_only_command::{collect_dirty_state, format_final_status_block};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -726,6 +807,44 @@ mod tests {
         assert!(prompt.contains("UI must consume runtime/API/generated truth"));
         assert!(prompt.contains("ENGINE-UI-CONTRACT.md"));
         assert!(prompt.contains("FRONTEND-QA.md"));
+    }
+
+    #[test]
+    fn design_report_only_rejects_disallowed_dirty_state() {
+        let root = temp_dir("design-report-only-boundary");
+        run_git_in(&root, ["init"]);
+        run_git_in(&root, ["config", "user.name", "autodev tests"]);
+        run_git_in(&root, ["config", "user.email", "autodev@example.com"]);
+        fs::write(root.join("README.md"), "# temp\n").unwrap();
+        run_git_in(&root, ["add", "README.md"]);
+        run_git_in(&root, ["commit", "-m", "init"]);
+        let output_dir = root.join(".auto/design/run");
+        fs::create_dir_all(&output_dir).unwrap();
+        let baseline = collect_dirty_state(&root).unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+
+        let err = enforce_design_report_only_write_boundary(&root, &output_dir, &baseline)
+            .expect_err("source edits should violate report-only design boundary");
+        assert!(err.to_string().contains("write boundary violation"));
+        assert!(err.to_string().contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn design_final_status_block_names_operator_contract_fields() {
+        let block = format_final_status_block(
+            "design artifacts verified",
+            &[".auto/design/run/DESIGN-REPORT.md".to_string()],
+            "none",
+            "review DESIGN-REPORT.md verdict",
+        );
+
+        assert!(block.contains("status:"));
+        assert!(block.contains("files written:"));
+        assert!(block.contains("blockers:"));
+        assert!(block.contains("next step:"));
+        assert!(block.contains("DESIGN-REPORT.md"));
     }
 
     #[test]
@@ -786,5 +905,19 @@ mod tests {
         let path = std::env::temp_dir().join(format!("autodev-{label}-{nanos}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn run_git_in<'a>(repo: &Path, args: impl IntoIterator<Item = &'a str>) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to launch git");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
