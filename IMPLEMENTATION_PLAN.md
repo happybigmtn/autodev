@@ -759,7 +759,7 @@
 - [x] `SAT-001` Report-only write-boundary helpers already exist for QA-only, health, and design surfaces.
   Evidence: `src/qa_only_command.rs` owns `report_only_dirty_state_report`; `src/health_command.rs` imports `require_nonempty_report` and dirty-state helpers; `src/design_command.rs` has `design_report_only_rejects_disallowed_dirty_state`.
 
-- [~] `SAT-002` Rich plan-task required fields already have a shared catalog.
+- [x] `SAT-002` Rich plan-task required fields already have a shared catalog.
   Evidence: `src/task_parser.rs` defines `PLAN_TASK_REQUIRED_FIELDS`, `PLAN_TASK_PROCESS_FIELDS`, and `TASK_FIELD_BOUNDARIES`; `src/generation.rs`, `src/spec_command.rs`, and `src/super_command.rs` consume those fields.
 
 - [~] `SAT-003` Verification receipt freshness already records important current-tree metadata.
