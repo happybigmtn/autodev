@@ -227,5 +227,30 @@
   Estimated scope: M
   Completion signal: generated worker proof commands are runnable one at a time and receipts can distinguish corrected proof from failed history.
 
+- [ ] `DESIGN-008` Active ledger reconciliation before generation
+
+  Spec: `specs/300426-operator-design-runtime-contract.md`
+  Why now: The pass-03 design gate found the pass-02 runtime fixes mostly present, but the operator ledgers still contradict each other. `TASK-016` is partial in `IMPLEMENTATION_PLAN.md`, passed in `ARCHIVED.md`, and stale lane recovery in `.auto/parallel`; `REVIEW.md` still lists completed `DESIGN-*` items with blockers even though receipts and regression tests now exist. `auto gen` or `auto parallel` would amplify false queue truth if this is not reconciled first.
+  Codebase evidence: `cargo run --quiet -- parallel status` labels lane-2 `TASK-016` as stale recovery and not active progress; `.auto/symphony/verification-receipts/DESIGN-001.json` through `DESIGN-007.json` exist; `ARCHIVED.md` says `TASK-016` passed; `REVIEW.md` still contains blocker entries for `DESIGN-001`, `DESIGN-003`, `DESIGN-006`, and other completed design rows.
+  Source of truth: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `.auto/symphony/verification-receipts/*.json`, `refs/tags/v0.2.0`, `.auto/parallel/*`
+  Runtime owner: `src/review_command.rs`, `src/parallel_command.rs`, `src/completion_artifacts.rs`, `src/ship_command.rs`
+  UI consumers: active queue, review/archive ledgers, `auto parallel status`, `auto review` handoff, `auto ship` release gate, generation prompts
+  Generated artifacts: `.auto/parallel/live.log`, `.auto/parallel/salvage/*.md`, `.auto/symphony/verification-receipts/*.json`, future `gen-*/IMPLEMENTATION_PLAN.md`
+  Fixture boundary: reconciliation must use live root ledgers, live git tag/readback, and current receipts; fixture receipts, copied archived prose, or stale lane notes cannot satisfy the row by themselves.
+  Retired surfaces: stale `REVIEW.md` blockers for already-archived or receipt-backed design work, stale partial `TASK-016` queue state, obsolete corpus claims that pass-02 runtime fixes are still missing
+  Owns: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `genesis/DESIGN.md`
+  Integration touchpoints: review harvest/archival behavior, completion evidence inspection, parallel status stale recovery output, release ledger proof, generation corpus intake
+  Scope boundary: ledger and planning-truth reconciliation only; do not change scheduler behavior unless the contradiction can be recreated from runtime code after the docs are reconciled.
+  Acceptance criteria: active queue has no partial/completed contradiction for `TASK-016`; `REVIEW.md` no longer reports stale blockers for design rows that have current receipts or tests; `ARCHIVED.md` and `COMPLETED.md` either agree or document the direct-review mode intentionally; pass-03 design artifacts identify any remaining stale `.auto/parallel` recovery as generated residue rather than active work.
+  Verification: `rg -n "^- \\[( |~)\\]" IMPLEMENTATION_PLAN.md`; `rg -n "DESIGN-00|TASK-016|Remaining blockers" REVIEW.md ARCHIVED.md COMPLETED.md IMPLEMENTATION_PLAN.md`; `git tag -l v0.2.0`; `git cat-file -p v0.2.0`; `cargo run --quiet -- parallel status`; `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_stale_commit_receipt`; `cargo test ship_command::tests::ship_gate_rejects_stale_completion_receipt`
+  Required tests: existing receipt freshness and ship-gate stale receipt tests; add a review/ledger regression only if the reconciliation exposes a repeatable runtime bug.
+  Contract generation: none -- no generated contract; future `auto gen` output is the readback surface after ledger reconciliation.
+  Cross-surface tests: grep proof across queue, review, archive, completed, tag, receipts, and live parallel status must show one current task state.
+  Review/closeout: reviewer verifies that no actionable repair work remains only in `.auto/super/*/design/pass-03` and that generation will not re-emit closed pass-02 blockers.
+  Completion artifacts: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `genesis/DESIGN.md`
+  Dependencies: none
+  Estimated scope: S
+  Completion signal: design/runtime ledgers tell one current story and `auto gen` can consume the corpus without reintroducing closed blockers.
+
 
 ## Follow-On Work

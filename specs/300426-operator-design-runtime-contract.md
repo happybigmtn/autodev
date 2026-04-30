@@ -20,6 +20,7 @@
 - A static frontend scan found no browser app, package manifest, route tree, component tree, or design-token stylesheet. The active design surface is terminal/operator UX.
 - Narrow runtime QA covered `auto design --help`, `auto super --help`, `auto doctor`, `cargo test design_command::tests`, and `cargo test super_command::tests`.
 - The pass-02 repair gate rechecked the same terminal/operator surface and found `auto parallel status` degraded by stale lane/recovery state plus older host warnings; root `IMPLEMENTATION_PLAN.md` also had open/partial rows without the full rich task contract required by the current deterministic gate.
+- The pass-03 repair gate found the pass-02 runtime items mostly implemented and receipt-backed, but the operator ledgers still contradict each other: `TASK-016` remains partial in the active queue while `ARCHIVED.md` says it passed, and `REVIEW.md` still lists completed design items as blocked. This is product-state drift even though the relevant tests now pass.
 
 ## Runtime Contract
 
@@ -31,6 +32,7 @@
 - Report-only and dry-run commands must enforce and print their write boundaries through runtime checks, not prompt-only discipline.
 - Gate commands must fail closed when required reports, receipts, generated artifacts, or source-owned fields are absent.
 - Parallel/status and release/readiness surfaces must classify stale lane state, recovery work, dependency frontier, review handoff gaps, and receipt drift as operator-visible product state rather than burying them in logs.
+- Review, archive, completion, active queue, receipt, and tag ledgers must be reconciled before a design gate can return GO. A green runtime fix with stale handoff rows is still a misleading operator interface.
 
 ## UI Contract
 
@@ -69,6 +71,7 @@
 - CLI help and doctor output have tests or smoke checks for high-value operator surfaces.
 - `auto parallel status` reports stale/recovery lanes and warning freshness in a way that lets the operator decide whether to reset, resume, or ignore old run state.
 - Receipt-backed completion evidence rejects stale or mismatched receipts when commit, dirty-state, plan, or declared artifacts no longer match current repo truth.
+- Active queue, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, verification receipts, and release tags agree on every design/release item before generation or execution is unblocked.
 
 ## Verification
 

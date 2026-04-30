@@ -126,3 +126,13 @@ The second design repair pass found that the strongest remaining design risks ar
 - Open or partial root queue rows must carry the same full runtime/UI task contract that `auto gen`, `auto spec`, and `auto super` now expect.
 
 Generation should keep those findings as design/runtime integrity work. Do not replace them with dashboard, mockup, or purely editorial polish tasks.
+
+## 2026-04-30 Pass 03 Amendment
+
+The third design repair pass rechecked pass-02 runtime claims against the live tree. The strongest remaining design risk is now ledger consistency, not missing status UI or receipt schema code:
+
+- `auto parallel status` now labels stale `TASK-016` recovery as not active progress and prints a reset command, but the stale lane still exists under `.auto/parallel`.
+- Receipt freshness and generated-verification lint tests now pass for the named regression handles.
+- `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, receipts, and tag evidence still do not tell one current story. In particular, `TASK-016` is partial in the active queue while `ARCHIVED.md` says it passed, and `REVIEW.md` still carries blockers for design items that now have receipts.
+
+Generation must not resurrect stale pass-01/pass-02 findings as new implementation work if the live code already closed them. The next design/runtime repair is the executor-visible `DESIGN-008` ledger reconciliation row in the root queue. Treat the older corpus findings as historical context until that row reconciles the live ledgers.

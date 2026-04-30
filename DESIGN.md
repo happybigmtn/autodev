@@ -79,6 +79,14 @@ Autodev's highest-risk UI is the operator's belief about whether work is safe to
 
 Design gates must return `Verdict: NO-GO` when unresolved source/runtime changes are needed to make those facts reliable, and the repair work must be inserted into the executor queue instead of living only inside `.auto/*` artifacts.
 
+## Ledger Consistency
+
+The active queue and review ledgers are product UI. `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, verification receipts, tags, and `auto parallel status` must tell one current story before `auto gen`, `auto super`, `auto parallel`, or `auto ship` can be treated as production-ready.
+
+- A task cannot be simultaneously partial in the active queue, passed in `ARCHIVED.md`, and blocked in `REVIEW.md` without an explicit reconciliation row.
+- Stale review handoffs for already-archived work are active operator drift until removed, archived by git history, or converted into a fresh unchecked repair task.
+- Planning corpus files under `genesis/` must be reconciled against the live ledgers before generation. They can supply context, but they cannot reintroduce closed blockers or stale command claims as new executor work.
+
 ## Responsive Terminal Behavior
 
 Autodev output must work in:
