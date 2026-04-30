@@ -31,3 +31,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-002.json`
 - Completion artifacts: `src/qa_only_command.rs`, `src/health_command.rs`, `src/design_command.rs`, `src/review_command.rs`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `DESIGN-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/design_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-004.json`
+- Completion artifacts: `src/design_command.rs`, `src/task_parser.rs`
+- Remaining blockers: missing REVIEW.md handoff

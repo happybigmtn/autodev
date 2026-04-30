@@ -77,7 +77,7 @@
   Estimated scope: M
   Completion signal: super, gen, spec, and execution surfaces agree on what makes a queue row executable.
 
-- [ ] `DESIGN-004` Design resolve NO-GO task preservation
+- [x] `DESIGN-004` Design resolve NO-GO task preservation
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: A design resolve pass can produce actionable `DESIGN-PLAN-ITEMS.md` rows and still end NO-GO; if the final failing pass exits before preserving those rows in the executor queue, the design gate blocks without giving `auto parallel` durable work.
