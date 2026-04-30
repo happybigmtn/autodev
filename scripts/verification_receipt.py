@@ -30,13 +30,10 @@ def repo_root() -> Path:
 
 
 def receipt_root(root: Path) -> Path:
-    if (
-        root.name == "repo"
-        and root.parent.parent.name == "lanes"
-        and root.parent.parent.parent.name == "parallel"
-        and root.parent.parent.parent.parent.name == ".auto"
-    ):
-        return root.parent.parent.parent.parent / "symphony" / "verification-receipts"
+    if root.name == "repo" and root.parent.parent.name == "lanes":
+        for ancestor in root.parents:
+            if ancestor.name == ".auto":
+                return ancestor / "symphony" / "verification-receipts"
     return root / ".auto" / "symphony" / "verification-receipts"
 
 
@@ -142,9 +139,11 @@ def runner_kind(argv: list[str]) -> str | None:
 def detects_zero_tests(kind: str, output: str) -> bool:
     normalized = output.lower()
     if kind in {"cargo-test", "cargo-nextest"}:
+        counts = cargo_running_test_counts(normalized)
+        if counts:
+            return not any(count > 0 for count in counts)
         return bool(
-            re.search(r"\brunning\s+0\s+tests\b", normalized)
-            or re.search(r"\btest result:\s+ok\.\s+0 passed\b", normalized)
+            re.search(r"\btest result:\s+ok\.\s+0 passed\b", normalized)
             or re.search(r"\b0\s+tests?\s+run\b", normalized)
         )
     if kind == "pytest":
@@ -159,12 +158,19 @@ def detects_zero_tests(kind: str, output: str) -> bool:
 def discovered_test_count(kind: str, output: str) -> int | None:
     normalized = output.lower()
     if kind in {"cargo-test", "cargo-nextest"}:
-        match = re.search(r"\brunning\s+(\d+)\s+tests?\b", normalized)
-        return int(match.group(1)) if match else None
+        counts = cargo_running_test_counts(normalized)
+        return sum(counts) if counts else None
     if kind == "pytest":
         match = re.search(r"\bcollected\s+(\d+)\s+items\b", normalized)
         return int(match.group(1)) if match else None
     return None
+
+
+def cargo_running_test_counts(normalized_output: str) -> list[int]:
+    return [
+        int(match.group(1))
+        for match in re.finditer(r"\brunning\s+(\d+)\s+tests?\b", normalized_output)
+    ]
 
 
 def record(args: argparse.Namespace) -> None:
