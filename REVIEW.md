@@ -50,3 +50,11 @@
 - Go/no-go: Go for local adapter migration design and deterministic adapter tests that build on the hardened renderer and receipt gate; no-go for live Linear state changes or external Symphony runtime migration until a later task owns operated infrastructure proof.
 - Completion artifacts: `REVIEW.md`
 - Remaining blockers: none for the local deterministic AD-014 checkpoint.
+
+## `DESIGN-005`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/parallel_command.rs`, `tests/parallel_status.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-005.json`
+- Completion artifacts: `src/parallel_command.rs`, `tests/parallel_status.rs`, `.auto/parallel/live.log`
+- Remaining blockers: missing REVIEW.md handoff

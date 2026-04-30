@@ -152,7 +152,7 @@
     Estimated scope: S
     Completion signal: release ledger and runtime version evidence present one consistent `v0.2.0` story.
 
-- [ ] `DESIGN-005` Parallel status stale-run recovery contract
+- [x] `DESIGN-005` Parallel status stale-run recovery contract
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: `cargo run --quiet -- parallel status` currently reports no host PIDs but also stale lane state, an active cherry-pick recovery lane for `TASK-016`, and older host warnings; operators cannot tell whether to reset, resume, or ignore stale state before a new production campaign.
