@@ -67,6 +67,18 @@ Runtime code owns canonical facts. Presentation surfaces render those facts thro
 
 If a surface needs new displayed data, the implementation must name the runtime owner, API or schema change, generated artifact, consumer, fixture boundary, and a proof that would fail if the display drifted.
 
+## Scheduler And Evidence Truth
+
+Autodev's highest-risk UI is the operator's belief about whether work is safe to launch, complete, blocked, or stale. Queue, review, receipt, release, and parallel-status surfaces must agree before a gate may say GO.
+
+- Unchecked or partial `IMPLEMENTATION_PLAN.md` rows must use the full runtime/UI task contract required by `auto gen`, `auto spec`, and `auto super`.
+- `Dependencies:` is scheduler input. It must be `none` or machine-readable task IDs, not prose.
+- `auto parallel status` must distinguish live workers, stale lane state, salvage/recovery work, dependency frontier, receipt drift, and old host warnings in text that is grep-friendly and actionable.
+- Verification receipts used for completion or release readiness must be tied to the current tree, plan identity, and relevant artifact state, not just to a historical command string.
+- `REVIEW.md`, `COMPLETED.md`, `ARCHIVED.md`, tags, and receipts are part of the operator interface. Contradictions between them are design/runtime drift, even when source code compiles.
+
+Design gates must return `Verdict: NO-GO` when unresolved source/runtime changes are needed to make those facts reliable, and the repair work must be inserted into the executor queue instead of living only inside `.auto/*` artifacts.
+
 ## Responsive Terminal Behavior
 
 Autodev output must work in:

@@ -115,3 +115,14 @@ Generation should preserve these design requirements:
 - Emit implementation tasks that name runtime owners, UI consumers, generated artifacts, fixture boundaries, contract generation, cross-surface proof, and closeout review.
 - Prioritize the `DESIGN-*` repair rows in the root queue before any CEO campaign treats design/runtime integrity as solved.
 - Keep `genesis/plans/011-first-run-dx-and-command-output-contracts.md` as the command-output design slice and `genesis/plans/008-auto-loop-auto-review-and-super-schema-parity.md` as the task-contract parity slice.
+
+## 2026-04-30 Pass 02 Amendment
+
+The second design repair pass found that the strongest remaining design risks are not visual styling; they are stale operator truth surfaces:
+
+- `auto parallel status` can show no live host process while stale lane recovery and old host warnings still read as urgent product state.
+- Completion receipts prove command history but do not yet bind that proof to the current commit, dirty-state fingerprint, plan hash, or declared artifact hashes.
+- Generated verification commands can still be syntactically or semantically unrunnable, including multi-filter cargo tests and shell-sensitive grep examples.
+- Open or partial root queue rows must carry the same full runtime/UI task contract that `auto gen`, `auto spec`, and `auto super` now expect.
+
+Generation should keep those findings as design/runtime integrity work. Do not replace them with dashboard, mockup, or purely editorial polish tasks.

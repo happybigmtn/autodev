@@ -107,32 +107,125 @@
   Spec: `specs/230426-symphony-workflow-and-linear-sync.md`
   Why now: Workflow rendering and completion evidence both affect unattended execution safety; future Linear sync or external Symphony runtime changes should wait until these local deterministic proofs are recorded.
   Codebase evidence: `src/symphony_command.rs` already reconciles terminal Linear issues through `inspect_task_completion_evidence` before marking local tasks done; `src/completion_artifacts.rs` is the shared evidence gate; `scripts/run-task-verification.sh` is the receipt-producing wrapper.
+  Source of truth: `src/symphony_command.rs`, `src/completion_artifacts.rs`, `scripts/run-task-verification.sh`, `REVIEW.md`
+  Runtime owner: `src/symphony_command.rs`, `src/completion_artifacts.rs`
+  UI consumers: `auto symphony workflow` stdout, `auto parallel` completion reconciliation, `REVIEW.md`, `.auto/symphony/verification-receipts/*.json`
+  Generated artifacts: `.auto/symphony/verification-receipts/*.json`, `WORKFLOW.md` when workflow rendering is explicitly requested
+  Fixture boundary: tests may render fixture workflows and receipts in temp dirs; production handoff must use current repo tests and current root `REVIEW.md`, not copied fixture receipts.
+  Retired surfaces: stale REVIEW handoff prose that treats zero-test or missing receipt evidence as complete
   Owns: `REVIEW.md`
   Integration touchpoints: `src/symphony_command.rs`, `src/completion_artifacts.rs`, `scripts/run-task-verification.sh`, `.auto/symphony/verification-receipts`
   Scope boundary: Validation and handoff only; do not call Linear, render a live external Symphony workflow, or launch Symphony runtime.
   Acceptance criteria: `REVIEW.md` records hostile workflow render test outcomes, zero-test receipt outcomes, any intentionally untested live Linear or Symphony surfaces, and a go/no-go decision for adapter migration work.
   Verification: `cargo test symphony_command::tests::workflow_render_rejects_hostile_branch`; `cargo test symphony_command::tests::workflow_render_rejects_hostile_model_and_effort`; `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`; `cargo test completion_artifacts::tests::inspect_task_completion_evidence_requires_wrapper_for_executable_verification`; `rg -n "AD-014|Symphony|zero-test|receipt" REVIEW.md`
   Required tests: `symphony_command::tests::workflow_render_rejects_hostile_branch`, `symphony_command::tests::workflow_render_rejects_hostile_model_and_effort`, `completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`, `completion_artifacts::tests::inspect_task_completion_evidence_requires_wrapper_for_executable_verification`
+  Contract generation: `scripts/run-task-verification.sh` writes receipt JSON; `auto symphony workflow` renders `WORKFLOW.md` only when explicitly requested
+  Cross-surface tests: receipt/review readback proof from current `REVIEW.md` plus the two Symphony workflow rendering tests
+  Review/closeout: reviewer confirms every command in the `Verification:` field was run separately, produced non-zero test discovery where applicable, and is summarized in `REVIEW.md`.
   Completion artifacts: `REVIEW.md`
-  Dependencies: `AD-011`, `AD-013`
+  Dependencies: none
   Estimated scope: XS
   Completion signal: Review handoff records local green proof or specific blockers for workflow rendering and receipt evidence.
 
 - [~] `TASK-016` Tag `v0.2.0` once the priority + first follow-on cluster is verified clean
 
     Spec: `specs/220426-release-ship.md`
-    Why now: `Cargo.toml` is still on `0.1.0`; once the visible drift (README, CI, dead code, hardening) is closed, cutting a `0.2.0` annotated tag locks the verified baseline. Spec frames this as a preservation contract; the only new work here is the actual tag.
-    Codebase evidence: `Cargo.toml:3` (`version = "0.1.0"`), `build.rs:8-62` provenance already wired, `src/util.rs:9-17` `CLI_LONG_VERSION`.
+    Why now: the release ledger is visible operator UI. `v0.2.0` exists and `Cargo.toml` is already `0.2.0`, but root `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, the tag annotation, and receipts do not present one consistent completion story.
+    Codebase evidence: `Cargo.toml:3` reads `version = "0.2.0"`; `git tag -l v0.2.0` resolves; `.auto/symphony/verification-receipts/TASK-016.json` exists; `COMPLETED.md` is empty; this row was still partial and previously described `Cargo.toml` with an obsolete pre-release version.
+    Source of truth: `Cargo.toml`, `Cargo.lock`, `COMPLETED.md`, `refs/tags/v0.2.0`, `.auto/symphony/verification-receipts/TASK-016.json`, `REVIEW.md`, `ARCHIVED.md`
+    Runtime owner: `src/ship_command.rs`, `src/completion_artifacts.rs`, `build.rs`, `src/util.rs`
+    UI consumers: `auto --version`, `auto ship` release gate output, release ledger docs, `auto parallel status`, `REVIEW.md`
+    Generated artifacts: `.auto/symphony/verification-receipts/TASK-016.json`, release/tag metadata under `refs/tags/v0.2.0`
+    Fixture boundary: release proof must come from the live git ref, live built binary, and current receipt; fixture tags or copied receipt excerpts cannot satisfy the row.
+    Retired surfaces: stale pre-release version prose and duplicate or contradictory TASK-016 handoffs
     Owns: `refs/tags/v0.2.0`
     Integration touchpoints: `Cargo.toml`, `Cargo.lock`, `COMPLETED.md`.
-    Scope boundary: bump `Cargo.toml` version to `0.2.0`, regenerate `Cargo.lock`, append a `## v0.2.0` section to `COMPLETED.md` summarizing the closed task IDs, and create the annotated tag locally. Do NOT push the tag in this task — `auto ship` (or a separate operator step) handles publishing and PR plumbing per spec.
-    Acceptance criteria: `Cargo.toml` reads `version = "0.2.0"`; `cargo build` regenerates `Cargo.lock` cleanly; `git tag -l v0.2.0` returns `v0.2.0`; the tag's annotation message lists TASK-001..TASK-011 plus any closed follow-ons; `auto --version` first line reads `auto 0.2.0`.
-    Verification: `cargo build && ./target/debug/auto --version | head -1` (must read `auto 0.2.0`); `git tag -l v0.2.0` returns `v0.2.0`; `git cat-file -p v0.2.0` shows annotated message with task list.
-    Required tests: none (release-mechanics only; `cargo test` regression already covered by prior checkpoints)
+    Scope boundary: reconcile release ledger truth only; do not retag, change model routing, or push tags unless the existing tag is proven wrong and the operator explicitly approves.
+    Acceptance criteria: `COMPLETED.md`, `REVIEW.md`, `ARCHIVED.md`, the TASK-016 receipt, `Cargo.toml`, `Cargo.lock`, and `refs/tags/v0.2.0` agree on whether the release baseline is complete; any intentional difference between tag annotation and later follow-on work is stated once in the durable ledger.
+    Verification: `git tag -l v0.2.0`; `git cat-file -p v0.2.0`; `cargo build`; `./target/debug/auto --version | head -1`; `rg -n "TASK-016|v0.2.0|0.2.0|release baseline" COMPLETED.md REVIEW.md ARCHIVED.md IMPLEMENTATION_PLAN.md`
+    Required tests: none -- release-ledger reconciliation only
+    Contract generation: `cargo build` refreshes binary/version readback and `git cat-file -p v0.2.0` reads the tag contract; no schema generator
+    Cross-surface tests: live git tag, live binary version, receipt JSON, and ledger grep all report the same release state
+    Review/closeout: reviewer checks that no stale pre-release TASK-016 prose remains and that `auto parallel status` no longer points operators at obsolete TASK-016 recovery as active truth.
     Completion artifacts: `Cargo.toml`, `Cargo.lock`, `COMPLETED.md`, `refs/tags/v0.2.0`
-    Dependencies: TASK-011
+    Dependencies: none
     Estimated scope: S
-    Completion signal: annotated `v0.2.0` tag exists locally with the closed task list, `auto --version` confirms the bump.
+    Completion signal: release ledger and runtime version evidence present one consistent `v0.2.0` story.
+
+- [ ] `DESIGN-005` Parallel status stale-run recovery contract
+
+  Spec: `specs/300426-operator-design-runtime-contract.md`
+  Why now: `cargo run --quiet -- parallel status` currently reports no host PIDs but also stale lane state, an active cherry-pick recovery lane for `TASK-016`, and older host warnings; operators cannot tell whether to reset, resume, or ignore stale state before a new production campaign.
+  Codebase evidence: `src/parallel_command.rs` prints tmux, host PID, lane, frontier, health, salvage, stale recovery, and warning summaries; `.auto/parallel/lanes/lane-2` still presents TASK-016 recovery while the root release ledger has later contradictory evidence.
+  Source of truth: `src/parallel_command.rs`, `.auto/parallel/*`, `IMPLEMENTATION_PLAN.md`, `REVIEW.md`
+  Runtime owner: `src/parallel_command.rs`
+  UI consumers: `auto parallel status` stdout, tmux pane titles, `.auto/parallel/live.log`, salvage notes
+  Generated artifacts: `.auto/parallel/live.log`, `.auto/parallel/salvage/*.md`, `.auto/parallel/lanes/*`
+  Fixture boundary: tests may create synthetic run roots and stale lane directories; production status must inspect the actual repo run root and must not invent lane state.
+  Retired surfaces: stale lane recovery notes and host warnings that no longer correspond to active worker or current root queue truth
+  Owns: `src/parallel_command.rs`, `tests/parallel_status.rs`
+  Integration touchpoints: parallel status renderer, stale lane cleanup hints, salvage note rendering, root queue/review evidence inspection
+  Scope boundary: status/readback contract only; do not delete user work, reset lanes, or auto-resume workers without an explicit operator command.
+  Acceptance criteria: when no host PID or tmux worker is alive, `auto parallel status` classifies stale lane recovery separately from live work, shows warning age/source, points to the exact recovery/reset command or artifact, and does not make stale TASK-016 recovery look like active progress.
+  Verification: `cargo test --test parallel_status parallel_status_reports_stale_lane_recovery_without_live_host`; `cargo test parallel_command::tests::stale_rebase_merge_state_is_reported_with_cleanup_recipe`; `cargo run --quiet -- parallel status`
+  Required tests: `parallel_status_reports_stale_lane_recovery_without_live_host`, `parallel_command::tests::stale_rebase_merge_state_is_reported_with_cleanup_recipe`
+  Contract generation: `cargo run --quiet -- parallel status` regenerates/readbacks status artifacts; no separate schema generator
+  Cross-surface tests: fixture status output plus live `auto parallel status` readback show stale/recovery/health labels with no browser UI.
+  Review/closeout: reviewer checks live status after the change and confirms any remaining degraded health has a current actionable reason.
+  Completion artifacts: `src/parallel_command.rs`, `tests/parallel_status.rs`, `.auto/parallel/live.log`
+  Dependencies: none
+  Estimated scope: M
+  Completion signal: operators can distinguish live parallel work from stale recovery residue before launching a new run.
+
+- [ ] `DESIGN-006` Verification receipt freshness and release-readiness binding
+
+  Spec: `specs/300426-operator-design-runtime-contract.md`
+  Why now: receipt-backed completion is a primary operator UI, but current receipts record command strings and output tails without binding completion proof to current commit, dirty state, plan hash, and declared artifact hashes.
+  Codebase evidence: `scripts/verification_receipt.py` writes `task_id`, `plan_path`, `recorded_at`, and command entries; `src/completion_artifacts.rs` validates command presence, failure, and zero-test status but does not reject stale commit/artifact evidence; `src/ship_command.rs` already treats stale QA/health reports as blockers.
+  Source of truth: `scripts/verification_receipt.py`, `scripts/run-task-verification.sh`, `src/completion_artifacts.rs`, `src/ship_command.rs`, `IMPLEMENTATION_PLAN.md`
+  Runtime owner: `src/completion_artifacts.rs`, `src/ship_command.rs`
+  UI consumers: `auto parallel` completion reconciliation, `REVIEW.md`, `auto ship` release gate, `.auto/symphony/verification-receipts/*.json`
+  Generated artifacts: `.auto/symphony/verification-receipts/*.json`, `SHIP.md`
+  Fixture boundary: tests may use fixture repos and synthetic receipts; production acceptance must compare receipt metadata against the current repo and declared artifacts.
+  Retired surfaces: historical receipt-only completion claims that are not tied to current tree state
+  Owns: `scripts/verification_receipt.py`, `scripts/run-task-verification.sh`, `src/completion_artifacts.rs`, `src/ship_command.rs`
+  Integration touchpoints: verification wrapper, completion evidence inspection, parallel drift audit, ship gate blockers, review handoff rendering
+  Scope boundary: receipt metadata and validation only; do not change task execution semantics or force network/live-provider checks.
+  Acceptance criteria: new receipts include commit, dirty-state fingerprint, plan hash, expected command argv, and declared artifact hashes when available; completion and ship gates reject stale or mismatched receipt metadata with a concrete reason.
+  Verification: `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`; add `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_stale_commit_receipt`; add `cargo test ship_command::tests::ship_gate_rejects_stale_completion_receipt`; `scripts/run-task-verification.sh DESIGN-006 cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_zero_cargo_tests`
+  Required tests: `completion_artifacts::tests::inspect_task_completion_evidence_rejects_stale_commit_receipt`, `ship_command::tests::ship_gate_rejects_stale_completion_receipt`
+  Contract generation: verification receipt JSON schema is implicit in `scripts/verification_receipt.py`; update parser/writer tests as the schema check.
+  Cross-surface tests: wrapper-produced receipt, completion evidence inspection, and ship gate blocker text all agree on stale/current receipt state.
+  Review/closeout: reviewer opens a produced receipt and confirms the current commit, dirty state, plan hash, artifact hash, and command argv are present and consumed.
+  Completion artifacts: `scripts/verification_receipt.py`, `src/completion_artifacts.rs`, `.auto/symphony/verification-receipts/DESIGN-006.json`
+  Dependencies: `AD-014`
+  Estimated scope: M
+  Completion signal: completion and release proof fails closed when receipts are from the wrong tree or artifact set.
+
+- [ ] `DESIGN-007` Generated verification command lint and review receipt clarity
+
+  Spec: `specs/300426-operator-design-runtime-contract.md`
+  Why now: the live design QA accidentally reproduced a known failure mode by invoking two cargo test filters in one command, and `WORKLIST.md` already records generated stale `cargo --lib`, malformed grep, zero-test, and corrected-command ambiguity issues.
+  Codebase evidence: `WORKLIST.md` has three required proof-command synthesis items; `src/generation.rs` and `src/spec_command.rs` reject some broad verification patterns; `src/completion_artifacts.rs` rejects zero-test receipts after execution but generated plans can still ask workers to run unrunnable commands.
+  Source of truth: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`, `WORKLIST.md`
+  Runtime owner: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`
+  UI consumers: generated `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, worker prompts, verification receipts
+  Generated artifacts: `gen-*/IMPLEMENTATION_PLAN.md`, `.auto/symphony/verification-receipts/*.json`
+  Fixture boundary: tests may use fixture plan rows and receipts; production plans must emit runnable per-command verification, not shell-sensitive prose.
+  Retired surfaces: multi-filter cargo commands, stale `cargo --lib` suggestions for bin-only crates, unescaped directory grep commands, and receipts that leave failed superseded commands indistinguishable from corrected proof
+  Owns: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`, `WORKLIST.md`
+  Integration touchpoints: plan generation validation, spec task insertion validation, receipt command matching, review handoff guidance
+  Scope boundary: verification-command synthesis and validation only; do not weaken proof requirements or silently ignore failed receipt entries.
+  Acceptance criteria: generated plan/spec validators reject multi-filter cargo invocations, bin-only `cargo --lib` proof for this crate, malformed shell grep snippets, and ambiguous corrected-command receipts unless the current passing command is explicitly marked as superseding the failed attempt.
+  Verification: `cargo test generation::tests::generated_plan_rejects_multiple_cargo_test_filters`; `cargo test spec_command::tests::auto_spec_rejects_prose_dependency_fields`; `cargo test completion_artifacts::tests::inspect_task_completion_evidence_rejects_mixed_failed_receipts`; `rg -n "multi-filter|zero-test|superseded|cargo --lib|verification command" WORKLIST.md src/generation.rs src/spec_command.rs src/completion_artifacts.rs`
+  Required tests: `generation::tests::generated_plan_rejects_multiple_cargo_test_filters`, `completion_artifacts::tests::inspect_task_completion_evidence_accepts_explicitly_superseded_failed_attempt`
+  Contract generation: generated plan validation via `cargo test generation::tests::generated_plan_rejects_multiple_cargo_test_filters`; no separate schema generator
+  Cross-surface tests: generated plan fixture, spec insertion fixture, and receipt fixture all reject the same ambiguous proof shapes.
+  Review/closeout: reviewer confirms every remaining `WORKLIST.md` proof-command issue is either implemented, moved into a narrower active task, or explicitly preserved as a blocker.
+  Completion artifacts: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`, `WORKLIST.md`
+  Dependencies: none
+  Estimated scope: M
+  Completion signal: generated worker proof commands are runnable one at a time and receipts can distinguish corrected proof from failed history.
 
 
 ## Follow-On Work

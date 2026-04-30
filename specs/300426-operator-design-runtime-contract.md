@@ -19,6 +19,7 @@
 - This spec is grounded in the live 2026-04-30 checkout and the design gate artifacts under `.auto/super/20260430-133225/design/pass-01`.
 - A static frontend scan found no browser app, package manifest, route tree, component tree, or design-token stylesheet. The active design surface is terminal/operator UX.
 - Narrow runtime QA covered `auto design --help`, `auto super --help`, `auto doctor`, `cargo test design_command::tests`, and `cargo test super_command::tests`.
+- The pass-02 repair gate rechecked the same terminal/operator surface and found `auto parallel status` degraded by stale lane/recovery state plus older host warnings; root `IMPLEMENTATION_PLAN.md` also had open/partial rows without the full rich task contract required by the current deterministic gate.
 
 ## Runtime Contract
 
@@ -29,12 +30,14 @@
 - `src/task_parser.rs` owns task status, dependency, verification, and completion-artifact parsing.
 - Report-only and dry-run commands must enforce and print their write boundaries through runtime checks, not prompt-only discipline.
 - Gate commands must fail closed when required reports, receipts, generated artifacts, or source-owned fields are absent.
+- Parallel/status and release/readiness surfaces must classify stale lane state, recovery work, dependency frontier, review handoff gaps, and receipt drift as operator-visible product state rather than burying them in logs.
 
 ## UI Contract
 
 - The terminal UI renders runtime facts and must not duplicate scheduler status, dependency readiness, receipt validity, model routing, release readiness, or credential state in docs or prompts without a runtime owner.
 - Every operator-facing long command should end with a stable final status block: status, files written, receipts, blockers, and next command.
 - Help and docs must describe required tools by workflow, separating no-model preflight from model-backed execution and GitHub/Symphony integrations.
+- Queue, review, archive, completion, tag, and receipt ledgers must not contradict each other at gate time. If they do, the UI must surface a concrete reconciliation task or blocker.
 - Any future web UI must consume the same runtime-owned contracts and generated bindings. Fake dashboards, fixture fallbacks, manual catalogs, or copied task logic are out of scope for production acceptance.
 
 ## Generated Artifacts
@@ -43,6 +46,7 @@
 - `auto super` generates CEO, functional review, design, execution gate, deterministic gate, branch reconciliation, and final sanity artifacts.
 - `auto gen` generates dated specs and `IMPLEMENTATION_PLAN.md` from `genesis/`.
 - Verification receipts must identify the current commit, dirty state, plan identity, and relevant artifact hashes when used as completion or release proof.
+- `.auto/parallel/*` status, salvage, and host-warning artifacts are generated evidence; they are not completion proof until reconciled with root queue/review state and current receipts.
 
 ## Fixture Policy
 
@@ -63,6 +67,8 @@
 - Report-only and dry-run commands either enforce their allowed write sets or clearly fail with the changed paths.
 - `auto design --resolve` preserves or promotes unresolved NO-GO design items before it exits.
 - CLI help and doctor output have tests or smoke checks for high-value operator surfaces.
+- `auto parallel status` reports stale/recovery lanes and warning freshness in a way that lets the operator decide whether to reset, resume, or ignore old run state.
+- Receipt-backed completion evidence rejects stale or mismatched receipts when commit, dirty-state, plan, or declared artifacts no longer match current repo truth.
 
 ## Verification
 
@@ -73,6 +79,7 @@
 - `cargo run --quiet -- design --help`
 - `cargo run --quiet -- super --help`
 - `rg -n "Operator Design System|DESIGN-00|Verdict:" DESIGN.md IMPLEMENTATION_PLAN.md .auto/super/20260430-133225/design/pass-01`
+- `cargo run --quiet -- parallel status`
 
 ## Review And Closeout
 
