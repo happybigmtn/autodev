@@ -537,6 +537,70 @@ mod tests {
     }
 
     #[test]
+    fn report_only_helper_allows_named_report_surfaces() {
+        let surfaces = [
+            (
+                "qa-only",
+                "QA.md",
+                ".auto/qa-only",
+                vec![
+                    ("QA.md", "# QA\n"),
+                    (".auto/logs/qa-only-prompt.md", "prompt\n"),
+                    (".auto/qa-only/codex.stderr.log", "stderr\n"),
+                ],
+            ),
+            (
+                "health",
+                "HEALTH.md",
+                ".auto/health",
+                vec![
+                    ("HEALTH.md", "# Health\n"),
+                    (".auto/logs/health-prompt.md", "prompt\n"),
+                    (".auto/health/codex.stderr.log", "stderr\n"),
+                ],
+            ),
+            (
+                "design",
+                ".auto/design",
+                ".auto/design",
+                vec![
+                    (".auto/design/run/DESIGN-REPORT.md", "# Design\n"),
+                    (".auto/design/run/codex.stderr.log", "stderr\n"),
+                ],
+            ),
+        ];
+
+        for (name, report_path, default_run_root, writes) in surfaces {
+            let repo = init_repo(name);
+            let baseline = collect_dirty_state(repo.path()).expect("baseline status should work");
+            let run_root = repo.path().join(default_run_root);
+
+            for (path, contents) in writes {
+                let path = repo.path().join(path);
+                fs::create_dir_all(path.parent().expect("report path should have parent"))
+                    .expect("failed to create report parent");
+                fs::write(path, contents).expect("failed to write report artifact");
+            }
+
+            let allowed = allowed_report_only_dirty_paths(
+                repo.path(),
+                &run_root,
+                report_path,
+                default_run_root,
+            );
+            let report = report_only_dirty_state_report(repo.path(), &baseline, &allowed)
+                .expect("dirty state report should build");
+
+            assert!(
+                !report.has_violations(),
+                "{name} should allow only declared report artifacts:\n{}",
+                report.render(name, report_path)
+            );
+            assert!(!report.has_preexisting_dirty_state());
+        }
+    }
+
+    #[test]
     fn qa_only_reports_preexisting_dirty_state() {
         let repo = init_repo("reports-preexisting");
         fs::write(repo.path().join("README.md"), "# temp\n\npreexisting\n")
