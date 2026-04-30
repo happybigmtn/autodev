@@ -58,3 +58,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-005.json`
 - Completion artifacts: `src/parallel_command.rs`, `tests/parallel_status.rs`, `.auto/parallel/live.log`
 - Remaining blockers: missing REVIEW.md handoff
+
+## `DESIGN-007`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `scripts/run-task-verification.sh`, `scripts/verification_receipt.py`, `src/completion_artifacts.rs`, `src/generation.rs`, `src/main.rs`, `src/spec_command.rs`, `src/verification_lint.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-007.json`
+- Completion artifacts: `src/generation.rs`, `src/spec_command.rs`, `src/completion_artifacts.rs`, `WORKLIST.md`
+- Remaining blockers: missing REVIEW.md handoff

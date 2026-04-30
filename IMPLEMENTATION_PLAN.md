@@ -202,7 +202,7 @@
   Estimated scope: M
   Completion signal: completion and release proof fails closed when receipts are from the wrong tree or artifact set.
 
-- [ ] `DESIGN-007` Generated verification command lint and review receipt clarity
+- [x] `DESIGN-007` Generated verification command lint and review receipt clarity
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: the live design QA accidentally reproduced a known failure mode by invoking two cargo test filters in one command, and `WORKLIST.md` already records generated stale `cargo --lib`, malformed grep, zero-test, and corrected-command ambiguity issues.
