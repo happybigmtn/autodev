@@ -10,6 +10,7 @@ use crate::task_parser::{
     PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
 };
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
+use crate::verification_lint::verify_commands_are_runnable;
 use crate::SpecArgs;
 
 const SPEC_REQUIRED_SECTIONS: [&str; 12] = [
@@ -352,6 +353,16 @@ fn verify_auto_spec_plan_task(
     verify_completion_artifacts(task)?;
     verify_field_did_not_swallow_metadata(task, "Verification:")?;
     verify_field_did_not_swallow_metadata(task, "Required tests:")?;
+    verify_commands_are_runnable(
+        task.id.as_str(),
+        "Verification:",
+        &task_field_body(task, "Verification:")?,
+    )?;
+    verify_commands_are_runnable(
+        task.id.as_str(),
+        "Required tests:",
+        &task_field_body(task, "Required tests:")?,
+    )?;
     Ok(())
 }
 
@@ -646,6 +657,59 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Dependencies:` must be machine-readable IDs only"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_rejects_prose_dependency_fields() {
+        let root = temp_root("dependency-prose-alias");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(
+            &plan_path,
+            valid_plan(
+                "specs/300426-runtime-ui.md",
+                "`SPEC-001` after runtime owner confirms the API",
+            ),
+        )
+        .expect("write plan");
+
+        let error = verify_plan_output(&plan_path, &spec_path).expect_err("prose rejected");
+        assert!(error
+            .to_string()
+            .contains("Dependencies:` must be machine-readable IDs only"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_plan_validation_rejects_multi_filter_verification_commands() {
+        let root = temp_root("multi-filter-verification");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        let plan = valid_plan("specs/300426-runtime-ui.md", "`SPEC-001`").replace(
+            "cargo test -p app runtime_foundation",
+            "cargo test generation::tests::one completion_artifacts::tests::two",
+        );
+        fs::write(&plan_path, plan).expect("write plan");
+
+        let error = verify_plan_output(&plan_path, &spec_path).expect_err("verification rejected");
+        assert!(error.to_string().contains("multi-filter cargo test"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_plan_validation_rejects_malformed_grep_verification_commands() {
+        let root = temp_root("malformed-grep-verification");
+        let plan_path = root.join("IMPLEMENTATION_PLAN.md");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        let plan = valid_plan("specs/300426-runtime-ui.md", "`SPEC-001`").replace(
+            "cargo test -p app runtime_foundation",
+            "grep -n Runtime src",
+        );
+        fs::write(&plan_path, plan).expect("write plan");
+
+        let error = verify_plan_output(&plan_path, &spec_path).expect_err("verification rejected");
+        assert!(error.to_string().contains("malformed grep verification"));
         let _ = fs::remove_dir_all(root);
     }
 

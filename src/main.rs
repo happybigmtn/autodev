@@ -38,6 +38,7 @@ mod super_command;
 mod symphony_command;
 mod task_parser;
 mod util;
+mod verification_lint;
 
 use std::path::PathBuf;
 

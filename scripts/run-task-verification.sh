@@ -28,6 +28,9 @@ receipt_args=(scripts/verification_receipt.py record)
 for arg in "$@"; do
   receipt_args+=("--argv=$arg")
 done
+if [[ -n "${AUTO_SUPERSEDES:-}" ]]; then
+  receipt_args+=("--supersedes=$AUTO_SUPERSEDES")
+fi
 receipt_args+=("--stdout-file=$stdout_file" "--stderr-file=$stderr_file")
 receipt_args+=(-- "$task_id" "$command" "$status")
 

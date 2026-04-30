@@ -17,6 +17,7 @@ use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
     list_markdown_files, timestamp_slug,
 };
+use crate::verification_lint::verify_commands_are_runnable;
 use crate::{CorpusArgs, GenerationArgs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2930,6 +2931,7 @@ fn verify_completion_artifacts_are_concrete(block: &PlanTaskBlock, body: &str) -
 }
 
 fn verify_verification_commands_are_scoped(block: &PlanTaskBlock, body: &str) -> Result<()> {
+    verify_commands_are_runnable(&block.task_id, "Verification:", body)?;
     let lowercase = body.to_ascii_lowercase();
     for forbidden in [
         "cargo check --workspace",
@@ -5247,7 +5249,7 @@ No external dependencies.
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
             "    cargo test -p docs exact_docs_test",
-            "    cargo test -p barely-human --lib",
+            "    cargo test -p barely-human",
         );
         write_generated_plan(&root, &task);
 
@@ -5255,6 +5257,54 @@ No external dependencies.
             .expect_err("expected package-wide cargo test failure");
 
         assert!(error.to_string().contains("package-wide cargo test"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_multiple_cargo_test_filters() {
+        let root = temp_dir("multi-filter-cargo-test-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    cargo test generation::tests::one completion_artifacts::tests::two",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected multi-filter cargo test failure");
+
+        assert!(error.to_string().contains("multi-filter cargo test"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_bin_only_cargo_lib_verification() {
+        let root = temp_dir("bin-only-cargo-lib-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    cargo test --lib generation::tests::one",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected cargo --lib verification failure");
+
+        assert!(error.to_string().contains("cargo test --lib"));
+    }
+
+    #[test]
+    fn generated_plan_rejects_malformed_directory_grep_verification() {
+        let root = temp_dir("malformed-directory-grep-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    grep -n verification src",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected malformed grep verification failure");
+
+        assert!(error.to_string().contains("malformed grep verification"));
     }
 
     #[test]

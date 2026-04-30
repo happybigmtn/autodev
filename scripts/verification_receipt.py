@@ -201,6 +201,8 @@ def record(args: argparse.Namespace) -> None:
         "recorded_at": timestamp,
         "status": "passed" if args.exit_code == 0 else "failed",
     }
+    if args.supersedes:
+        command_entry["supersedes"] = args.supersedes
     captured_runner = runner_summary(command, args.argv, captured_output)
     if captured_runner is not None:
         command_entry["runner_summary"] = captured_runner
@@ -222,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     record_parser = subparsers.add_parser("record")
     record_parser.add_argument("--argv", action="append", default=[])
+    record_parser.add_argument("--supersedes", action="append", default=[])
     record_parser.add_argument("--stdout-file")
     record_parser.add_argument("--stderr-file")
     record_parser.add_argument("task_id")

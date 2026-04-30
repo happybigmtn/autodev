@@ -523,6 +523,8 @@ struct VerificationReceiptCommand {
     #[serde(default)]
     argv: Vec<String>,
     #[serde(default)]
+    supersedes: Vec<String>,
+    #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
     status: Option<String>,
@@ -671,7 +673,58 @@ fn inspect_verification_receipt(
         );
     }
 
+    let mut unsuperseded_failed = receipt
+        .commands
+        .iter()
+        .filter(|entry| !verification_receipt_command_passed(entry))
+        .filter(|entry| {
+            !verification_receipt_failed_entry_is_superseded(
+                entry,
+                &receipt.commands,
+                expected_commands,
+            )
+        })
+        .map(|entry| entry.command.clone())
+        .collect::<Vec<_>>();
+    unsuperseded_failed.sort();
+    unsuperseded_failed.dedup();
+    if !unsuperseded_failed.is_empty() {
+        return (
+            false,
+            Some(format!(
+                "verification receipt `{}` has unsuperseded failed command(s): {}",
+                verification_receipt_path.display(),
+                unsuperseded_failed
+                    .iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+    }
+
     (true, None)
+}
+
+fn verification_receipt_command_passed(entry: &VerificationReceiptCommand) -> bool {
+    entry.status.as_deref() == Some("passed") && entry.exit_code == Some(0)
+}
+
+fn verification_receipt_failed_entry_is_superseded(
+    failed_entry: &VerificationReceiptCommand,
+    all_entries: &[VerificationReceiptCommand],
+    expected_commands: &[String],
+) -> bool {
+    all_entries.iter().any(|entry| {
+        verification_receipt_command_passed(entry)
+            && expected_commands
+                .iter()
+                .any(|expected| verification_receipt_command_matches(entry, expected))
+            && entry
+                .supersedes
+                .iter()
+                .any(|superseded| superseded == &failed_entry.command)
+    })
 }
 
 fn verification_receipt_reports_zero_tests(entry: &VerificationReceiptCommand) -> bool {
@@ -1287,6 +1340,35 @@ Dependencies: none
     }
 
     #[test]
+    fn inspect_task_completion_evidence_accepts_explicitly_superseded_failed_attempt() {
+        let root = temp_dir("superseded-failed-receipt");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-SUPERSEDED`\n",
+        )
+        .expect("failed to write review");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-SUPERSEDED.json"),
+            r#"{"commands":[{"command":"rg -n multi-filter WORKLIST.md src","exit_code":2,"status":"failed"},{"command":"rg -n \"multi-filter\" WORKLIST.md src/generation.rs","exit_code":0,"status":"passed","supersedes":["rg -n multi-filter WORKLIST.md src"]}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-SUPERSEDED",
+            "- [ ] `TASK-SUPERSEDED` Example\nVerification:\n  - `rg -n \"multi-filter\" WORKLIST.md src/generation.rs`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+        assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
     fn inspect_task_completion_evidence_rejects_incomplete_receipts() {
         let root = temp_dir("partial-receipt");
         fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
@@ -1342,8 +1424,8 @@ Dependencies: none
     }
 
     #[test]
-    fn inspect_task_completion_evidence_ignores_extra_historical_receipts() {
-        let root = temp_dir("extra-receipts");
+    fn inspect_task_completion_evidence_rejects_unsuperseded_extra_failed_receipts() {
+        let root = temp_dir("unsuperseded-extra-receipts");
         fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
         fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
             .expect("failed to write wrapper");
@@ -1366,7 +1448,10 @@ Dependencies: none
             "- [ ] `TASK-10` Example\nVerification:\n  - `cargo test -p demo current`\nDependencies: none\n",
         );
 
-        assert!(evidence.verification_receipt_present);
-        assert!(evidence.missing_reasons().is_empty());
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("unsuperseded failed command(s)"));
     }
 }
