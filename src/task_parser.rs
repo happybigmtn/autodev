@@ -451,7 +451,44 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_task_id_like, parse_task_header, parse_tasks, TaskStatus};
+    use super::{
+        is_task_id_like, parse_task_header, parse_tasks, TaskStatus, PLAN_TASK_PROCESS_FIELDS,
+        PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
+    };
+
+    #[test]
+    fn plan_task_field_catalog_covers_rich_contract_boundaries() {
+        for required in [
+            "Source of truth:",
+            "Runtime owner:",
+            "UI consumers:",
+            "Generated artifacts:",
+            "Fixture boundary:",
+            "Retired surfaces:",
+            "Contract generation:",
+            "Cross-surface tests:",
+            "Review/closeout:",
+        ] {
+            assert!(
+                PLAN_TASK_REQUIRED_FIELDS.contains(&required),
+                "{required} must stay in the shared required-field catalog"
+            );
+        }
+
+        for process_field in PLAN_TASK_PROCESS_FIELDS {
+            assert!(
+                PLAN_TASK_REQUIRED_FIELDS.contains(process_field),
+                "{process_field} must be required before process validation can read it"
+            );
+        }
+
+        for field in PLAN_TASK_REQUIRED_FIELDS {
+            assert!(
+                TASK_FIELD_BOUNDARIES.contains(field),
+                "{field} must bound multiline task-field parsing"
+            );
+        }
+    }
 
     #[test]
     fn parses_all_plan_statuses_and_fields() {
