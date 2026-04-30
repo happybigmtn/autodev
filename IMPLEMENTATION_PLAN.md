@@ -771,5 +771,5 @@
 - [x] `SAT-005` Professional audit status and file-quality gates already exist.
   Evidence: `src/audit_everything.rs` owns `.auto/audit-everything`, `RUN-STATUS.md`, pause/unpause/status controls, final-review evidence classification, file-quality accept score `9.0`, and target score `10.0`.
 
-- [~] `SAT-006` The planning corpus remains subordinate to root queue truth.
+- [x] `SAT-006` The planning corpus remains subordinate to root queue truth.
   Evidence: `gen-20260430-184141/specs/` contains ten generated specs and `gen-20260430-184141/corpus/**` contains the copied corpus, while the reviewed root `IMPLEMENTATION_PLAN.md` now contains the active promoted worker queue and references `gen-*` only as provenance or promotion evidence.
