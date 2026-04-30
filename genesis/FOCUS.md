@@ -1,62 +1,51 @@
 # Focus Brief
 
-## Raw Focus String
+## Raw Focus
 
 You are the new CEO inheriting this codebase. Over the next 14 days, race it to production with unlimited compute and resources. Do not capacity-trim the ambition: prioritize the deliverables that maximize production readiness, then assume max parallel execution can attack them. Perfect design/runtime integrity first, then run equally rigorous functional reviews across product, engineering, security, reliability, QA, data/contracts, operations, release, DX, and performance. Keep auto corpus and auto gen as the control primitives, but shape the corpus toward release blockers, operator trust, verification evidence, first-run DX, and maintainable execution contracts.
 
-You are the new CEO of autodev. Review the autodev repository as the canonical autonomous development framework. Identify the highest-impact production-readiness improvements to the auto spec, auto super, auto parallel, auto review, auto design, auto audit, and end-to-end workflow surfaces. Prioritize suggestions that improve semantic consistency, scheduler safety, runtime/design sync, resumability, implementation quality, verification receipts, and agent usability. Generate any needed specs and plan items, then implement the approved queue with auto parallel. Keep changes tightly scoped and commit/push successful improvements.
+You are the new CEO of autodev. Continue the production-readiness auto super campaign from the cleared design/runtime ledger state. Design gate blockers have been reconciled; proceed through CEO functional review, generation, execution gate review, and auto parallel execution. Prioritize semantic consistency, scheduler safety, runtime/design sync, resumability, implementation quality, verification receipts, agent usability, and release readiness. Keep changes tightly scoped and commit/push successful improvements.
 
 ## Normalized Focus Themes
 
-- Production readiness before feature expansion.
-- Runtime truth before planner presentation, especially for `auto corpus`, `auto gen`, `auto parallel`, `auto review`, `auto design`, `auto audit`, `auto super`, and `auto ship`.
-- Operator trust through receipt freshness, clean queue state, rollback-safe corpus generation, dependency-safe scheduling, and clear release gates.
-- Agent usability through honest first-run checks, consistent dry-run semantics, deterministic plan schemas, and recovery paths that preserve evidence.
-- Parallel execution as the future delivery mechanism, but only after the queue and credential model are safe enough to run many lanes at once.
+- Production-readiness race, not feature ideation.
+- Design/runtime integrity before throughput.
+- Scheduler safety, resumability, and completion evidence before broad `auto parallel` launch.
+- Verification receipts and release gate proof as first-class product surfaces.
+- Operator trust: terminal output, queue truth, review ledgers, and recovery paths must agree.
+- First-run DX should create a fast, honest success moment for a new operator.
+- Functional review must cover product, engineering, security, reliability, QA, data/contracts, operations, release, DX, and performance.
 
-## Likely Surfaces
+## Implied Surfaces
 
-Code surfaces implied by the focus:
-
-- `src/main.rs` command definitions and defaults.
-- `src/corpus.rs` and `src/generation.rs` for `genesis/` creation, corpus validation, `auto gen`, and root-plan synchronization.
-- `src/parallel_command.rs`, `src/task_parser.rs`, and `src/completion_artifacts.rs` for scheduler truth, dependency parsing, lane recovery, and completion evidence.
-- `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_accounts.rs`, and model execution modules for credential safety and backend routing.
-- `src/review_command.rs`, `src/design_command.rs`, `src/health_command.rs`, `src/qa_only_command.rs`, `src/super_command.rs`, `src/audit_everything.rs`, `src/audit_command.rs`, `src/nemesis.rs`, `src/symphony_command.rs`, and `src/ship_command.rs`.
-- `scripts/run-task-verification.sh`, `scripts/verification_receipt.py`, `.github/workflows/ci.yml`, `README.md`, `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `REVIEW.md`, `ARCHIVED.md`, `specs/`, and `docs/decisions/`.
-
-Product and operational surfaces implied by the focus:
-
-- First-run command path: install, `auto --version`, `auto doctor`, help surfaces, and tool availability.
-- Planning path: `auto corpus`, `genesis/`, `auto gen --snapshot-only`, root `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, and dated specs.
-- Execution path: `auto parallel`, tmux lanes, salvage notes, receipts, review handoffs, and completion artifacts.
-- Release path: `auto ship`, CI install proof, QA/health/design/review reports, tag evidence, and rollback notes.
+- Code surfaces: `src/main.rs`, `src/generation.rs`, `src/corpus.rs`, `src/super_command.rs`, `src/parallel_command.rs`, `src/loop_command.rs`, `src/task_parser.rs`, `src/completion_artifacts.rs`, `src/verification_lint.rs`, `src/quota_*`, `src/ship_command.rs`, `src/design_command.rs`, `src/qa_only_command.rs`, `src/health_command.rs`, `src/audit_everything.rs`, `src/nemesis.rs`, and `src/util.rs`.
+- Product surfaces: `auto corpus`, `auto gen`, `auto super`, `auto parallel`, `auto quota`, `auto design`, `auto review`, `auto qa-only`, `auto health`, `auto audit --everything`, `auto nemesis`, `auto ship`, `auto doctor`, and `auto --help`.
+- Planning and evidence surfaces: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `WORKLIST.md`, `genesis/`, root `specs/`, `.auto/state.json`, `.auto/parallel/`, `.auto/symphony/verification-receipts/`, `.auto/ship/`, `SHIP.md`, `QA.md`, and `HEALTH.md`.
+- Operational surfaces: CI, installed binary smoke tests, model backend wrappers, quota credential profiles, state checkpointing, dirty worktree handling, run manifests, logs, and release receipts.
 
 ## Repo-Wide Review Still Required
 
-The focus is broad but it is still biased toward autonomous workflow surfaces. The review still covered and should continue to cover:
-
-- Security boundaries outside scheduler code, especially quota account path handling, credential activation, prompt transport, and dangerous model execution flags.
-- Documentation and spec staleness that can feed bad prompts into otherwise correct automation.
-- Test and CI gaps around scripts, shell wrappers, installed binaries, and report-only commands.
-- Performance and reliability issues created by very large command modules, long-running child processes, and missing timeout contracts.
-- Design and DX as terminal/operator experiences, not only web or visual UI.
+- Security cannot be scoped only to scheduler code because credential profile names, `.auto/state.json`, generated artifact paths, prompt delivery, and report-only write boundaries all cross module boundaries.
+- Runtime/design sync cannot be scoped only to `DESIGN.md`; CLI help, README, specs, queue ledgers, and model prompts all render product truth.
+- Release readiness requires the full chain from queue row to worker lane to receipt to review handoff to ship gate.
+- DX requires the full first-run path: clone, install, required external tools, doctor output, help text, and the first meaningful command.
+- Performance and reliability require large-file orchestrators, CI, status commands, manifest/resume behavior, and stale worker recovery.
 
 ## Main Questions
 
-- Can `auto corpus` and `auto gen` be trusted as control primitives if a failed corpus run can leave `genesis/` empty?
-- Can `auto parallel` safely select work when dependencies are written in common human forms, or when missing dependency IDs are present?
-- Can quota-backed model execution run parallel lanes without one lane changing another lane's active credentials?
-- Can completion and release receipts prove the current tree, current plan, and current artifacts, rather than merely proving that a similar command passed sometime earlier?
-- Can review/design/health/qa/super/audit outputs be treated as honest product surfaces with consistent report-only, dry-run, and final status contracts?
-- Is the active root queue ready for `auto parallel`, or must stale `TASK-016`, `AD-014`, and `WORKLIST.md` truth be reconciled first?
+1. Can a new operator trust the root queue, `REVIEW.md`, receipts, and status output to mean the same thing?
+2. Can `auto corpus` and `auto gen` be run without losing the previous planning corpus or trusting corrupted saved state?
+3. Can `auto parallel` fail closed when plan truth is stale, lanes are stale, or completion evidence is incomplete?
+4. Can quota failover avoid duplicate side effects and keep account profiles inside the intended namespace?
+5. Can release gates prove current tree readiness after sync and after any model-driven ship pass?
+6. Can a new developer get to a meaningful success moment without reverse-engineering a long README?
 
 ## Priority Impact
 
-The focus moved priority away from new command features and toward safety-critical control-plane work:
+The focus moves the plan order toward safety and evidence before feature breadth. It keeps `auto corpus`, `auto gen`, and `auto parallel` as the control primitives, but it does not launch parallel execution from the current root queue because the root queue is cleared and the generated corpus is subordinate until accepted and promoted. The ordering therefore becomes:
 
-1. Quota credential safety outranks command polish because parallel production execution can corrupt global auth state.
-2. Corpus atomicity and non-empty validation outrank generated-plan expansion because an empty `genesis/` breaks the stated control primitive.
-3. Dependency truth, salvage durability, and completion evidence outrank speed because an autonomous scheduler that runs the wrong row is worse than a slow one.
-4. Receipt freshness and release proof outrank docs cleanup, but docs cleanup remains necessary because stale specs feed future model prompts.
-5. First-run DX remains high priority because this is a developer-facing CLI; the fastest successful path must produce a meaningful, honest success moment.
+1. Restore and harden planning corpus/state safety.
+2. Close quota, scheduler, and completion-ledger risks that can corrupt operator trust.
+3. Bind receipts and release gates to current tree state.
+4. Normalize report-only, audit, nemesis, and DX contracts.
+5. Run a final release decision gate before promoting work into the active root queue.

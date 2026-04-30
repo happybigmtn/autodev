@@ -1,92 +1,123 @@
-# Master Plan for Autodev Production Readiness
+# Master Production-Readiness Campaign
 
-This ExecPlan is a living document. Keep the Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective sections current as work proceeds. No root `PLANS.md` exists in this checkout; if one is added later, this plan must be maintained in accordance with root `PLANS.md`.
+This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current as work proceeds. No root `PLANS.md` exists in this checkout; if one is added, maintain this plan in accordance with it.
 
 ## Purpose / Big Picture
 
-This plan turns the genesis assessment into an ordered production-readiness program. Operators gain a clear path from current repository truth to a safe `auto parallel` launch and release gate. They can see it working when quota credentials are isolated, corpus generation is rollback-safe, scheduling refuses blocked work, receipts prove the current tree, and `auto ship` refuses stale evidence.
+This plan frames the full production-readiness campaign for `auto`. The operator gains a clear order of operations: protect state and credentials, make scheduler truth deterministic, bind evidence to current code, normalize lifecycle commands, then promote a root queue for parallel execution. They can see it working when the root ledgers, generated corpus, status output, receipts, and release gates all agree on whether execution is safe.
 
 ## Requirements Trace
 
-- R1: Preserve `auto corpus` and `auto gen` as control primitives while making them safe.
-- R2: Close high-severity security and scheduler risks before throughput work.
-- R3: Keep active root planning truth in `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, and `specs/` unless the operator promotes a new surface.
-- R4: Split work into independently verifiable slices with checkpoint gates.
-- R5: Avoid running `auto parallel` until the queue and evidence model are trustworthy.
+- R1: Keep `genesis/` subordinate until operator promotion.
+- R2: Preserve `auto corpus`, `auto gen`, `auto super`, and `auto parallel` as control primitives.
+- R3: Do not launch parallel execution from an empty or unpromoted root queue.
+- R4: Prioritize security, scheduler safety, resumability, receipts, first-run DX, and release readiness.
+- R5: Include checkpoint gates after meaningful phase boundaries.
 
 ## Scope Boundaries
 
-This master plan does not implement code by itself. It governs the generated plan set and names the order in which work should land. It does not replace root planning files, does not rewrite old specs directly, and does not launch parallel workers.
+This master plan does not directly change Rust code. It defines sequencing and gates for the numbered plans. It does not replace `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, or root specs. It does not declare `genesis/` active execution truth.
 
 ## Progress
 
-- [x] 2026-04-30: Reviewed root instructions, current code, active plans, previous snapshot, CI, receipts, and history.
-- [x] 2026-04-30: Identified the high-priority production risks and grouped them into numbered ExecPlans.
-- [ ] 2026-04-30: Promote selected slices into the active root queue after operator approval.
+- [x] 2026-04-30: Reviewed root instructions, root ledgers, command surface, CI, key runtime modules, git history, and archived genesis snapshot.
+- [x] 2026-04-30: Confirmed no root `PLANS.md` or root `plans/` directory exists.
+- [x] 2026-04-30: Confirmed current `genesis/` needed outside review before promotion.
+- [ ] Promote accepted slices into root `IMPLEMENTATION_PLAN.md` after operator review.
+- [ ] Execute checkpoint plans before broader queue launch.
 
 ## Surprises & Discoveries
 
-- `genesis/` was empty/deleted in the working tree, which reproduced the corpus-root risk in current state.
-- The most urgent risks are not missing product features; they are trust-boundary failures in quota, corpus, dependencies, and receipts.
+- The root queue is cleared, but runtime completion gates may not understand the empty-review convention.
+- The archived genesis snapshot had useful ordering but some release-ledger claims are superseded by current root files.
+- The authoring pass reported pre-refresh `genesis/` degradation; independent review should rely on current corpus shape and saved-state/code-path evidence.
 
 ## Decision Log
 
-- Mechanical: No root `PLANS.md` or root `plans/` exists, so this corpus is subordinate to root control docs.
-- Mechanical: Plans include a terminal/operator design slice because the CLI is a user-facing product.
-- Taste: Two checkpoint plans divide the queue into safety and execution-contract phases.
-- User Challenge: The operator focus mentions implementing the approved queue with `auto parallel`, but this plan defers launch until safety gates pass.
+- Mechanical: Keep root ledgers as active truth because repo docs and file layout say so.
+- Mechanical: Start with quota/state/scheduler safety because failures there can corrupt credentials, delete planning inputs, or dispatch false work.
+- Taste: Use twelve plans with three checkpoint gates to keep ambition high without creating a flat backlog.
+- User Challenge: Defer `auto parallel` launch until a root queue is promoted and safety blockers are closed.
 
 ## Outcomes & Retrospective
 
-None yet. Fill this in after the operator promotes slices or after the first checkpoint gate is run.
+None yet. Fill this section after the operator accepts, promotes, or revises the campaign.
 
 ## Context and Orientation
 
-Relevant files:
+Start at the repository root. The main CLI entry is `src/main.rs`. Planning generation lives in `src/generation.rs` and `src/corpus.rs`. Execution scheduling lives in `src/parallel_command.rs`, `src/loop_command.rs`, `src/super_command.rs`, `src/task_parser.rs`, and `src/completion_artifacts.rs`. Quota and backend execution live in `src/quota_*`, `src/codex_exec.rs`, `src/claude_exec.rs`, `src/kimi_backend.rs`, and `src/pi_backend.rs`. Release and quality gates live in `src/ship_command.rs`, `src/design_command.rs`, `src/qa_only_command.rs`, `src/health_command.rs`, `src/audit_everything.rs`, and `src/nemesis.rs`.
 
-- `src/main.rs` defines the `auto` command surface.
-- `src/corpus.rs` and `src/generation.rs` own corpus and generation behavior.
-- `src/quota_config.rs` and `src/quota_exec.rs` own quota-backed credential handling.
-- `src/task_parser.rs`, `src/parallel_command.rs`, and `src/completion_artifacts.rs` own queue, dependencies, lanes, and completion evidence.
-- `src/ship_command.rs`, `scripts/run-task-verification.sh`, and `scripts/verification_receipt.py` own release proof.
-- Root planning truth currently lives in `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, and `specs/`.
+The active planning files are `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `WORKLIST.md`, and root `specs/`.
 
 ## Plan of Work
 
-Execute the queue in four phases. First, close quota security, corpus atomicity, and dependency truth. Second, run a security/state checkpoint. Third, bind receipts, repair reconciliation paths, and align schema consumers. Fourth, run an execution-contract checkpoint, then normalize audit/DX and decide whether to promote the queue into active root execution.
+First, execute Plans 002-004 to close the highest-risk state, credential, and scheduler truth gaps. Then run Plan 005 as a checkpoint to decide whether the control plane is safe enough for evidence and release-contract work. Next, execute Plans 006-008 to unify receipts, harden release gates, and normalize execution schema. Run Plan 009 as the second checkpoint. Then execute Plans 010-011 for lifecycle truth, first-run DX, observability, and performance. Finish with Plan 012, which decides whether to promote root queue work and launch `auto parallel`.
 
 ## Implementation Units
 
-- Unit 1: Safety tranche. Goal: remove immediate production blockers. Requirements advanced: R1, R2. Dependencies: none. Files: Plans 002-004. Tests: quota path/lease tests, corpus failure tests, parser/scheduler tests. Approach: implement isolated fixes by module ownership. Scenarios: malicious account name rejected; failed corpus preserves previous root; missing dependency blocks scheduling.
-- Unit 2: First checkpoint. Goal: decide whether evidence supports moving into execution-contract work. Requirements advanced: R4, R5. Dependencies: Unit 1. Files: Plan 005 and checkpoint notes. Tests: targeted command suite from Plans 002-004. Approach: run review and record go/no-go. Scenarios: all safety tests pass or blockers are listed.
-- Unit 3: Execution-contract tranche. Goal: make evidence, reconciliation, and command schemas consistent. Requirements advanced: R2, R4. Dependencies: Unit 2. Files: Plans 006-008. Tests: receipt freshness, Symphony/review no-write, loop/super schema tests. Approach: add shared helpers before command-specific behavior. Scenarios: stale receipt rejected; partial rows preserved; blocked loop row skipped.
-- Unit 4: Release tranche. Goal: normalize audit/DX and decide queue promotion. Requirements advanced: R3, R5. Dependencies: Unit 3. Files: Plans 009-012. Tests: report-only write boundaries, doctor/help smoke, release gate. Approach: close stale root truth and record decision. Scenarios: `auto parallel status` is green or explicit blockers remain.
+- Unit 1: Campaign acceptance.
+  - Goal: Decide whether this generated corpus becomes the next production-readiness input.
+  - Requirements advanced: R1, R2, R3.
+  - Dependencies: This corpus.
+  - Files to create or modify: none unless promoted to root ledgers.
+  - Tests to add or modify: none.
+  - Approach: Review `GENESIS-REPORT.md`, `ASSESSMENT.md`, and this plan set.
+  - Test scenarios: Test expectation: none -- this unit is a planning decision.
+
+- Unit 2: Root queue promotion gate.
+  - Goal: Convert accepted slices into active root work only after checkpoint acceptance.
+  - Requirements advanced: R1, R3, R5.
+  - Dependencies: Plans 002-005 accepted.
+  - Files to create or modify: `IMPLEMENTATION_PLAN.md`, possibly root `specs/`.
+  - Tests to add or modify: plan-validation checks appropriate to promoted rows.
+  - Approach: Promote minimal, evidence-backed rows rather than copying the whole corpus.
+  - Test scenarios: Run root plan parser/status checks after promotion.
+
+- Unit 3: Production execution decision.
+  - Goal: Decide whether `auto parallel` can launch.
+  - Requirements advanced: R4, R5.
+  - Dependencies: Plans 005, 009, and 012.
+  - Files to create or modify: `REVIEW.md`, `SHIP.md`, receipts, root ledgers as needed.
+  - Tests to add or modify: release and scheduler fixture tests from later plans.
+  - Approach: Require current receipts, clean status, and no unresolved safety blockers.
+  - Test scenarios: Launch only after `auto parallel status` and release gate proof agree.
 
 ## Concrete Steps
 
 From the repository root:
 
-    git status --short
-    cargo test -- --list
-    rg -n "AD-014|TASK-016|WORKLIST|Dependencies:" IMPLEMENTATION_PLAN.md WORKLIST.md
-    auto doctor
+    git status --short --branch
 
-After each implementation tranche, run its plan-specific tests and update root planning files only when the operator promotes the work.
+Expected observation: current branch and only intentional corpus changes.
+
+    find genesis -maxdepth 2 -type f | sort
+
+Expected observation: all mandatory corpus files and numbered plans exist.
+
+    rg -n "^- \\[( |~|!)\\]" IMPLEMENTATION_PLAN.md REVIEW.md
+
+Expected observation: no accidental open root queue rows unless deliberately promoted.
+
+Review this corpus, then promote only accepted slices into root ledgers.
 
 ## Validation and Acceptance
 
-Acceptance for this master plan is a coherent plan set, not code behavior. The generated files must exist, use the required ExecPlan headings, and rank security/control-plane blockers before parallel execution. Later acceptance belongs to the child plans and checkpoint gates.
+Acceptance for this master plan is not code behavior. It is accepted when the operator can identify the active planning surface, see why `genesis/` is subordinate, understand the dependency order, and choose which slices to promote. The plan fails if it encourages launching `auto parallel` against an empty queue or treats archived snapshots as current truth.
 
 ## Idempotence and Recovery
 
-Rerun this planning pass by regenerating `genesis/` from current code and root plan truth. If partial plan edits occur, compare `git status --short`, restore only the affected `genesis/` files, and keep unrelated user changes intact.
+Rereading or regenerating this master plan is safe. If promotion partially edits root ledgers, recover by comparing `git diff -- IMPLEMENTATION_PLAN.md REVIEW.md specs genesis` and keeping only accepted rows. If a later root `PLANS.md` is added, update this plan to reference its standard.
 
 ## Artifacts and Notes
 
-- This file indexes the overall program.
-- `genesis/PLANS.md` is the human-readable plan index.
-- `genesis/GENESIS-REPORT.md` records the decision audit trail.
+- Corpus artifact: `genesis/GENESIS-REPORT.md`.
+- Focus artifact: `genesis/FOCUS.md`.
+- Plan index: `genesis/PLANS.md`.
+- Historical context: `.auto/fresh-input/genesis-previous-20260430-180207/`.
 
 ## Interfaces and Dependencies
 
-This plan depends on the current Rust CLI architecture, root planning docs, CI workflow, receipt scripts, and active git state. It does not introduce external services.
+- Root ledgers: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `WORKLIST.md`.
+- Generated corpus: `genesis/`.
+- Scheduler: `auto parallel`, `auto super`, `auto loop`.
+- Gates: `auto design`, `auto qa-only`, `auto health`, `auto ship`.

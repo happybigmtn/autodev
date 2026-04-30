@@ -1,65 +1,75 @@
-# Autodev Product Specification
+# Product Specification
 
-## Problem Statement
+## Product Frame
 
-How might we make `auto` a production-grade autonomous development control plane that converts repository truth into plans, runs model-backed implementation safely, verifies the result with durable evidence, and gives operators enough confidence to ship without hand-reconstructing what happened?
+`auto` is a Rust CLI for autonomous repository work. It turns a repository root into an operator-controlled development system: it reviews the codebase, writes planning corpora, generates root execution queues, runs model-backed workers, checks evidence, audits quality, and gates releases.
 
-The current code shows a real Rust CLI, not a planning-only prototype. It owns command routing, corpus generation, task parsing, parallel lane orchestration, quota-backed model execution, design/QA/health/review surfaces, receipt capture, audit passes, and release gating. The next system step is not to invent a new product. It is to make the existing control plane impossible to fool by stale plans, unsafe credentials, empty corpora, lossy dependencies, or old receipts.
+The product is not a web app. Its meaningful user-facing surfaces are terminal output, markdown ledgers, generated corpora, receipts, logs, and installed CLI help.
 
-## Primary Users
+## Primary Behaviors
 
-- Repository operator: runs `auto corpus`, `auto gen`, `auto parallel`, `auto review`, `auto audit`, and `auto ship` to move real work through a repo.
-- Engineering lead: uses generated plans, receipts, review handoffs, and release gates to decide what can be trusted.
-- Agent worker: receives generated prompts and task contracts from `auto parallel`, `auto loop`, `auto super`, Symphony, or quota-backed execution.
-- Maintainer of autodev itself: must be able to test, install, recover, and release the CLI without guessing state.
+- `auto corpus` reviews the current repository and writes a planning corpus under `genesis/` by default.
+- `auto gen` turns a planning corpus into root specs and implementation ledgers.
+- `auto super` composes corpus, design gate, functional review, generation, execution gate, and optional parallel execution.
+- `auto parallel` schedules root queue rows into isolated lanes, lands evidence-backed work, and reconciles `IMPLEMENTATION_PLAN.md` and `REVIEW.md`.
+- `auto loop` runs a serial queue execution loop.
+- `auto design`, `auto qa-only`, and `auto health` produce report-only artifacts with write-boundary checks.
+- `auto qa`, `auto review`, `auto audit`, `auto audit --everything`, `auto nemesis`, and `auto book` provide quality, audit, adversarial, and knowledge-corpus workflows.
+- `auto quota` manages model account profiles and quota-aware backend execution.
+- `auto ship` evaluates release readiness using receipts, QA/health evidence, blockers, rollback notes, and PR state.
+- `auto doctor`, `auto --help`, and installed binary smoke are the first-run operator surfaces.
 
-## Current System Behaviors Verified From Code
+## Current Control Truth
 
-- `src/main.rs` defines 21 command variants and central dispatch for the `auto` binary.
-- `README.md` presents the current command surface as 21 commands; older specs and previous genesis snapshots are stale where they claim 16 or 17.
-- `src/generation.rs` validates generated corpus and task contracts, provides `--snapshot-only`, preserves blocked task rows better than older code, and rejects broad or low-signal verification commands.
-- `src/corpus.rs` and generation state currently allow a partial planning root with `plans/` but no numbered plans to be treated as usable input; this is a production risk after an interrupted corpus run.
-- `src/task_parser.rs` is the shared task parser and recognizes statuses, dependencies, verification text, and completion artifacts, but dependency extraction is still lossy for bare references such as `Dependencies: TASK-011`.
-- `src/parallel_command.rs` implements tmux-backed lanes, status, preflight, salvage, drift audit, and queue state, but lane reuse can make salvage records point at dead working directories.
-- `src/quota_config.rs` and `src/quota_exec.rs` support account profiles, credential swapping, owner-only file writes, and symlink rejection, but account names are not fully path-bounded and provider locks are not held while the child process runs.
-- `src/completion_artifacts.rs` and `scripts/verification_receipt.py` capture executable proof and reject zero-test receipts, but receipts are not bound to the current commit, dirty state, plan hash, or artifact hashes.
-- `src/ship_command.rs` has a mechanical release gate and bypass trail, but it can accept stale receipts and does not require the locked install proof claimed by README and CI.
-- `src/symphony_command.rs` validates hostile workflow inputs, but reconciliation can corrupt partial task rows by marking `[~]` lines through a code path built around `[ ]` and `[!]`.
-- `src/doctor_command.rs` gives a useful no-model first-run preflight, but optional-versus-required tool language differs between `AGENTS.md`, README, and doctor output.
-- `.github/workflows/ci.yml` runs format, clippy, tests, locked install, and selected help smoke tests, but it does not exercise the shell/Python receipt writer path or every important operator help surface.
+Runtime truth lives in `src/`. Active planning truth lives in `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `WORKLIST.md`, root `specs/`, and verification receipts. `genesis/` is planning input and is subordinate until an operator promotes slices into the root queue.
 
-## Near-Term Direction
+No root `PLANS.md` file exists in this checkout. Numbered plans in this corpus therefore use the requested full ExecPlan envelope, but they do not replace the active root ledger set.
 
-Recommended direction: keep `auto corpus` and `auto gen` as the control primitives, but harden the control plane before scaling parallel implementation. The next 14-day production race should be ordered around these contracts:
+## Near-Term Product Direction
 
-- Corpus roots are atomic and never accepted when empty or partially generated.
-- Quota-backed model execution cannot cross-contaminate credentials across parallel lanes.
-- Scheduler eligibility uses the same dependency truth everywhere and treats missing dependencies as blockers.
-- Receipts prove current tree state and current artifacts, not just command text.
-- Report-only and dry-run commands have explicit, tested write boundaries.
-- Release gates reconcile root planning truth, review evidence, CI proof, install proof, and tag state.
+The next 14-day campaign should make `auto` production-trustworthy for autonomous parallel execution:
+
+1. Restore and protect the planning corpus and saved-state boundaries.
+2. Harden quota credential profile containment and failover semantics.
+3. Make scheduler eligibility fail closed on stale or contradictory plan truth.
+4. Bind completion and release evidence to current commit, dirty state, plan hash, artifact hash, and explicit evidence class.
+5. Normalize report-only, verdict, QA, health, audit, nemesis, and ship contracts.
+6. Improve first-run DX so a new operator can see a meaningful success moment quickly.
+7. Add performance and reliability proof around large queues, stale lane recovery, and installed binary behavior.
 
 ## Requirements
 
-- R1: `genesis/` must be generated atomically and validated as non-empty before it becomes the active planning root.
-- R2: quota account names must be path-safe, and credential leases must cover the child process lifetime.
-- R3: dependency parsing must handle backticked and bare task IDs, and missing dependency IDs must block scheduling.
-- R4: completion and release receipts must record commit, dirty state, plan identity, artifact identity where relevant, command status, output tails, and zero-test summaries.
-- R5: `auto parallel`, `auto loop`, `auto super`, Symphony reconciliation, and root-plan updates must share one task contract.
-- R6: `auto doctor`, report-only commands, dry-run commands, and help surfaces must give honest first-run and recovery signals.
-- R7: release readiness must be a gate over code, docs, specs, review handoff, receipts, CI, installed binary proof, and rollback notes.
+- R1: Planning roots used by corpus/generation must be inside approved repository-relative locations or explicitly supplied and confirmed.
+- R2: `genesis/` must not be left empty after a failed corpus generation.
+- R3: Loading a planning corpus must reject an empty numbered plan set.
+- R4: Quota account names must be safe slugs and profile paths must remain under the quota profile directory.
+- R5: Quota failover must not retry write-capable model work after detected progress without an explicit recovery path.
+- R6: Completion evidence must not depend on contradictory ledger conventions.
+- R7: Parallel dispatch must fail closed when current plan truth cannot be refreshed unless the operator selects a recovery mode.
+- R8: Lane resume must bind to task body, dependency, verification, and base-commit hashes.
+- R9: Receipts and declared artifacts must be root-contained and bound to current tree state.
+- R10: Release gates must run after branch sync and again after model-driven ship iterations.
+- R11: GO/PASS verdicts must use a shared exact parser that rejects mixed verdicts.
+- R12: Report-only commands must have explicit write boundaries and honest naming.
+- R13: First-run commands must produce clear, copy-pasteable, non-mutating proof.
+- R14: CI must keep Rust, installed binary, help, and critical model-free workflow contracts honest.
 
-## Non-Goals
+## Non-Requirements
 
-- Do not replace the Rust CLI architecture.
-- Do not build a web UI before the terminal/operator experience is trustworthy.
-- Do not make `genesis/` the root active queue unless repo instructions explicitly promote it.
-- Do not run `auto parallel` on a queue with unresolved stale plan rows, unsafe credentials, or unbound receipts.
-- Do not treat older dated specs as current requirements when code and root plans have moved.
+- Do not build a web UI in this campaign.
+- Do not replace all markdown ledgers with a database.
+- Do not make archived genesis snapshots authoritative.
+- Do not launch `auto parallel` against an empty or unpromoted root queue.
+- Do not treat model-written prose as command execution proof when host receipts are required.
 
-## Open Questions
+## Version And Detail Ledger
 
-- Should quota execution serialize per provider for safety, or can it use isolated per-process credential homes for real parallelism?
-- Should `auto gen` remain mutating by default, or should production use require explicit root-sync flags after a snapshot passes validation?
-- Should `auto doctor` gain structured output for automation, or remain a human-readable preflight with tests around important labels?
-- Should stale `TASK-016` be closed by root-plan reconciliation, or should the release gate own it as a final tag-evidence assertion including `COMPLETED.md` and tag-annotation cleanup?
+- Verified from code: Cargo package version is `0.2.0`.
+- Verified from code: Rust edition is `2021`.
+- Verified from code: CI uses stable Rust with rustfmt and clippy, runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and installed binary help smoke.
+- Verified from code: corpus/gen/spec/super default to `gpt-5.5` with `xhigh` planning effort in `src/main.rs`.
+- Verified from code: audit file-quality merge floor is `9.0` and aspirational target is `10.0`.
+- Recommendation: production dispatch should fail closed on stale plan refresh by default.
+- Recommendation: quota account names should use a conservative ASCII slug contract.
+- Hypothesis/open question: exact production performance targets for large queue size and lane count need benchmark evidence before becoming requirements.
+- Hypothesis/open question: whether Kimi/PI can move prompts off argv depends on backend CLI capabilities and should be researched before implementation promises.

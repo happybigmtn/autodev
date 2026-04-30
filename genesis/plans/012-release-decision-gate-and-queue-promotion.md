@@ -1,111 +1,165 @@
-# Release Decision Gate and Queue Promotion
+# Release Decision Gate And Queue Promotion
 
-This ExecPlan is a living document. Keep the Progress, Surprises & Discoveries, Decision Log, and Outcomes & Retrospective sections current as work proceeds. No root `PLANS.md` exists in this checkout; if one is added later, this plan must be maintained in accordance with root `PLANS.md`.
+This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current as work proceeds. No root `PLANS.md` exists in this checkout; if one is added, maintain this plan in accordance with it.
 
 ## Purpose / Big Picture
 
-This final gate decides whether the repository is ready to promote generated slices into the active root queue, run `auto parallel`, and prepare a release. Operators gain a clear go/no-go decision backed by code, docs, tests, receipts, and root planning truth. They can see it working when stale rows are closed, blockers are explicit, and `auto ship` has current proof.
+This final gate decides whether the production-readiness campaign is ready to become active root work and, eventually, parallel execution. The operator gains a clear GO/NO-GO decision backed by current corpus, root ledgers, receipts, tests, status, and release evidence.
 
 ## Requirements Trace
 
-- R1: Root planning truth must reconcile `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, specs, and receipts.
-- R2: `TASK-016` release/tag truth must be closed or converted into a current evidence task, including `COMPLETED.md` and tag-annotation consistency.
-- R3: `AD-014` must have local evidence recorded and external proof explicitly marked tested or untested.
-- R4: All checkpoint gates must pass or have explicit operator waivers.
-- R5: Queue promotion and `auto parallel` launch must be a deliberate operator decision.
+- R1: Plans 002-011 are closed or explicitly waived with risk ownership.
+- R2: `genesis/` is complete and subordinate unless promoted.
+- R3: Root queue promotion includes only accepted, evidence-backed slices.
+- R4: `auto gen` or manual promotion must not overwrite active root truth without review.
+- R5: `auto parallel` launch requires clean scheduler status, current receipts, and no high-severity blockers.
+- R6: Release readiness requires current CI-equivalent local proof or a documented reason CI is the accepted proof.
 
 ## Scope Boundaries
 
-This plan does not itself implement earlier fixes. It does not push commits or launch `auto parallel` unless the operator approves after the gate. It does not hide unresolved blockers to make the queue look clean.
+This plan does not implement the earlier fixes. It does not force a release if gates fail. It does not promote the entire generated corpus automatically. It does not bypass operator sovereignty.
 
 ## Progress
 
-- [x] 2026-04-30: Identified root queue staleness and release-proof risks.
-- [x] 2026-04-30: Verified `v0.2.0` exists while `TASK-016`, `COMPLETED.md`, archive prose, and tag annotation content still disagree.
-- [ ] 2026-04-30: Run after Plans 002-011 and checkpoints complete.
-- [ ] 2026-04-30: Record final go/no-go and queue promotion decision.
+- [x] 2026-04-30: Final gate positioned after safety, evidence, lifecycle, DX, and performance plans.
+- [ ] Confirm all earlier plan outcomes.
+- [ ] Decide root queue promotion strategy.
+- [ ] Run generation or manual promotion in the selected mode.
+- [ ] Decide whether `auto parallel` can launch.
+- [ ] Record release GO/NO-GO.
 
 ## Surprises & Discoveries
 
-- `v0.2.0` exists while root plan text still contains stale partial release wording.
-- `COMPLETED.md` is empty even though `TASK-016` names it as a completion artifact, and the tag annotation omits `TASK-014` while archive prose says the baseline runs through `TASK-015`.
-- The installed binary can match a clean commit while the checkout itself is dirty from planning corpus changes.
+None yet.
 
 ## Decision Log
 
-- Mechanical: Release and parallel launch require clean root truth and current receipts.
-- Taste: Keep final gate as a research/decision plan so unresolved external proof is visible rather than papered over.
-- User Challenge: "Implement approved queue with auto parallel" is only safe after this gate; approval should be explicit and based on current evidence.
+- Mechanical: Queue promotion should be narrow because `genesis/` is not active truth by default.
+- Mechanical: `auto parallel` launch requires a non-empty, valid root queue and scheduler status GO.
+- Taste: Prefer snapshot/review before sync when using `auto gen` for production control changes.
+- User Challenge: If the operator asks for immediate launch despite NO-GO blockers, record the challenge and require explicit acceptance.
 
 ## Outcomes & Retrospective
 
-None yet. Record the final decision, any waivers, and whether `auto parallel` launched.
+None yet.
 
 ## Context and Orientation
 
 Relevant files:
 
-- `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, `COMPLETED.md`.
-- `specs/`, `docs/decisions/`, README.
-- `src/ship_command.rs`, `src/parallel_command.rs`, `src/completion_artifacts.rs`.
-- `.auto/symphony/verification-receipts/`, `.auto/parallel/`, `.auto/state.json`.
-- `genesis/` corpus generated by this pass.
+- This corpus under `genesis/`.
+- Active root ledgers: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, `WORKLIST.md`.
+- Root specs and decision docs.
+- Receipts under `.auto/symphony/verification-receipts/`.
+- Release artifacts: `SHIP.md`, `QA.md`, `HEALTH.md`.
+- CI workflow: `.github/workflows/ci.yml`.
 
 Non-obvious terms:
 
-- Queue promotion: moving generated or proposed plan slices into the active root planning files that `auto parallel` consumes.
-- Waiver: an explicit operator-approved exception to a gate, with reason and scope.
+- Queue promotion: moving accepted plan slices from generated corpus into active root `IMPLEMENTATION_PLAN.md` and related specs.
+- Snapshot/review: producing generated outputs without immediately syncing them into root truth, so an operator can inspect first.
+- GO/NO-GO: explicit release or execution decision with blockers and waivers.
 
 ## Plan of Work
 
-Review all earlier plan outcomes. Reconcile root plan rows with current code and receipts. Close stale `TASK-016` if tag/install proof is current, or rewrite it as a current release evidence task that also accounts for `COMPLETED.md` and tag-annotation drift. Close or narrow AD-014 based on local proof and external proof availability. Confirm docs/specs no longer feed stale command counts into generation. Run final status, tests, receipt checks, and release gate. Then ask the operator to choose: launch `auto parallel`, hold for blockers, or promote only a subset.
+Review outcomes from Plans 002-011. If all required gates pass, decide whether to use `auto gen --snapshot-only`, `auto steward`, or manual narrow edits to promote accepted slices. Because root ledgers are active truth, do not copy all generated plans wholesale. Promote the smallest coherent queue that advances production readiness and has machine-readable dependencies.
+
+After promotion, run the shared schema validator, scheduler status, focused tests for touched modules, and release gate checks. If the root queue is valid and non-empty, run `auto parallel status` and decide whether to launch. If any high-severity blocker remains, record NO-GO and return to the owning plan.
 
 ## Implementation Units
 
-- Unit 1: Root truth reconciliation. Goal: eliminate stale active rows. Requirements advanced: R1, R2, R3. Dependencies: Plans 002-011. Files: `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, specs/docs when promoted. Tests: grep acceptance checks. Approach: compare root docs to code and receipts. Scenarios: stale command count; partial release row; empty completion ledger; tag annotation mismatch; active worklist evidence task.
-- Unit 2: Final evidence run. Goal: prove release readiness. Requirements advanced: R4. Dependencies: Unit 1. Files: receipts and reports. Tests: `cargo fmt --check`, clippy, tests, locked install, doctor, parallel status, ship gate. Approach: run commands under receipt wrapper where required. Scenarios: clean tree; dirty tree blocker; stale receipt blocker.
-- Unit 3: Queue promotion decision. Goal: decide whether to run `auto parallel`. Requirements advanced: R5. Dependencies: Units 1-2. Artifact: go/no-go note and promoted queue if approved. Test expectation: none -- this is an operator decision artifact unless queue files are edited. Approach: present evidence and get explicit approval. Scenarios: launch full queue; launch subset; hold.
+- Unit 1: Earlier plan closeout review.
+  - Goal: Verify closure or waivers for Plans 002-011.
+  - Requirements advanced: R1.
+  - Dependencies: Plans 002-011.
+  - Files to create or modify: release decision artifact if promoted.
+  - Tests to add or modify: none in this unit.
+  - Approach: Read progress, outcomes, test evidence, and waivers.
+  - Test scenarios: Test expectation: none -- this is evidence review.
+
+- Unit 2: Promotion mode decision.
+  - Goal: Choose `auto gen --snapshot-only`, `auto steward`, or manual promotion.
+  - Requirements advanced: R2, R3, R4.
+  - Dependencies: Unit 1.
+  - Files to create or modify: root ledgers/specs only after decision.
+  - Tests to add or modify: plan schema validation after promotion.
+  - Approach: Prefer reviewable snapshots or narrow manual edits; avoid blind sync.
+  - Test scenarios: promoted rows parse and have dependencies, artifacts, and verification fields.
+
+- Unit 3: Root queue validation.
+  - Goal: Confirm promoted queue is safe for execution.
+  - Requirements advanced: R3, R5.
+  - Dependencies: Unit 2.
+  - Files to create or modify: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, specs if promoted.
+  - Tests to add or modify: none unless validator gaps are found.
+  - Approach: Run parser/schema checks, scheduler status, and focused tests.
+  - Test scenarios: no missing dependency ids, no evidence-impossible rows, no stale completion drift.
+
+- Unit 4: Release/execution GO decision.
+  - Goal: Decide whether to run `auto parallel` and whether repo is release-ready.
+  - Requirements advanced: R5, R6.
+  - Dependencies: Unit 3.
+  - Files to create or modify: `SHIP.md` or decision artifact if promoted.
+  - Tests to add or modify: none in this gate.
+  - Approach: Run CI-equivalent local proof or cite current CI; evaluate ship gate; record GO/NO-GO.
+  - Test scenarios: Test expectation: none -- this is a release decision consuming prior tests.
 
 ## Concrete Steps
 
 From the repository root:
 
     git status --short --branch
+    find genesis -maxdepth 2 -type f | sort
+    rg -n "^- \\[( |~|!)\\]" IMPLEMENTATION_PLAN.md REVIEW.md
+
+If choosing snapshot generation:
+
+    auto gen --snapshot-only
+
+Expected observation: generated snapshot output is available for review without root sync.
+
+If promoting manually or through reviewed sync, validate:
+
+    cargo test task_parser
+    cargo test generation
+    cargo test parallel_status
+    cargo test completion_artifacts
+    cargo test ship
+    cargo clippy --all-targets --all-features -- -D warnings
+
+Before any parallel launch:
+
     auto parallel status
-    rg -n "AD-014|TASK-016|\\[ \\]|\\[~\\]|\\[!\\]|Dependencies:" IMPLEMENTATION_PLAN.md WORKLIST.md REVIEW.md
+
+Expected observation: status says launch is safe, names a non-empty pending queue, and reports no stale plan or evidence blockers.
+
+Release proof, when appropriate:
+
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test
-    cargo install --path . --locked --root "$(mktemp -d)"
-    auto doctor
-    auto ship --help
+    cargo install --path . --locked --root "$PWD/.auto/install-proof"
+    .auto/install-proof/bin/auto --version
 
-Expected observations: no stale active rows, no missing dependency blockers, current receipts for release-relevant commands, and a clear operator decision.
+Expected observation: CI-equivalent local proof passes, or the decision artifact explicitly cites current CI as accepted proof.
 
 ## Validation and Acceptance
 
-Acceptance:
-
-- Root plan, worklist, review, archived history, specs, and receipts agree on current status.
-- Checkpoint gates from Plans 005 and 009 passed or have explicit waivers.
-- `auto parallel status` reports no hidden blockers for promoted rows.
-- `auto ship` accepts current proof or reports precise blockers.
-- Operator explicitly approves or rejects queue promotion.
+GO requires all earlier blockers closed or waived, a complete subordinate corpus, a valid promoted root queue, safe scheduler status, current evidence, and release-gate proof. NO-GO is required if the queue is empty, stale, invalid, or blocked by high-severity security/state/evidence issues. The final decision must include the Not Doing list and any waivers.
 
 ## Idempotence and Recovery
 
-The gate can be rerun after any blocker fix. If a command writes reports or receipts, rerun under the same wrapper and replace stale proof with current proof. Do not delete historical receipts unless a cleanup plan exists.
+Snapshot generation is safe to rerun. Manual promotion should be reviewed with `git diff` before execution. If `auto gen --sync-only` or another mutating promotion fails, recover from git diff and generated snapshots; do not reset unrelated user changes. If `.auto/install-proof` is created, it is generated state and can be removed after proof if desired.
 
 ## Artifacts and Notes
 
-Fill in:
-
-- Final root queue state.
-- Final validation commands and receipt paths.
-- Waivers, if any.
-- Queue promotion decision.
-- Release go/no-go.
+- Evidence to fill in: promoted root rows or decision not to promote.
+- Evidence to fill in: scheduler status output.
+- Evidence to fill in: CI/local release proof.
+- Evidence to fill in: final GO/NO-GO decision and waivers.
 
 ## Interfaces and Dependencies
 
-Interfaces: root planning docs, cargo validation, receipt wrapper, installed binary proof, `auto doctor`, `auto parallel status`, `auto ship`. Dependencies: completion of earlier plans and explicit operator approval for launch/push.
+- Depends on Plans 002-011.
+- Commands: `auto gen`, `auto steward`, `auto parallel status`, `auto parallel`, `auto ship`, Cargo validation commands.
+- Files: `genesis/`, root ledgers, root specs, receipts, `SHIP.md`, `QA.md`, `HEALTH.md`.
