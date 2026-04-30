@@ -10,6 +10,7 @@ use crate::qa_only_command::{
     allowed_report_only_dirty_paths, collect_dirty_state, print_final_status_block,
     report_only_dirty_state_report,
 };
+use crate::task_parser::parse_tasks;
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
@@ -304,6 +305,17 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             return Ok(());
         }
         if pass == max_passes {
+            if let Some(promoted) = preserve_final_no_go_design_plan_items(
+                &repo_root,
+                &output_root,
+                pass,
+                max_passes,
+                &pass_dir,
+            )? {
+                println!(
+                    "status:      promoted {promoted} design task(s) into IMPLEMENTATION_PLAN.md"
+                );
+            }
             break;
         }
         if let Some(promoted) = promote_design_plan_items_to_root_queue(&repo_root, &pass_dir)? {
@@ -396,6 +408,57 @@ fn write_design_resolution_status(
     })
 }
 
+fn preserve_final_no_go_design_plan_items(
+    repo_root: &Path,
+    output_root: &Path,
+    pass: usize,
+    max_passes: usize,
+    pass_dir: &Path,
+) -> Result<Option<usize>> {
+    let promoted = promote_design_plan_items_to_root_queue(repo_root, pass_dir)?;
+    let status = if promoted.is_some() {
+        "no-go-promoted-design-tasks"
+    } else {
+        "no-go-no-new-design-tasks"
+    };
+    write_design_no_go_resolution_status(
+        output_root,
+        repo_root,
+        pass,
+        max_passes,
+        pass_dir,
+        status,
+    )?;
+    Ok(promoted)
+}
+
+fn write_design_no_go_resolution_status(
+    output_root: &Path,
+    repo_root: &Path,
+    pass: usize,
+    max_passes: usize,
+    pass_dir: &Path,
+    status: &str,
+) -> Result<()> {
+    let markdown = format!(
+        "# Design Resolve Status\n\n- Status: `{status}`\n- Pass: `{pass}/{max_passes}`\n- Latest artifacts: `{}`\n- Latest report: `{}`\n- Design plan items: `{}`\n- Executor queue: `{}`\n- Recovery: final NO-GO preserved design repair work in the executor queue when parser-visible tasks were present; otherwise inspect the latest report and plan-items artifact for blockers.\n",
+        pass_dir.display(),
+        pass_dir.join("DESIGN-REPORT.md").display(),
+        pass_dir.join("DESIGN-PLAN-ITEMS.md").display(),
+        repo_root.join("IMPLEMENTATION_PLAN.md").display(),
+    );
+    atomic_write(
+        &output_root.join("DESIGN-RESOLVE-STATUS.md"),
+        markdown.as_bytes(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            output_root.join("DESIGN-RESOLVE-STATUS.md").display()
+        )
+    })
+}
+
 pub(crate) async fn run_super_design_module(
     args: &SuperArgs,
     repo_root: &Path,
@@ -474,13 +537,16 @@ fn promote_design_plan_items_to_root_queue(
         return Ok(None);
     }
 
+    let existing_task_ids = parse_tasks(&root_plan)
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut missing = Vec::new();
     for block in blocks {
         let Some(task_id) = design_plan_block_task_id(&block) else {
             continue;
         };
-        let needle = format!("`{task_id}`");
-        if !root_plan.contains(&needle) {
+        if !existing_task_ids.contains(&task_id) {
             missing.push(block);
         }
     }
@@ -783,9 +849,11 @@ fn require_nonempty_file(path: &Path) -> Result<()> {
 mod tests {
     use super::{
         build_design_prompt, enforce_design_report_only_write_boundary,
-        promote_design_plan_items_to_root_queue, DesignRunKind,
+        preserve_final_no_go_design_plan_items, promote_design_plan_items_to_root_queue,
+        DesignRunKind,
     };
     use crate::qa_only_command::{collect_dirty_state, format_final_status_block};
+    use crate::task_parser::{parse_tasks, TaskStatus};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -890,9 +958,62 @@ mod tests {
         assert!(
             root_plan.find("`DESIGN-001`").unwrap() < root_plan.find("## Follow-On Work").unwrap()
         );
+        let tasks = parse_tasks(&root_plan);
+        let promoted = tasks
+            .iter()
+            .find(|task| task.id == "DESIGN-001")
+            .expect("promoted design task should be parser-visible");
+        assert_eq!(promoted.status, TaskStatus::Pending);
+        assert!(promoted.dependencies.is_empty());
 
         assert_eq!(
             promote_design_plan_items_to_root_queue(&root, &pass_dir).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn final_no_go_promotes_design_tasks_before_failure() {
+        let root = temp_dir("design-final-no-go-promotion");
+        let output_root = root.join(".auto/design/run");
+        let pass_dir = output_root.join("pass-01");
+        fs::create_dir_all(&pass_dir).unwrap();
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n",
+        )
+        .unwrap();
+        fs::write(
+            pass_dir.join("DESIGN-REPORT.md"),
+            "Remaining design/runtime gaps.\n\nVerdict: NO-GO\n",
+        )
+        .unwrap();
+        fs::write(
+            pass_dir.join("DESIGN-PLAN-ITEMS.md"),
+            "- [ ] `DESIGN-999` Final NO-GO repair\n\n    Source of truth: `src/design_command.rs`\n    Runtime owner: `src/design_command.rs`\n    UI consumers: root `IMPLEMENTATION_PLAN.md`\n    Generated artifacts: `.auto/design/run/pass-01/DESIGN-PLAN-ITEMS.md`, root `IMPLEMENTATION_PLAN.md`\n    Fixture boundary: tests use temporary pass directories only.\n    Verification: `cargo test design_command::tests::final_no_go_promotes_design_tasks_before_failure`\n    Dependencies: none\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            preserve_final_no_go_design_plan_items(&root, &output_root, 1, 1, &pass_dir).unwrap(),
+            Some(1)
+        );
+
+        let root_plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).unwrap();
+        let tasks = parse_tasks(&root_plan);
+        let promoted = tasks
+            .iter()
+            .find(|task| task.id == "DESIGN-999")
+            .expect("final NO-GO design task should be parser-visible");
+        assert_eq!(promoted.status, TaskStatus::Pending);
+        assert!(promoted.dependencies.is_empty());
+
+        let status = fs::read_to_string(output_root.join("DESIGN-RESOLVE-STATUS.md")).unwrap();
+        assert!(status.contains("no-go-promoted-design-tasks"));
+        assert!(status.contains("DESIGN-PLAN-ITEMS.md"));
+
+        assert_eq!(
+            preserve_final_no_go_design_plan_items(&root, &output_root, 1, 1, &pass_dir).unwrap(),
             None
         );
     }
