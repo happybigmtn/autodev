@@ -1,122 +1,117 @@
-# DESIGN - operator-facing surfaces
+# Operator Experience Design
 
-## Scope
+## Design Scope
 
-This repo does not have a browser UI. It does have meaningful user-facing surfaces:
-
-- CLI commands and help text from `src/main.rs`;
-- terminal status output from command modules;
-- generated markdown under `genesis/`, `gen-*`, root specs, plans, and review docs;
-- logs, prompts, stderr captures, and receipts under `.auto/`, `bug/`, and `nemesis/`;
-- tmux lane names and status output for `auto parallel`;
-- generated Symphony workflow YAML and embedded shell.
-
-Design quality for this repo means information clarity, state coverage, recoverability, accessibility in terminals, and resistance to AI-generated sludge.
+Autodev has meaningful user-facing surfaces even without a graphical UI. The interface is a terminal product made of command names, help text, prompts, state files, reports, logs, receipts, recovery instructions, and release gates. This design pass therefore covers information architecture, state coverage, user journeys, accessibility, responsive terminal behavior, and AI-slop risk for operator workflows.
 
 ## Information Architecture
 
-The command surface currently spans five mental buckets:
+The command surface should read as one system:
 
-1. Planning: `corpus`, `gen`, `reverse`, `steward`.
-2. Execution: `loop`, `parallel`, `symphony`.
-3. Quality: `review`, `qa`, `qa-only`, `health`, `ship`.
-4. Discovery/remediation: `bug`, `nemesis`, `audit`.
-5. Accounts/infrastructure: `quota`.
+- Plan: `auto corpus`, `auto gen`, `auto spec`, `auto design`, `auto super`.
+- Execute: `auto loop`, `auto parallel`, `auto symphony`, quota-backed model execution.
+- Verify: `auto qa`, `auto qa-only`, `auto health`, `auto review`, `auto audit`, `auto nemesis`.
+- Release: `auto ship`, receipts, QA/health/review reports, install proof, tag evidence.
+- Operate: `auto doctor`, `auto quota`, `auto steward`, `auto book`, state files under `.auto/`.
 
-The README and help should present these buckets explicitly. A flat sixteen-command list is discoverable but not teachable.
+Current IA risk: the code owns this separation better than older specs do. The top of README is mostly current, while dated specs and previous genesis snapshots can pull model prompts back toward an older 16-command product.
 
-The active planning surfaces should be named consistently:
+## Key Journeys
 
-- `genesis/` is generated planning corpus.
-- `gen-*` is generated implementation output.
-- `IMPLEMENTATION_PLAN.md` and `specs/` are active root planning surfaces.
-- `ARCHIVED.md` and `WORKLIST.md` are state ledgers, not source-of-truth specs.
+Fresh operator:
 
-## User Journeys
+1. Install or run the local binary.
+2. Run `auto --version`.
+3. Run `auto doctor`.
+4. Run `git status --short`.
+5. Read the active queue in `IMPLEMENTATION_PLAN.md` and `WORKLIST.md`.
 
-New operator:
-
-1. Run `auto --version`.
-2. Run a no-model health/doctor path.
-3. Learn which selected command needs which external tools.
-4. Run `auto corpus --dry-run` or an equivalent local smoke.
-5. See exactly where output will be written and how to recover archives.
+The journey exists, but tool requirements are not presented consistently: `AGENTS.md` calls `claude`, `codex`, `pi`, and `gh` required, while doctor/README treat unavailable tools as capability warnings.
 
 Planning operator:
 
-1. Run `auto corpus`.
-2. Review generated corpus and Codex review output.
-3. Run `auto gen`.
-4. Promote only chosen generated tasks into root queue.
+1. Run `auto corpus` with a focus.
+2. Inspect `genesis/ASSESSMENT.md`, `SPEC.md`, `PLANS.md`, and numbered plans.
+3. Use `auto gen --snapshot-only` or an explicit sync path after validation.
 
-Execution operator:
+The gap is rollback safety: a failed corpus run can leave `genesis/` empty, and `auto gen` can later accept the empty root.
 
-1. Check dirty state and current branch.
-2. Run `auto loop`, `auto parallel`, or `auto symphony`.
-3. Watch command status without reading raw model logs.
-4. Inspect receipts and review handoff before accepting completion.
+Parallel operator:
 
-Quota operator:
+1. Run `auto parallel status`.
+2. Confirm clean worktree, dependency-ready queue rows, safe quota state, and no stale salvage.
+3. Launch lanes.
+4. Monitor `.auto/parallel/live.log`, receipts, REVIEW handoffs, and lane summaries.
 
-1. Capture accounts.
-2. Check status without leaking tokens.
-3. Run a provider command through `auto quota open`.
-4. Trust that previous active credentials are restored.
+The gap is trust: dependency truth is lossy, salvage notes can outlive lane repos, and credential swaps are not held across the process lifetime.
+
+Release operator:
+
+1. Confirm QA, health, review, design, and audit reports.
+2. Confirm verification receipts from the current tree.
+3. Confirm installed binary proof and version.
+4. Run `auto ship`.
+
+The gap is proof freshness: receipts are not currently bound to commit, dirty state, plan hash, or artifact hashes.
 
 ## State Coverage
 
-Every command that mutates files or credentials should expose:
+Autodev should label state by durability:
 
-- current repo branch;
-- dirty-state summary;
-- planned output directory;
-- archive/checkpoint path before destructive changes;
-- selected model/backend and dangerous-mode status;
-- selected quota provider/account label when applicable;
-- completion proof location;
-- recovery instructions.
+- Source-controlled control inputs: `AGENTS.md`, `README.md`, `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, `specs/`, `docs/decisions/`, `genesis/`.
+- Runtime state: `.auto/`, `.auto/parallel/`, `.auto/symphony/verification-receipts/`, `.auto/audit-everything/`.
+- Generated investigation surfaces: `bug/`, `nemesis/`.
+- Excluded generated workspaces: `gen-*`.
 
-Some commands already do parts of this. The design gap is consistency.
+The current code expresses parts of this in `.gitignore`, `src/state.rs`, and `src/util.rs`, but the user-facing explanation is scattered. Production design should make every command say which class it reads and writes.
 
-## Accessibility And Terminal Behavior
+## Accessibility and Terminal Ergonomics
 
-Terminal output should not depend on color alone. Status words such as `OK`, `FAILED`, `BLOCKED`, `PARTIAL`, and `ARCHIVED` should be present in plain text.
-
-Output should remain legible at common terminal widths. Avoid long unwrapped generated paths when a relative path is sufficient. When paths are long, put them on their own line.
-
-Logs should be searchable. Prefer stable prefixes like `[quota-router]`, `[parallel]`, `[genesis]`, and `[verification]` over prose-only output.
+- Prefer stable labels over color-only status.
+- End every long-running command with a compact final status block: status, files written, receipts, next command, and blockers.
+- Keep help text grouped by journey, not only alphabetic command lists.
+- Avoid long unwrapped paragraphs in terminal output.
+- Provide structured output where automation needs it, especially for `auto doctor`, `auto parallel status`, and release gates.
+- Ensure dry-run output says whether it wrote prompt logs, state directories, or no files.
 
 ## Responsive Behavior
 
-There is no responsive web layout. The equivalent concern is terminal width and tmux panes. `auto parallel status` and other status commands should avoid tables that become unreadable in narrow panes. Use one fact per line when the data is operationally important.
+Terminal output should work in narrow logs, tmux panes, and CI:
+
+- Use short line prefixes and avoid table formats that require wide terminals.
+- Write full details to durable files and keep stdout summaries compact.
+- Make progress logs resumable by stable artifact path, not by transient lane directory.
+- Avoid hiding critical warnings behind decorative formatting.
 
 ## AI-Slop Risk
 
-This repo is especially vulnerable to plausible but false markdown because it generates plans, specs, receipts, reviews, and reports. Design countermeasures:
+Primary AI-slop risks:
 
-- Require code-linked evidence for current-state claims.
-- Separate `Verified`, `Recommendation`, and `Open Question` labels.
-- Preserve failing validation results instead of smoothing them into optimistic prose.
-- Keep generated plans as subordinate until promoted into root queue.
-- Prefer receipts and specific command outputs over narrative claims.
+- Generated plans that pass prose review but do not match code contracts.
+- Report-only commands that write state and then sound dry-run safe.
+- Receipts that prove a command passed but not that it passed for the current tree.
+- Stale specs that present old command counts or missing-command claims as current truth.
+- Worker prompts that encourage broad edits without exact source-of-truth boundaries.
 
-## Copy And Help Principles
+Design remedy: every command that invokes a model should name source truth, write boundaries, validation receipts, and recovery path in deterministic text assembled by code.
 
-Use concrete verbs: `archive`, `write`, `sync`, `commit`, `push`, `restore`, `verify`.
+## Recommended Design Contract
 
-Say when a command may call a live model, mutate the working tree, change credentials, create a checkpoint, or push to a remote.
+- `auto doctor`: no-model first-run truth, with optional structured output.
+- `auto corpus`: atomic planning-root generation, with a non-empty manifest.
+- `auto gen`: snapshot first; root sync only after explicit validated intent.
+- `auto parallel status`: queue truth, dependency blockers, stale salvage, receipt drift, quota readiness.
+- `auto qa-only`, `auto design`, `auto health`, `auto review`: consistent report-only/write-boundary enforcement.
+- `auto ship`: proof summary that names commit, dirty state, installed binary version, receipt freshness, and bypass reason if any.
 
-Avoid saying a command is safe because it is "just planning" if it archives, deletes, or rewrites generated directories first.
+## 2026-04-30 Design Gate Amendment
 
-## Design Decisions
+The root `DESIGN.md` is now the durable design doctrine for autodev's terminal/operator product surface. This corpus file remains planning input for `auto gen`; it must not become a competing source of live product truth.
 
-| Decision | Classification | Rationale |
-|---|---|---|
-| Treat CLI/log/docs as the design surface | Mechanical | No browser UI exists, but these are operator-facing interfaces. |
-| Bucket commands into five mental groups | Taste | The grouping makes onboarding easier without changing CLI names. |
-| Prefer extending `health` or adding a doctor path only after design | User Challenge | Adding a new command changes the public surface; extending existing health may be less disruptive. |
-| Keep generated markdown evidence-heavy | Mechanical | The product creates markdown for agent execution; false polish is a real failure mode. |
+Generation should preserve these design requirements:
 
-## Not Applicable
-
-Visual layout, mobile responsiveness, iconography, and component styling are not relevant because this repo has no app UI. If a UI is added later, it should be planned separately and should not be implied by this design pass.
+- Treat terminal help, stdout, prompt logs, plans, reports, receipts, and release gates as the real product UI.
+- Reject web-dashboard or mockup work unless it is clearly non-authoritative and not used as acceptance evidence.
+- Emit implementation tasks that name runtime owners, UI consumers, generated artifacts, fixture boundaries, contract generation, cross-surface proof, and closeout review.
+- Prioritize the `DESIGN-*` repair rows in the root queue before any CEO campaign treats design/runtime integrity as solved.
+- Keep `genesis/plans/011-first-run-dx-and-command-output-contracts.md` as the command-output design slice and `genesis/plans/008-auto-loop-auto-review-and-super-schema-parity.md` as the task-contract parity slice.

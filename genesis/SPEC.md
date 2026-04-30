@@ -1,154 +1,65 @@
-# SPEC - autodev as an operator-trust CLI
+# Autodev Product Specification
 
-## Product Summary
+## Problem Statement
 
-`autodev` builds the `auto` command, a repo-root CLI for planning, generating, executing, reviewing, and shipping agent-driven engineering work. It is a local operator tool, not a hosted service. Its main job is to convert a real working tree into actionable planning artifacts, run model-backed workers against that tree, and preserve enough evidence that a human can trust what happened.
+How might we make `auto` a production-grade autonomous development control plane that converts repository truth into plans, runs model-backed implementation safely, verifies the result with durable evidence, and gives operators enough confidence to ship without hand-reconstructing what happened?
 
-Near-term product direction: stabilize the current command lifecycle before expanding the surface. The product should become an evidence-first operator console for existing commands: planning truth, credential safety, verification receipts, backend policy, and first-run confidence.
+The current code shows a real Rust CLI, not a planning-only prototype. It owns command routing, corpus generation, task parsing, parallel lane orchestration, quota-backed model execution, design/QA/health/review surfaces, receipt capture, audit passes, and release gating. The next system step is not to invent a new product. It is to make the existing control plane impossible to fool by stale plans, unsafe credentials, empty corpora, lossy dependencies, or old receipts.
 
-## Users And Jobs
+## Primary Users
 
-Primary operator job: "I need to move a real repo forward with agent help without losing track of source truth, credentials, worktree state, or verification evidence."
+- Repository operator: runs `auto corpus`, `auto gen`, `auto parallel`, `auto review`, `auto audit`, and `auto ship` to move real work through a repo.
+- Engineering lead: uses generated plans, receipts, review handoffs, and release gates to decide what can be trusted.
+- Agent worker: receives generated prompts and task contracts from `auto parallel`, `auto loop`, `auto super`, Symphony, or quota-backed execution.
+- Maintainer of autodev itself: must be able to test, install, recover, and release the CLI without guessing state.
 
-Contributor job: "I need to change `auto` safely, understand which command owns which behavior, and run tests that prove I did not break the lifecycle."
+## Current System Behaviors Verified From Code
 
-Reviewer job: "I need generated plans, receipts, and logs that let me distinguish implemented code from model prose."
+- `src/main.rs` defines 21 command variants and central dispatch for the `auto` binary.
+- `README.md` presents the current command surface as 21 commands; older specs and previous genesis snapshots are stale where they claim 16 or 17.
+- `src/generation.rs` validates generated corpus and task contracts, provides `--snapshot-only`, preserves blocked task rows better than older code, and rejects broad or low-signal verification commands.
+- `src/corpus.rs` and generation state currently allow a partial planning root with `plans/` but no numbered plans to be treated as usable input; this is a production risk after an interrupted corpus run.
+- `src/task_parser.rs` is the shared task parser and recognizes statuses, dependencies, verification text, and completion artifacts, but dependency extraction is still lossy for bare references such as `Dependencies: TASK-011`.
+- `src/parallel_command.rs` implements tmux-backed lanes, status, preflight, salvage, drift audit, and queue state, but lane reuse can make salvage records point at dead working directories.
+- `src/quota_config.rs` and `src/quota_exec.rs` support account profiles, credential swapping, owner-only file writes, and symlink rejection, but account names are not fully path-bounded and provider locks are not held while the child process runs.
+- `src/completion_artifacts.rs` and `scripts/verification_receipt.py` capture executable proof and reject zero-test receipts, but receipts are not bound to the current commit, dirty state, plan hash, or artifact hashes.
+- `src/ship_command.rs` has a mechanical release gate and bypass trail, but it can accept stale receipts and does not require the locked install proof claimed by README and CI.
+- `src/symphony_command.rs` validates hostile workflow inputs, but reconciliation can corrupt partial task rows by marking `[~]` lines through a code path built around `[ ]` and `[!]`.
+- `src/doctor_command.rs` gives a useful no-model first-run preflight, but optional-versus-required tool language differs between `AGENTS.md`, README, and doctor output.
+- `.github/workflows/ci.yml` runs format, clippy, tests, locked install, and selected help smoke tests, but it does not exercise the shell/Python receipt writer path or every important operator help surface.
 
-## Current System Behaviors Grounded In Code
+## Near-Term Direction
 
-Planning:
+Recommended direction: keep `auto corpus` and `auto gen` as the control primitives, but harden the control plane before scaling parallel implementation. The next 14-day production race should be ordered around these contracts:
 
-- `auto corpus` writes a planning corpus under `genesis/`, can accept idea/focus/reference repo inputs, runs an author phase, optionally runs Codex review, sanitizes absolute repo-root paths, and verifies required corpus shape.
-- `auto gen` and `auto reverse` load the corpus, emit `gen-*` snapshots, generate specs and an implementation plan, and synchronize selected output back to root docs.
-- `src/corpus.rs` defines the corpus loader shape. Numbered plans are expected under `genesis/plans/`.
+- Corpus roots are atomic and never accepted when empty or partially generated.
+- Quota-backed model execution cannot cross-contaminate credentials across parallel lanes.
+- Scheduler eligibility uses the same dependency truth everywhere and treats missing dependencies as blockers.
+- Receipts prove current tree state and current artifacts, not just command text.
+- Report-only and dry-run commands have explicit, tested write boundaries.
+- Release gates reconcile root planning truth, review evidence, CI proof, install proof, and tag state.
 
-Execution:
+## Requirements
 
-- `auto loop` picks sequential plan work, syncs/checkpoints/pushes the primary branch, and runs a model worker.
-- `auto parallel` parses plan tasks, assigns lanes, runs tmux-backed workers, lands lane commits, writes review handoffs, and can sync with Linear.
-- `auto symphony` renders and runs Linear/Symphony workflows.
-
-Quality and review:
-
-- `auto review`, `auto qa`, `auto qa-only`, `auto health`, and `auto ship` are model-backed operator commands around review, QA, status, and release control.
-- `auto audit`, `auto bug`, and `auto nemesis` generate findings and remediation work through specialized prompts and parsers.
-
-Quota and backend execution:
-
-- `auto quota` manages provider accounts, usage selection, and credential swapping for Codex and Claude.
-- Codex and Claude wrappers exist, but several command modules also build direct spawn paths.
-
-State and generated artifacts:
-
-- `.auto/` stores runtime state, logs, receipts, and snapshots.
-- `bug/` and `nemesis/` store generated outputs for their respective commands.
-- `genesis/` is a planning corpus.
-- `gen-*` directories are generated plan/spec outputs.
-
-## Verified Technical Details
-
-The following values are verified from current code or checked-in configuration, not invented requirements:
-
-- Package version: `0.2.0` from `Cargo.toml`.
-- Rust edition: `2021` from `Cargo.toml`.
-- Binary name: `auto` from `Cargo.toml`.
-- Dependency tags in `Cargo.toml`: `anyhow = "1"`, `chrono = "0.4"`, `clap = "4"`, `console = "0.15"`, `dirs = "6"`, `fd-lock = "4"`, `regex = "1"`, `reqwest = "0.12"`, `serde = "1"`, `serde_json = "1"`, `shlex = "1.3"`, `tokio = "1"`, `base64 = "0.22"`, `sha2 = "0.10"`, `toml = "0.8"`.
-- Corpus default model and review model in current `src/main.rs`: `gpt-5.5` with `xhigh` reasoning.
-- Bug, nemesis, audit, loop, parallel, QA, review, ship, steward, and Symphony defaults currently favor Codex `gpt-5.5` paths unless explicit Claude/Kimi/PI options are selected.
-- Codex max context helper: `MAX_CODEX_MODEL_CONTEXT_WINDOW = 1_000_000` in `src/codex_exec.rs`.
-- Quota selector floors: weekly floor `10` percent and session floor `25` percent in `src/quota_selector.rs`.
-- Quota exhaustion cooldown: `1` hour in `src/quota_state.rs`.
-- Claude token refresh endpoint and client id are hardcoded in `src/quota_usage.rs`; treat those as verified implementation details, not a recommendation to expose them in docs.
-- Claude refresh buffer: `300` seconds in `src/quota_usage.rs`.
-- Codex CLI refresh timeout: `20` seconds in `src/quota_usage.rs`.
-- Parallel poll/cleanup timing constants are defined in `src/parallel_command.rs`; keep future docs tied to those constants rather than retyping values casually.
-- CI currently runs format check, clippy with warnings denied, and tests from `.github/workflows/ci.yml`.
-
-The exact resolved dependency versions are in `Cargo.lock`; this corpus does not restate the full lockfile as requirements.
-
-## Recommended Requirements
-
-R1. Planning truth must be singular. Root `IMPLEMENTATION_PLAN.md` plus `specs/` remain the active planning surface unless the repo adds a root `PLANS.md` or explicit instruction to promote another control plane. `genesis/` remains generated corpus input for planning.
-
-R2. Credential swapping must be transactional. Every provider auth file or directory backed up during quota execution must be restored or removed on all success and failure paths.
-
-R3. Credential profile storage must be owner-only and symlink-safe. Profile capture must reject or dereference symlinks intentionally, prune stale files, and create sensitive files with restricted permissions on Unix.
-
-R4. Generated executable workflow text must validate and quote every shell/YAML scalar. Branch, model, reasoning, path, and remote values must not be interpolated raw.
-
-R5. Verification evidence must be risk-classed. Safe local tests, shell interpreters, network/external tools, and destructive commands should not be treated as the same proof type.
-
-R6. Task parsing should converge. Generation, loop, parallel, review, completion artifacts, and Symphony should share one model for status, dependencies, verification commands, spec refs, and completion artifacts.
-
-R7. Backend policy should be explicit. Dangerous bypass flags may remain available, but they should be controlled through one policy layer and visible in command help or logs.
-
-R8. First-run operator experience should include a local, no-model success path that proves the binary, repo layout, required tools for the selected command, and safe dry-run behavior.
+- R1: `genesis/` must be generated atomically and validated as non-empty before it becomes the active planning root.
+- R2: quota account names must be path-safe, and credential leases must cover the child process lifetime.
+- R3: dependency parsing must handle backticked and bare task IDs, and missing dependency IDs must block scheduling.
+- R4: completion and release receipts must record commit, dirty state, plan identity, artifact identity where relevant, command status, output tails, and zero-test summaries.
+- R5: `auto parallel`, `auto loop`, `auto super`, Symphony reconciliation, and root-plan updates must share one task contract.
+- R6: `auto doctor`, report-only commands, dry-run commands, and help surfaces must give honest first-run and recovery signals.
+- R7: release readiness must be a gate over code, docs, specs, review handoff, receipts, CI, installed binary proof, and rollback notes.
 
 ## Non-Goals
 
-- No web UI or TUI in this phase.
-- No new provider backend in this phase.
-- No rewrite into a workspace, daemon, or plugin architecture.
-- No silent default change that makes existing operator workflows fail without migration text.
-- No encryption-at-rest commitment yet. File permissions and symlink safety are immediate requirements; encryption is a separate user challenge because it introduces key management.
-- No attempt to make `genesis/` the active root queue.
-
-## System Interfaces
-
-CLI interface: `src/main.rs`.
-
-Planning corpus interface: `genesis/ASSESSMENT.md`, `genesis/SPEC.md`, `genesis/PLANS.md`, `genesis/GENESIS-REPORT.md`, `genesis/DESIGN.md`, and numbered plans under `genesis/plans/`.
-
-Active repo planning interface: `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and `specs/`.
-
-Provider execution interface: `src/codex_exec.rs`, `src/claude_exec.rs`, `src/pi_backend.rs`, `src/kimi_backend.rs`, plus direct command-specific spawn paths that should be audited.
-
-Credential interface: `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_state.rs`, `src/quota_usage.rs`, and provider home-directory auth files.
-
-Workflow rendering interface: `src/symphony_command.rs` and `src/linear_tracker.rs`.
-
-Verification interface: `src/completion_artifacts.rs`, `scripts/run-task-verification.sh` if present, `auto parallel` handoff logic, and loop/review prompt contracts.
-
-## Data Flow
-
-1. A human starts from a repo root and runs planning (`auto corpus`, then `auto gen`) or execution (`auto loop`, `auto parallel`, `auto symphony`).
-2. The command reads root instructions, current docs, specs, and source.
-3. The command may call provider CLIs through direct or shared wrappers.
-4. It writes logs, prompts, receipts, generated artifacts, and sometimes commits.
-5. Review and landing commands parse those artifacts to decide whether tasks are done, partial, blocked, or stale.
-
-The safest future architecture keeps these contracts explicit and shared. The highest-risk current drift is that several commands do similar parsing and proof evaluation differently.
-
-## Observability Requirements
-
-Every mutating command should emit:
-
-- command name, model/backend, reasoning effort, and whether dangerous mode is active;
-- repo branch and dirty-state summary before mutation;
-- output directory or log path before model invocation;
-- verification receipt path when executable proof is claimed;
-- credential provider/account label when quota routing is active, without secrets;
-- recovery instructions when an archive, checkpoint, or backup is created.
-
-Logs should pass through one redaction layer before persistence.
-
-## Validation Strategy
-
-Near-term validation should prioritize targeted unit and integration tests:
-
-- quota restore and profile capture regression tests;
-- Symphony hostile scalar golden tests;
-- completion-artifact false-proof fixtures;
-- shared task parser fixtures for `[ ]`, `[~]`, `[!]`, `[x]`, dependencies, spec refs, verification, and artifacts;
-- fake-model CLI smoke tests for command wiring;
-- installed-binary proof after source changes that affect user invocation.
-
-Full `cargo test`, clippy, and CI remain release gates, but targeted tests should fail before and pass after each vertical slice.
+- Do not replace the Rust CLI architecture.
+- Do not build a web UI before the terminal/operator experience is trustworthy.
+- Do not make `genesis/` the root active queue unless repo instructions explicitly promote it.
+- Do not run `auto parallel` on a queue with unresolved stale plan rows, unsafe credentials, or unbound receipts.
+- Do not treat older dated specs as current requirements when code and root plans have moved.
 
 ## Open Questions
 
-- Should `genesis/` be tracked long-term or treated as disposable generated state? Current code treats it as generated corpus, but it is currently tracked.
-- Should dangerous backend bypass remain the default for all agent commands, or should commands require an explicit trust profile?
-- Should `steward` eventually replace `corpus + gen` for mid-flight repos, or remain a separate reconciliation command?
-- Should quota credentials be encrypted at rest, or is owner-only file permission sufficient for this local developer tool?
-- Should the repo add a new `auto doctor` command or extend `auto health` for command-specific preflight?
+- Should quota execution serialize per provider for safety, or can it use isolated per-process credential homes for real parallelism?
+- Should `auto gen` remain mutating by default, or should production use require explicit root-sync flags after a snapshot passes validation?
+- Should `auto doctor` gain structured output for automation, or remain a human-readable preflight with tests around important labels?
+- Should stale `TASK-016` be closed by root-plan reconciliation, or should the release gate own it as a final tag-evidence assertion including `COMPLETED.md` and tag-annotation cleanup?

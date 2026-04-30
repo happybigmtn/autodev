@@ -1,58 +1,46 @@
-# PLANS - generated corpus index
+# Genesis Plan Index
 
-This file indexes the generated `genesis/plans/` ExecPlans. It is not the root implementation queue and it is not a replacement for root planning docs.
+## Planning Surface
 
-## Active Planning Surface
+No root `PLANS.md` file and no root `plans/` directory exist in this checkout. The active root planning truth is therefore the repository's existing control corpus: `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, `specs/`, `docs/decisions/`, and receipts under `.auto/symphony/verification-receipts/`.
 
-No root `PLANS.md` file exists in this repository today, and no root `plans/` directory exists. The active control surface remains `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and `specs/`. The generated `genesis/` corpus is subordinate to those root docs. Its numbered plans are recommendations and ready-to-run slices, not automatic queue authority until promoted into the root implementation plan.
+This generated `genesis/` corpus is a strategic planning artifact and is subordinate to that root planning truth until the operator promotes specific slices into the active queue. The numbered plans below use the full ExecPlan envelope requested for this corpus. If a root `PLANS.md` standard is added later, these plans should be reconciled to it.
 
-If a root `PLANS.md` standard is later added, future generated numbered plans should explicitly conform to it.
+## Sequencing Rationale
 
-## Sequencing Principles
+The chosen order front-loads work that can make autonomous execution unsafe or misleading:
 
-The chosen order prioritizes trust and recovery before expansion:
+1. Fix credential and corpus control-plane safety before adding more parallel throughput.
+2. Fix dependency truth before trusting lane assignment.
+3. Add checkpoint gates after the first safety tranche and after execution-contract alignment.
+4. Bind receipts and release evidence before treating `auto ship` as production proof.
+5. Reconcile report-only, audit, nemesis, docs, and DX after the scheduler can be trusted.
+6. End with a release decision gate that decides whether root queue promotion and `auto parallel` launch are safe.
 
-1. Reconcile the planning truth surface so operators stop executing stale work.
-2. Fix credential and generated workflow safety risks.
-3. Gate after security fixes before changing execution contracts.
-4. Harden verification evidence and shared task parsing.
-5. Gate again before changing first-run and CI surfaces.
-6. Improve first-run DX and release proof.
-7. Leave lifecycle research as a decision gate rather than silently changing product direction.
+Obvious alternative rejected: starting with README/spec cleanup. That would improve prompts, but it would not prevent unsafe credential swaps, empty corpus roots, or stale receipts from producing false confidence.
 
-The obvious alternative would be to start with modular refactors. That was rejected because current risks are behavioral and operator-facing: credential restore, shell/YAML rendering, false verification proof, and stale planning truth. Current `cargo test` is green, but it does not cover the higher-risk credential restore and workflow-rendering gaps.
+Obvious alternative rejected: immediately running `auto parallel`. The root queue still contains stale or partially reconciled rows, and code review found safety issues in quota execution, dependency parsing, and salvage durability.
 
-## Plan Index
+## Plan Set
 
-| Plan | Title | Type | Depends on | Why now |
-|---|---|---|---|---|
-| 001 | Master Plan | Coordination | none | Orients the whole corpus and keeps later slices focused |
-| 002 | Root Planning Truth Reconciliation | Implementation | 001 | Prevents stale root docs from steering execution |
-| 003 | Quota Credential Restore And Profile Hardening | Implementation | 001 | Fixes the highest-severity credential risk and preserves quota usage error-surfacing coverage |
-| 004 | Symphony Workflow Rendering Hardening | Implementation | 001 | Hardens generated executable shell/YAML before more Symphony use |
-| 005 | Security Checkpoint Gate | Checkpoint | 002, 003, 004 | Stops later execution-contract work until the security baseline is proved |
-| 006 | Verification Command And Receipt Hardening | Implementation | 005 | Closes known false-proof worklist items |
-| 007 | Shared Task Parser And Blocked-Task Preservation | Implementation | 005 | Aligns generation, loop, parallel, review, and Symphony on one task contract |
-| 008 | Backend Invocation Policy Research | Research gate | 005 | Designs a shared execution policy before refactoring live runners |
-| 009 | Execution Contract Checkpoint Gate | Checkpoint | 006, 007, 008 | Confirms evidence and parser changes before DX/CI changes |
-| 010 | First-Run Doctor And Hermetic Smoke Tests | Implementation | 009 | Gives operators a no-model success path and contributors integration proof |
-| 011 | CI Fidelity And Installed-Binary Proof | Implementation | 009, 010 | Aligns CI with real operator commands and installed CLI expectations |
-| 012 | Release Readiness And Command Lifecycle Decision Gate | Checkpoint/research | 010, 011 | Decides whether current lifecycle is ready for release and whether `steward` changes product direction |
+- `001-master-plan.md`: master production-readiness frame and 14-day sequencing.
+- `002-quota-profile-path-and-credential-lease-hardening.md`: path-bound account names and process-lifetime credential leases.
+- `003-corpus-atomic-restore-and-non-empty-planning-root.md`: atomic corpus generation and non-empty `genesis/` validation.
+- `004-dependency-truth-and-scheduler-eligibility.md`: dependency parser and scheduler readiness fixes.
+- `005-security-and-state-checkpoint-gate.md`: checkpoint before broader execution.
+- `006-receipt-freshness-and-release-evidence-binding.md`: commit/dirty/artifact-aware receipts and release gate proof.
+- `007-symphony-and-review-reconciliation-safety.md`: AD-014, partial-row safety, branch validation, and review write ordering.
+- `008-auto-loop-auto-review-and-super-schema-parity.md`: loop dependency safety and shared plan schema enforcement.
+- `009-execution-contract-checkpoint-gate.md`: checkpoint before audit/DX/release polish.
+- `010-audit-nemesis-and-report-only-lifecycle-truth.md`: audit status, nemesis flags, and report-only write boundaries.
+- `011-first-run-dx-and-command-output-contracts.md`: doctor, help, dry-run, and terminal-output contracts.
+- `012-release-decision-gate-and-queue-promotion.md`: final go/no-go gate for root queue promotion and `auto parallel`.
 
-## Phase Boundaries
+## Dependency Order
 
-Phase 1: Plans 002-004.
-
-Goal: root truth and security. This phase should end with Plan 005.
-
-Phase 2: Plans 006-008.
-
-Goal: execution evidence and shared contracts. This phase should end with Plan 009.
-
-Phase 3: Plans 010-011.
-
-Goal: first-run confidence and CI fidelity. This phase should end with Plan 012.
-
-## Promotion Guidance
-
-To promote a `genesis/plans/` plan into active work, copy its chosen slice into `IMPLEMENTATION_PLAN.md` using the root plan's existing task style, then keep the `genesis/` plan as supporting detail. Do not execute every generated plan automatically.
+- Plans 002, 003, and 004 can be implemented in parallel only if write ownership is split across quota, corpus/generation, and task/scheduler modules.
+- Plan 005 must run after 002-004.
+- Plans 006, 007, and 008 can run after Plan 005, with care around shared parser and review/ship evidence helpers.
+- Plan 009 must run after 006-008.
+- Plans 010 and 011 can run after Plan 009 or in parallel if the report-only and DX write sets remain disjoint.
+- Plan 012 is the final gate and should not be executed until all earlier blockers are closed or explicitly waived.

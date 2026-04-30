@@ -1,87 +1,56 @@
-# GENESIS-REPORT - corpus refresh
+# Genesis Report
 
 ## Refresh Summary
 
-This corpus was refreshed on 2026-04-23 against the current working tree. The previous snapshot under `.auto/fresh-input/genesis-previous-20260423-201851` was read as history, not truth. The current codebase and dirty working tree are authoritative.
+This corpus refresh reviewed the actual codebase first, then reconciled that code against README, root planning files, dated specs, CI, receipts, git history, previous genesis snapshots, and focused sub-reviews. The previous `genesis/` files were deleted in the working tree before this pass; this refresh restores `genesis/` with a current corpus instead of copying an archived snapshot forward.
 
-The generated output lives under `genesis/`. No corpus content is printed here beyond this report, and no root implementation files were modified by the corpus authoring pass.
+The repository is a real Rust CLI product. It is not a speculative plan repository. The `auto` binary owns autonomous planning, model execution, scheduler orchestration, receipts, audit, quality reports, and release gating. The strongest next direction is to make those control primitives safe enough for production parallel execution.
 
 ## Major Findings
 
-1. The repo is now a mid-sized operator CLI, not a small prompt wrapper. It has sixteen commands, multiple backend routes, quota credential swapping, parallel lane orchestration, and Linear/Symphony integration.
-2. Root planning truth is stale. `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, `WORKLIST.md`, and specs need reconciliation before operators can trust the active queue.
-3. Validation truth changed during review. The authoring pass recorded a full `cargo test` failure in `quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error`, but this Codex review reran that exact test and then full `cargo test`; both passed. Current evidence is 377 passed, 0 failed.
-4. The highest-severity code risk is quota credential restore. Claude runs can back up `.claude.json` without restoring it through the normal restore path.
-5. Credential profile capture/copy remains too permissive around symlinks, stale files, and owner-only storage.
-6. Symphony workflow rendering interpolates shell/YAML values without enough validation or quoting.
-7. Verification proof remains a known weak point. `WORKLIST.md` still names malformed generated verification commands and false-positive proof patterns.
-8. Backend invocation policy is split across wrappers and direct command spawn paths, making dangerous-mode behavior harder to audit.
-9. The meaningful user-facing design surface is terminal UX: command help, status, logs, generated markdown, and receipts.
-10. First-run DX needs a no-model local success path and command-specific requirement checks.
+- Highest security risk: quota account names can escape the intended profile tree, and credential swaps are not held for the full child-process lifetime.
+- Highest control-plane risk: `auto corpus` can archive/delete the old corpus and leave `genesis/` empty after failure, while later generation can accept the empty root.
+- Highest scheduler risk: dependency truth is lossy for bare task IDs and missing dependency IDs; `auto loop` can select dependency-blocked work.
+- Highest evidence risk: verification receipts are not bound to current commit, dirty state, plan hash, or artifact hash, and release gates can accept stale proof.
+- Highest reconciliation risk: Symphony/review/root-plan paths can write before validation or mishandle partial rows.
+- Highest release-ledger drift: `v0.2.0` exists, but active `TASK-016`, `COMPLETED.md`, archive prose, and tag annotation content do not fully agree.
+- Highest documentation risk: older specs and previous snapshots claim obsolete command counts and missing command behavior, while README is closer to code reality.
+- Highest DX risk: `auto doctor` is useful but narrow, and dry-run/report-only semantics vary across commands.
 
 ## Recommended Direction
 
-Build an operator-trust kernel around the existing command surface.
-
-The recommended next state is not more commands. It is a safer, more legible lifecycle:
-
-`corpus -> gen -> loop/parallel/symphony -> review/ship`, with shared task parsing, transactional credentials, quoted workflow rendering, risk-classed verification, redacted logs, and first-run smoke tests.
+Keep `auto corpus` and `auto gen` as the control primitives, but do not scale execution until the control plane is safer. The first production tranche should harden quota credentials, corpus atomicity, dependency truth, and receipt freshness. The second tranche should reconcile Symphony/review/super/loop contracts. The third tranche should normalize audit/nemesis/report-only/DX behavior and then run a release decision gate before queue promotion.
 
 ## Top Next Priorities
 
-1. Reconcile root planning truth and stale docs.
-2. Fix quota credential restore/profile hardening and keep the quota usage error-surfacing regression covered.
-3. Harden Symphony workflow rendering against hostile shell/YAML scalars.
-4. Gate the security baseline before touching execution contracts.
-5. Harden verification commands and shared task parsing.
-6. Add a no-model first-run success path and CI-installed-binary proof.
+1. Implement path-safe quota account names and credential leases that cover the model child process lifetime.
+2. Make corpus generation atomic and reject empty planning roots everywhere.
+3. Parse dependency truth consistently and block missing dependency IDs.
+4. Bind receipts to current tree state and release artifacts.
+5. Fix Symphony/review reconciliation ordering and partial-row safety.
+6. Reconcile stale root plan rows, especially `TASK-016`, `AD-014`, the empty `COMPLETED.md`, tag annotation drift, and the active `WORKLIST.md` items.
+
+## Focus Impact
+
+The operator focus moved the corpus from broad product ideation to a production-readiness race. It elevated release blockers, operator trust, verification evidence, first-run DX, scheduler safety, and execution contracts above new features. It did not hide non-focused risks: quota credential safety and corpus rollback safety outrank several named command-surface polish items because they can corrupt auth state or erase the planning root.
 
 ## Not Doing
 
-- Adding a seventeenth command.
-- Rewriting the CLI into a daemon, service, plugin framework, or workspace.
-- Promoting `genesis/` to the active root implementation queue.
-- Treating the previous corpus snapshot as current truth.
-- Encrypting quota credentials at rest in this phase. Owner-only permissions, restore correctness, stale-file pruning, and symlink safety come first; encryption is a separate user challenge.
-- Refactoring `parallel_command.rs` broadly before security and evidence gates pass.
-- Replacing the current provider CLIs.
-- Building a web UI or TUI.
-
-## Focus-Seed Response
-
-No focus seed was supplied. Priority order was therefore determined by full-repo evidence. If a future focus seed emphasizes model defaults or command lifecycle, the quota restore bug, credential copy safety, and Symphony workflow rendering still outrank most other topics because they affect credential integrity and generated executable content.
+- Not replacing the Rust CLI with a new architecture.
+- Not making a web UI or dashboard before terminal/operator contracts are trustworthy.
+- Not running `auto parallel` until root queue and safety blockers are reconciled.
+- Not treating archived genesis snapshots as current truth.
+- Not changing active root planning primacy from `IMPLEMENTATION_PLAN.md` and related root files without operator promotion.
+- Not capacity-trimming ambition; instead, splitting it into parallelizable, evidence-backed slices.
 
 ## Decision Audit Trail
 
-| Decision | Classification | Rationale |
-|---|---|---|
-| Treat root `IMPLEMENTATION_PLAN.md` plus `specs/` as active planning surface | Mechanical | No root `PLANS.md` or root `plans/` exists; the code treats `genesis/` as generated corpus input. |
-| Generate `DESIGN.md` | Mechanical | The repo has meaningful user-facing terminal, log, markdown, and receipt surfaces. |
-| Put planning truth reconciliation first | Taste | It is not the highest security issue, but it prevents stale docs from misdirecting every later slice. |
-| Put quota restore/profile hardening before verification-contract work | Mechanical | Credential restore is the highest-severity verified code risk. |
-| Treat Symphony shell/YAML rendering as Phase 1 security work | Mechanical | It emits executable workflow text from string inputs. |
-| Add checkpoint plans after every phase | Mechanical | The operator requested explicit checkpoint or decision-gate plans after meaningful boundaries. |
-| Keep backend invocation unification as research first | Taste | There are enough direct spawn paths to justify design work, but a rushed shared runner could destabilize live commands. |
-| Do not silently change dangerous-mode defaults | User Challenge | Changing default trust behavior affects operator workflows and must be explicit. |
-| Do not decide encryption-at-rest now | User Challenge | Encryption introduces key management and recovery policy choices beyond the evidence in this pass. |
-| Keep `steward` lifecycle replacement as a decision gate | User Challenge | Whether `steward` should supersede `corpus + gen` for mid-flight repos is product direction, not a mechanical cleanup. |
-| Treat full-suite validation as currently green | Mechanical | The named quota failure from the authoring pass now passes targeted review, and full `cargo test` passed with 377 tests. |
-
-## Review Discipline Applied
-
-CEO: The premise was challenged. The repo should focus on trustworthy execution of current commands rather than breadth.
-
-Design: CLI information architecture, state coverage, user journeys, accessibility, responsive terminal behavior, and AI-slop risk are covered in `DESIGN.md`.
-
-Engineering: The plan set orders architecture work after concrete safety fixes and evidence-contract hardening.
-
-DX: The plan set includes a first-run path, hermetic smoke tests, CI fidelity, and installed-binary proof.
-
-## Generated Artifacts
-
-- `genesis/ASSESSMENT.md`
-- `genesis/SPEC.md`
-- `genesis/PLANS.md`
-- `genesis/GENESIS-REPORT.md`
-- `genesis/DESIGN.md`
-- `genesis/plans/001-master-plan.md` through `genesis/plans/012-release-readiness-and-command-lifecycle-gate.md`
+- Mechanical: `DESIGN.md` is included because the CLI has meaningful user-facing terminal/operator surfaces.
+- Mechanical: `genesis/` remains subordinate because no root `PLANS.md` or root `plans/` directory exists, and repo control truth lives in root planning files.
+- Mechanical: plans use current command count 21 because `src/main.rs` and README agree; older specs are stale.
+- Mechanical: quota and corpus safety are first because code review found concrete high-severity risks.
+- Mechanical: generated plan validation commands must be runnable; independent review split multi-filter `cargo test` examples and removed nonexistent `auto gen --dry-run` / `auto ship --dry-run` examples.
+- Taste: the corpus is organized into 12 plans with two checkpoint gates, not a larger backlog, to keep parallel slices clear while preserving production ambition.
+- Taste: release proof and DX are later than credential/corpus/scheduler safety, even though they are operator-visible, because they depend on trustworthy evidence plumbing.
+- User Challenge: the focus asks to implement an approved queue with `auto parallel`, but this pass only authors the corpus because no newly approved queue exists and current safety findings argue against launching lanes immediately.
+- User Challenge: `auto gen` remains the desired control primitive, but mutating generation by default should be reconsidered for production use.

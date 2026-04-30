@@ -1,225 +1,200 @@
-# ASSESSMENT - autodev
+# Repository Assessment
 
-Review date: 2026-04-23.
+## Executive Summary
 
-This assessment treats the current working tree as the source of truth. The archived previous corpus under `.auto/fresh-input/genesis-previous-20260423-201851` was used as historical context only. Several findings from that snapshot have since been implemented or superseded, so they are not carried forward as current facts.
+Autodev says it is a lightweight repo-root planning and execution toolchain for AI-assisted development. The code shows something more consequential: a Rust autonomous development control plane with model-backed planning, generation, review, design, QA, audit, parallel execution, quota routing, completion receipts, and release gating.
 
-Independent Codex review update: the authoring pass recorded one failing full-suite test, `quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error`. This review reran that exact test with `cargo test quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error -- --exact`, and it passed. Full `cargo test` also passed with 377 tests, 0 failed.
-
-## How Might We
-
-How might we make `auto` a trustworthy operator console for planning and executing agent work in real repositories, so a human can see what the tool will touch, what evidence proves progress, which credentials are active, and whether generated plans are true before the tool commits or pushes anything?
-
-The code already answers part of that question: it is no longer a small prompt wrapper. It is a repo-ops CLI with planning corpus generation, implementation-plan synthesis, sequential and parallel agent execution, quota-account credential swapping, Linear/Symphony integration, audit and bug pipelines, and release/review/QA prompts. The next phase should make that reality safer and easier to operate rather than adding more surface area.
+How might we make this control plane production-ready without losing the operator sovereignty and evidence discipline that make it useful? The answer is not a new product layer. It is to harden the existing runtime truth: credentials, corpus generation, dependency parsing, receipts, root-plan reconciliation, and release proof.
 
 ## Target Users, Success Criteria, and Constraints
 
-Primary users are hands-on engineering operators who run coding agents against real checkouts. They need high-confidence repo state, narrow task execution, recoverable checkpoints, truthful planning artifacts, and clear failure modes.
+Target users:
 
-Secondary users are future contributors to this CLI. They need honest onboarding, fast local smoke tests, and a command architecture that does not require reading a 7,000-line module before making a safe change.
+- Operators running real repositories through `auto corpus`, `auto gen`, `auto parallel`, `auto review`, `auto audit`, and `auto ship`.
+- Engineering leads who need durable evidence and a trustworthy queue.
+- Agent workers receiving prompts, task contracts, and write boundaries.
+- Maintainers releasing the `auto` binary itself.
 
 Success looks like:
 
-- `auto corpus` produces a corpus that is honest about current code and does not revive historical findings as active work.
-- `auto gen`, `auto loop`, and `auto parallel` share the same task-contract interpretation.
-- Credential swapping always restores the previous account and does not leave active provider auth in a surprising state.
-- Generated verification commands prove work without accepting malformed shell snippets, zero-test filters, or directory greps as sufficient evidence.
-- First-run operators can get to a meaningful success moment without already knowing every external dependency.
+- A fresh operator can install, run `auto doctor`, understand required tools, and see a meaningful success moment.
+- A corpus run cannot destroy the only planning root on failure.
+- A parallel run cannot execute dependency-blocked work or corrupt credentials.
+- A completion claim has receipts tied to the current tree and artifacts.
+- A release gate catches stale docs, stale receipts, dirty trees, missing install proof, and incomplete review handoff.
 
-Major constraints:
+Constraints:
 
-- The CLI intentionally operates on real repository roots and may commit or push.
-- The tool relies on external CLIs: `codex`, `claude`, `pi`, and `gh` are listed in `AGENTS.md`; Symphony and Linear flows also require API credentials.
-- Several commands intentionally run models with permission or sandbox bypass flags. That is powerful, but it raises the standard for preflight, logging, checkpointing, and redaction.
-- The working tree is currently dirty outside `genesis/`; those edits are treated as operator-owned and were not changed by this corpus pass.
+- Rust CLI, binary name `auto`, package version currently `0.2.0`.
+- Runtime/generated state includes `.auto/`, `bug/`, `nemesis/`, and `gen-*`.
+- Source-controlled planning truth currently lives in root planning docs and dated specs, not root `PLANS.md`.
+- Model backends intentionally use powerful edit permissions, so prompt provenance, state isolation, and receipts are the real trust boundary.
 
-## What The Project Says It Is Vs What The Code Shows
+## What It Says vs What Code Shows
 
-The README describes `autodev` as a lightweight repo-root planning and execution toolchain and documents the binary as `auto`. That is directionally true, but understated.
-
-The code shows a mid-sized autonomous repo-ops system. `src/main.rs` wires sixteen top-level commands: `corpus`, `gen`, `reverse`, `bug`, `loop`, `parallel`, `qa`, `qa-only`, `health`, `review`, `steward`, `audit`, `ship`, `nemesis`, `quota`, and `symphony`.
-
-The live implementation includes:
-
-- strict planning-corpus generation and validation in `src/generation.rs`;
-- corpus loading and snapshots in `src/corpus.rs`;
-- sequential execution in `src/loop_command.rs`;
-- large multi-lane orchestration in `src/parallel_command.rs`;
-- credential/account routing in `src/quota_*.rs`;
-- Linear-backed Symphony rendering and sync in `src/symphony_command.rs` and `src/linear_tracker.rs`;
-- bug, nemesis, audit, QA, review, steward, and ship prompt pipelines.
-
-The repo is developer-facing and operator-facing. Its user experience is primarily terminal commands, generated markdown, logs, receipts, and status output rather than a web UI.
+| Area | Claim | Code reality | Assessment |
+| --- | --- | --- | --- |
+| Product identity | Lightweight planning/execution toolchain | 21-command autonomous control plane | README top-level framing should be updated to match runtime ambition. |
+| Command count | Older specs say 16 or 17 | `src/main.rs` and README show 21 | Older specs and previous snapshots are stale. |
+| First-run proof | Some dated specs say no doctor/install proof | `auto doctor` and CI install smoke exist | Specs need reconciliation. |
+| Planning root | Previous genesis snapshot existed | `genesis/` was empty/deleted before this refresh, and failed corpus generation can leave only a skeleton `genesis/plans/` directory | Corpus rollback and non-empty validation are production blockers. |
+| Active queue | Root implementation plan plus worklist | `IMPLEMENTATION_PLAN.md` has stale/partial rows; `WORKLIST.md` has live evidence tasks; `COMPLETED.md` is empty | Need root truth reconciliation before parallel launch. |
+| Release proof | `auto ship` gates release | Receipts are not bound to current tree/artifact hashes | Good gate, insufficient freshness proof. |
 
 ## What Works
 
-- CLI dispatch and help are centralized in `src/main.rs`, with clear argument defaults and a build-provenance long version from `src/util.rs` and `build.rs`.
-- `auto corpus` encodes an unusually strict corpus contract: required docs, full ExecPlan section validation, checkpoint plan expectations, absolute repo-root sanitization, and Codex review hooks.
-- `auto gen` and `auto reverse` can load the planning corpus and synchronize generated specs/plans back into root planning surfaces.
-- Non-Claude authoring models route through Codex in `src/generation.rs`; Claude-family model names remain explicit Claude routes.
-- `auto parallel` has substantial recovery machinery: lane state, tmux orchestration, landing, partial follow-ups, health status, and Linear best-effort sync.
-- `util.rs` provides atomic writes, git checkpointing, remote sync, and generated-path exclusions.
-- CI exists under `.github/workflows/ci.yml` with fmt, clippy, and tests on push and pull request.
-- Many pure parser and state-machine surfaces have unit tests. Full `cargo test` passed with 377 tests in the binary target, and the previously reported quota usage test passes under targeted review.
+- Central CLI routing and help generation in `src/main.rs`.
+- Stronger `auto gen` task contract validation in `src/generation.rs`.
+- Shared parser foundation in `src/task_parser.rs`.
+- `auto parallel` has tmux lane orchestration, status, preflight, salvage, drift audit, and worker prompt discipline.
+- Receipt writer captures output tails and zero-test summaries.
+- Completion evidence rejects zero-test executable receipts.
+- `auto ship` has a mechanical release gate and bypass reason trail.
+- `auto doctor` gives a no-model first-run preflight.
+- CI runs format, clippy, tests, locked install, and selected help smoke tests.
+- Quota capture now rejects symlinked credential files and writes sensitive files owner-only.
+- Symphony workflow rendering rejects hostile branch/model/effort values.
 
 ## What Is Broken
 
-- The root validation baseline in docs is stale. Root docs still cite older validation counts and task states, while this review's current validation evidence is full `cargo test`: 377 passed, 0 failed. Docs that claim the old `333`-test baseline are stale.
-- Claude quota credential restore is incomplete on the normal path. `swap_credentials` backs up both `.claude/` and `.claude.json`, but `restore_credentials` only restores the `.claude/` directory, and `restore_and_update_state` disarms the guard before calling the restore function.
-- Symphony workflow rendering interpolates `base_branch`, `model`, and `reasoning_effort` into shell/YAML contexts without typed validation and without consistently using the existing `shell_quote` helper.
-- Root planning truth is inconsistent. `IMPLEMENTATION_PLAN.md`, `ARCHIVED.md`, and specs disagree about which tasks are complete and what the current validation baseline is.
-- The tracked `genesis/` corpus files were deleted before this pass, leaving the repo temporarily without a usable checked-in corpus. This pass rebuilds the corpus but should not be treated as the active root queue.
+- Quota profile paths interpolate raw account names, allowing path traversal risks.
+- Quota credential swaps are not locked for the child process lifetime.
+- `auto corpus` can leave a skeleton `genesis/plans/` after interruption or model failure.
+- Planning roots with empty `plans/` directories can be accepted later.
+- Dependency parsing misses common bare task references and treats missing dependency IDs as resolved.
+- Symphony plan reconciliation can corrupt partial rows.
+- Salvage notes can point at lane repos that have since been reset.
+- Receipts are not tied to current commit, dirty state, plan hash, or artifact hashes.
+- `auto review` can write plan/review docs before branch validation.
+- `auto loop` can choose dependency-blocked work as first actionable.
 
 ## What Is Half-Built
 
-- Verification evidence is stronger in `auto parallel` than in `auto loop`. The loop receipt policy exists as a decision document, but enforcement is still prompt-oriented.
-- Completion evidence parsing is broad enough to normalize shell/network/destructive-looking commands as verification proof. It does not execute those commands, but it can bless risky proof text without a risk class.
-- Markdown task parsing is duplicated across generation, loop, parallel, review, completion artifacts, and Symphony. Behavior has drifted; for example, blocked tasks and partial/dependency handling differ by command.
-- Backend execution policy is split across shared wrappers and command-specific spawn paths. Some paths bypass `src/codex_exec.rs` or `src/claude_exec.rs`, which makes safety mode, quota routing, logging, and context-window behavior hard to audit globally.
-- First-run DX depends on the operator already knowing which commands require a git remote, provider auth, Linear auth, Docker, browser tools, or `kimi-cli`.
+- Backend invocation policy exists as an inventory but is not a full drift guard against actual spawn sites.
+- `auto doctor` is useful but does not cover all high-value help surfaces or structured status.
+- Report-only/dry-run semantics are inconsistent across corpus/spec/design/health/qa/review surfaces.
+- `auto audit --everything` is mature, but status/pause/unpause can create run state and remediation can break dependency ordering.
+- `nemesis` exposes `audit_passes`, but the reviewed code does not use it as a real multi-pass runtime control.
+- Release gating is strong in shape but weak on proof freshness.
 
 ## Tech Debt Inventory
 
-| Item | Severity | Evidence | Next action |
-|---|---:|---|---|
-| Root planning drift | High | `IMPLEMENTATION_PLAN.md` and `ARCHIVED.md` disagree on completed tasks and test counts | Plan 002 |
-| Quota credential restore gap | Critical | `src/quota_exec.rs` backs up `.claude.json` but does not restore it in `restore_credentials` | Plan 003 |
-| Quota capture/copy hardening | High | `copy_auth_to_profile` uses raw `fs::copy`, preserves symlinks, and does not prune stale profile files | Plan 003 |
-| Symphony workflow injection risk | High | `src/symphony_command.rs` interpolates shell/YAML scalars raw in workflow text | Plan 004 |
-| Checkpoint staging includes `genesis/` | High | `CHECKPOINT_EXCLUDE_RULES` excludes `.auto`, `bug`, `nemesis`, and `gen-*`, not `genesis` | Plan 005 gate decision |
-| Verification command false proof | High | `WORKLIST.md` names malformed generated receipts and false-positive proof paths | Plan 006 |
-| Duplicated task parsing | Medium | plan/task parsing appears in generation, loop, parallel, review, Symphony, and completion artifacts | Plan 007 |
-| Backend spawn duplication | Medium | direct model launches exist outside wrapper modules | Plan 008 |
-| Large orchestration modules | Medium | `parallel_command.rs`, `generation.rs`, `bug_command.rs`, and `nemesis.rs` mix parsing, prompting, state, and IO | Research after Plan 009 |
-| Weak first-run smoke | Medium | no top-level integration tests prove `auto --help`, dry-run corpus, incomplete corpus errors, or installed binary behavior | Plan 010 and Plan 011 |
+- Very large modules, especially `src/parallel_command.rs`, concentrate scheduler, lane, salvage, prompt, and report logic.
+- Dated specs encode historical truth next to current truth without an explicit staleness marker.
+- Multiple commands maintain similar report-only/write-boundary semantics independently.
+- Task schema enforcement differs across `auto spec`, `auto gen`, `auto super`, `auto loop`, Symphony, and review flows.
+- Runtime state paths, durable artifacts, and source-controlled control docs are explained in scattered places.
+- Model/default observability can hardcode GPT-5.5 xhigh in review prompts even when CLI overrides are supplied.
+- Filesystem copy/archive helpers need stronger symlink-boundary semantics before they are used as production recovery primitives.
 
 ## Security Risks
 
-| Risk | Severity | Evidence | Status |
-|---|---:|---|---|
-| Claude credential restore can leave selected profile active | Critical | `src/quota_exec.rs` backup pair includes `.claude.json`; restore path omits it | Verified from code |
-| Credential profile capture is not symlink-safe | High | `src/quota_config.rs` recreates symlinks during recursive copy | Verified from code |
-| Agent execution uses sandbox/approval bypass flags | High | Codex wrapper uses `--dangerously-bypass-approvals-and-sandbox`; Claude wrapper uses `--dangerously-skip-permissions`; Kimi uses `--yolo` | Verified from code, intentional but under-controlled |
-| Auto checkpoints can stage sensitive untracked paths | High | `stage_checkpoint_changes` stages all non-ignored, non-excluded untracked files | Verified from code |
-| Symphony workflow shell/YAML injection | High | branch/model/reasoning values are interpolated without typed validators | Verified from code |
-| Logs can persist raw stderr and provider output | Medium | stderr appenders exist across Codex, Claude, bug, stream rendering, and parallel logs | Verified from code |
-| Quota state load-modify-save is not uniformly transaction-locked | Medium | swap paths lock provider credentials; status/reset/select paths still deserve a state-lock audit | Verified from code pattern, needs focused proof |
+- High: quota account names are not path-bounded before becoming profile paths used by add/remove/capture/select flows.
+- High: quota credential activation is global and not protected for the full model child process lifetime.
+- Medium: Claude activation can leave mixed active credentials when the selected profile lacks files present in the active directory.
+- Medium: `auto quota open` does not classify quota/auth failures or rotate the way shared wrappers do.
+- Medium: repository archive/copy helpers can follow symlinks while copying planning or runtime trees.
+- Medium: Kimi and PI prompt transport puts full prompts in argv, exposing sensitive repo prompts to process listings and risking argv-size failures.
+- Medium: dangerous model execution flags are intentional but increase the importance of prompt boundaries, dirty-state checks, and receipts.
 
 ## Test Gaps
 
-The test suite is broad but mostly unit-level. Current review evidence re-establishes a green full-suite baseline: 377 tests passed. The gaps below remain because the suite is still light on integration and security-boundary coverage.
-
-| Area | Current coverage | Gap |
-|---|---|---|
-| `util.rs` | strong unit coverage for atomic writes, checkpoints, sync, push, and exclusions | secret-looking checkpoint classification is absent |
-| `generation.rs` | strong validation/prompt tests | integration tests with fake model binaries are still missing |
-| `parallel_command.rs` | extensive parser/status/recovery tests | live tmux multi-lane behavior is not hermetic in CI |
-| `completion_artifacts.rs` | receipt and narrative evidence tests | command risk classes and false-proof fixtures remain open |
-| `quota_*` | selector/state/config tests plus usage tests | restore path, profile pruning, symlink rejection, and concurrent state mutation need stronger tests |
-| `symphony_command.rs` | parser/render tests | hostile shell/YAML scalar golden tests are missing |
-| `qa`, `qa-only`, `health`, `ship` | mostly prompt text tests or no tests | first-run and fake-model smoke tests are missing |
-| installed binary | no current proof in this pass | `cargo install --path . --root ~/.local` was not run |
+- Quota path traversal, provider-lock lifetime, mixed active credential cleanup, and quota-open retry behavior.
+- Corpus rollback after model failure and rejection of empty planning roots.
+- Corpus/archive symlink behavior and root-boundary preservation.
+- Bare dependency references, external dependency semantics, missing dependency blockers, loop dependency filtering, and audit cycle-breaker dependency safety.
+- Symphony marking `[~]` rows, git-ref completion artifacts, review stale follow-up parser visibility, and review branch-mismatch no-write behavior.
+- Receipt current-commit mismatch, dirty-state mismatch, artifact hash mismatch, and corrupted receipt handling.
+- Actual shell/Python receipt wrapper execution in CI.
+- Report-only write-boundary enforcement, required `QA.md`/`HEALTH.md` output, and dry-run preview semantics across commands.
+- Super gate parity with the richer `auto gen` task contract.
 
 ## Documentation Staleness
 
-| Document | Current status |
-|---|---|
-| `AGENTS.md` | Accurate on build basics and required tools; validate block omits `cargo fmt --check`, which CI runs. |
-| `README.md` | Much fresher than the archived corpus, but still contains wording that implies `--model` picks a Claude model for corpus even though non-Claude values route through Codex. It also overstates `origin` as a global runtime requirement. |
-| `IMPLEMENTATION_PLAN.md` | Stale active queue. It includes old validation counts and leaves tasks open that `ARCHIVED.md` describes as completed. |
-| `ARCHIVED.md` | Useful completion ledger, but should not be treated as proof without receipts or code validation. |
-| `WORKLIST.md` | Current and important. It names verification-command synthesis and false-positive proof gaps. |
-| `specs/220426-*.md` | Mixed. Some specs describe code that has moved on, especially CI, README truth, release status, and audit backend defaults. |
-| `genesis/` | Rebuilt by this pass. It is a planning corpus, not the active root implementation queue. |
+- `specs/220426-cli-command-surface.md` is stale where it describes the older command count.
+- `specs/230426-first-run-ci-and-installed-binary-proof.md` is stale where it says there is no doctor/install proof.
+- `specs/230426-planning-corpus-and-generation.md` contains older planning-surface assumptions.
+- `docs/decisions/backend-invocation-policy.md` does not fully cover newer command modules.
+- `README.md` is mostly current at the top, but deeper design and CI sections lag current commands and exact CI help probes.
+- `IMPLEMENTATION_PLAN.md` still contains stale release/version evidence around `TASK-016`.
 
-## Implementation-Status Table For Prior Claims And Plans
+## Prior Claims and Plans
 
-| Prior claim or plan theme | Current status | Evidence | Corpus response |
-|---|---|---|---|
-| Old corpus: no CI exists | Stale | `.github/workflows/ci.yml` exists and runs fmt/clippy/tests | Do not carry forward as active |
-| Old corpus: README misses `steward`, `audit`, `symphony` | Mostly stale | README now documents the sixteen-command surface, though wording still needs cleanup | Narrow to wording and runtime requirement drift |
-| Old corpus: dead tmux scaffold in `codex_exec.rs` | Stale | recent history removed that scaffold; current Codex wrapper is live | Do not plan deletion |
-| Old corpus: quota file permissions absent | Partly stale | config/state saves use owner-only writes, but profile capture/copy and restore remain risky | Plan focused hardening |
-| Root plan: old test baseline | Refuted | full `cargo test` passed with 377 tests; targeted quota usage rerun also passes | Plan 002 updates root planning truth |
-| `WORKLIST.md`: malformed review verification command synthesis | Still open | no evidence that the worklist item was resolved | Plan 006 |
-| `WORKLIST.md`: false-positive proof from zero-test filters or directory grep | Still open | no evidence that the worklist item was resolved | Plan 006 |
-| `docs/decisions/loop-receipt-gating.md`: loop receipt gating deferred | Still relevant | loop enforcement remains weaker than parallel evidence checks | Plan 006/009 decision gate |
-| Broad Codex `gpt-5.5` default migration | Current working-tree direction | dirty source/docs show broad default changes; actual routing must be validated by runtime tests | Treat as current but not release-proven |
-| Root `plans/` governs ExecPlans | Not applicable | no root `PLANS.md`; no root `plans/` directory | Generated plans remain subordinate to root queue/specs |
+| Claim or plan | Current status | Evidence reviewed | Required action |
+| --- | --- | --- | --- |
+| Command surface has 16/17 commands | Stale | `src/main.rs`, README | Update specs/docs when promoted. |
+| Command surface has 21 commands | Verified | `src/main.rs`, README | Keep as current product truth. |
+| `auto doctor` missing | Stale | `src/doctor_command.rs`, local help behavior reported | Reconcile old spec. |
+| CI installed binary proof missing | Stale | `.github/workflows/ci.yml` | Reconcile old spec; add missing help/receipt smoke. |
+| Quota symlink rejection/owner-only writes | Mostly implemented | `src/quota_config.rs`, `src/quota_exec.rs` | Do not reopen completed work; address remaining path/lease risks. |
+| Shared parser blocked-task preservation | Partly implemented | `src/task_parser.rs`, `src/generation.rs` | Extend to dependency truth and all consumers. |
+| AD-014 Symphony/receipt checkpoint | Still active evidence task | `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, Symphony/receipt code | Convert to concrete plan slice. |
+| TASK-016 v0.2.0 tag | Stale/partial | `Cargo.toml`, git tag, root plan, `COMPLETED.md`, receipt tail | Reconcile root plan and completion artifact semantics; the tag exists, but the active row still says `0.1.0`, `COMPLETED.md` lacks the expected release section, and the tag annotation omits `TASK-014` while archive prose says through `TASK-015`. |
+| Previous genesis snapshot | Historical context only | archived `.auto/fresh-input/...` | Do not copy forward as truth. |
 
-## Code-Review Coverage List
+## Code Review Coverage
 
-Files read directly or through targeted ranges:
+Files and areas read directly or through focused review:
 
-- Root instructions and docs: `AGENTS.md`, `README.md`, `ARCHIVED.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, `LEARNINGS.md`, `.gitignore`.
+- Root control docs: `AGENTS.md`, `README.md`, `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `ARCHIVED.md`, `REVIEW.md`, `COMPLETED.md`.
 - Build and CI: `Cargo.toml`, `Cargo.lock`, `build.rs`, `.github/workflows/ci.yml`.
-- Core CLI and state: `src/main.rs`, `src/state.rs`, `src/util.rs`, `src/corpus.rs`, `src/generation.rs`.
-- Agent execution: `src/codex_exec.rs`, `src/claude_exec.rs`, `src/pi_backend.rs`, `src/kimi_backend.rs`, `src/codex_stream.rs`.
-- Task execution and review: `src/loop_command.rs`, `src/parallel_command.rs`, `src/completion_artifacts.rs`, `src/review_command.rs`.
-- Product commands: `src/audit_command.rs`, `src/bug_command.rs`, `src/nemesis.rs`, `src/steward_command.rs`, `src/qa_command.rs`, `src/qa_only_command.rs`, `src/health_command.rs`, `src/ship_command.rs`.
-- Quota router: `src/quota_accounts.rs`, `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_patterns.rs`, `src/quota_selector.rs`, `src/quota_state.rs`, `src/quota_status.rs`, `src/quota_usage.rs`.
-- Symphony/Linear: `src/symphony_command.rs`, `src/linear_tracker.rs`.
-- Specs and decisions: `specs/220426-*.md`, `specs/050426-nemesis-audit.md`, `docs/decisions/loop-receipt-gating.md`, `docs/decisions/symphony-graphql-surface.md`, `docs/audit-doctrine-template.md`.
-- Historical corpus: `.auto/fresh-input/genesis-previous-20260423-201851/*`.
+- Main and commands: `src/main.rs`, `src/spec_command.rs`, `src/generation.rs`, `src/corpus.rs`, `src/design_command.rs`, `src/super_command.rs`, `src/parallel_command.rs`, `src/review_command.rs`, `src/loop_command.rs`, `src/audit_command.rs`, `src/audit_everything.rs`, `src/qa_only_command.rs`, `src/health_command.rs`, `src/nemesis.rs`, `src/ship_command.rs`, `src/symphony_command.rs`, `src/doctor_command.rs`, `src/book_command.rs`, `src/steward_command.rs`.
+- State and evidence: `src/task_parser.rs`, `src/completion_artifacts.rs`, `src/state.rs`, `src/util.rs`, `scripts/run-task-verification.sh`, `scripts/verification_receipt.py`, `tests/parallel_status.rs`.
+- Backends/security: `src/backend_policy.rs`, `src/codex_exec.rs`, `src/claude_exec.rs`, `src/kimi_backend.rs`, `src/pi_backend.rs`, `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_accounts.rs`, `src/quota_status.rs`, `src/quota_usage.rs`, `src/quota_patterns.rs`.
+- Planning history: all `specs/`, `docs/decisions/`, archived previous genesis snapshot, recent git log and tag state.
 
-Git history was reviewed for recent corpus/spec/hardening work, including the sequence that generated the first corpus, converted it into root specs and plans, added Codex authoring support, hardened quota permissions, added CI, and removed older dead code.
+Independent review update on 2026-04-30:
 
-Independent Codex review spot-checks on 2026-04-23 inspected:
-
-- repo and corpus shape: `git status --short`, `find genesis -type f -name '*.md'`, and absence of root `plans/`;
-- corpus docs and plan headings: `genesis/GENESIS-REPORT.md`, `ASSESSMENT.md`, `SPEC.md`, `PLANS.md`, `DESIGN.md`, and representative numbered ExecPlans;
-- root controls: `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `.gitignore`, `.github/workflows/ci.yml`, and targeted README/default greps;
-- code evidence: targeted ranges in `src/main.rs`, `src/generation.rs`, `src/util.rs`, `src/quota_exec.rs`, `src/quota_config.rs`, `src/symphony_command.rs`, `src/codex_exec.rs`, `src/claude_exec.rs`, and `src/kimi_backend.rs`;
-- validation evidence: `cargo test quota_usage::tests::codex_cli_refresh_surfaces_human_refresh_error -- --exact`, `cargo test -- --list`, and full `cargo test`.
+- Rechecked repo instructions, README lifecycle text, root queue docs, CI, command definitions, corpus/generation code, quota execution, task parsing, receipts, ship gate, and representative quality-command write boundaries.
+- Verified the generated corpus has 12 numbered plans and no absolute repository-root paths.
+- Found and corrected non-runnable generated plan commands such as multi-filter `cargo test` invocations and nonexistent `auto gen --dry-run` / `auto ship --dry-run` examples.
+- Did not run long integration suites or model-backed commands during this document review.
 
 ## Assumption Ledger
 
-| Statement | Status | Proof or next proof |
-|---|---|---|
-| The binary name is `auto` | Verified | `Cargo.toml` declares `[[bin]] name = "auto"` and `AGENTS.md` lists the CLI binary |
-| The package version is `0.2.0` | Verified | `Cargo.toml` |
-| The active root planning surface is `IMPLEMENTATION_PLAN.md` plus `specs/` | Verified by repo layout | no root `PLANS.md`; no root `plans/`; these docs exist and are referenced by commands |
-| `genesis/` is a generated corpus, not root queue authority | Verified by code and layout | `auto corpus` writes it; `auto gen` consumes it; root queue remains separate |
-| Current tests are green | Verified for unit suite | full `cargo test` passed with 377 tests; clippy/install proof not rerun |
-| Broad `gpt-5.5` defaults are intended | Likely, but release decision still in progress | dirty code/docs show it; runtime validation and commit history should confirm before release |
-| Quota restore bug is exploitable in normal use | High-confidence code finding | focused regression should prove selected-profile leakage and backup cleanup |
-| Symphony shell/YAML injection can execute hostile input | Plausible risk | add golden tests before deciding exact exploitability |
-| First-run operator flow is too sharp | Verified by docs/code review | missing command-specific doctor and hermetic smoke tests |
+| Assumption | Status | Proof or next proof |
+| --- | --- | --- |
+| `auto` version is `0.2.0` | Verified, with release-ledger drift | `Cargo.toml` and `v0.2.0` tag; root `TASK-016` and `COMPLETED.md` still need reconciliation. |
+| Root `PLANS.md` governs ExecPlans | False in current checkout | `rg --files -g 'PLANS.md' -g 'plans/**'` returned none. |
+| `genesis/` is active planning truth | False unless promoted | Root docs and state point to root planning files; corpus is subordinate. |
+| The old genesis snapshot is accurate | False/stale | It predates command and hardening changes. |
+| Quota can safely run parallel lanes | Not proved; risk found | Requires Plan 002. |
+| Receipts prove current release readiness | Not proved; risk found | Requires Plan 006. |
+| `auto parallel` can be launched safely now | Not proved; likely no | Requires checkpoint plans and root queue reconciliation. |
 
 ## Focus Response
 
-No operator focus seed was supplied. Priority order therefore comes from full-repo review. If a focus seed later points at model defaults, review command synthesis, or Symphony, the quota credential restore bug and shell/YAML rendering risk still outrank most non-security work because they affect credential integrity and generated executable workflow text.
+The operator focus emphasized production readiness, semantic consistency, scheduler safety, runtime/design sync, resumability, implementation quality, verification receipts, and agent usability. Code reality agrees with the focus: the repository already has the major workflow surfaces, but several trust boundaries are too soft for production-scale parallel execution.
+
+Non-focused risks that outrank polish:
+
+- Credential safety in quota execution.
+- Atomicity of the corpus root.
+- Dependency parsing correctness.
+- Receipt freshness and release evidence binding.
+
+The focus changed plan ordering by moving credential/corpus/scheduler evidence ahead of docs and DX, while still preserving a DX plan because this is a developer-facing CLI.
 
 ## Opportunity Framing
 
-Recommended direction: build an operator-trust kernel around the existing command surface. That means truthful planning surfaces, safe credential/account handling, shared task and verification contracts, explicit backend execution policy, and first-run smoke tests.
+Recommended direction: production hardening of the current autonomous control plane.
 
-Rejected direction 1: add more commands or backends now. The repo already has sixteen commands and several direct backend spawn paths. More surface would amplify current safety and DX debt.
+Rejected direction: build a dashboard or new product shell. Reason: the terminal control plane is already the product surface and has more urgent trust gaps.
 
-Rejected direction 2: rewrite the CLI into a plugin system or service. The current single-binary Rust shape is valuable for local operators. The immediate problems are contracts and safety boundaries, not deployment architecture.
+Rejected direction: generate a large greenfield backlog. Reason: root planning truth already exists; the useful move is reconciliation and high-leverage hardening.
 
-Rejected direction 3: make `genesis/` the active control plane. The code treats `genesis/` as corpus input to generation, while root docs hold implementation state. Promoting `genesis/` to queue authority would create two competing sources of truth.
+Rejected direction: immediately execute `auto parallel`. Reason: unsafe credential leases, lossy dependencies, stale receipts, and stale root rows make a launch premature.
 
-Rejected direction 4: treat the archived previous corpus as truth. It is useful history, but many of its findings have been implemented or superseded.
+Rejected direction: docs-only cleanup. Reason: stale docs matter, but code-level safety defects can cause false execution or credential corruption.
 
 ## DX Assessment
 
-First-run friction is moderate to high. A Rust contributor can build quickly with `cargo check`, `cargo build`, and `cargo test`, but an operator needs several external CLIs, model auth, a git repository, and sometimes a remote or Linear credentials depending on command. The README is detailed, but it does not yet make command-specific runtime requirements clear enough.
+First-run friction is improving. `auto doctor` provides a no-model success path, CI installs the binary, and README's top-level command list is close to code truth. The fastest path can produce a meaningful success moment with `auto --version` and `auto doctor`.
 
-The fastest honest success moment should be:
+The gaps are sharp but tractable:
 
-1. Build or run `auto --version`.
-2. Run a local doctor or dry-run command that proves required binaries and repo layout without calling a model.
-3. Run a small corpus dry run or fixture-backed generation smoke test.
-
-Current docs make the system look more turnkey than it is. Onboarding should be adjusted so copy-paste examples are honest about live model calls, potential commits/pushes, and generated artifact locations. Error clarity is strong in many code paths, but preflight is inconsistent across commands.
-
-## Review Discipline Summary
-
-CEO review: challenge the premise. The repo should not chase a larger autonomous platform until it proves trust in the existing command lifecycle.
-
-Design review: the meaningful user surfaces are CLI help, status output, logs, generated markdown, and receipts. There is no browser UI, but information architecture and terminal accessibility matter.
-
-Engineering review: fix security and contract seams before modular refactors. The main risk is not one missing abstraction; it is multiple commands interpreting the same plan, verification, and backend concepts differently.
-
-DX review: build a command-specific first-run path and integration smoke tests. The system should teach operators what it will do before it asks them to trust live agents with repo writes.
+- Required versus optional tools are described inconsistently.
+- Dry-run output sometimes means no writes and sometimes means prompt/state writes without model execution.
+- Help smoke tests do not cover all important operator commands.
+- Error clarity around stale corpus roots, stale receipts, missing dependencies, and unsafe quota state needs to be more deterministic.
+- Copy-paste onboarding should be honest about the real work: planning and execution are evidence-bound workflows, not one-command magic.
