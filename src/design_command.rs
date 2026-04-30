@@ -249,6 +249,9 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
         if pass == max_passes {
             break;
         }
+        if let Some(promoted) = promote_design_plan_items_to_root_queue(&repo_root, &pass_dir)? {
+            println!("status:      promoted {promoted} design task(s) into IMPLEMENTATION_PLAN.md");
+        }
         println!("stage:       design implementation pass {pass}/{max_passes}");
         run_design_parallel_pass(&args, &output_root, pass).await?;
         write_design_resolution_status(
@@ -373,6 +376,96 @@ pub(crate) async fn run_super_design_module(
     verify_design_artifacts(&design_root)?;
     require_design_go(&design_root)?;
     Ok(())
+}
+
+fn promote_design_plan_items_to_root_queue(
+    repo_root: &Path,
+    pass_dir: &Path,
+) -> Result<Option<usize>> {
+    let plan_items_path = pass_dir.join("DESIGN-PLAN-ITEMS.md");
+    let root_plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_items_path.exists() || !root_plan_path.exists() {
+        return Ok(None);
+    }
+
+    let plan_items = fs::read_to_string(&plan_items_path)
+        .with_context(|| format!("failed to read {}", plan_items_path.display()))?;
+    let mut root_plan = fs::read_to_string(&root_plan_path)
+        .with_context(|| format!("failed to read {}", root_plan_path.display()))?;
+    let blocks = extract_unchecked_design_plan_item_blocks(&plan_items);
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut missing = Vec::new();
+    for block in blocks {
+        let Some(task_id) = design_plan_block_task_id(&block) else {
+            continue;
+        };
+        let needle = format!("`{task_id}`");
+        if !root_plan.contains(&needle) {
+            missing.push(block);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    let insertion = format!(
+        "\n<!-- auto design promoted unresolved design/runtime tasks from {} -->\n{}\n",
+        plan_items_path.display(),
+        missing.join("\n\n")
+    );
+    if let Some(index) = root_plan.find("\n## Follow-On Work") {
+        root_plan.insert_str(index, &insertion);
+    } else {
+        if !root_plan.ends_with('\n') {
+            root_plan.push('\n');
+        }
+        root_plan.push_str(&insertion);
+    }
+    atomic_write(&root_plan_path, root_plan.as_bytes())
+        .with_context(|| format!("failed to write {}", root_plan_path.display()))?;
+    Ok(Some(missing.len()))
+}
+
+fn extract_unchecked_design_plan_item_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("- [ ] `") || line.trim_start().starts_with("- [~] `") {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+            current.push(line.to_string());
+        } else if !current.is_empty() {
+            current.push(line.to_string());
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+    blocks
+        .into_iter()
+        .filter(|block| {
+            let lower = block.to_ascii_lowercase();
+            block.contains("Dependencies:")
+                && block.contains("Verification:")
+                && (lower.contains("runtime owner")
+                    || lower.contains("source of truth")
+                    || lower.contains("ui consumer"))
+        })
+        .collect()
+}
+
+fn design_plan_block_task_id(block: &str) -> Option<String> {
+    let header = block.lines().next()?.trim_start();
+    let rest = header
+        .strip_prefix("- [ ] `")
+        .or_else(|| header.strip_prefix("- [~] `"))?;
+    let end = rest.find('`')?;
+    Some(rest[..end].trim().to_string())
 }
 
 async fn run_design_codex_phase(
@@ -611,8 +704,10 @@ fn require_nonempty_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_design_prompt, DesignRunKind};
+    use super::{build_design_prompt, promote_design_plan_items_to_root_queue, DesignRunKind};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn design_prompt_rejects_fake_mockup_and_requires_runtime_truth() {
@@ -649,5 +744,47 @@ mod tests {
         assert!(prompt.contains("Design is first-class and blocking"));
         assert!(prompt
             .contains("Do not edit source code, root specs, or root `IMPLEMENTATION_PLAN.md`"));
+    }
+
+    #[test]
+    fn design_plan_items_promote_missing_executor_tasks_to_root_queue() {
+        let root = temp_dir("design-plan-promotion");
+        let pass_dir = root.join(".auto/design/pass-01");
+        fs::create_dir_all(&pass_dir).unwrap();
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n",
+        )
+        .unwrap();
+        fs::write(
+            pass_dir.join("DESIGN-PLAN-ITEMS.md"),
+            "- [ ] `DESIGN-001` Runtime-backed surface\n\n    Runtime owner: `src/api.rs`\n    UI consumers: `src/App.tsx`\n    Verification: `cargo test design_001`\n    Dependencies: none\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            promote_design_plan_items_to_root_queue(&root, &pass_dir).unwrap(),
+            Some(1)
+        );
+        let root_plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).unwrap();
+        assert!(root_plan.contains("`DESIGN-001`"));
+        assert!(
+            root_plan.find("`DESIGN-001`").unwrap() < root_plan.find("## Follow-On Work").unwrap()
+        );
+
+        assert_eq!(
+            promote_design_plan_items_to_root_queue(&root, &pass_dir).unwrap(),
+            None
+        );
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("autodev-{label}-{nanos}"));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

@@ -1470,7 +1470,8 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             Err(err) => (false, format!("worker pid unreadable: {err:#}")),
         };
         let repo_root = lane_root.join("repo");
-        let recovery_active = lane_repo_has_active_cherry_pick(&repo_root);
+        let recovery_active = lane_repo_has_active_cherry_pick(&repo_root)
+            || lane_repo_has_rebase_recovery(&repo_root);
         if recovery_active {
             active_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
         }
@@ -1580,10 +1581,12 @@ fn lane_repo_status_summary(repo_root: &Path) -> String {
     let mut lines = branch.lines();
     let head = lines.next().unwrap_or("## unknown").trim();
     let dirty_count = lines.count();
-    let recovery_clause = if lane_repo_has_active_cherry_pick(repo_root) {
-        "; cherry-pick recovery"
+    let recovery_clause = if let Some(issue) = lane_repo_rebase_recovery_issue(repo_root) {
+        format!("; {issue}")
+    } else if lane_repo_has_active_cherry_pick(repo_root) {
+        "; cherry-pick recovery".to_string()
     } else {
-        ""
+        String::new()
     };
     if dirty_count == 0 {
         format!("{head}{recovery_clause}; clean")
@@ -2404,16 +2407,18 @@ async fn run_parallel_loop(
                                 &mut attempted_partial_followups,
                                 &mut deferred_partial_tasks,
                             );
+                            let result_label = if auto_repaired {
+                                "landed-with-host-repair-after-nonzero"
+                            } else if completion_status == LoopTaskStatus::Partial {
+                                "landed-partial-after-nonzero"
+                            } else {
+                                "landed-after-nonzero"
+                            };
                             parallel_logger.info(format!(
-                                "landed:      [{}] {} via lane-{} after non-zero worker exit{}{} (total landed: {})",
+                                "{result_label}: [{}] {} via lane-{}{} (total landed: {})",
                                 classify_task_execution_kind(&assignment.task),
                                 assignment.task.id,
                                 assignment.lane_index,
-                                if auto_repaired {
-                                    " after host auto-repair"
-                                } else {
-                                    ""
-                                },
                                 status_suffix,
                                 landed
                             ));
@@ -2423,14 +2428,14 @@ async fn run_parallel_loop(
                                 &assignment.task.id,
                                 if auto_repaired {
                                     if completion_status == LoopTaskStatus::Partial {
-                                        "landed: host auto-repaired and harvested committed work after non-zero worker exit; task remains [~] until local evidence is complete"
+                                        "landed-with-host-repair-after-nonzero: task remains [~] until local evidence is complete"
                                     } else {
-                                        "landed: host auto-repaired and harvested committed work after non-zero worker exit"
+                                        "landed-with-host-repair-after-nonzero: host harvested committed work"
                                     }
                                 } else if completion_status == LoopTaskStatus::Partial {
-                                    "landed: host harvested committed work after non-zero worker exit; task remains [~] until local evidence is complete"
+                                    "landed-partial-after-nonzero: task remains [~] until local evidence is complete"
                                 } else {
-                                    "landed: host harvested committed work after non-zero worker exit"
+                                    "landed-after-nonzero: host harvested committed work"
                                 },
                             );
                             last_idle_summary = None;
@@ -2774,16 +2779,18 @@ async fn run_parallel_loop(
                             &mut attempted_partial_followups,
                             &mut deferred_partial_tasks,
                         );
+                        let result_label = if auto_repaired {
+                            "landed-with-host-repair"
+                        } else if completion_status == LoopTaskStatus::Partial {
+                            "landed-partial"
+                        } else {
+                            "landed-clean"
+                        };
                         parallel_logger.info(format!(
-                            "landed:      [{}] {} via lane-{}{}{} (total landed: {})",
+                            "{result_label}: [{}] {} via lane-{}{} (total landed: {})",
                             classify_task_execution_kind(&assignment.task),
                             assignment.task.id,
                             assignment.lane_index,
-                            if auto_repaired {
-                                " after host auto-repair"
-                            } else {
-                                ""
-                            },
                             status_suffix,
                             landed
                         ));
@@ -2793,14 +2800,14 @@ async fn run_parallel_loop(
                             &assignment.task.id,
                             if auto_repaired {
                                 if completion_status == LoopTaskStatus::Partial {
-                                    "landed: host auto-repaired and harvested committed work; task remains [~] until local evidence is complete"
+                                    "landed-with-host-repair: task remains [~] until local evidence is complete"
                                 } else {
-                                    "landed: host auto-repaired and harvested committed work"
+                                    "landed-with-host-repair: host harvested committed work"
                                 }
                             } else if completion_status == LoopTaskStatus::Partial {
-                                "landed: host harvested committed work; task remains [~] until local evidence is complete"
+                                "landed-partial: task remains [~] until local evidence is complete"
                             } else {
-                                "landed: host harvested committed work"
+                                "landed-clean: host harvested committed work"
                             },
                         );
                         last_idle_summary = None;
@@ -2894,14 +2901,14 @@ fn try_spawn_lane_recovery_attempt(
     let next_attempt = assignment.attempts + 1;
     let total_attempts = max_retries + 1;
     parallel_logger.info(format!(
-        "repair:      lane-{} `{}` {}; retrying attempt {}/{}",
+        "retry-needed: lane-{} `{}` {}; retrying attempt {}/{}",
         assignment.lane_index, assignment.task.id, reason, next_attempt, total_attempts
     ));
     append_lane_host_event(
         &assignment.stdout_log_path,
         assignment.lane_index,
         &assignment.task.id,
-        &format!("repair: {reason}; retrying attempt {next_attempt}/{total_attempts}"),
+        &format!("retry-needed: {reason}; retrying attempt {next_attempt}/{total_attempts}"),
     );
     assignment.host_recovery_note = Some(recovery_note);
     spawn_parallel_lane_attempt(
@@ -2990,11 +2997,54 @@ Dirty status seen by the host:
 }
 
 fn lane_repo_recovery_note(lane_repo_root: &Path, branch: &str, status: &str) -> String {
-    if lane_repo_has_active_cherry_pick(lane_repo_root) {
+    if let Some(issue) = lane_repo_rebase_recovery_issue(lane_repo_root) {
+        stale_rebase_recovery_note(branch, status, &issue)
+    } else if lane_repo_has_active_cherry_pick(lane_repo_root) {
         resumed_landing_recovery_note(branch, status)
     } else {
         dirty_worktree_recovery_note(status)
     }
+}
+
+fn lane_repo_has_rebase_recovery(lane_repo_root: &Path) -> bool {
+    lane_repo_rebase_recovery_issue(lane_repo_root).is_some()
+}
+
+fn lane_repo_rebase_recovery_issue(lane_repo_root: &Path) -> Option<String> {
+    let rebase_merge = git_path(lane_repo_root, "rebase-merge")?;
+    if !rebase_merge.exists() {
+        return None;
+    }
+    let expected = ["head-name", "onto", "orig-head"];
+    let missing = expected
+        .into_iter()
+        .filter(|name| !rebase_merge.join(name).exists())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Some("rebase recovery".to_string())
+    } else {
+        Some(format!("stale rebase-merge missing {}", missing.join(", ")))
+    }
+}
+
+fn stale_rebase_recovery_note(branch: &str, status: &str, issue: &str) -> String {
+    format!(
+        r#"This lane repo has an in-progress or stale Git rebase state against `{branch}`.
+
+Detected state:
+{issue}
+
+Required recovery:
+1. Run `git status` and inspect `.git/rebase-merge` with `git rev-parse --git-path rebase-merge`.
+2. Try `git rebase --abort` first.
+3. If Git reports incomplete rebase metadata or leaves only stale files behind, remove the remaining files under the reported `rebase-merge` directory, then `rmdir` that directory.
+4. If Git saved an autostash, inspect it before dropping or applying it; do not discard task-owned work blindly.
+5. Rebase or cherry-pick the task commits onto the latest `{branch}`, rerun verification, and finish with clean `git status --short`.
+6. Do not push or edit shared queue files; the host still owns landing and queue reconciliation.
+
+Dirty status seen by the host:
+{status}"#
+    )
 }
 
 fn lane_repo_has_active_cherry_pick(lane_repo_root: &Path) -> bool {
@@ -3008,6 +3058,29 @@ fn lane_repo_has_active_cherry_pick(lane_repo_root: &Path) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn git_path(repo_root: &Path, path: &str) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-path", path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rendered = String::from_utf8(output.stdout).ok()?;
+    let rendered = rendered.trim();
+    if rendered.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(rendered);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    })
 }
 
 fn environment_blocker_recovery_note(reason: &str, preflight_report: &str) -> String {
@@ -6094,13 +6167,14 @@ mod tests {
         effective_parallel_claude_max_turns, environment_blocker_reason,
         host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
         is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
-        landing_recovery_note, lane_repo_has_active_cherry_pick, lane_repo_recovery_note,
-        lane_repo_status_summary, lane_scope_budget, lane_status_task_id, last_parallel_stop_state,
-        maybe_disable_linear_auto_sync_for_run, next_parallel_unblock_candidate,
-        no_dependency_ready_stop_message, parallel_blocker_frontier, parallel_run_root,
-        parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
-        parse_parallel_stop_ids, preflight_warning_names, prepare_lane_landing_recovery,
-        prepare_parallel_startup, prepared_landing_recovery_note, preserve_resume_recovery_notes,
+        landing_recovery_note, lane_repo_has_active_cherry_pick, lane_repo_has_rebase_recovery,
+        lane_repo_recovery_note, lane_repo_status_summary, lane_scope_budget, lane_status_task_id,
+        last_parallel_stop_state, maybe_disable_linear_auto_sync_for_run,
+        next_parallel_unblock_candidate, no_dependency_ready_stop_message,
+        parallel_blocker_frontier, parallel_run_root, parallel_tmux_command,
+        parallel_tmux_session_name, parse_loop_plan, parse_parallel_stop_ids,
+        preflight_warning_names, prepare_lane_landing_recovery, prepare_parallel_startup,
+        prepared_landing_recovery_note, preserve_resume_recovery_notes,
         prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
         recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
         render_parallel_health_summary, repo_forbids_legacy_review_trackers,
@@ -6308,6 +6382,33 @@ mod tests {
         assert!(dirty.contains("unrelated formatter spillover"));
         assert!(dirty.contains("revert just that file"));
         assert!(dirty.contains("M src/lib.rs"));
+    }
+
+    #[test]
+    fn stale_rebase_merge_state_is_reported_with_cleanup_recipe() {
+        let repo = unique_temp_dir("parallel-stale-rebase-merge");
+        fs::create_dir_all(&repo).expect("failed to create temp repo");
+        run_git_in(&repo, ["init", "-b", "main"]);
+        run_git_in(&repo, ["config", "user.name", "autodev tests"]);
+        run_git_in(&repo, ["config", "user.email", "autodev@example.com"]);
+        fs::write(repo.join("README.md"), "init\n").expect("failed to write readme");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+
+        let rebase_merge = repo.join(".git").join("rebase-merge");
+        fs::create_dir_all(&rebase_merge).expect("failed to create stale rebase dir");
+        fs::write(rebase_merge.join("autostash"), "deadbeef\n")
+            .expect("failed to write stale autostash");
+
+        assert!(lane_repo_has_rebase_recovery(&repo));
+        let summary = lane_repo_status_summary(&repo);
+        assert!(summary.contains("stale rebase-merge"));
+        let note = lane_repo_recovery_note(&repo, "main", " M README.md");
+        assert!(note.contains("git rebase --abort"));
+        assert!(note.contains("rebase-merge"));
+        assert!(note.contains("autostash"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
 
     #[test]

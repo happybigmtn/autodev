@@ -689,6 +689,9 @@ What it actually does:
   bindings, and QA surfaces. By default, when execution is enabled, it can repair NO-GO design
   feedback by inserting executable design/runtime tasks into `IMPLEMENTATION_PLAN.md`, launching
   `auto parallel`, and re-running the design gate up to `--design-resolve-passes`.
+- If a design repair pass leaves executable work only in `DESIGN-PLAN-ITEMS.md`, the host promotes
+  missing unchecked design/runtime tasks into root `IMPLEMENTATION_PLAN.md` before launching
+  workers. The artifact remains the audit trail; the root queue remains executor truth.
 - Runs a CEO functional review board across Product, Design/Frontend, Architecture, Runtime/Engine,
   Security/Trust, Reliability/Ops, QA/Test, Data/Contracts, Performance, DX/Agent Workflow, and
   Release perspectives
@@ -698,6 +701,8 @@ What it actually does:
 - Requires `EXECUTION-GATE.md` to say exactly `Verdict: GO`
 - Runs a deterministic Rust gate that rejects empty queues, missing task fields, oversized task
   scope, vague ownership, placeholders, and broad or malformed verification commands
+- Writes cross-repo and closeout artifacts: `CROSS-REPO-MANIFEST.json`,
+  `BRANCH-RECONCILIATION.md`, and `FINAL-SANITY.md`
 - Launches `auto parallel` only after both the model gate and deterministic gate pass
 
 When to run it:
@@ -1071,6 +1076,15 @@ What it actually does:
 - Host reconciliation requires receipt-backed proof for executable `Verification:` commands. If a
   repo has executable verification but no `scripts/run-task-verification.sh`, the host leaves the
   task `[~]` instead of marking it complete from a prose handoff alone.
+- Host live logs use typed result labels such as `landed-clean`, `landed-partial`,
+  `landed-after-nonzero`, `landed-with-host-repair-after-nonzero`,
+  `landed-partial-after-nonzero`, and `retry-needed` instead of collapsing all recovery paths into
+  generic landed/non-zero lines.
+- `auto parallel status` detects lane repos left in cherry-pick or rebase recovery. If a stale
+  `.git/rebase-merge` directory remains after an interrupted rebase/autostash, status reports the
+  exact degraded state and recovery prompts tell the worker to run `git rebase --abort`, inspect any
+  autostash, remove leftover `rebase-merge` files only when metadata is incomplete, and then rebase
+  or cherry-pick the task work onto the target branch.
 - Lanes can mark external infrastructure failures with `AUTO_ENV_BLOCKER: <reason>`; the host logs
   those separately from code failures and retries with explicit recovery context while retries
   remain.

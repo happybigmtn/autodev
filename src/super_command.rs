@@ -47,6 +47,9 @@ struct SuperManifest {
     execute: bool,
     design_enabled: bool,
     design_resolve_passes: usize,
+    branch: Option<String>,
+    reference_repos: Vec<String>,
+    binary: String,
     stages: Vec<SuperStage>,
 }
 
@@ -55,6 +58,15 @@ struct SuperStage {
     name: String,
     status: String,
     artifact: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SuperRepoRecord {
+    role: String,
+    path: String,
+    branch: String,
+    head: String,
+    status: String,
 }
 
 pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
@@ -126,9 +138,17 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         } else {
             args.design_resolve_passes.max(1)
         },
+        branch: args.branch.clone(),
+        reference_repos: args
+            .reference_repos
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        binary: binary_provenance_line(),
         stages: Vec::new(),
     };
     write_manifest(&super_root, &manifest)?;
+    write_super_cross_repo_manifest(&super_root, &repo_root, &planning_root, &args)?;
 
     println!("stage:       corpus");
     generation::run_corpus(CorpusArgs {
@@ -259,6 +279,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     let gate_artifact = super_root.join("DETERMINISTIC-GATE.json");
     atomic_write(&gate_artifact, &serde_json::to_vec_pretty(&gate)?)
         .with_context(|| format!("failed to write {}", gate_artifact.display()))?;
+    write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "pre-parallel")?;
+    write_super_final_sanity(&super_root, &repo_root, &gate, &args, "pre-parallel")?;
     push_stage(
         &super_root,
         &mut manifest,
@@ -296,6 +318,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         max_retries: 2,
     })
     .await?;
+    write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "post-parallel")?;
+    write_super_final_sanity(&super_root, &repo_root, &gate, &args, "post-parallel")?;
     push_stage(
         &super_root,
         &mut manifest,
@@ -308,6 +332,138 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     println!("super root:  {}", super_root.display());
     println!("elapsed:     {:?}", started_at.elapsed());
     Ok(())
+}
+
+fn write_super_cross_repo_manifest(
+    super_root: &Path,
+    repo_root: &Path,
+    planning_root: &Path,
+    args: &SuperArgs,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct CrossRepoManifest {
+        primary: SuperRepoRecord,
+        references: Vec<SuperRepoRecord>,
+        autodev_binary: String,
+        planning_root: String,
+        worker_model: String,
+        worker_reasoning_effort: String,
+    }
+
+    let manifest = CrossRepoManifest {
+        primary: repo_record("primary", repo_root),
+        references: args
+            .reference_repos
+            .iter()
+            .map(|path| repo_record("reference", path))
+            .collect(),
+        autodev_binary: binary_provenance_line(),
+        planning_root: planning_root.display().to_string(),
+        worker_model: args.worker_model.clone(),
+        worker_reasoning_effort: args.worker_reasoning_effort.clone(),
+    };
+    let path = super_root.join("CROSS-REPO-MANIFEST.json");
+    atomic_write(&path, &serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn repo_record(role: &str, path: &Path) -> SuperRepoRecord {
+    SuperRepoRecord {
+        role: role.to_string(),
+        path: path.display().to_string(),
+        branch: git_text(path, ["branch", "--show-current"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        head: git_text(path, ["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string()),
+        status: git_text(path, ["status", "--short", "--branch"])
+            .unwrap_or_else(|| "not a readable git repo".to_string()),
+    }
+}
+
+fn write_super_branch_reconciliation_plan(
+    super_root: &Path,
+    repo_root: &Path,
+    args: &SuperArgs,
+    phase: &str,
+) -> Result<()> {
+    let branch =
+        git_text(repo_root, ["branch", "--show-current"]).unwrap_or_else(|| "unknown".to_string());
+    let head = git_text(repo_root, ["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let status = git_text(repo_root, ["status", "--short", "--branch"])
+        .unwrap_or_else(|| "git status unavailable".to_string());
+    let target = args.branch.as_deref().unwrap_or(branch.as_str());
+    let content = format!(
+        "# Auto Super Branch Reconciliation\n\n\
+Phase: `{phase}`\n\
+Primary repo: `{}`\n\
+Active branch: `{branch}`\n\
+Parallel target branch: `{target}`\n\
+HEAD: `{head}`\n\n\
+## Current Status\n\n```text\n{}\n```\n\n\
+## Reconciliation Doctrine\n\n\
+1. Do not merge this branch into trunk while auto super or auto parallel is still mutating it.\n\
+2. Preserve dirty operator/audit artifacts on trunk before updating trunk from origin.\n\
+3. After the run is complete, merge or intentionally cherry-pick this branch into trunk, then run the gate commands named in `FINAL-SANITY.md`.\n\
+4. Push trunk only after queue truth, receipts, branch head, and remote head agree.\n",
+        repo_root.display(),
+        status.trim()
+    );
+    let path = super_root.join("BRANCH-RECONCILIATION.md");
+    atomic_write(&path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_super_final_sanity(
+    super_root: &Path,
+    repo_root: &Path,
+    gate: &DeterministicGateSummary,
+    args: &SuperArgs,
+    phase: &str,
+) -> Result<()> {
+    let branch =
+        git_text(repo_root, ["branch", "--show-current"]).unwrap_or_else(|| "unknown".to_string());
+    let head = git_text(repo_root, ["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let remote =
+        git_text(repo_root, ["ls-remote", "--heads", "origin", &branch]).unwrap_or_default();
+    let remote_head = remote
+        .split_whitespace()
+        .next()
+        .unwrap_or("unavailable")
+        .to_string();
+    let content = format!(
+        "# Auto Super Final Sanity\n\n\
+Phase: `{phase}`\n\
+Branch: `{branch}`\n\
+HEAD: `{head}`\n\
+Remote HEAD: `{remote_head}`\n\
+Execute: `{}`\n\
+Ready tasks at deterministic gate: `{}`\n\
+Priority tasks: `{}`\n\
+Follow-on tasks: `{}`\n\
+Worker model: `{}`\n\
+Worker reasoning effort: `{}`\n\n\
+## Required Closeout Checks\n\n\
+- Root queue has no accidental empty or malformed executable rows.\n\
+- Every landed implementation item has a `REVIEW.md` handoff or repo-native completion artifact.\n\
+- Verification receipts exist for executable `Verification:` commands where the repo requires the wrapper.\n\
+- No lane repo remains in cherry-pick, rebase, or stale `rebase-merge` recovery.\n\
+- Branch reconciliation is recorded in `BRANCH-RECONCILIATION.md` before trunk is pushed.\n",
+        !args.no_execute,
+        gate.unchecked_tasks,
+        gate.priority_tasks,
+        gate.follow_on_tasks,
+        args.worker_model,
+        args.worker_reasoning_effort,
+    );
+    let path = super_root.join("FINAL-SANITY.md");
+    atomic_write(&path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn git_text<const N: usize>(repo_root: &Path, args: [&str; N]) -> Option<String> {
+    crate::util::git_stdout(repo_root, args)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn build_super_focus(prompt: Option<&str>, focus: Option<&str>) -> String {
