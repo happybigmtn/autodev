@@ -249,9 +249,11 @@ fn log_parallel_startup_prep(prep: ParallelStartupPrep, target_branch: &str) {
 }
 
 fn parallel_run_root(repo_root: &Path, args: &ParallelArgs) -> PathBuf {
-    args.run_root
-        .clone()
-        .unwrap_or_else(|| repo_root.join(".auto").join("parallel"))
+    match args.run_root.as_deref() {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => repo_root.join(path),
+        None => repo_root.join(".auto").join("parallel"),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6095,10 +6097,10 @@ mod tests {
         landing_recovery_note, lane_repo_has_active_cherry_pick, lane_repo_recovery_note,
         lane_repo_status_summary, lane_scope_budget, lane_status_task_id, last_parallel_stop_state,
         maybe_disable_linear_auto_sync_for_run, next_parallel_unblock_candidate,
-        no_dependency_ready_stop_message, parallel_blocker_frontier, parallel_tmux_command,
-        parallel_tmux_session_name, parse_loop_plan, parse_parallel_stop_ids,
-        preflight_warning_names, prepare_lane_landing_recovery, prepare_parallel_startup,
-        prepared_landing_recovery_note, preserve_resume_recovery_notes,
+        no_dependency_ready_stop_message, parallel_blocker_frontier, parallel_run_root,
+        parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
+        parse_parallel_stop_ids, preflight_warning_names, prepare_lane_landing_recovery,
+        prepare_parallel_startup, prepared_landing_recovery_note, preserve_resume_recovery_notes,
         prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
         recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
         render_parallel_health_summary, repo_forbids_legacy_review_trackers,
@@ -6158,6 +6160,33 @@ mod tests {
         assert!(command.contains("host.stderr.log"));
         assert!(command.contains("tee -a"));
         assert!(command.contains("exec bash"));
+    }
+
+    #[test]
+    fn parallel_run_root_resolves_relative_override_under_repo_root() {
+        let args = ParallelArgs {
+            action: None,
+            max_iterations: None,
+            max_concurrent_workers: 5,
+            cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::Auto,
+            prompt_file: None,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: None,
+            reference_repos: Vec::new(),
+            include_siblings: false,
+            run_root: Some(PathBuf::from(".auto/super/run-1")),
+            codex_bin: PathBuf::from("codex"),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        };
+
+        assert_eq!(
+            parallel_run_root(&PathBuf::from("/repo"), &args),
+            PathBuf::from("/repo/.auto/super/run-1")
+        );
     }
 
     #[test]
