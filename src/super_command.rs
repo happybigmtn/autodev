@@ -10,6 +10,10 @@ use crate::design_command;
 use crate::generation;
 use crate::parallel_command;
 use crate::state::load_state;
+use crate::task_parser::{
+    task_field_body_until_any, PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS,
+    TASK_FIELD_BOUNDARIES,
+};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
@@ -737,25 +741,15 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
 }
 
 fn verify_super_task(task: &SuperTaskBlock) -> Result<()> {
-    for field in [
-        "Spec:",
-        "Why now:",
-        "Codebase evidence:",
-        "Owns:",
-        "Integration touchpoints:",
-        "Scope boundary:",
-        "Acceptance criteria:",
-        "Verification:",
-        "Required tests:",
-        "Completion artifacts:",
-        "Dependencies:",
-        "Estimated scope:",
-        "Completion signal:",
-    ] {
-        if !task.markdown.contains(field) {
-            bail!("task `{}` is missing `{field}`", task.task_id);
+    for &field in PLAN_TASK_REQUIRED_FIELDS {
+        let body = super_task_field_body(task, field)
+            .with_context(|| format!("task `{}` is missing `{field}`", task.task_id))?;
+        if body.trim().is_empty() {
+            bail!("task `{}` has empty required field `{field}`", task.task_id);
         }
     }
+    verify_super_task_process_fields(task)?;
+
     let scope = task_field_value(task, "Estimated scope:")
         .with_context(|| format!("task `{}` missing `Estimated scope:`", task.task_id))?;
     if !matches!(scope, "XS" | "S" | "M") {
@@ -777,19 +771,71 @@ fn verify_super_task(task: &SuperTaskBlock) -> Result<()> {
             );
         }
     }
-    let verification =
-        task_field_body(task, "Verification:", "Required tests:").unwrap_or_default();
+    let verification = super_task_field_body(task, "Verification:").unwrap_or_default();
     if verification_looks_broad_or_malformed(&verification) {
         bail!(
             "task `{}` has broad or malformed verification; tighten it before parallel execution",
             task.task_id
         );
     }
-    let owns = task_field_body(task, "Owns:", "Integration touchpoints:").unwrap_or_default();
+    let owns = super_task_field_body(task, "Owns:").unwrap_or_default();
     if !contains_path_like_token(&owns) {
         bail!("task `{}` has non-concrete `Owns:` field", task.task_id);
     }
     Ok(())
+}
+
+fn verify_super_task_process_fields(task: &SuperTaskBlock) -> Result<()> {
+    for &field in PLAN_TASK_PROCESS_FIELDS {
+        let value = first_super_task_field_line(task, field)
+            .with_context(|| format!("task `{}` is missing `{field}`", task.task_id))?;
+        let lowercase = value.to_ascii_lowercase();
+        for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
+            if lowercase.contains(forbidden) {
+                bail!(
+                    "task `{}` has vague `{field}` content `{forbidden}`",
+                    task.task_id
+                );
+            }
+        }
+    }
+
+    let ui_consumers = first_super_task_field_line(task, "UI consumers:").unwrap_or("none");
+    let has_ui = !field_value_is_none(ui_consumers);
+    let cross_surface = first_super_task_field_line(task, "Cross-surface tests:").unwrap_or("none");
+    if has_ui && field_value_is_none(cross_surface) {
+        bail!(
+            "task `{}` names UI consumers but has no `Cross-surface tests:` proof",
+            task.task_id
+        );
+    }
+
+    let generated_artifacts =
+        first_super_task_field_line(task, "Generated artifacts:").unwrap_or("none");
+    let contract_generation =
+        first_super_task_field_line(task, "Contract generation:").unwrap_or("none");
+    if !field_value_is_none(generated_artifacts) && field_value_is_none(contract_generation) {
+        bail!(
+            "task `{}` names generated artifacts but has no `Contract generation:` command",
+            task.task_id
+        );
+    }
+
+    let review_closeout = first_super_task_field_line(task, "Review/closeout:").unwrap_or("");
+    let review_lower = review_closeout.to_ascii_lowercase();
+    if review_lower == "cargo check" || review_lower.contains("cargo check only") {
+        bail!(
+            "task `{}` cannot use only cargo check for `Review/closeout:`",
+            task.task_id
+        );
+    }
+
+    Ok(())
+}
+
+fn field_value_is_none(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower == "none" || lower.starts_with("none ") || lower.starts_with("none --")
 }
 
 fn verification_looks_broad_or_malformed(body: &str) -> bool {
@@ -951,25 +997,15 @@ fn task_field_value<'a>(task: &'a SuperTaskBlock, field: &str) -> Option<&'a str
         .filter(|value| !value.is_empty())
 }
 
-fn task_field_body(task: &SuperTaskBlock, field: &str, next_field: &str) -> Option<String> {
-    let mut collecting = false;
-    let mut body = Vec::new();
-    for line in task.markdown.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix(field) {
-            collecting = true;
-            if !rest.trim().is_empty() {
-                body.push(rest.trim().to_string());
-            }
-            continue;
-        }
-        if collecting && line.trim_start().starts_with(next_field) {
-            break;
-        }
-        if collecting {
-            body.push(line.to_string());
-        }
-    }
-    collecting.then(|| body.join("\n"))
+fn first_super_task_field_line<'a>(task: &'a SuperTaskBlock, field: &str) -> Option<&'a str> {
+    task.markdown
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(field).map(str::trim))
+        .filter(|value| !value.is_empty())
+}
+
+fn super_task_field_body(task: &SuperTaskBlock, field: &str) -> Option<String> {
+    task_field_body_until_any(&task.markdown, field, TASK_FIELD_BOUNDARIES)
 }
 
 fn require_nonempty_file(path: &Path) -> Result<()> {
@@ -1038,6 +1074,43 @@ mod tests {
             .contains("broad or malformed verification"));
     }
 
+    #[test]
+    fn super_rejects_task_missing_runtime_ui_fields() {
+        let root = temp_dir("super-gate-missing-runtime-ui");
+        let plan = root.join(IMPLEMENTATION_PLAN);
+        let malformed = valid_plan(
+            "cargo test super_command::tests::super_rejects_task_missing_runtime_ui_fields",
+        )
+        .replace("    Runtime owner: `src/super_command.rs`\n", "");
+        fs::write(&plan, malformed).unwrap();
+
+        let error = verify_parallel_ready_plan(&plan)
+            .expect_err("expected rich runtime/UI task contract rejection");
+
+        assert!(error
+            .to_string()
+            .contains("task `TASK-001` is missing `Runtime owner:`"));
+    }
+
+    #[test]
+    fn super_accepts_generated_rich_task_contract() {
+        let root = temp_dir("super-gate-rich-contract");
+        let plan = root.join(IMPLEMENTATION_PLAN);
+        fs::write(
+            &plan,
+            valid_plan(
+                "cargo test super_command::tests::super_accepts_generated_rich_task_contract",
+            ),
+        )
+        .unwrap();
+
+        let summary = verify_parallel_ready_plan(&plan).unwrap();
+
+        assert_eq!(summary.unchecked_tasks, 1);
+        assert_eq!(summary.priority_tasks, 1);
+        assert_eq!(summary.follow_on_tasks, 0);
+    }
+
     fn valid_plan(verification: &str) -> String {
         format!(
             r#"# IMPLEMENTATION_PLAN
@@ -1049,12 +1122,21 @@ mod tests {
     Spec: `specs/220426-super.md`
     Why now: proves the gate works.
     Codebase evidence: `src/super_command.rs`
+    Source of truth: `src/super_command.rs`
+    Runtime owner: `src/super_command.rs`
+    UI consumers: terminal output
+    Generated artifacts: `.auto/super/*/DETERMINISTIC-GATE.json`
+    Fixture boundary: production code parses the live root plan, not fixture rows.
+    Retired surfaces: legacy active task rows without runtime/UI contract fields.
     Owns: `src/super_command.rs`
     Integration touchpoints: `src/main.rs`
     Scope boundary: do not launch workers.
     Acceptance criteria: scoped plan passes.
     Verification: {verification}
     Required tests: `deterministic_gate_accepts_scoped_unfinished_task`
+    Contract generation: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
+    Cross-surface tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
+    Review/closeout: reviewer checks super and generation task contracts stay aligned.
     Completion artifacts: `src/super_command.rs`
     Dependencies: none
     Estimated scope: S

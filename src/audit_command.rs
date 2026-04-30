@@ -456,22 +456,20 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     let output_dir_arc = Arc::new(output_dir.clone());
     let doctrine_arc = Arc::new(doctrine);
     let rubric_arc = Arc::new(rubric);
+    let worker_context = AuditWorkerContext {
+        repo_root: repo_root_arc,
+        output_dir: output_dir_arc,
+        doctrine: doctrine_arc,
+        rubric: rubric_arc,
+        args: args.clone(),
+        cap,
+    };
     let mut join_set = JoinSet::new();
     let mut plan_iter = selected_plan.into_iter().enumerate();
     let mut active = 0usize;
     for _ in 0..workers {
         if let Some((idx, entry)) = plan_iter.next() {
-            spawn_audit_worker(
-                &mut join_set,
-                repo_root_arc.clone(),
-                output_dir_arc.clone(),
-                doctrine_arc.clone(),
-                rubric_arc.clone(),
-                args.clone(),
-                idx,
-                cap,
-                entry,
-            );
+            spawn_audit_worker(&mut join_set, worker_context.clone(), idx, entry);
             active += 1;
         }
     }
@@ -486,17 +484,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
             Ok(Err(err)) => {
                 eprintln!("audit worker failed: {err:#}");
                 if let Some((idx, entry)) = plan_iter.next() {
-                    spawn_audit_worker(
-                        &mut join_set,
-                        repo_root_arc.clone(),
-                        output_dir_arc.clone(),
-                        doctrine_arc.clone(),
-                        rubric_arc.clone(),
-                        args.clone(),
-                        idx,
-                        cap,
-                        entry,
-                    );
+                    spawn_audit_worker(&mut join_set, worker_context.clone(), idx, entry);
                     active += 1;
                 }
                 continue;
@@ -504,17 +492,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
             Err(err) => {
                 eprintln!("audit worker task panicked: {err}");
                 if let Some((idx, entry)) = plan_iter.next() {
-                    spawn_audit_worker(
-                        &mut join_set,
-                        repo_root_arc.clone(),
-                        output_dir_arc.clone(),
-                        doctrine_arc.clone(),
-                        rubric_arc.clone(),
-                        args.clone(),
-                        idx,
-                        cap,
-                        entry,
-                    );
+                    spawn_audit_worker(&mut join_set, worker_context.clone(), idx, entry);
                     active += 1;
                 }
                 continue;
@@ -555,17 +533,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
                 );
                 write_manifest(&manifest_path, &manifest)?;
                 if let Some((idx, entry)) = plan_iter.next() {
-                    spawn_audit_worker(
-                        &mut join_set,
-                        repo_root_arc.clone(),
-                        output_dir_arc.clone(),
-                        doctrine_arc.clone(),
-                        rubric_arc.clone(),
-                        args.clone(),
-                        idx,
-                        cap,
-                        entry,
-                    );
+                    spawn_audit_worker(&mut join_set, worker_context.clone(), idx, entry);
                     active += 1;
                 }
                 continue;
@@ -625,17 +593,7 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
             )?;
         }
         if let Some((idx, entry)) = plan_iter.next() {
-            spawn_audit_worker(
-                &mut join_set,
-                repo_root_arc.clone(),
-                output_dir_arc.clone(),
-                doctrine_arc.clone(),
-                rubric_arc.clone(),
-                args.clone(),
-                idx,
-                cap,
-                entry,
-            );
+            spawn_audit_worker(&mut join_set, worker_context.clone(), idx, entry);
             active += 1;
         }
     }
@@ -665,37 +623,38 @@ pub(crate) async fn run_audit(args: AuditArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_audit_worker(
-    join_set: &mut JoinSet<Result<AuditWorkerResult>>,
+#[derive(Clone)]
+struct AuditWorkerContext {
     repo_root: Arc<PathBuf>,
     output_dir: Arc<PathBuf>,
     doctrine: Arc<String>,
     rubric: Arc<String>,
     args: AuditArgs,
-    idx: usize,
     cap: usize,
-    entry: ManifestEntry,
-) {
-    join_set.spawn(async move {
-        run_audit_worker(
-            repo_root, output_dir, doctrine, rubric, args, idx, cap, entry,
-        )
-        .await
-    });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_audit_worker(
-    repo_root: Arc<PathBuf>,
-    output_dir: Arc<PathBuf>,
-    doctrine: Arc<String>,
-    rubric: Arc<String>,
-    args: AuditArgs,
+fn spawn_audit_worker(
+    join_set: &mut JoinSet<Result<AuditWorkerResult>>,
+    context: AuditWorkerContext,
     idx: usize,
-    cap: usize,
+    entry: ManifestEntry,
+) {
+    join_set.spawn(async move { run_audit_worker(context, idx, entry).await });
+}
+
+async fn run_audit_worker(
+    context: AuditWorkerContext,
+    idx: usize,
     entry: ManifestEntry,
 ) -> Result<AuditWorkerResult> {
+    let AuditWorkerContext {
+        repo_root,
+        output_dir,
+        doctrine,
+        rubric,
+        args,
+        cap,
+    } = context;
     let abs_path = repo_root.join(&entry.path);
     if !abs_path.exists() {
         bail!(

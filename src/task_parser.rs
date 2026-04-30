@@ -253,6 +253,43 @@ fn parse_task_completion_path(markdown: &str) -> Option<String> {
     })
 }
 
+pub(crate) const PLAN_TASK_REQUIRED_FIELDS: &[&str] = &[
+    "Spec:",
+    "Why now:",
+    "Codebase evidence:",
+    "Source of truth:",
+    "Runtime owner:",
+    "UI consumers:",
+    "Generated artifacts:",
+    "Fixture boundary:",
+    "Retired surfaces:",
+    "Owns:",
+    "Integration touchpoints:",
+    "Scope boundary:",
+    "Acceptance criteria:",
+    "Verification:",
+    "Required tests:",
+    "Contract generation:",
+    "Cross-surface tests:",
+    "Review/closeout:",
+    "Completion artifacts:",
+    "Dependencies:",
+    "Estimated scope:",
+    "Completion signal:",
+];
+
+pub(crate) const PLAN_TASK_PROCESS_FIELDS: &[&str] = &[
+    "Source of truth:",
+    "Runtime owner:",
+    "UI consumers:",
+    "Generated artifacts:",
+    "Fixture boundary:",
+    "Retired surfaces:",
+    "Contract generation:",
+    "Cross-surface tests:",
+    "Review/closeout:",
+];
+
 pub(crate) const TASK_FIELD_BOUNDARIES: &[&str] = &[
     "Spec:",
     "Why now:",

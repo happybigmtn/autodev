@@ -6,7 +6,8 @@ use chrono::Local;
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
-    parse_task_header, parse_tasks, task_field_body_until_any, TaskStatus, TASK_FIELD_BOUNDARIES,
+    parse_task_header, parse_tasks, task_field_body_until_any, TaskStatus,
+    PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
 };
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
 use crate::SpecArgs;
@@ -24,31 +25,6 @@ const SPEC_REQUIRED_SECTIONS: [&str; 12] = [
     "## Verification",
     "## Review And Closeout",
     "## Open Questions",
-];
-
-const PLAN_REQUIRED_FIELDS: [&str; 22] = [
-    "Spec:",
-    "Why now:",
-    "Codebase evidence:",
-    "Source of truth:",
-    "Runtime owner:",
-    "UI consumers:",
-    "Generated artifacts:",
-    "Fixture boundary:",
-    "Retired surfaces:",
-    "Owns:",
-    "Integration touchpoints:",
-    "Scope boundary:",
-    "Acceptance criteria:",
-    "Verification:",
-    "Required tests:",
-    "Contract generation:",
-    "Cross-surface tests:",
-    "Review/closeout:",
-    "Completion artifacts:",
-    "Dependencies:",
-    "Estimated scope:",
-    "Completion signal:",
 ];
 
 pub(crate) async fn run_spec(args: SpecArgs) -> Result<()> {
@@ -351,7 +327,7 @@ fn verify_auto_spec_plan_task(
         );
     }
 
-    for field in PLAN_REQUIRED_FIELDS {
+    for &field in PLAN_TASK_REQUIRED_FIELDS {
         let body = task_field_body(task, field)?;
         if body.trim().is_empty() {
             bail!(

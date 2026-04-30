@@ -9,7 +9,10 @@ use chrono::{Local, NaiveDate};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state, AutoState};
-use crate::task_parser::{parse_task_header as parse_shared_task_header, TaskStatus};
+use crate::task_parser::{
+    parse_task_header as parse_shared_task_header, TaskStatus, PLAN_TASK_PROCESS_FIELDS,
+    PLAN_TASK_REQUIRED_FIELDS,
+};
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
     list_markdown_files, timestamp_slug,
@@ -128,30 +131,6 @@ const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Priority Work",
     "## Follow-On Work",
     "## Completed / Already Satisfied",
-];
-const REQUIRED_PLAN_TASK_FIELDS: [&str; 22] = [
-    "Spec:",
-    "Why now:",
-    "Codebase evidence:",
-    "Source of truth:",
-    "Runtime owner:",
-    "UI consumers:",
-    "Generated artifacts:",
-    "Fixture boundary:",
-    "Retired surfaces:",
-    "Owns:",
-    "Integration touchpoints:",
-    "Scope boundary:",
-    "Acceptance criteria:",
-    "Verification:",
-    "Required tests:",
-    "Contract generation:",
-    "Cross-surface tests:",
-    "Review/closeout:",
-    "Completion artifacts:",
-    "Dependencies:",
-    "Estimated scope:",
-    "Completion signal:",
 ];
 const CORPUS_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
     "## Purpose / Big Picture",
@@ -2654,7 +2633,7 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         if block.checked {
             continue;
         }
-        for field in REQUIRED_PLAN_TASK_FIELDS {
+        for &field in PLAN_TASK_REQUIRED_FIELDS {
             if !block.markdown.contains(field) {
                 bail!(
                     "generated implementation plan task `{}` is missing `{}`",
@@ -2731,17 +2710,7 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
 }
 
 fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
-    for field in [
-        "Source of truth:",
-        "Runtime owner:",
-        "UI consumers:",
-        "Generated artifacts:",
-        "Fixture boundary:",
-        "Retired surfaces:",
-        "Contract generation:",
-        "Cross-surface tests:",
-        "Review/closeout:",
-    ] {
+    for &field in PLAN_TASK_PROCESS_FIELDS {
         let value = plan_task_field_line_value(block, field)
             .with_context(|| format!("task `{}` missing `{field}`", block.task_id))?;
         let lowercase = value.to_ascii_lowercase();
