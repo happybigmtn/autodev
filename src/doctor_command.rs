@@ -7,7 +7,9 @@ use clap::Args;
 
 use crate::util::git_repo_root;
 
-const REQUIRED_LAYOUT: &[&str] = &["Cargo.toml", "src/main.rs", "README.md", "AGENTS.md"];
+const AUTODEV_REQUIRED_LAYOUT: &[&str] = &["Cargo.toml", "src/main.rs", "README.md", "AGENTS.md"];
+const PROJECT_AGENT_INSTRUCTION_FILES: &[&str] =
+    &["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"];
 const HELP_SURFACES: &[&[&str]] = &[
     &["--help"],
     &["corpus", "--help"],
@@ -103,10 +105,7 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
                 detail: format!("found {}", repo_root.display()),
                 action: None,
             });
-            report.required.extend(check_required_layout(&repo_root));
-            report
-                .required
-                .push(check_cargo_manifest(&repo_root.join("Cargo.toml")));
+            report.required.extend(check_repo_checkout(&repo_root));
         }
         Err(err) => report.required.push(RequiredCheck {
             name: "repo root".to_string(),
@@ -127,8 +126,21 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
     report
 }
 
-fn check_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
-    let missing: Vec<&str> = REQUIRED_LAYOUT
+fn check_repo_checkout(repo_root: &Path) -> Vec<RequiredCheck> {
+    match read_cargo_manifest(&repo_root.join("Cargo.toml")) {
+        Ok(Some(manifest)) if manifest_is_autodev_source(&manifest) => {
+            let mut checks = check_autodev_required_layout(repo_root);
+            checks.push(check_autodev_cargo_manifest(&manifest));
+            checks
+        }
+        Ok(Some(_)) => vec![check_project_checkout_layout(repo_root)],
+        Ok(None) => vec![check_project_checkout_layout(repo_root)],
+        Err(check) => vec![check],
+    }
+}
+
+fn check_autodev_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
+    let missing: Vec<&str> = AUTODEV_REQUIRED_LAYOUT
         .iter()
         .copied()
         .filter(|relative| !repo_root.join(relative).is_file())
@@ -138,7 +150,7 @@ fn check_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
         vec![RequiredCheck {
             name: "repo layout".to_string(),
             passed: true,
-            detail: format!("found {}", REQUIRED_LAYOUT.join(", ")),
+            detail: format!("found {}", AUTODEV_REQUIRED_LAYOUT.join(", ")),
             action: None,
         }]
     } else {
@@ -151,44 +163,70 @@ fn check_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
     }
 }
 
-fn check_cargo_manifest(path: &Path) -> RequiredCheck {
+fn check_project_checkout_layout(repo_root: &Path) -> RequiredCheck {
+    let found_instructions: Vec<&str> = PROJECT_AGENT_INSTRUCTION_FILES
+        .iter()
+        .copied()
+        .filter(|relative| repo_root.join(relative).is_file())
+        .collect();
+
+    if found_instructions.is_empty() {
+        return RequiredCheck {
+            name: "project checkout".to_string(),
+            passed: false,
+            detail: format!(
+                "missing agent instructions; expected one of {}",
+                PROJECT_AGENT_INSTRUCTION_FILES.join(", ")
+            ),
+            action: Some(
+                "add AGENTS.md or equivalent repo-local agent instructions before model-backed work"
+                    .to_string(),
+            ),
+        };
+    }
+
+    RequiredCheck {
+        name: "project checkout".to_string(),
+        passed: true,
+        detail: format!(
+            "non-autodev repo with agent instructions at {}",
+            found_instructions.join(", ")
+        ),
+        action: None,
+    }
+}
+
+fn read_cargo_manifest(path: &Path) -> std::result::Result<Option<toml::Value>, RequiredCheck> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return RequiredCheck {
+            return Err(RequiredCheck {
                 name: "Cargo.toml manifest".to_string(),
                 passed: false,
                 detail: format!("failed to read {}: {err}", path.display()),
                 action: Some("restore Cargo.toml before rerunning doctor".to_string()),
-            };
+            });
         }
     };
 
-    let manifest: toml::Value = match toml::from_str(&text) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            return RequiredCheck {
-                name: "Cargo.toml manifest".to_string(),
-                passed: false,
-                detail: format!("failed to parse {}: {err}", path.display()),
-                action: Some("fix Cargo.toml before rerunning doctor".to_string()),
-            };
-        }
-    };
+    match toml::from_str(&text) {
+        Ok(manifest) => Ok(Some(manifest)),
+        Err(err) => Err(RequiredCheck {
+            name: "Cargo.toml manifest".to_string(),
+            passed: false,
+            detail: format!("failed to parse {}: {err}", path.display()),
+            action: Some("fix Cargo.toml before rerunning doctor".to_string()),
+        }),
+    }
+}
 
+fn check_autodev_cargo_manifest(manifest: &toml::Value) -> RequiredCheck {
     let package_name = manifest
         .get("package")
         .and_then(|package| package.get("name"))
         .and_then(toml::Value::as_str);
-    let has_auto_bin = manifest
-        .get("bin")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|bins| {
-            bins.iter().any(|bin| {
-                bin.get("name").and_then(toml::Value::as_str) == Some("auto")
-                    && bin.get("path").and_then(toml::Value::as_str) == Some("src/main.rs")
-            })
-        });
+    let has_auto_bin = manifest_declares_auto_bin(manifest);
 
     if package_name == Some("autodev") && has_auto_bin {
         RequiredCheck {
@@ -205,6 +243,27 @@ fn check_cargo_manifest(path: &Path) -> RequiredCheck {
             action: Some("restore the autodev package and auto binary declarations".to_string()),
         }
     }
+}
+
+fn manifest_is_autodev_source(manifest: &toml::Value) -> bool {
+    manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        == Some("autodev")
+        || manifest_declares_auto_bin(manifest)
+}
+
+fn manifest_declares_auto_bin(manifest: &toml::Value) -> bool {
+    manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|bins| {
+            bins.iter().any(|bin| {
+                bin.get("name").and_then(toml::Value::as_str) == Some("auto")
+                    && bin.get("path").and_then(toml::Value::as_str) == Some("src/main.rs")
+            })
+        })
 }
 
 fn check_version_probe(probe: &CommandProbe) -> RequiredCheck {
@@ -393,11 +452,13 @@ fn format_auto_args(args: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_optional_tool_checks, check_help_surfaces_with, format_auto_args, CommandProbe,
-        HELP_SURFACES,
+        build_optional_tool_checks, check_help_surfaces_with, check_repo_checkout,
+        format_auto_args, CommandProbe, HELP_SURFACES,
     };
 
     #[test]
@@ -455,5 +516,71 @@ mod tests {
         );
         assert_eq!(checks.len(), HELP_SURFACES.len());
         assert!(checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn doctor_accepts_non_autodev_project_with_agent_instructions() {
+        let repo = temp_repo("project-checkout");
+        fs::write(repo.join("AGENTS.md"), "build here\n").expect("write AGENTS.md");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"agent-product\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        let checks = check_repo_checkout(&repo);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "project checkout");
+        assert!(checks[0].passed, "{checks:?}");
+        fs::remove_dir_all(repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn doctor_rejects_project_without_agent_instructions() {
+        let repo = temp_repo("missing-agent-instructions");
+        fs::write(repo.join("README.md"), "no instructions yet\n").expect("write README.md");
+
+        let checks = check_repo_checkout(&repo);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "project checkout");
+        assert!(!checks[0].passed, "{checks:?}");
+        fs::remove_dir_all(repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn doctor_keeps_strict_autodev_manifest_check_for_autodev_source() {
+        let repo = temp_repo("autodev-source");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("write main");
+        fs::write(repo.join("README.md"), "autodev\n").expect("write README");
+        fs::write(repo.join("AGENTS.md"), "autodev agents\n").expect("write AGENTS");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"autodev\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        let checks = check_repo_checkout(&repo);
+
+        assert_eq!(checks.len(), 2);
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "repo layout" && check.passed));
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "Cargo.toml manifest" && !check.passed));
+        fs::remove_dir_all(repo).expect("cleanup temp repo");
+    }
+
+    fn temp_repo(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("autodev-doctor-{label}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp repo");
+        path
     }
 }
