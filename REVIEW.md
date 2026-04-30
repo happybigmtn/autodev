@@ -7,3 +7,11 @@
 - Validation: host observed verification receipt at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/TASK-016.json`
 - Completion artifacts: `COMPLETED.md`, `refs/tags/v0.2.0`
 - Remaining blockers: missing REVIEW.md handoff; missing completion artifact(s): `refs/tags/v0.2.0`
+
+## `DESIGN-001`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `.github/workflows/ci.yml`, `DESIGN.md`, `README.md`, `src/audit_command.rs`, `src/audit_everything.rs`, `src/doctor_command.rs`, `src/main.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt still missing at `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-001.json`
+- Completion artifacts: `DESIGN.md`, `.github/workflows/ci.yml`, `README.md`, `AGENTS.md`
+- Remaining blockers: missing REVIEW.md handoff; missing verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/DESIGN-001.json`

@@ -2,7 +2,7 @@
 
 ## Priority Work
 
-- [ ] `DESIGN-001` CLI operator design doctrine and help smoke coverage
+- [~] `DESIGN-001` CLI operator design doctrine and help smoke coverage
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: `auto super` treats design/runtime integrity as blocking, but the live product surface is terminal UX and the repo only gained durable root design doctrine in this pass; high-value help and doctor surfaces need runtime smoke proof so docs do not drift from command reality.
