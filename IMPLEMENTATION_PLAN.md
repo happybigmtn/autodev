@@ -177,7 +177,7 @@
   Estimated scope: M
   Completion signal: operators can distinguish live parallel work from stale recovery residue before launching a new run.
 
-- [~] `DESIGN-006` Verification receipt freshness and release-readiness binding
+- [x] `DESIGN-006` Verification receipt freshness and release-readiness binding
 
   Spec: `specs/300426-operator-design-runtime-contract.md`
   Why now: receipt-backed completion is a primary operator UI, but current receipts record command strings and output tails without binding completion proof to current commit, dirty state, plan hash, and declared artifact hashes.
