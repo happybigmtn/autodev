@@ -768,7 +768,7 @@
 - [~] `SAT-004` `auto doctor` already provides a no-model first-run proof for layout, binary metadata, help surfaces, and optional tools.
   Evidence: `src/doctor_command.rs` prints required checks, capabilities, and a no-model/network guarantee; `.github/workflows/ci.yml` smokes the installed binary help surfaces.
 
-- [~] `SAT-005` Professional audit status and file-quality gates already exist.
+- [x] `SAT-005` Professional audit status and file-quality gates already exist.
   Evidence: `src/audit_everything.rs` owns `.auto/audit-everything`, `RUN-STATUS.md`, pause/unpause/status controls, final-review evidence classification, file-quality accept score `9.0`, and target score `10.0`.
 
 - [~] `SAT-006` The planning corpus remains subordinate to root queue truth.
