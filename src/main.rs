@@ -641,6 +641,11 @@ pub(crate) struct SuperArgs {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
+    /// Resume an existing auto super run from its .auto/super/<run-id> directory.
+    /// Completed manifest stages are skipped; the first incomplete stage continues.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
     /// Seed corpus generation with product direction
     #[arg(long)]
     idea: Option<String>,
@@ -1632,6 +1637,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{Cli, Command, SymphonySubcommand};
     use clap::{CommandFactory, Parser};
+    use std::path::Path;
 
     #[test]
     fn top_level_command_surface_matches_live_enum() {
@@ -1735,8 +1741,16 @@ mod tests {
             Ok(_) => panic!("expected help output"),
         };
         assert!(help.contains("Usage: auto super"));
+        assert!(help.contains("--resume"));
         assert!(help.contains("--skip-design"));
         assert!(help.contains("--design-resolve-passes"));
+
+        let cli = Cli::try_parse_from(["auto", "super", "--resume", ".auto/super/run-1"])
+            .expect("cli parse");
+        let Command::Super(args) = cli.command else {
+            panic!("expected super command");
+        };
+        assert_eq!(args.resume.as_deref(), Some(Path::new(".auto/super/run-1")));
     }
 
     #[test]

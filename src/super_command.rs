@@ -1,9 +1,9 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::design_command;
@@ -30,7 +30,7 @@ const SUPER_REPORT_FILES: [&str; 7] = [
 const EXECUTION_GATE_FILE: &str = "EXECUTION-GATE.md";
 const IMPLEMENTATION_PLAN: &str = "IMPLEMENTATION_PLAN.md";
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SuperManifest {
     run_id: String,
     repo_root: String,
@@ -47,6 +47,8 @@ struct SuperManifest {
     max_iterations: Option<usize>,
     execute: bool,
     design_enabled: bool,
+    #[serde(default)]
+    super_review_skipped: bool,
     design_resolve_passes: usize,
     branch: Option<String>,
     reference_repos: Vec<String>,
@@ -54,7 +56,7 @@ struct SuperManifest {
     stages: Vec<SuperStage>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SuperStage {
     name: String,
     status: String,
@@ -74,8 +76,9 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     let started_at = Instant::now();
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
-    let run_id = timestamp_slug();
-    let super_root = repo_root.join(".auto").join("super").join(&run_id);
+    let mut args = args;
+    let resume_requested = args.resume.is_some();
+    let (super_root, mut manifest) = prepare_super_run(&repo_root, &mut args)?;
     let planning_root = args
         .planning_root
         .clone()
@@ -84,6 +87,9 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
 
     println!("auto super");
     println!("binary:      {}", binary_provenance_line());
+    if resume_requested {
+        println!("mode:        resume");
+    }
     println!("repo root:   {}", repo_root.display());
     println!("planning:    {}", planning_root.display());
     if let Some(output_dir) = &args.output_dir {
@@ -115,76 +121,43 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
 
     fs::create_dir_all(&super_root)
         .with_context(|| format!("failed to create {}", super_root.display()))?;
-    let mut manifest = SuperManifest {
-        run_id,
-        repo_root: repo_root.display().to_string(),
-        planning_root: planning_root.display().to_string(),
-        output_dir: args
-            .output_dir
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        super_root: super_root.display().to_string(),
-        prompt: args.prompt.clone(),
-        focus: args.focus.clone(),
-        model: args.model.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        worker_model: args.worker_model.clone(),
-        worker_reasoning_effort: args.worker_reasoning_effort.clone(),
-        max_concurrent_workers: args.max_concurrent_workers.max(1),
-        max_iterations: args.max_iterations,
-        execute: !args.no_execute,
-        design_enabled: !args.skip_design,
-        design_resolve_passes: if args.no_execute || args.skip_design {
-            0
-        } else {
-            args.design_resolve_passes.max(1)
-        },
-        branch: args.branch.clone(),
-        reference_repos: args
-            .reference_repos
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect(),
-        binary: binary_provenance_line(),
-        stages: Vec::new(),
-    };
     write_manifest(&super_root, &manifest)?;
     write_super_cross_repo_manifest(&super_root, &repo_root, &planning_root, &args)?;
 
-    println!("stage:       corpus");
-    generation::run_corpus(CorpusArgs {
-        planning_root: Some(planning_root.clone()),
-        idea: args.idea.clone(),
-        focus: Some(focus.clone()),
-        reference_repos: args.reference_repos.clone(),
-        model: args.model.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        codex_review_model: args.model.clone(),
-        codex_review_effort: args.reasoning_effort.clone(),
-        codex_bin: args.codex_bin.clone(),
-        skip_codex_review: false,
-        verify_only: false,
-        max_turns: args.max_turns,
-        parallelism: args.planning_parallelism,
-        dry_run: false,
-    })
-    .await?;
-    push_stage(
-        &super_root,
-        &mut manifest,
-        "corpus",
-        "complete",
-        Some(&planning_root),
-    )?;
-
-    if args.skip_design {
+    if super_stage_terminal(&manifest, "corpus") {
+        println!("stage:       corpus (resume skip)");
+    } else {
+        println!("stage:       corpus");
+        generation::run_corpus(CorpusArgs {
+            planning_root: Some(planning_root.clone()),
+            idea: args.idea.clone(),
+            focus: Some(focus.clone()),
+            reference_repos: args.reference_repos.clone(),
+            model: args.model.clone(),
+            reasoning_effort: args.reasoning_effort.clone(),
+            codex_review_model: args.model.clone(),
+            codex_review_effort: args.reasoning_effort.clone(),
+            codex_bin: args.codex_bin.clone(),
+            skip_codex_review: false,
+            verify_only: false,
+            max_turns: args.max_turns,
+            parallelism: args.planning_parallelism,
+            dry_run: false,
+        })
+        .await?;
         push_stage(
             &super_root,
             &mut manifest,
-            "design perfection gate",
-            "skipped",
-            None,
+            "corpus",
+            "complete",
+            Some(&planning_root),
         )?;
+    }
+
+    if args.skip_design {
+        push_skipped_stage_if_needed(&super_root, &mut manifest, "design perfection gate")?;
+    } else if super_stage_terminal(&manifest, "design perfection gate") {
+        println!("stage:       design perfection gate (resume skip)");
     } else {
         println!("stage:       design perfection gate");
         design_command::run_super_design_module(&args, &repo_root, &planning_root, &super_root)
@@ -199,13 +172,10 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     }
 
     if args.skip_super_review {
-        push_stage(
-            &super_root,
-            &mut manifest,
-            "super corpus review",
-            "skipped",
-            None,
-        )?;
+        push_skipped_stage_if_needed(&super_root, &mut manifest, "super corpus review")?;
+    } else if super_stage_terminal_any(&manifest, &["CEO functional review", "super corpus review"])
+    {
+        println!("stage:       CEO functional review (resume skip)");
     } else {
         println!("stage:       CEO functional review");
         run_super_corpus_review(&args, &repo_root, &planning_root, &super_root).await?;
@@ -218,44 +188,46 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         )?;
     }
 
-    println!("stage:       gen");
-    generation::run_gen(GenerationArgs {
-        planning_root: Some(planning_root.clone()),
-        output_dir: args.output_dir.clone(),
-        model: args.model.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        codex_review_model: args.model.clone(),
-        codex_review_effort: args.reasoning_effort.clone(),
-        codex_bin: args.codex_bin.clone(),
-        skip_codex_review: false,
-        max_turns: args.max_turns,
-        parallelism: args.planning_parallelism,
-        plan_only: false,
-        snapshot_only: false,
-        sync_only: false,
-    })
-    .await?;
-    let state = load_state(&repo_root)?;
-    let output_dir = state
-        .latest_output_dir
-        .clone()
-        .or_else(|| args.output_dir.clone());
-    push_stage(
-        &super_root,
-        &mut manifest,
-        "gen",
-        "complete",
-        output_dir.as_deref(),
-    )?;
-
-    if args.skip_super_review {
+    let output_dir = if super_stage_terminal(&manifest, "gen") {
+        println!("stage:       gen (resume skip)");
+        super_stage_artifact(&manifest, "gen").or_else(|| args.output_dir.clone())
+    } else {
+        println!("stage:       gen");
+        generation::run_gen(GenerationArgs {
+            planning_root: Some(planning_root.clone()),
+            output_dir: args.output_dir.clone(),
+            model: args.model.clone(),
+            reasoning_effort: args.reasoning_effort.clone(),
+            codex_review_model: args.model.clone(),
+            codex_review_effort: args.reasoning_effort.clone(),
+            codex_bin: args.codex_bin.clone(),
+            skip_codex_review: false,
+            max_turns: args.max_turns,
+            parallelism: args.planning_parallelism,
+            plan_only: false,
+            snapshot_only: false,
+            sync_only: false,
+        })
+        .await?;
+        let state = load_state(&repo_root)?;
+        let output_dir = state
+            .latest_output_dir
+            .clone()
+            .or_else(|| args.output_dir.clone());
         push_stage(
             &super_root,
             &mut manifest,
-            "execution gate review",
-            "skipped",
-            None,
+            "gen",
+            "complete",
+            output_dir.as_deref(),
         )?;
+        output_dir
+    };
+
+    if args.skip_super_review {
+        push_skipped_stage_if_needed(&super_root, &mut manifest, "execution gate review")?;
+    } else if super_stage_terminal(&manifest, "execution gate review") {
+        println!("stage:       execution gate review (resume skip)");
     } else {
         println!("stage:       execution gate review");
         run_super_execution_gate(
@@ -275,20 +247,26 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         )?;
     }
 
-    println!("stage:       deterministic execution gate");
-    let gate = verify_parallel_ready_plan(&repo_root.join(IMPLEMENTATION_PLAN))?;
-    let gate_artifact = super_root.join("DETERMINISTIC-GATE.json");
-    atomic_write(&gate_artifact, &serde_json::to_vec_pretty(&gate)?)
-        .with_context(|| format!("failed to write {}", gate_artifact.display()))?;
-    write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "pre-parallel")?;
-    write_super_final_sanity(&super_root, &repo_root, &gate, &args, "pre-parallel")?;
-    push_stage(
-        &super_root,
-        &mut manifest,
-        "deterministic execution gate",
-        "complete",
-        Some(&gate_artifact),
-    )?;
+    let gate = if super_stage_terminal(&manifest, "deterministic execution gate") {
+        println!("stage:       deterministic execution gate (resume skip)");
+        read_deterministic_gate(&super_root)?
+    } else {
+        println!("stage:       deterministic execution gate");
+        let gate = verify_parallel_ready_plan(&repo_root.join(IMPLEMENTATION_PLAN))?;
+        let gate_artifact = super_root.join("DETERMINISTIC-GATE.json");
+        atomic_write(&gate_artifact, &serde_json::to_vec_pretty(&gate)?)
+            .with_context(|| format!("failed to write {}", gate_artifact.display()))?;
+        write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "pre-parallel")?;
+        write_super_final_sanity(&super_root, &repo_root, &gate, &args, "pre-parallel")?;
+        push_stage(
+            &super_root,
+            &mut manifest,
+            "deterministic execution gate",
+            "complete",
+            Some(&gate_artifact),
+        )?;
+        gate
+    };
     println!("ready tasks: {}", gate.unchecked_tasks);
 
     if args.no_execute {
@@ -299,40 +277,195 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("stage:       parallel");
-    parallel_command::run_parallel(ParallelArgs {
-        action: None::<ParallelAction>,
-        max_iterations: args.max_iterations,
-        max_concurrent_workers: args.max_concurrent_workers.max(1),
-        cargo_build_jobs: None,
-        cargo_target: ParallelCargoTarget::Auto,
-        prompt_file: None,
-        model: args.worker_model.clone(),
-        reasoning_effort: args.worker_reasoning_effort.clone(),
-        branch: args.branch.clone(),
-        reference_repos: args.reference_repos.clone(),
-        include_siblings: false,
-        run_root: Some(super_root.join("parallel")),
-        codex_bin: args.codex_bin.clone(),
-        claude: false,
-        max_turns: None,
-        max_retries: 2,
-    })
-    .await?;
-    write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "post-parallel")?;
-    write_super_final_sanity(&super_root, &repo_root, &gate, &args, "post-parallel")?;
-    push_stage(
-        &super_root,
-        &mut manifest,
-        "parallel",
-        "launched",
-        Some(&super_root.join("parallel")),
-    )?;
+    if super_stage_terminal(&manifest, "parallel") {
+        println!("stage:       parallel (resume skip)");
+    } else {
+        println!("stage:       parallel");
+        parallel_command::run_parallel(ParallelArgs {
+            action: None::<ParallelAction>,
+            max_iterations: args.max_iterations,
+            max_concurrent_workers: args.max_concurrent_workers.max(1),
+            cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::Auto,
+            prompt_file: None,
+            model: args.worker_model.clone(),
+            reasoning_effort: args.worker_reasoning_effort.clone(),
+            branch: args.branch.clone(),
+            reference_repos: args.reference_repos.clone(),
+            include_siblings: false,
+            run_root: Some(super_root.join("parallel")),
+            codex_bin: args.codex_bin.clone(),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        })
+        .await?;
+        write_super_branch_reconciliation_plan(&super_root, &repo_root, &args, "post-parallel")?;
+        write_super_final_sanity(&super_root, &repo_root, &gate, &args, "post-parallel")?;
+        push_stage(
+            &super_root,
+            &mut manifest,
+            "parallel",
+            "launched",
+            Some(&super_root.join("parallel")),
+        )?;
+    }
 
     println!("auto super complete");
     println!("super root:  {}", super_root.display());
     println!("elapsed:     {:?}", started_at.elapsed());
     Ok(())
+}
+
+fn prepare_super_run(repo_root: &Path, args: &mut SuperArgs) -> Result<(PathBuf, SuperManifest)> {
+    if let Some(resume_root) = args.resume.clone() {
+        let super_root = absolutize_super_path(repo_root, &resume_root);
+        let manifest = load_super_manifest(&super_root)?;
+        if manifest.repo_root != repo_root.display().to_string() {
+            bail!(
+                "refusing to resume auto super run rooted at `{}` from repo `{}`; manifest belongs to `{}`",
+                super_root.display(),
+                repo_root.display(),
+                manifest.repo_root
+            );
+        }
+        hydrate_super_args_from_manifest(args, &manifest);
+        return Ok((super_root, manifest));
+    }
+
+    let run_id = timestamp_slug();
+    let super_root = repo_root.join(".auto").join("super").join(&run_id);
+    let planning_root = args
+        .planning_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join("genesis"));
+    let manifest = SuperManifest {
+        run_id,
+        repo_root: repo_root.display().to_string(),
+        planning_root: planning_root.display().to_string(),
+        output_dir: args
+            .output_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        super_root: super_root.display().to_string(),
+        prompt: args.prompt.clone(),
+        focus: args.focus.clone(),
+        model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
+        worker_model: args.worker_model.clone(),
+        worker_reasoning_effort: args.worker_reasoning_effort.clone(),
+        max_concurrent_workers: args.max_concurrent_workers.max(1),
+        max_iterations: args.max_iterations,
+        execute: !args.no_execute,
+        design_enabled: !args.skip_design,
+        super_review_skipped: args.skip_super_review,
+        design_resolve_passes: if args.no_execute || args.skip_design {
+            0
+        } else {
+            args.design_resolve_passes.max(1)
+        },
+        branch: args.branch.clone(),
+        reference_repos: args
+            .reference_repos
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        binary: binary_provenance_line(),
+        stages: Vec::new(),
+    };
+    Ok((super_root, manifest))
+}
+
+fn absolutize_super_path(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn load_super_manifest(super_root: &Path) -> Result<SuperManifest> {
+    let path = super_root.join("manifest.json");
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn hydrate_super_args_from_manifest(args: &mut SuperArgs, manifest: &SuperManifest) {
+    if args.prompt.is_none() {
+        args.prompt = manifest.prompt.clone();
+    }
+    if args.focus.is_none() {
+        args.focus = manifest.focus.clone();
+    }
+    if args.planning_root.is_none() {
+        args.planning_root = Some(PathBuf::from(&manifest.planning_root));
+    }
+    if args.output_dir.is_none() {
+        args.output_dir = manifest.output_dir.as_ref().map(PathBuf::from);
+    }
+    if args.branch.is_none() {
+        args.branch = manifest.branch.clone();
+    }
+    if args.reference_repos.is_empty() {
+        args.reference_repos = manifest.reference_repos.iter().map(PathBuf::from).collect();
+    }
+    args.model = manifest.model.clone();
+    args.reasoning_effort = manifest.reasoning_effort.clone();
+    args.worker_model = manifest.worker_model.clone();
+    args.worker_reasoning_effort = manifest.worker_reasoning_effort.clone();
+    args.max_concurrent_workers = manifest.max_concurrent_workers.max(1);
+    args.max_iterations = manifest.max_iterations;
+    args.no_execute = !manifest.execute;
+    args.skip_design = !manifest.design_enabled;
+    args.skip_super_review = manifest.super_review_skipped;
+    if manifest.design_resolve_passes > 0 {
+        args.design_resolve_passes = manifest.design_resolve_passes;
+    }
+}
+
+fn super_stage_terminal(manifest: &SuperManifest, name: &str) -> bool {
+    manifest
+        .stages
+        .iter()
+        .rev()
+        .find(|stage| stage.name == name)
+        .is_some_and(|stage| matches!(stage.status.as_str(), "complete" | "skipped" | "launched"))
+}
+
+fn super_stage_terminal_any(manifest: &SuperManifest, names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| super_stage_terminal(manifest, name))
+}
+
+fn super_stage_artifact(manifest: &SuperManifest, name: &str) -> Option<PathBuf> {
+    manifest
+        .stages
+        .iter()
+        .rev()
+        .find(|stage| stage.name == name)
+        .and_then(|stage| stage.artifact.as_ref())
+        .map(PathBuf::from)
+}
+
+fn push_skipped_stage_if_needed(
+    super_root: &Path,
+    manifest: &mut SuperManifest,
+    name: &str,
+) -> Result<()> {
+    if super_stage_terminal(manifest, name) {
+        println!("stage:       {name} (resume skip)");
+        return Ok(());
+    }
+    push_stage(super_root, manifest, name, "skipped", None)
+}
+
+fn read_deterministic_gate(super_root: &Path) -> Result<DeterministicGateSummary> {
+    let path = super_root.join("DETERMINISTIC-GATE.json");
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn write_super_cross_repo_manifest(
@@ -686,7 +819,7 @@ Only write `Verdict: GO` if it is safe and useful for `auto parallel` to begin i
     )
 }
 
-#[derive(Serialize, Debug, Eq, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Eq, PartialEq)]
 struct DeterministicGateSummary {
     unchecked_tasks: usize,
     priority_tasks: usize,
@@ -757,6 +890,13 @@ fn verify_super_task(
         })?;
     validate_execution_row(&parsed_task, all_task_ids)
         .with_context(|| format!("task `{}` failed execution-row validation", task.task_id))?;
+    let verification = first_super_task_field_line(task, "Verification:").unwrap_or("");
+    if verification_looks_broad_or_malformed(verification) {
+        bail!(
+            "task `{}` uses package-wide cargo test verification; include a concrete test-name filter",
+            task.task_id
+        );
+    }
 
     for forbidden in [
         "TBD",
@@ -829,7 +969,6 @@ fn field_value_is_none(value: &str) -> bool {
     lower == "none" || lower.starts_with("none ") || lower.starts_with("none --")
 }
 
-#[allow(dead_code)]
 fn verification_looks_broad_or_malformed(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("cargo test --all")
@@ -1076,9 +1215,7 @@ mod tests {
         let error = verify_parallel_ready_plan(&plan)
             .expect_err("expected rich runtime/UI task contract rejection");
 
-        assert!(error
-            .to_string()
-            .contains("task `TASK-001` is missing `Runtime owner:`"));
+        assert!(format!("{error:#}").contains("task `TASK-001` missing `Runtime owner:`"));
     }
 
     #[test]
@@ -1098,6 +1235,69 @@ mod tests {
         assert_eq!(summary.unchecked_tasks, 1);
         assert_eq!(summary.priority_tasks, 1);
         assert_eq!(summary.follow_on_tasks, 0);
+    }
+
+    #[test]
+    fn resume_helpers_skip_terminal_stages_and_restore_gate_artifact() {
+        let root = temp_dir("super-resume-manifest");
+        let artifact = root.join("gen-output");
+        let gate = DeterministicGateSummary {
+            unchecked_tasks: 3,
+            priority_tasks: 2,
+            follow_on_tasks: 1,
+        };
+        fs::write(
+            root.join("DETERMINISTIC-GATE.json"),
+            serde_json::to_vec_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+
+        let manifest = SuperManifest {
+            run_id: "run-1".to_string(),
+            repo_root: "/repo".to_string(),
+            planning_root: "/repo/genesis".to_string(),
+            output_dir: Some("/repo/gen-out".to_string()),
+            super_root: root.display().to_string(),
+            prompt: Some("ship it".to_string()),
+            focus: Some("market drama".to_string()),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "xhigh".to_string(),
+            worker_model: "gpt-5.5".to_string(),
+            worker_reasoning_effort: "high".to_string(),
+            max_concurrent_workers: 5,
+            max_iterations: None,
+            execute: true,
+            design_enabled: true,
+            super_review_skipped: false,
+            design_resolve_passes: 3,
+            branch: Some("main".to_string()),
+            reference_repos: vec!["/ref".to_string()],
+            binary: "auto test".to_string(),
+            stages: vec![
+                SuperStage {
+                    name: "gen".to_string(),
+                    status: "complete".to_string(),
+                    artifact: Some(artifact.display().to_string()),
+                },
+                SuperStage {
+                    name: "parallel".to_string(),
+                    status: "launched".to_string(),
+                    artifact: Some(root.join("parallel").display().to_string()),
+                },
+            ],
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_super_manifest(&root).unwrap();
+
+        assert!(super_stage_terminal(&loaded, "gen"));
+        assert!(super_stage_terminal(&loaded, "parallel"));
+        assert_eq!(super_stage_artifact(&loaded, "gen"), Some(artifact));
+        assert_eq!(read_deterministic_gate(&root).unwrap(), gate);
     }
 
     fn valid_plan(verification: &str) -> String {
@@ -1127,6 +1327,7 @@ mod tests {
     Cross-surface tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
     Review/closeout: reviewer checks super and generation task contracts stay aligned.
     Completion artifacts: `src/super_command.rs`
+    Lane kind: code
     Dependencies: none
     Estimated scope: S
     Completion signal: tests pass.
