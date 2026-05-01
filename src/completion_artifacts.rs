@@ -3,7 +3,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use shlex::split as shell_split;
 
@@ -13,6 +15,9 @@ use crate::task_parser::{
 use crate::util::atomic_write;
 
 const REVIEW_HEADER: &str = "# REVIEW\n\nAwaiting auto review:\n";
+const RECEIPT_FOOTER_VERSION: &str = "Auto-Verification-Receipt-Version:";
+const RECEIPT_FOOTER_TASK: &str = "Auto-Verification-Receipt-Task:";
+const RECEIPT_FOOTER_JSON: &str = "Auto-Verification-Receipt-JSON:";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TaskCompletionEvidence {
@@ -445,6 +450,147 @@ fn verification_receipt_path(repo_root: &Path, task_id: &str) -> PathBuf {
     verification_receipt_root(repo_root).join(format!("{task_id}.json"))
 }
 
+pub(crate) fn verification_receipt_commit_footer(
+    repo_root: &Path,
+    task_id: &str,
+) -> Result<Option<String>> {
+    let path = verification_receipt_path(repo_root, task_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let receipt_text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let compact = compact_receipt_json_for_footer(&receipt_text)
+        .with_context(|| format!("failed to prepare receipt footer from {}", path.display()))?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compact.as_bytes());
+    Ok(Some(format!(
+        "{RECEIPT_FOOTER_VERSION} 1\n{RECEIPT_FOOTER_TASK} {task_id}\n{RECEIPT_FOOTER_JSON} {encoded}"
+    )))
+}
+
+pub(crate) fn latest_verification_receipt_footer(
+    repo_root: &Path,
+    task_id: &str,
+) -> Option<VerificationReceiptFooter> {
+    git_verification_receipt_footers(repo_root)
+        .into_iter()
+        .find(|footer| footer.task_id == task_id)
+}
+
+pub(crate) fn git_verification_receipt_footers(repo_root: &Path) -> Vec<VerificationReceiptFooter> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "log",
+            "--format=%H%x1f%B%x1e",
+            "--grep=Auto-Verification-Receipt-Task:",
+            "HEAD",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    rendered
+        .split('\x1e')
+        .filter_map(|record| {
+            let (commit, body) = record.split_once('\x1f')?;
+            parse_verification_receipt_footer(commit.trim(), body)
+        })
+        .collect()
+}
+
+pub(crate) fn shared_footer_receipt_freshness_problem(
+    repo_root: &Path,
+    footer: &VerificationReceiptFooter,
+    expected_commands: &[String],
+    declared_artifacts: &[String],
+) -> Result<Option<String>> {
+    let receipt =
+        serde_json::from_str::<VerificationReceipt>(&footer.receipt_text).with_context(|| {
+            format!(
+                "invalid verification receipt footer for `{}` in commit {}",
+                footer.task_id, footer.commit
+            )
+        })?;
+    Ok(verification_receipt_freshness_problem_for_source(
+        repo_root,
+        &PathBuf::from(format!(
+            "commit:{}:Auto-Verification-Receipt",
+            footer.commit
+        )),
+        &receipt,
+        expected_commands,
+        declared_artifacts,
+        VerificationReceiptSource::CommitFooter,
+    ))
+}
+
+fn parse_verification_receipt_footer(
+    commit: &str,
+    body: &str,
+) -> Option<VerificationReceiptFooter> {
+    let mut task_id = None::<String>;
+    let mut encoded = None::<String>;
+    let mut version_ok = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix(RECEIPT_FOOTER_VERSION) {
+            version_ok = value.trim() == "1";
+        } else if let Some(value) = trimmed.strip_prefix(RECEIPT_FOOTER_TASK) {
+            let value = value.trim();
+            if !value.is_empty() {
+                task_id = Some(value.to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix(RECEIPT_FOOTER_JSON) {
+            let value = value.trim();
+            if !value.is_empty() {
+                encoded = Some(value.to_string());
+            }
+        }
+    }
+    if !version_ok {
+        return None;
+    }
+    let task_id = task_id?;
+    let encoded = encoded?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    let receipt_text = String::from_utf8(decoded).ok()?;
+    Some(VerificationReceiptFooter {
+        task_id,
+        commit: commit.to_string(),
+        receipt_text,
+    })
+}
+
+fn compact_receipt_json_for_footer(receipt_text: &str) -> Result<String> {
+    let mut value = serde_json::from_str::<Value>(receipt_text)?;
+    prune_receipt_output_tails(&mut value);
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn prune_receipt_output_tails(value: &mut Value) {
+    let Some(commands) = value.get_mut("commands").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for command in commands {
+        let Some(output) = command
+            .get_mut("output_summary")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        output.remove("stdout_tail");
+        output.remove("stderr_tail");
+    }
+}
+
 fn verification_receipt_root(repo_root: &Path) -> PathBuf {
     if repo_root.file_name().and_then(|name| name.to_str()) == Some("repo") {
         let ancestors = repo_root.ancestors().collect::<Vec<_>>();
@@ -516,8 +662,10 @@ fn verification_step_looks_external(step: &str) -> bool {
     .any(|marker| step.contains(marker))
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationReceipt {
+    #[serde(default)]
+    task_id: Option<String>,
     #[serde(default)]
     commit: Option<String>,
     #[serde(default)]
@@ -530,20 +678,20 @@ struct VerificationReceipt {
     commands: Vec<VerificationReceiptCommand>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationDirtyState {
     #[serde(default)]
     fingerprint: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationReceiptArtifact {
     path: String,
     #[serde(default)]
     sha256: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationReceiptCommand {
     command: String,
     #[serde(default)]
@@ -560,10 +708,23 @@ struct VerificationReceiptCommand {
     runner_summary: Option<VerificationRunnerSummary>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationRunnerSummary {
     #[serde(default)]
     zero_test_detected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerificationReceiptSource {
+    JsonFile,
+    CommitFooter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerificationReceiptFooter {
+    pub(crate) task_id: String,
+    pub(crate) commit: String,
+    pub(crate) receipt_text: String,
 }
 
 fn inspect_verification_receipt(
@@ -575,6 +736,51 @@ fn inspect_verification_receipt(
     declared_artifacts: &[String],
 ) -> (bool, Option<String>) {
     if !verification_receipt_required {
+        return (true, None);
+    }
+    if let Some(footer) = latest_verification_receipt_footer(
+        repo_root,
+        task_id_from_receipt_path(verification_receipt_path)
+            .as_deref()
+            .unwrap_or_default(),
+    ) {
+        let footer_path = PathBuf::from(format!(
+            "commit:{}:Auto-Verification-Receipt",
+            footer.commit
+        ));
+        let receipt = match serde_json::from_str::<VerificationReceipt>(&footer.receipt_text) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                return (
+                    false,
+                    Some(format!(
+                        "invalid verification receipt footer for `{}` in commit {}: {err}",
+                        footer.task_id, footer.commit
+                    )),
+                );
+            }
+        };
+        if let Some(problem) = verification_receipt_freshness_problem_for_source(
+            repo_root,
+            &footer_path,
+            &receipt,
+            expected_commands,
+            declared_artifacts,
+            VerificationReceiptSource::CommitFooter,
+        ) {
+            return (
+                false,
+                Some(format!(
+                    "stale verification receipt footer for `{}` in commit {}: {problem}",
+                    footer.task_id, footer.commit
+                )),
+            );
+        }
+        if let Some(problem) =
+            verification_receipt_content_problem(&footer_path, &receipt, expected_commands)
+        {
+            return (false, Some(problem));
+        }
         return (true, None);
     }
     if !verification_wrapper_present {
@@ -752,6 +958,122 @@ fn inspect_verification_receipt(
     (true, None)
 }
 
+fn task_id_from_receipt_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+}
+
+fn verification_receipt_content_problem(
+    verification_receipt_path: &Path,
+    receipt: &VerificationReceipt,
+    expected_commands: &[String],
+) -> Option<String> {
+    let mut missing = expected_commands
+        .iter()
+        .filter(|command| {
+            !receipt
+                .commands
+                .iter()
+                .any(|entry| verification_receipt_command_matches(entry, command))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    if !missing.is_empty() {
+        return Some(format!(
+            "verification receipt `{}` is missing command(s): {}",
+            verification_receipt_path.display(),
+            missing
+                .iter()
+                .map(|command| format!("`{command}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut failed = expected_commands
+        .iter()
+        .filter(|command| {
+            let matching_entries = receipt
+                .commands
+                .iter()
+                .filter(|entry| verification_receipt_command_matches(entry, command))
+                .collect::<Vec<_>>();
+            !matching_entries.is_empty()
+                && matching_entries.iter().all(|entry| {
+                    entry.status.as_deref() != Some("passed") || entry.exit_code != Some(0)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    failed.sort();
+    if !failed.is_empty() {
+        return Some(format!(
+            "verification receipt `{}` has failed command(s): {}",
+            verification_receipt_path.display(),
+            failed
+                .iter()
+                .map(|command| format!("`{command}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut zero_test = expected_commands
+        .iter()
+        .filter(|command| {
+            receipt
+                .commands
+                .iter()
+                .filter(|entry| verification_receipt_command_matches(entry, command))
+                .any(verification_receipt_reports_zero_tests)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    zero_test.sort();
+    if !zero_test.is_empty() {
+        return Some(format!(
+            "verification receipt `{}` reported zero-test run(s): {}",
+            verification_receipt_path.display(),
+            zero_test
+                .iter()
+                .map(|command| format!("`{command}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut unsuperseded_failed = receipt
+        .commands
+        .iter()
+        .filter(|entry| !verification_receipt_command_passed(entry))
+        .filter(|entry| {
+            !verification_receipt_failed_entry_is_superseded(
+                entry,
+                &receipt.commands,
+                expected_commands,
+            )
+        })
+        .map(|entry| entry.command.clone())
+        .collect::<Vec<_>>();
+    unsuperseded_failed.sort();
+    unsuperseded_failed.dedup();
+    if !unsuperseded_failed.is_empty() {
+        return Some(format!(
+            "verification receipt `{}` has unsuperseded failed command(s): {}",
+            verification_receipt_path.display(),
+            unsuperseded_failed
+                .iter()
+                .map(|command| format!("`{command}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    None
+}
+
 pub(crate) fn shared_receipt_freshness_problem(
     repo_root: &Path,
     verification_receipt_path: &Path,
@@ -802,50 +1124,75 @@ fn verification_receipt_freshness_problem(
     expected_commands: &[String],
     declared_artifacts: &[String],
 ) -> Option<String> {
+    verification_receipt_freshness_problem_for_source(
+        repo_root,
+        verification_receipt_path,
+        receipt,
+        expected_commands,
+        declared_artifacts,
+        VerificationReceiptSource::JsonFile,
+    )
+}
+
+fn verification_receipt_freshness_problem_for_source(
+    repo_root: &Path,
+    verification_receipt_path: &Path,
+    receipt: &VerificationReceipt,
+    expected_commands: &[String],
+    declared_artifacts: &[String],
+    source: VerificationReceiptSource,
+) -> Option<String> {
     let current_commit = current_git_commit(repo_root);
     let current_dirty_fingerprint = current_dirty_state_fingerprint(repo_root);
     let current_plan_hash = current_plan_hash(repo_root);
-    let requires_current_metadata = current_commit.is_some()
-        || current_dirty_fingerprint.is_some()
-        || current_plan_hash.is_some();
+    let requires_current_metadata = source == VerificationReceiptSource::JsonFile
+        && (current_commit.is_some()
+            || current_dirty_fingerprint.is_some()
+            || current_plan_hash.is_some());
 
-    if let Some(current) = current_commit {
-        match receipt.commit.as_deref() {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "commit mismatch, recorded `{recorded}` but current HEAD is `{current}`"
-                ))
+    if source == VerificationReceiptSource::JsonFile {
+        if let Some(current) = current_commit {
+            match receipt.commit.as_deref() {
+                Some(recorded) if recorded == current => {}
+                Some(recorded) => {
+                    return Some(format!(
+                        "commit mismatch, recorded `{recorded}` but current HEAD is `{current}`"
+                    ))
+                }
+                None => return Some("missing current commit metadata".to_string()),
             }
-            None => return Some("missing current commit metadata".to_string()),
         }
     }
 
-    if let Some(current) = current_dirty_fingerprint {
-        match receipt
-            .dirty_state
-            .as_ref()
-            .and_then(|state| state.fingerprint.as_deref())
-        {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
-                ))
+    if source == VerificationReceiptSource::JsonFile {
+        if let Some(current) = current_dirty_fingerprint {
+            match receipt
+                .dirty_state
+                .as_ref()
+                .and_then(|state| state.fingerprint.as_deref())
+            {
+                Some(recorded) if recorded == current => {}
+                Some(recorded) => {
+                    return Some(format!(
+                        "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
+                    ))
+                }
+                None => return Some("missing dirty-state fingerprint".to_string()),
             }
-            None => return Some("missing dirty-state fingerprint".to_string()),
         }
     }
 
-    if let Some(current) = current_plan_hash {
-        match receipt.plan_hash.as_deref() {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "plan hash mismatch, recorded `{recorded}` but current IMPLEMENTATION_PLAN.md hash is `{current}`"
-                ))
+    if source == VerificationReceiptSource::JsonFile {
+        if let Some(current) = current_plan_hash {
+            match receipt.plan_hash.as_deref() {
+                Some(recorded) if recorded == current => {}
+                Some(recorded) => {
+                    return Some(format!(
+                        "plan hash mismatch, recorded `{recorded}` but current IMPLEMENTATION_PLAN.md hash is `{current}`"
+                    ))
+                }
+                None => return Some("missing plan hash".to_string()),
             }
-            None => return Some("missing plan hash".to_string()),
         }
     }
 
@@ -1176,7 +1523,8 @@ mod tests {
 
     use super::{
         assess_task_completion_gap, declared_completion_artifacts, ensure_host_review_handoff,
-        inspect_task_completion_evidence, review_contains_task, verification_plan,
+        inspect_task_completion_evidence, latest_verification_receipt_footer, review_contains_task,
+        verification_plan, verification_receipt_commit_footer,
         verification_receipt_freshness_problem, CompletionGapKind, TaskCompletionEvidence,
         VerificationDirtyState, VerificationReceipt, VerificationReceiptArtifact,
         VerificationReceiptCommand,
@@ -1240,6 +1588,20 @@ mod tests {
             .to_string()
     }
 
+    fn git_ok(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git command failed to launch");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn declared_completion_artifacts_extracts_repo_relative_paths() {
         let markdown = r#"- [ ] `TASK-1` Example
@@ -1300,6 +1662,57 @@ Dependencies: none
             "- [ ] `TASK-1` Example\nVerification:\n  - `cargo test -p demo receipt_example`\nCompletion artifacts:\n  - `docs/ops/proof.md`\nDependencies: none\n",
         );
         assert!(evidence.is_fully_evidenced());
+        assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_accepts_commit_footer_receipts() {
+        let root = temp_dir("footer-evidence");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-FOOTER`\n",
+        )
+        .expect("failed to write review");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-FOOTER.json"),
+            r#"{"task_id":"TASK-FOOTER","commands":[{"command":"cargo test footer_receipt","exit_code":0,"status":"passed","output_summary":{"stdout_tail":"large transient output","stderr_tail":"","stdout_bytes":22,"stderr_bytes":0}}]}"#,
+        )
+        .expect("failed to write receipt");
+        let footer = verification_receipt_commit_footer(&root, "TASK-FOOTER")
+            .expect("footer generation should succeed")
+            .expect("footer should be present");
+        assert!(footer.contains("Auto-Verification-Receipt-Task: TASK-FOOTER"));
+        assert!(!footer.contains("large transient output"));
+        git_ok(
+            &root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "footer evidence",
+                "-m",
+                &footer,
+            ],
+        );
+        fs::remove_file(root.join(".auto/symphony/verification-receipts/TASK-FOOTER.json"))
+            .expect("failed to remove json receipt");
+
+        let footer = latest_verification_receipt_footer(&root, "TASK-FOOTER")
+            .expect("footer receipt should be discoverable");
+        assert_eq!(footer.task_id, "TASK-FOOTER");
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-FOOTER",
+            "- [ ] `TASK-FOOTER` Example\nVerification:\n  - `cargo test footer_receipt`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
         assert!(evidence.missing_reasons().is_empty());
     }
 
@@ -1702,6 +2115,7 @@ Dependencies: none
             "completion_artifacts::tests::metadata_receipt".to_string(),
         ];
         let base_receipt = VerificationReceipt {
+            task_id: Some("TASK-METADATA".to_string()),
             commit: Some(commit.clone()),
             dirty_state: Some(VerificationDirtyState {
                 fingerprint: Some(dirty_fingerprint.clone()),

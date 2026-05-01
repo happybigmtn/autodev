@@ -23,6 +23,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Dated specs: `specs/`
 - Generated/runtime state: `.auto/`, `bug/`, `nemesis/`
 - Checkpoint exclusions are `.auto/`, `bug/`, `nemesis/`, and `gen-*` via `CHECKPOINT_EXCLUDE_RULES` in `src/util.rs`
+- `auto parallel` host-owned queue state includes `IMPLEMENTATION_PLAN.md`,
+  `REVIEW.md`, legacy queue files, and `RECEIPTS-DRIFT.md`; lane workers should
+  preserve evidence in commits/logs instead of editing those shared files
+  directly.
+- Verification receipt JSON under `.auto/symphony/verification-receipts/` is
+  staging/compatibility data. Durable task proof should travel in
+  `Auto-Verification-Receipt-*` commit-message footers produced by the host.
 
 ## Loom Access
 

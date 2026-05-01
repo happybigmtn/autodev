@@ -9,14 +9,19 @@ Task: `TASK-012`
 - The execution-pipeline spec says both runners should require receipt-backed proof for executable `Verification:` steps, and it explicitly claims `auto loop` never leaves a task at `- [x]` unless the task's completion evidence is present (`specs/220426-execution-loop-and-parallel.md:5`, `specs/220426-execution-loop-and-parallel.md:46`, `specs/220426-execution-loop-and-parallel.md:64`).
 - The built-in `auto loop` worker prompt already tells the worker to preserve the task row, mark `- [x]` only when review handoff, verification evidence, and completion artifacts are present, and use `- [~]` when code landed but evidence is incomplete (`src/loop_command.rs:51-58`).
 - The `auto loop` runtime does not verify any of that itself. After a successful worker exit it only checks whether commits or dirty tracked changes exist, then pushes and optionally checkpoints trailing changes (`src/loop_command.rs:286-323`).
-- `inspect_task_completion_evidence` is the existing repo-side gate for review handoff, receipt presence, and declared completion artifacts (`src/completion_artifacts.rs:115-149`). For executable `Verification:` commands it requires `scripts/run-task-verification.sh`, which now records JSON receipts via `scripts/verification_receipt.py`; without that wrapper it reports the evidence as missing (`src/completion_artifacts.rs:125-133`, `src/completion_artifacts.rs:347-365`).
+- `inspect_task_completion_evidence` is the existing repo-side gate for review handoff, receipt presence, and declared completion artifacts. For executable `Verification:` commands it requires `scripts/run-task-verification.sh`, which now records JSON receipts via `scripts/verification_receipt.py`; without that wrapper it reports the evidence as missing.
 - The real existing call sites are in `parallel_command.rs`, not `review_command.rs`:
-  - host drift audit demotes completed tasks back to `- [~]` when evidence is missing (`src/parallel_command.rs:3461-3485`)
-  - landed-task reconciliation decides `Done` vs `Partial` after the host re-checks evidence and synthesizes a review handoff (`src/parallel_command.rs:5511-5532`)
-  - partial follow-up notes also inspect the same evidence to guide repair passes (`src/parallel_command.rs:4189-4228`)
+  - host drift audit now warns and writes `RECEIPTS-DRIFT.md` when completed rows have stale or
+    missing repo-local evidence; it does not demote `- [x]` rows during sync
+  - landed-task reconciliation decides `Done` vs `Partial` after the host re-checks evidence and
+    synthesizes a review handoff
+  - partial follow-up notes also inspect the same evidence to guide repair passes
 - The task row's claim that `review_command.rs` also calls `inspect_task_completion_evidence` is stale. The live code imports only `review_contains_task` there (`src/review_command.rs:11`).
 - The task row's optional follow-up test command is also still hypothetical. `src/loop_command.rs` has branch-selection, reference-repo, and queue-parsing tests, but no `downgrades_marker_when_receipt_missing` case yet, so `cargo test loop_command::tests::downgrades_marker_when_receipt_missing` currently filters to zero tests rather than validating shipped behavior.
-- The current README scopes hard receipt-backed proof to `auto parallel` host reconciliation, not to `auto loop` (`README.md:596-598`). The same loop section still describes prompt-driven worker behavior and says finished tasks are removed from the plan, which is already a different model from the built-in prompt's preserve-row-and-mark-`[x]` flow (`README.md:534-535`).
+- The current README scopes hard receipt-backed proof to `auto parallel` host reconciliation, not
+  to `auto loop`. The same loop section still describes prompt-driven worker behavior and says
+  finished tasks are removed from the plan, which is already a different model from the built-in
+  prompt's preserve-row-and-mark-`[x]` flow.
 
 ## Decision
 

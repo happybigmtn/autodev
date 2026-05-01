@@ -56,6 +56,9 @@ need to pass directories in the normal case.
   launches `auto parallel` with `gpt-5.5` `high` workers unless `--no-execute` is supplied
 - `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
   state, worker PIDs, and latest lane log lines
+- `auto parallel` treats root queue files, receipt-drift triage, and operator-action files as
+  host-owned state. Lane workers preserve evidence in commits and logs, while the host reconciles
+  shared queue truth.
 - `auto qa` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and the
   `standard` tier
 - `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and
@@ -1073,7 +1076,8 @@ Purpose:
 What it actually does:
 
 - Defaults to five workers with `gpt-5.5` and `high`
-- Requires a clean repo before launch
+- Auto-checkpoints stageable canonical repo changes with an `auto parallel checkpoint` commit
+  before dispatch, then refuses to launch only if checkpointing cannot clear dirty dispatch paths
 - When run outside tmux, starts a detached `<repo>-parallel` tmux session running the same command
   and prints the `tmux attach` command
 - Inside tmux, creates `parallel-lane-1` through `parallel-lane-N` windows that tail each lane's
@@ -1087,9 +1091,22 @@ What it actually does:
   proof. Use `--cargo-target shared` only when shared build-cache speed is worth the risk.
 - Lane prompts reject `0 tests` as passing evidence and reject direct target-dir test binaries as
   final proof unless the lane just built that exact artifact from its current sources.
-- Host reconciliation requires receipt-backed proof for executable `Verification:` commands. If a
-  repo has executable verification but no `scripts/run-task-verification.sh`, the host leaves the
-  task `[~]` instead of marking it complete from a prose handoff alone.
+- Plan rows may declare `Lane kind: code`, `Lane kind: evidence`, or `Lane kind: operator`.
+  Code lanes are dispatched to workers. Evidence lanes stay visible as proof/closeout work.
+  Operator lanes are not sent to code workers; the host writes the full task contract to
+  `.auto/parallel/operator-actions.md` for live SSH, credential, quorum, funding, or other
+  human/operator-controlled actions.
+- Host reconciliation requires receipt-backed proof for executable `Verification:` commands. The
+  verification wrapper writes JSON as a transient staging artifact; the host embeds compact
+  `Auto-Verification-Receipt-*` footers in task closeout commits so proof travels with landed
+  work. If a repo has executable verification but no `scripts/run-task-verification.sh` and no
+  reachable footer receipt, the host leaves the task `[~]` instead of marking it complete from a
+  prose handoff alone.
+- Receipt drift is warning-only during sync. If a completed row's repo-local receipt, review
+  handoff, or declared artifact evidence no longer matches, the host writes `RECEIPTS-DRIFT.md`
+  with exact task IDs and reasons, but it does not demote `[x]` rows back to `[~]`. If a partial
+  row appears fully evidenced, the same file lists it as a manual closeout candidate rather than
+  silently promoting it.
 - Host live logs use typed result labels such as `landed-clean`, `landed-partial`,
   `landed-after-nonzero`, `landed-with-host-repair-after-nonzero`,
   `landed-partial-after-nonzero`, and `retry-needed` instead of collapsing all recovery paths into
@@ -1102,6 +1119,8 @@ What it actually does:
 - Lanes can mark external infrastructure failures with `AUTO_ENV_BLOCKER: <reason>`; the host logs
   those separately from code failures and retries with explicit recovery context while retries
   remain.
+- See `docs/decisions/parallel-host-reconciliation-policy.md` for the durable queue-truth and
+  receipt-drift policy.
 
 Useful flags:
 

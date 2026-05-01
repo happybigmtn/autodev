@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -7,7 +8,10 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::codex_exec::run_codex_exec;
-use crate::completion_artifacts::shared_receipt_freshness_problem;
+use crate::completion_artifacts::{
+    git_verification_receipt_footers, shared_footer_receipt_freshness_problem,
+    shared_receipt_freshness_problem,
+};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
@@ -214,45 +218,72 @@ fn receipt_passed(receipt: &VerificationReceiptCommand) -> bool {
 
 fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptCommand> {
     let receipt_root = repo_root.join(".auto/symphony/verification-receipts");
+    let mut receipts = Vec::new();
+    let mut footer_task_ids = BTreeSet::new();
+    for footer in git_verification_receipt_footers(repo_root) {
+        footer_task_ids.insert(footer.task_id.clone());
+        let Some(receipt) = serde_json::from_str::<VerificationReceipt>(&footer.receipt_text).ok()
+        else {
+            continue;
+        };
+        let expected_commands = receipt
+            .commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let freshness_problem =
+            shared_footer_receipt_freshness_problem(repo_root, &footer, &expected_commands, &[])
+                .ok()
+                .flatten();
+        receipts.extend(receipt.commands.into_iter().map(|mut command| {
+            command.freshness_problem = freshness_problem.clone();
+            command
+        }));
+    }
+
     let Ok(entries) = fs::read_dir(receipt_root) else {
-        return Vec::new();
+        return receipts;
     };
 
-    entries
-        .filter_map(|entry| entry.ok())
-        .flat_map(|entry| {
-            let path = entry.path();
-            let Some(receipt_text) = fs::read_to_string(&path).ok() else {
-                return Vec::new();
-            };
-            let Some(receipt) = serde_json::from_str::<VerificationReceipt>(&receipt_text).ok()
-            else {
-                return Vec::new();
-            };
-            let expected_commands = receipt
-                .commands
-                .iter()
-                .map(|command| command.command.clone())
-                .collect::<Vec<_>>();
-            let freshness_problem = shared_receipt_freshness_problem(
-                repo_root,
-                &path,
-                &receipt_text,
-                &expected_commands,
-                &[],
-            )
-            .ok()
-            .flatten();
-            receipt
-                .commands
-                .into_iter()
-                .map(|mut command| {
-                    command.freshness_problem = freshness_problem.clone();
-                    command
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    receipts.extend(entries.filter_map(|entry| entry.ok()).flat_map(|entry| {
+        let path = entry.path();
+        if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|task_id| footer_task_ids.contains(task_id))
+        {
+            return Vec::new();
+        }
+        let Some(receipt_text) = fs::read_to_string(&path).ok() else {
+            return Vec::new();
+        };
+        let Some(receipt) = serde_json::from_str::<VerificationReceipt>(&receipt_text).ok() else {
+            return Vec::new();
+        };
+        let expected_commands = receipt
+            .commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let freshness_problem = shared_receipt_freshness_problem(
+            repo_root,
+            &path,
+            &receipt_text,
+            &expected_commands,
+            &[],
+        )
+        .ok()
+        .flatten();
+        receipt
+            .commands
+            .into_iter()
+            .map(|mut command| {
+                command.freshness_problem = freshness_problem.clone();
+                command
+            })
+            .collect::<Vec<_>>()
+    }));
+    receipts
 }
 
 fn normalized_command(command: &str) -> String {
