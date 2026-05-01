@@ -10,8 +10,8 @@ use crate::codex_exec::run_codex_exec_max_context;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
 use crate::state::{load_state, save_state, AutoState};
 use crate::task_parser::{
-    parse_task_header as parse_shared_task_header, TaskStatus, PLAN_TASK_PROCESS_FIELDS,
-    PLAN_TASK_REQUIRED_FIELDS,
+    parse_task_header as parse_shared_task_header, validate_execution_rows, TaskStatus,
+    PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS,
 };
 use crate::util::{
     atomic_write, binary_provenance_line, copy_tree, ensure_repo_layout, git_repo_root,
@@ -24,6 +24,34 @@ use crate::{CorpusArgs, GenerationArgs};
 enum GenerationMode {
     Gen,
     Reverse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanningRootSource {
+    Cli,
+    SavedState,
+    DefaultGenesis,
+}
+
+impl PlanningRootSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::SavedState => "saved state",
+            Self::DefaultGenesis => "default genesis",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ResolvedPlanningRoot {
+    path: PathBuf,
+    source: PlanningRootSource,
+}
+
+struct CorpusPreparation {
+    authoring_root: PathBuf,
+    previous_snapshot: Option<PathBuf>,
 }
 
 impl GenerationMode {
@@ -214,7 +242,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     }
     if args.verify_only {
         ensure_planning_root_exists(&planning_root)?;
-        let summary = sanitize_verify_and_save_corpus_outputs(
+        let summary = verify_corpus_outputs_read_only(
             &repo_root,
             &planning_root,
             args.focus.is_some(),
@@ -242,21 +270,22 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     }
 
     print_stage("prepare planning root", run_started_at);
-    let previous_snapshot = prepare_planning_root_for_corpus(&repo_root, &planning_root)?;
+    let preparation = prepare_planning_root_for_corpus(&repo_root, &planning_root)?;
+    let authoring_root = preparation.authoring_root;
 
     print_stage("create corpus skeleton", run_started_at);
-    fs::create_dir_all(planning_root.join("plans")).with_context(|| {
+    fs::create_dir_all(authoring_root.join("plans")).with_context(|| {
         format!(
             "failed to create corpus plan directory {}",
-            planning_root.join("plans").display()
+            authoring_root.join("plans").display()
         )
     })?;
 
     let prompt = build_corpus_prompt(
         &repo_root,
-        &planning_root,
+        &authoring_root,
         CorpusPromptInputs {
-            previous_planning_snapshot: previous_snapshot.as_deref(),
+            previous_planning_snapshot: preparation.previous_snapshot.as_deref(),
             parallelism: args.parallelism.clamp(1, 10),
             idea: args.idea.as_deref(),
             focus: args.focus.as_deref(),
@@ -284,7 +313,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         let report_path = codex_review_report_path(&repo_root, "corpus-codex-review");
         let review_prompt = build_corpus_codex_review_prompt(
             &repo_root,
-            &planning_root,
+            &authoring_root,
             &report_path,
             &reference_repos,
             &active_plan_surface,
@@ -303,7 +332,16 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         )
     };
 
-    let summary = sanitize_verify_and_save_corpus_outputs(
+    let _staged_summary = sanitize_and_verify_corpus_outputs(
+        &repo_root,
+        &authoring_root,
+        args.focus.is_some(),
+        &active_plan_surface,
+        run_started_at,
+    )?;
+    print_stage("promote staged corpus", run_started_at);
+    promote_staged_planning_root(&authoring_root, &planning_root)?;
+    let summary = save_verified_corpus_state(
         &repo_root,
         &planning_root,
         args.focus.is_some(),
@@ -326,7 +364,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     if let Some(idea) = summary.idea_path {
         println!("idea brief:  {}", idea.display());
     }
-    if let Some(previous) = previous_snapshot {
+    if let Some(previous) = preparation.previous_snapshot {
         println!("prior input: {}", previous.display());
     }
     println!("plan files:  {}", summary.plan_count);
@@ -345,7 +383,23 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     Ok(())
 }
 
-fn sanitize_verify_and_save_corpus_outputs(
+fn verify_corpus_outputs_read_only(
+    repo_root: &Path,
+    planning_root: &Path,
+    focus_requested: bool,
+    active_plan_surface: &ActivePlanSurface,
+    run_started_at: Instant,
+) -> Result<CorpusOutputSummary> {
+    print_stage("verify corpus outputs", run_started_at);
+    verify_corpus_outputs(
+        repo_root,
+        planning_root,
+        focus_requested,
+        active_plan_surface,
+    )
+}
+
+fn sanitize_and_verify_corpus_outputs(
     repo_root: &Path,
     planning_root: &Path,
     focus_requested: bool,
@@ -356,6 +410,23 @@ fn sanitize_verify_and_save_corpus_outputs(
     sanitize_corpus_outputs(repo_root, planning_root)?;
 
     print_stage("verify corpus outputs", run_started_at);
+    let summary = verify_corpus_outputs(
+        repo_root,
+        planning_root,
+        focus_requested,
+        active_plan_surface,
+    )?;
+    Ok(summary)
+}
+
+fn save_verified_corpus_state(
+    repo_root: &Path,
+    planning_root: &Path,
+    focus_requested: bool,
+    active_plan_surface: &ActivePlanSurface,
+    run_started_at: Instant,
+) -> Result<CorpusOutputSummary> {
+    print_stage("verify promoted corpus outputs", run_started_at);
     let summary = verify_corpus_outputs(
         repo_root,
         planning_root,
@@ -388,11 +459,9 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
         );
     }
     let mut state = load_state(&repo_root)?;
-    let planning_root = args
-        .planning_root
-        .clone()
-        .or_else(|| state.planning_root.clone())
-        .unwrap_or_else(|| repo_root.join("genesis"));
+    let resolved_planning_root =
+        resolve_generation_planning_root(&repo_root, args.planning_root.as_deref(), &state)?;
+    let planning_root = resolved_planning_root.path;
     ensure_planning_root_exists(&planning_root)?;
 
     let output_dir = if args.plan_only || args.sync_only {
@@ -428,6 +497,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
+    println!("planning source: {}", resolved_planning_root.source.label());
     println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
     println!(
         "snapshot:    {}",
@@ -815,41 +885,123 @@ fn ensure_planning_root_ready_for_corpus(planning_root: &Path) -> Result<()> {
     );
 }
 
+fn resolve_generation_planning_root(
+    repo_root: &Path,
+    cli_planning_root: Option<&Path>,
+    state: &AutoState,
+) -> Result<ResolvedPlanningRoot> {
+    if let Some(path) = cli_planning_root {
+        return Ok(ResolvedPlanningRoot {
+            path: normalize_repo_relative_path(repo_root, path),
+            source: PlanningRootSource::Cli,
+        });
+    }
+
+    if let Some(path) = state.planning_root.as_deref() {
+        let normalized = normalize_repo_relative_path(repo_root, path);
+        if !normalized.starts_with(repo_root) {
+            bail!(
+                "saved planning root {} is outside repo root {}; pass --planning-root explicitly to use an external corpus",
+                normalized.display(),
+                repo_root.display()
+            );
+        }
+        return Ok(ResolvedPlanningRoot {
+            path: normalized,
+            source: PlanningRootSource::SavedState,
+        });
+    }
+
+    Ok(ResolvedPlanningRoot {
+        path: repo_root.join("genesis"),
+        source: PlanningRootSource::DefaultGenesis,
+    })
+}
+
+fn normalize_repo_relative_path(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
 fn prepare_planning_root_for_corpus(
     repo_root: &Path,
     planning_root: &Path,
-) -> Result<Option<PathBuf>> {
-    if !planning_root.exists() {
-        return Ok(None);
-    }
-    let has_contents = fs::read_dir(planning_root)
-        .with_context(|| format!("failed to read {}", planning_root.display()))?
-        .next()
-        .transpose()?
-        .is_some();
-    let archived = if has_contents {
-        let snapshot_root = repo_root.join(".auto").join("fresh-input").join(format!(
-            "{}-previous-{}",
-            planning_root
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("planning-root"),
-            timestamp_slug()
-        ));
-        copy_tree(planning_root, &snapshot_root).with_context(|| {
-            format!(
-                "failed to archive existing planning corpus from {} into {}",
-                planning_root.display(),
-                snapshot_root.display()
-            )
-        })?;
-        Some(snapshot_root)
+) -> Result<CorpusPreparation> {
+    let previous_snapshot = if planning_root.exists() {
+        let has_contents = fs::read_dir(planning_root)
+            .with_context(|| format!("failed to read {}", planning_root.display()))?
+            .next()
+            .transpose()?
+            .is_some();
+        if has_contents {
+            let snapshot_root = repo_root.join(".auto").join("fresh-input").join(format!(
+                "{}-previous-{}",
+                planning_root
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("planning-root"),
+                timestamp_slug()
+            ));
+            copy_tree(planning_root, &snapshot_root).with_context(|| {
+                format!(
+                    "failed to archive existing planning corpus from {} into {}",
+                    planning_root.display(),
+                    snapshot_root.display()
+                )
+            })?;
+            Some(snapshot_root)
+        } else {
+            None
+        }
     } else {
         None
     };
-    fs::remove_dir_all(planning_root)
-        .with_context(|| format!("failed to clear {}", planning_root.display()))?;
-    Ok(archived)
+    let staging_root = repo_root.join(".auto").join("corpus-staging").join(format!(
+        "{}-{}",
+        planning_root
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("planning-root"),
+        timestamp_slug()
+    ));
+    if staging_root.exists() {
+        fs::remove_dir_all(&staging_root)
+            .with_context(|| format!("failed to clear {}", staging_root.display()))?;
+    }
+    fs::create_dir_all(&staging_root)
+        .with_context(|| format!("failed to create {}", staging_root.display()))?;
+    Ok(CorpusPreparation {
+        authoring_root: staging_root,
+        previous_snapshot,
+    })
+}
+
+fn promote_staged_planning_root(staging_root: &Path, planning_root: &Path) -> Result<()> {
+    if !staging_root.exists() {
+        bail!(
+            "staged planning root {} does not exist",
+            staging_root.display()
+        );
+    }
+    if let Some(parent) = planning_root.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if planning_root.exists() {
+        fs::remove_dir_all(planning_root)
+            .with_context(|| format!("failed to clear {}", planning_root.display()))?;
+    }
+    fs::rename(staging_root, planning_root).with_context(|| {
+        format!(
+            "failed to promote staged corpus {} -> {}",
+            staging_root.display(),
+            planning_root.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn prepare_generation_output_dir(output_dir: &Path) -> Result<()> {
@@ -2630,6 +2782,8 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         }
     }
     let blocks = extract_plan_task_blocks(&normalized)?;
+    validate_execution_rows(&normalized)
+        .context("generated implementation plan failed shared execution-row validation")?;
     for block in &blocks {
         if block.checked {
             continue;
@@ -3658,12 +3812,15 @@ mod tests {
         finalize_verified_generation_outputs, generated_spec_has_acceptance_criteria,
         lint_session_resume_wire_contract, lint_signature_policy_consistency,
         merge_generated_plan_with_existing_open_tasks, normalize_generated_implementation_plan,
-        normalize_generated_spec_markdown, rewrite_plan_spec_refs_to_root,
-        sanitize_corpus_numbered_plan_shapes, sanitize_corpus_repo_root_paths,
-        scrub_root_generated_outputs, sync_generated_specs_to_root_for_date,
-        verify_corpus_execplan, verify_corpus_outputs, verify_generated_implementation_plan,
+        normalize_generated_spec_markdown, prepare_planning_root_for_corpus,
+        promote_staged_planning_root, resolve_generation_planning_root,
+        rewrite_plan_spec_refs_to_root, sanitize_corpus_numbered_plan_shapes,
+        sanitize_corpus_repo_root_paths, scrub_root_generated_outputs,
+        sync_generated_specs_to_root_for_date, verify_corpus_execplan, verify_corpus_outputs,
+        verify_corpus_outputs_read_only, verify_generated_implementation_plan,
         verify_generated_specs, ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument,
-        GenerationMode, SpecSyncSummary, SyncVerifiedGenerationOutputs, IMPLEMENTATION_PLAN_HEADER,
+        GenerationMode, PlanningRootSource, SpecSyncSummary, SyncVerifiedGenerationOutputs,
+        IMPLEMENTATION_PLAN_HEADER,
     };
     use crate::state::{load_state, AutoState};
     use chrono::NaiveDate;
@@ -3698,6 +3855,74 @@ mod tests {
         .unwrap();
     }
 
+    fn write_valid_corpus(root: &Path) {
+        fs::create_dir_all(root.join("plans")).unwrap();
+        for (relative, body) in [
+            ("ASSESSMENT.md", "# Assessment\n\nReady.\n"),
+            ("SPEC.md", "# Spec\n\nRuntime contract.\n"),
+            ("PLANS.md", "# Plans\n\n- plans/001-build.md\n"),
+            ("GENESIS-REPORT.md", "# Report\n\nCorpus report.\n"),
+        ] {
+            fs::write(root.join(relative), body).unwrap();
+        }
+        fs::write(root.join("plans/001-build.md"), valid_corpus_execplan()).unwrap();
+    }
+
+    fn valid_corpus_execplan() -> String {
+        [
+            "# Build",
+            "",
+            "## Purpose / Big Picture",
+            "Build the thing.",
+            "",
+            "## Requirements Trace",
+            "Trace to SPEC.md.",
+            "",
+            "## Scope Boundaries",
+            "Stay narrow.",
+            "",
+            "## Progress",
+            "- [ ] Implement.",
+            "",
+            "## Surprises & Discoveries",
+            "None yet.",
+            "",
+            "## Decision Log",
+            "None yet.",
+            "",
+            "## Outcomes & Retrospective",
+            "Pending.",
+            "",
+            "## Context and Orientation",
+            "Context.",
+            "",
+            "## Plan of Work",
+            "Work plan.",
+            "",
+            "## Implementation Units",
+            "- Goal: implement docs.",
+            "- Files: README.md.",
+            "- Test: cargo test exact_filter.",
+            "",
+            "## Concrete Steps",
+            "Do it.",
+            "",
+            "## Validation and Acceptance",
+            "Validate it.",
+            "",
+            "## Idempotence and Recovery",
+            "Safe to rerun.",
+            "",
+            "## Artifacts and Notes",
+            "Notes.",
+            "",
+            "## Interfaces and Dependencies",
+            "None.",
+            "",
+        ]
+        .join("\n")
+    }
+
     fn valid_generated_plan_task() -> String {
         [
             "Spec: `specs/050426-real.md`",
@@ -3718,7 +3943,7 @@ mod tests {
             "    cargo test -p docs exact_docs_test",
             "    ```",
             "Required tests:",
-            "    - `exact_docs_test`",
+            "    - `cargo test -p docs exact_docs_test`",
             "Contract generation: none -- no generated contract",
             "Cross-surface tests: none -- no UI/runtime boundary",
             "Review/closeout: `grep -n docs docs/README.md` plus exact_docs_test catches drift",
@@ -5053,6 +5278,114 @@ No external dependencies.
     }
 
     #[test]
+    fn saved_outside_repo_planning_root_is_rejected_before_generation() {
+        let repo_root = temp_dir("saved-outside-repo");
+        let outside = temp_dir("external-corpus");
+        let state = AutoState {
+            planning_root: Some(outside.clone()),
+            latest_output_dir: None,
+        };
+
+        let error = resolve_generation_planning_root(&repo_root, None, &state)
+            .expect_err("saved outside planning root should fail");
+
+        assert!(error.to_string().contains("outside repo root"));
+    }
+
+    #[test]
+    fn planning_root_resolution_reports_cli_saved_or_default_source() {
+        let repo_root = temp_dir("planning-root-source");
+        let mut state = AutoState::default();
+
+        let defaulted = resolve_generation_planning_root(&repo_root, None, &state).unwrap();
+        assert_eq!(defaulted.source, PlanningRootSource::DefaultGenesis);
+        assert_eq!(defaulted.path, repo_root.join("genesis"));
+
+        state.planning_root = Some(PathBuf::from("genesis"));
+        let saved = resolve_generation_planning_root(&repo_root, None, &state).unwrap();
+        assert_eq!(saved.source, PlanningRootSource::SavedState);
+        assert_eq!(saved.path, repo_root.join("genesis"));
+
+        let cli = resolve_generation_planning_root(
+            &repo_root,
+            Some(Path::new("../operator-corpus")),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(cli.source, PlanningRootSource::Cli);
+        assert_eq!(cli.path, repo_root.join("../operator-corpus"));
+    }
+
+    #[test]
+    fn corpus_verify_only_does_not_rewrite_corpus_files() {
+        let repo_root = temp_dir("corpus-verify-read-only");
+        let planning_root = repo_root.join("genesis");
+        write_valid_corpus(&planning_root);
+        let state_path = repo_root.join(".auto/state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, "{\"planning_root\":\"old\"}\n").unwrap();
+        let plan_path = planning_root.join("plans/001-build.md");
+        let before_plan = fs::read_to_string(&plan_path).unwrap();
+        let before_state = fs::read_to_string(&state_path).unwrap();
+
+        verify_corpus_outputs_read_only(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface {
+                root_plan_standard_path: None,
+                active_plan_paths: Vec::new(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&plan_path).unwrap(), before_plan);
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), before_state);
+    }
+
+    #[test]
+    fn corpus_refresh_failure_preserves_previous_planning_root() {
+        let repo_root = temp_dir("corpus-refresh-preserves");
+        let planning_root = repo_root.join("genesis");
+        write_valid_corpus(&planning_root);
+        let original_plan = fs::read_to_string(planning_root.join("plans/001-build.md")).unwrap();
+
+        let prep = prepare_planning_root_for_corpus(&repo_root, &planning_root).unwrap();
+        fs::write(prep.authoring_root.join("BROKEN.md"), "# Broken\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(planning_root.join("plans/001-build.md")).unwrap(),
+            original_plan
+        );
+        assert!(prep
+            .previous_snapshot
+            .as_ref()
+            .is_some_and(|path| path.join("plans/001-build.md").exists()));
+    }
+
+    #[test]
+    fn corpus_refresh_promotes_staged_root_after_validation() {
+        let repo_root = temp_dir("corpus-refresh-promotes");
+        let planning_root = repo_root.join("genesis");
+        write_valid_corpus(&planning_root);
+        let prep = prepare_planning_root_for_corpus(&repo_root, &planning_root).unwrap();
+        write_valid_corpus(&prep.authoring_root);
+        fs::write(
+            prep.authoring_root.join("plans/001-build.md"),
+            valid_corpus_execplan().replace("# Build", "# New Build"),
+        )
+        .unwrap();
+
+        promote_staged_planning_root(&prep.authoring_root, &planning_root).unwrap();
+
+        assert!(fs::read_to_string(planning_root.join("plans/001-build.md"))
+            .unwrap()
+            .contains("# New Build"));
+        assert!(!prep.authoring_root.exists());
+    }
+
+    #[test]
     fn generated_plan_rejects_large_active_scope() {
         let root = temp_dir("large-scope");
         write_real_spec(&root);
@@ -5086,7 +5419,7 @@ No external dependencies.
         let root = temp_dir("required-tests-see-spec");
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
-            "Required tests:\n    - `exact_docs_test`",
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
             "Required tests: See spec",
         );
         write_generated_plan(&root, &task);
@@ -5102,8 +5435,8 @@ No external dependencies.
         let root = temp_dir("inline-required-tests");
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
-            "Required tests:\n    - `exact_docs_test`",
-            "Required tests: `codex_exec::` (existing progress tests must still pass)",
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
+            "Required tests: `cargo test codex_exec::tests::progress` (existing progress tests must still pass)",
         );
         write_generated_plan(&root, &task);
 
@@ -5151,7 +5484,7 @@ No external dependencies.
         let root = temp_dir("too-many-required-tests");
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
-            "Required tests:\n    - `exact_docs_test`",
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
             "Required tests:\n    - `t1`\n    - `t2`\n    - `t3`\n    - `t4`\n    - `t5`\n    - `t6`",
         );
         write_generated_plan(&root, &task);
@@ -5167,7 +5500,7 @@ No external dependencies.
         let root = temp_dir("too-many-inline-required-tests");
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
-            "Required tests:\n    - `exact_docs_test`",
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
             "Required tests: `t1`, `t2`, `t3`, `t4`, `t5`, `t6`",
         );
         write_generated_plan(&root, &task);

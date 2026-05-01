@@ -26,6 +26,10 @@ pub(crate) async fn score_accounts(
         );
     }
 
+    if std::env::var_os("AUTO_QUOTA_SKIP_USAGE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return Ok(candidates.into_iter().map(|entry| (entry, None)).collect());
+    }
+
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
         Vec::with_capacity(candidates.len());
     for entry in candidates {

@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use crate::claude_exec::{describe_claude_harness, run_claude_exec, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec;
 use crate::completion_artifacts::inspect_task_completion_evidence;
-use crate::task_parser::{parse_task_header, parse_tasks, PlanTask, TaskStatus};
+use crate::task_parser::{
+    parse_task_header, parse_tasks, validate_execution_rows, PlanTask, TaskStatus,
+};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
@@ -376,6 +378,8 @@ fn inspect_loop_queue(repo_root: &Path) -> Result<LoopQueueSnapshot> {
     }
     let plan = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    validate_execution_rows(&plan)
+        .with_context(|| format!("{} contains an invalid execution row", plan_path.display()))?;
     Ok(parse_loop_queue(&plan))
 }
 
@@ -960,6 +964,39 @@ mod tests {
                 blocked_ids: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn loop_rejects_invalid_execution_row() {
+        let root = unique_temp_dir("loop-invalid-row");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            r#"- [ ] `TASK-1` Invalid task
+  Spec: `specs/task.md`
+  Dependencies: after something happens
+"#,
+        )
+        .expect("failed to write plan");
+
+        let err = super::inspect_loop_queue(&root).expect_err("invalid row rejected");
+        assert!(format!("{err:#}").contains("invalid execution row"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn loop_and_parallel_ready_sets_match_for_schema_fixture() {
+        let queue = parse_loop_queue(
+            r#"
+- [ ] `TASK-1` Ready
+  Dependencies: none
+- [ ] `TASK-2` Blocked
+  Dependencies: `TASK-1`
+- [!] `TASK-3` Explicitly blocked
+  Dependencies: none
+"#,
+        );
+        assert_eq!(queue.pending_ids, vec!["TASK-1", "TASK-2"]);
+        assert_eq!(queue.blocked_ids, vec!["TASK-3"]);
     }
 
     #[test]

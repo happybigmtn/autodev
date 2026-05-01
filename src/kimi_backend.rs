@@ -115,6 +115,11 @@ pub(crate) fn kimi_exec_args(model: &str, thinking: &str, prompt: &str) -> Vec<S
     args
 }
 
+#[cfg(test)]
+pub(crate) fn kimi_prompt_transport_label() -> &'static str {
+    "argv -p"
+}
+
 /// Extract the final assistant TextPart from a single `kimi-cli --output-format
 /// stream-json` line. Returns None for `think` / tool-call frames so callers
 /// can concatenate text across frames.
@@ -262,6 +267,15 @@ mod tests {
             "short id `k2.6` must be resolved to the provider-qualified default model"
         );
         assert!(args.last().map(String::as_str) == Some("audit this"));
+    }
+
+    #[test]
+    fn exec_args_use_decided_prompt_transport() {
+        let args = kimi_exec_args("k2.6", "high", "audit this");
+        assert_eq!(kimi_prompt_transport_label(), "argv -p");
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-p" && w[1] == "audit this"));
     }
 
     #[test]

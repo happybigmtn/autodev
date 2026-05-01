@@ -286,6 +286,7 @@ fn acquire_provider_lock(provider: Provider) -> Result<fd_lock::RwLock<fs::File>
     Ok(fd_lock::RwLock::new(file))
 }
 
+#[derive(Debug)]
 pub(crate) struct QuotaExecResult {
     pub(crate) exit_status: std::process::ExitStatus,
     pub(crate) stderr_text: String,
@@ -404,14 +405,16 @@ where
 
                 match verdict {
                     QuotaVerdict::Exhausted => {
-                        let progress_note = if quota_output_has_agent_progress(&stderr_text) {
-                            " after worker progress was detected"
-                        } else {
-                            ""
-                        };
+                        if quota_output_has_agent_progress(&stderr_text) {
+                            let recovery_marker =
+                                write_quota_progress_recovery_marker(provider, &account_name)?;
+                            anyhow::bail!(
+                                "account '{account_name}' quota exhausted after worker progress was detected; credentials restored and retry stopped to avoid duplicate side effects. recovery marker: {}",
+                                recovery_marker.display()
+                            );
+                        }
                         eprintln!(
-                            "[quota-router] account '{account_name}' quota exhausted{progress_note}, \
-                             trying next..."
+                            "[quota-router] account '{account_name}' quota exhausted, trying next..."
                         );
                         continue;
                     }
@@ -483,6 +486,26 @@ fn restore_credentials(provider: Provider) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn write_quota_progress_recovery_marker(provider: Provider, account_name: &str) -> Result<PathBuf> {
+    let dir = QuotaConfig::config_dir().join("quota-recovery");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!(
+        "{}-{}-{}.json",
+        provider.label(),
+        account_name,
+        Utc::now().format("%Y%m%d%H%M%S")
+    ));
+    let body = serde_json::json!({
+        "provider": provider.label(),
+        "account": account_name,
+        "reason": "quota exhausted after worker progress",
+        "action": "stopped failover to avoid duplicate side effects",
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    write_0o600_if_unix(&path, serde_json::to_string_pretty(&body)?.as_bytes())?;
+    Ok(path)
 }
 
 pub(crate) fn is_quota_available(provider: Provider) -> bool {
@@ -587,8 +610,10 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quota_output_has_agent_progress, restore_credentials, swap_credentials};
-    use crate::quota_config::Provider;
+    use super::{
+        quota_output_has_agent_progress, restore_credentials, run_with_quota, swap_credentials,
+    };
+    use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
 
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -598,6 +623,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     #[cfg(unix)]
     use std::sync::MutexGuard;
     #[cfg(unix)]
@@ -609,6 +636,7 @@ mod tests {
         home_previous: Option<OsString>,
         config_previous: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
+        skip_usage_previous: Option<OsString>,
     }
 
     #[cfg(unix)]
@@ -629,12 +657,15 @@ mod tests {
             fs::create_dir_all(&config).expect("failed to create temp config");
             let home_previous = std::env::var_os("HOME");
             let config_previous = std::env::var_os("XDG_CONFIG_HOME");
+            let skip_usage_previous = std::env::var_os("AUTO_QUOTA_SKIP_USAGE");
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("AUTO_QUOTA_SKIP_USAGE", "1");
             Self {
                 root,
                 home_previous,
                 config_previous,
+                skip_usage_previous,
                 _lock: lock,
             }
         }
@@ -654,6 +685,13 @@ mod tests {
         fn backup_dir(&self) -> PathBuf {
             self.root.join("config").join("quota-router").join("backup")
         }
+
+        fn write_codex_account(&self, name: &str) {
+            let profile_dir = self.profile_dir(Provider::Codex, name);
+            fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+            fs::write(profile_dir.join("auth.json"), br#"{"tokens":{"access_token":"invalid","refresh_token":"invalid","account_id":"acct"}}"#)
+                .expect("failed to write profile auth");
+        }
     }
 
     #[cfg(unix)]
@@ -668,6 +706,11 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", previous);
             } else {
                 std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            if let Some(previous) = &self.skip_usage_previous {
+                std::env::set_var("AUTO_QUOTA_SKIP_USAGE", previous);
+            } else {
+                std::env::remove_var("AUTO_QUOTA_SKIP_USAGE");
             }
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -694,6 +737,105 @@ mod tests {
         assert!(!quota_output_has_agent_progress(
             "Error: rate limit exceeded for this organization"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quota_exhaustion_after_progress_does_not_try_next_account() {
+        let home = TempQuotaHome::new("quota-exec-progress-stop");
+        home.write_codex_account("primary");
+        home.write_codex_account("secondary");
+        fs::create_dir_all(home.home().join(".codex")).expect("failed to create active codex dir");
+
+        let mut config = QuotaConfig::default();
+        config
+            .add_account(AccountEntry {
+                name: "primary".to_string(),
+                provider: Provider::Codex,
+            })
+            .expect("failed to add primary");
+        config
+            .add_account(AccountEntry {
+                name: "secondary".to_string(),
+                provider: Provider::Codex,
+            })
+            .expect("failed to add secondary");
+        config.save().expect("failed to save quota config");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let error = run_with_quota(Provider::Codex, move || {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let status = std::process::Command::new("true")
+                    .status()
+                    .expect("failed to run true");
+                Ok((
+                    status,
+                    "agent-progress-detected=true\nError: rate limit exceeded".to_string(),
+                ))
+            }
+        })
+        .await
+        .expect_err("progress after quota exhaustion should stop failover");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("retry stopped"));
+        assert!(home
+            .root
+            .join("config")
+            .join("quota-router")
+            .join("quota-recovery")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn immediate_quota_error_can_try_next_account() {
+        let home = TempQuotaHome::new("quota-exec-immediate-failover");
+        home.write_codex_account("primary");
+        home.write_codex_account("secondary");
+        fs::create_dir_all(home.home().join(".codex")).expect("failed to create active codex dir");
+
+        let mut config = QuotaConfig::default();
+        config
+            .add_account(AccountEntry {
+                name: "primary".to_string(),
+                provider: Provider::Codex,
+            })
+            .expect("failed to add primary");
+        config
+            .add_account(AccountEntry {
+                name: "secondary".to_string(),
+                provider: Provider::Codex,
+            })
+            .expect("failed to add secondary");
+        config.save().expect("failed to save quota config");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let result = run_with_quota(Provider::Codex, move || {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let status = std::process::Command::new("true")
+                    .status()
+                    .expect("failed to run true");
+                let stderr = if call == 0 {
+                    "Error: rate limit exceeded".to_string()
+                } else {
+                    String::new()
+                };
+                Ok((status, stderr))
+            }
+        })
+        .await
+        .expect("immediate quota exhaustion should fail over");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(result.exit_status.success());
+        assert!(result.stderr_text.is_empty());
     }
 
     #[cfg(unix)]

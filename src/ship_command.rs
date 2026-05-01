@@ -1,14 +1,13 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use shlex::split as shell_split;
 
 use crate::codex_exec::run_codex_exec;
+use crate::completion_artifacts::shared_receipt_freshness_problem;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
@@ -92,37 +91,12 @@ impl ShipGateReport {
 #[derive(Debug, Deserialize)]
 struct VerificationReceipt {
     #[serde(default)]
-    commit: Option<String>,
-    #[serde(default)]
-    dirty_state: Option<VerificationDirtyState>,
-    #[serde(default)]
-    plan_hash: Option<String>,
-    #[serde(default)]
-    declared_artifacts: Vec<VerificationReceiptArtifact>,
-    #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerificationDirtyState {
-    #[serde(default)]
-    fingerprint: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerificationReceiptArtifact {
-    path: String,
-    #[serde(default)]
-    sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct VerificationReceiptCommand {
     command: String,
-    #[serde(default)]
-    argv: Vec<String>,
-    #[serde(default)]
-    expected_argv: Option<Vec<String>>,
     #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
@@ -248,23 +222,27 @@ fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptComman
         .filter_map(|entry| entry.ok())
         .flat_map(|entry| {
             let path = entry.path();
-            let Some(receipt) = fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<VerificationReceipt>(&text).ok())
+            let Some(receipt_text) = fs::read_to_string(&path).ok() else {
+                return Vec::new();
+            };
+            let Some(receipt) = serde_json::from_str::<VerificationReceipt>(&receipt_text).ok()
             else {
                 return Vec::new();
             };
-            let freshness_problem = verification_receipt_freshness_problem(
+            let expected_commands = receipt
+                .commands
+                .iter()
+                .map(|command| command.command.clone())
+                .collect::<Vec<_>>();
+            let freshness_problem = shared_receipt_freshness_problem(
                 repo_root,
                 &path,
-                &receipt,
-                &receipt
-                    .commands
-                    .iter()
-                    .map(|command| command.command.clone())
-                    .collect::<Vec<_>>(),
+                &receipt_text,
+                &expected_commands,
                 &[],
-            );
+            )
+            .ok()
+            .flatten();
             receipt
                 .commands
                 .into_iter()
@@ -275,251 +253,6 @@ fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptComman
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-fn verification_receipt_freshness_problem(
-    repo_root: &Path,
-    verification_receipt_path: &Path,
-    receipt: &VerificationReceipt,
-    expected_commands: &[String],
-    declared_artifacts: &[String],
-) -> Option<String> {
-    let current_commit = current_git_commit(repo_root);
-    let current_dirty_fingerprint = current_dirty_state_fingerprint(repo_root);
-    let current_plan_hash = current_plan_hash(repo_root);
-    let requires_current_metadata = current_commit.is_some()
-        || current_dirty_fingerprint.is_some()
-        || current_plan_hash.is_some();
-
-    if let Some(current) = current_commit {
-        match receipt.commit.as_deref() {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "commit mismatch, recorded `{recorded}` but current HEAD is `{current}`"
-                ))
-            }
-            None => return Some("missing current commit metadata".to_string()),
-        }
-    }
-
-    if let Some(current) = current_dirty_fingerprint {
-        match receipt
-            .dirty_state
-            .as_ref()
-            .and_then(|state| state.fingerprint.as_deref())
-        {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
-                ))
-            }
-            None => return Some("missing dirty-state fingerprint".to_string()),
-        }
-    }
-
-    if let Some(current) = current_plan_hash {
-        match receipt.plan_hash.as_deref() {
-            Some(recorded) if recorded == current => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "plan hash mismatch, recorded `{recorded}` but current IMPLEMENTATION_PLAN.md hash is `{current}`"
-                ))
-            }
-            None => return Some("missing plan hash".to_string()),
-        }
-    }
-
-    for (path, current_hash) in
-        current_declared_artifact_hashes(repo_root, verification_receipt_path, declared_artifacts)
-    {
-        match receipt
-            .declared_artifacts
-            .iter()
-            .find(|artifact| artifact.path == path)
-            .and_then(|artifact| artifact.sha256.as_deref())
-        {
-            Some(recorded) if recorded == current_hash => {}
-            Some(recorded) => {
-                return Some(format!(
-                    "declared artifact `{path}` hash mismatch, recorded `{recorded}` but current hash is `{current_hash}`"
-                ))
-            }
-            None => return Some(format!("missing declared artifact `{path}` hash")),
-        }
-    }
-
-    if requires_current_metadata {
-        for expected_command in expected_commands {
-            if let Some(problem) = verification_command_argv_problem(receipt, expected_command) {
-                return Some(problem);
-            }
-        }
-    }
-
-    None
-}
-
-fn verification_command_argv_problem(
-    receipt: &VerificationReceipt,
-    expected_command: &str,
-) -> Option<String> {
-    let expected_argv = shell_split(expected_command)?;
-    let matching = receipt
-        .commands
-        .iter()
-        .filter(|entry| verification_receipt_command_matches(entry, expected_command))
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        return None;
-    }
-    if matching
-        .iter()
-        .any(|entry| entry.expected_argv.as_ref() == Some(&expected_argv))
-    {
-        return None;
-    }
-    Some(format!(
-        "command `{expected_command}` is missing matching expected argv metadata"
-    ))
-}
-
-fn verification_receipt_command_matches(
-    entry: &VerificationReceiptCommand,
-    expected_command: &str,
-) -> bool {
-    if entry.command == expected_command {
-        return true;
-    }
-    if entry.argv.is_empty() {
-        return false;
-    }
-    shell_split(expected_command)
-        .map(|expected_argv| expected_argv == entry.argv)
-        .unwrap_or(false)
-}
-
-fn current_git_commit(repo_root: &Path) -> Option<String> {
-    command_stdout(repo_root, ["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
-}
-
-fn current_dirty_state_fingerprint(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain=v1", "-z"])
-        .output()
-        .ok()?;
-    output.status.success().then(|| sha256_hex(&output.stdout))
-}
-
-fn current_plan_hash(repo_root: &Path) -> Option<String> {
-    fs::read(repo_root.join("IMPLEMENTATION_PLAN.md"))
-        .ok()
-        .map(|bytes| sha256_hex(&bytes))
-}
-
-fn command_stdout<const N: usize>(repo_root: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn current_declared_artifact_hashes(
-    repo_root: &Path,
-    verification_receipt_path: &Path,
-    declared_artifacts: &[String],
-) -> Vec<(String, String)> {
-    declared_artifacts
-        .iter()
-        .filter_map(|relative| {
-            let path = declared_artifact_path(repo_root, relative)?;
-            if same_path(&path, verification_receipt_path) {
-                return None;
-            }
-            artifact_hash(&path).map(|hash| (relative.clone(), hash))
-        })
-        .collect()
-}
-
-fn declared_artifact_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
-    let direct = repo_root.join(relative);
-    if direct.exists() {
-        return Some(direct);
-    }
-    relative
-        .strip_prefix(".auto/symphony/verification-receipts/")
-        .map(|file_name| {
-            repo_root
-                .join(".auto/symphony/verification-receipts")
-                .join(file_name)
-        })
-        .filter(|path| path.exists())
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-fn artifact_hash(path: &Path) -> Option<String> {
-    if path.is_file() {
-        return fs::read(path).ok().map(|bytes| sha256_hex(&bytes));
-    }
-    if !path.is_dir() {
-        return None;
-    }
-
-    let mut entries = Vec::new();
-    collect_artifact_dir_entries(path, path, &mut entries).ok()?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hasher = Sha256::new();
-    for (relative, hash) in entries {
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        hasher.update(hash.as_bytes());
-        hasher.update([0]);
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-fn collect_artifact_dir_entries(
-    root: &Path,
-    dir: &Path,
-    entries: &mut Vec<(String, String)>,
-) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_artifact_dir_entries(root, &path, entries)?;
-        } else if path.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            let hash = sha256_hex(&fs::read(&path)?);
-            entries.push((relative, hash));
-        }
-    }
-    Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn normalized_command(command: &str) -> String {
@@ -1109,6 +842,49 @@ mod tests {
     }
 
     #[test]
+    fn ship_gate_uses_shared_receipt_inspector() {
+        let repo = test_dir("shared-receipt-gate");
+        init_git_repo(&repo);
+        let stale_commit = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse failed");
+        let stale_commit = String::from_utf8_lossy(&stale_commit.stdout)
+            .trim()
+            .to_string();
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), "# changed\n")
+            .expect("failed to update plan");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "IMPLEMENTATION_PLAN.md"])
+            .output()
+            .expect("git add failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "changed"])
+            .output()
+            .expect("git commit failed");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_receipt_json(
+            &repo,
+            &format!(
+                r#"{{"commit":"{}","commands":[{{"command":"cargo fmt --check","expected_argv":["cargo","fmt","--check"],"exit_code":0,"status":"passed"}}]}}"#,
+                stale_commit
+            ),
+        );
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("commit mismatch")));
+    }
+
+    #[test]
     fn ship_gate_rejects_failed_status_even_with_zero_exit() {
         let repo = test_dir("failed-status-zero-exit");
         write_release_reports(&repo, "feature/ship", "main");
@@ -1130,6 +906,41 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker == "red validation receipt: `cargo test`"));
+    }
+
+    #[test]
+    fn ship_gate_runs_after_remote_sync_before_model() {
+        let repo = test_dir("post-sync-gate");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_passing_release_receipts(&repo);
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(
+            !report.is_blocked(),
+            "passing receipts and fresh reports should allow model execution: {:?}",
+            report.blockers
+        );
+    }
+
+    #[test]
+    fn ship_gate_reruns_after_model_iteration_changes() {
+        let repo = test_dir("rerun-gate");
+        write_release_reports(&repo, "feature/ship", "main");
+        write_passing_release_receipts(&repo);
+        fs::write(
+            repo.join("SHIP.md"),
+            "# SHIP\n\nRelease Blockers:\n- unresolved production blocker\nRollback: revert.\nMonitoring: inspect CI.\nPR: none.\n",
+        )
+        .expect("failed to write SHIP");
+
+        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+
+        assert!(report.is_blocked());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("unresolved release blocker")));
     }
 
     #[test]

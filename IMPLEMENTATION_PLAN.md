@@ -2,7 +2,7 @@
 
 ## Priority Work
 
-- [~] `QSEC-001` Validate quota account slugs and profile containment
+- [x] `QSEC-001` Validate quota account slugs and profile containment
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: Raw quota account names still flow into profile paths before any slug or containment policy runs, so credential capture can touch paths outside the intended profile root before the config write fails.
@@ -27,7 +27,7 @@
     Estimated scope: M
     Completion signal: quota account identity becomes a validated slug before any credential/profile mutation.
 
-- [ ] `QSEC-002` Stop quota failover after detected worker progress
+- [x] `QSEC-002` Stop quota failover after detected worker progress
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: `run_with_quota` detects progress in provider output but still logs that it is trying the next account, risking duplicate model-backed side effects after a partially completed worker run.
@@ -52,7 +52,7 @@
     Estimated scope: S
     Completion signal: quota failover is safe after progress and still useful before progress.
 
-- [ ] `QSEC-003` Decide Kimi and PI prompt transport plus quota migration policy
+- [x] `QSEC-003` Decide Kimi and PI prompt transport plus quota migration policy
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: The generated quota spec flags Kimi and PI argv prompt delivery as a safety recommendation, but local code only proves `kimi_exec_args` uses `-p <prompt>` and does not prove stdin or file-prompt support.
@@ -77,7 +77,7 @@
     Estimated scope: S
     Completion signal: backend prompt-transport and unsafe-account migration choices are explicit before code promises safer Kimi or PI behavior.
 
-- [ ] `CHECK-001` Security and credential safety checkpoint
+- [x] `CHECK-001` Security and credential safety checkpoint
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: The quota slice touches credential paths and retry behavior, so the queue should stop and re-evaluate before planning-root and scheduler work expands the blast radius.
@@ -102,7 +102,7 @@
     Estimated scope: XS
     Completion signal: quota security work is reviewed before state and scheduler changes begin.
 
-- [ ] `CSTATE-001` Resolve planning-root provenance and saved-state containment
+- [x] `CSTATE-001` Resolve planning-root provenance and saved-state containment
 
     Spec: `specs/300426-corpus-state-and-planning-root-safety.md`
     Why now: `auto gen` and `auto reverse` trust raw `.auto/state.json` planning-root paths before printing why that root was selected, so a future corrupt saved path can still steer destructive generation behavior even when the current state points at this run.
@@ -127,7 +127,7 @@
     Estimated scope: M
     Completion signal: saved state is a hint with provenance, not an untrusted source of active planning truth.
 
-- [ ] `CSTATE-002` Reject empty primary corpora and make verify-only non-mutating
+- [x] `CSTATE-002` Reject empty primary corpora and make verify-only non-mutating
 
     Spec: `specs/300426-corpus-state-and-planning-root-safety.md`
     Why now: `load_planning_corpus` can return an empty `primary_plans` vector and `auto corpus --verify-only` currently runs sanitize-and-save code that can rewrite corpus files and `.auto/state.json`.
@@ -152,7 +152,7 @@
     Estimated scope: S
     Completion signal: corpus validation fails early and verify-only is a true no-mutation check.
 
-- [ ] `CSTATE-003` Stage corpus refresh before replacing live planning input
+- [x] `CSTATE-003` Stage corpus refresh before replacing live planning input
 
     Spec: `specs/300426-corpus-state-and-planning-root-safety.md`
     Why now: `prepare_planning_root_for_corpus` archives and removes the existing planning root before replacement validation succeeds, so a failed corpus authoring pass can leave the operator without the prior valid `genesis/`.
@@ -177,7 +177,7 @@
     Estimated scope: M
     Completion signal: corpus refresh behaves like a validated swap instead of a destructive rewrite.
 
-- [ ] `CHECK-002` Corpus and planning-root safety checkpoint
+- [x] `CHECK-002` Corpus and planning-root safety checkpoint
 
     Spec: `specs/300426-production-control-and-planning-primacy.md`
     Why now: The generated snapshot is subordinate and `.auto/state.json` points at an older output dir, so state and corpus safety should be reviewed before schema or scheduler work consumes generated queue truth.
@@ -202,7 +202,7 @@
     Estimated scope: XS
     Completion signal: corpus/state safety is reviewed and the generated snapshot remains explicitly subordinate.
 
-- [ ] `ROW-001` Extract one shared execution-row validator
+- [x] `ROW-001` Extract one shared execution-row validator
 
     Spec: `specs/300426-execution-row-schema-parity.md`
     Why now: The rich task field list already exists in `task_parser`, and generation/spec/super enforce similar rules, but loop, parallel, review, and steward can still drift without one shared validator.
@@ -227,7 +227,7 @@
     Estimated scope: M
     Completion signal: the execution-row schema has one runtime owner.
 
-- [ ] `ROW-002` Enforce execution-row parity at dispatch and queue-write boundaries
+- [x] `ROW-002` Enforce execution-row parity at dispatch and queue-write boundaries
 
     Spec: `specs/300426-execution-row-schema-parity.md`
     Why now: A shared validator is only useful if every command that selects, schedules, promotes, or writes rows calls it before workers see malformed queue truth.
@@ -252,7 +252,7 @@
     Estimated scope: M
     Completion signal: workers cannot receive rows that generation or super would reject.
 
-- [ ] `CHECK-003A` Execution-row schema checkpoint
+- [x] `CHECK-003A` Execution-row schema checkpoint
 
     Spec: `specs/300426-execution-row-schema-parity.md`
     Why now: Row validation changes every queue-writing and dispatch boundary, so evidence-model refactors should wait until the shared row contract has been reviewed independently.
@@ -277,7 +277,7 @@
     Estimated scope: XS
     Completion signal: execution-row schema truth is reviewed before receipt/artifact evidence policy changes consume it.
 
-- [ ] `EVID-001` Reject completion artifact paths outside the repo
+- [x] `EVID-001` Reject completion artifact paths outside the repo
 
     Spec: `specs/300426-receipt-artifact-and-evidence-binding.md`
     Why now: Completion and ship evidence both resolve declared artifact strings with `repo_root.join(relative)`, which needs canonical repo containment before hashing or accepting any markdown-declared path.
@@ -302,7 +302,7 @@
     Estimated scope: S
     Completion signal: declared artifacts are repo-contained before they can satisfy completion or release proof.
 
-- [ ] `EVID-002` Consolidate receipt freshness into one shared inspector
+- [x] `EVID-002` Consolidate receipt freshness into one shared inspector
 
     Spec: `specs/300426-receipt-artifact-and-evidence-binding.md`
     Why now: `completion_artifacts` and `ship_command` already check the same receipt freshness concepts, but duplicate structs and functions can drift as receipt fields evolve.
@@ -327,7 +327,7 @@
     Estimated scope: M
     Completion signal: receipt freshness policy cannot silently diverge between completion and release.
 
-- [ ] `EVID-003` Model external evidence and waiver classes explicitly
+- [x] `EVID-003` Model external evidence and waiver classes explicitly
 
     Spec: `specs/300426-receipt-artifact-and-evidence-binding.md`
     Why now: Some tasks require live or external evidence that cannot be represented by local receipts, but the current completion model mainly distinguishes local verification repairs and external follow-ups without a durable waiver/evidence contract.
@@ -352,7 +352,7 @@
     Estimated scope: M
     Completion signal: non-local evidence is visible and never confused with host receipts.
 
-- [ ] `CHECK-003` Row schema and evidence checkpoint
+- [x] `CHECK-003` Row schema and evidence checkpoint
 
     Spec: `specs/300426-execution-row-schema-parity.md`
     Why now: Shared row validation and evidence binding change the scheduler truth model, so the queue should stop before dispatch/resume behavior is tightened.
@@ -377,7 +377,7 @@
     Estimated scope: XS
     Completion signal: execution-row and evidence contracts are stable enough for scheduler hardening.
 
-- [ ] `SCHED-001` Fail closed on current plan refresh failure
+- [x] `SCHED-001` Fail closed on current plan refresh failure
 
     Spec: `specs/300426-scheduler-completion-and-lane-resume.md`
     Why now: Production dispatch currently continues from a last-good queue snapshot when current plan refresh fails, which can schedule stale work after root queue or dependency truth changes.
@@ -402,7 +402,7 @@
     Estimated scope: M
     Completion signal: stale queue snapshots are opt-in recovery, not normal production dispatch.
 
-- [ ] `SCHED-002` Persist lane assignment metadata and reject stale resume
+- [x] `SCHED-002` Persist lane assignment metadata and reject stale resume
 
     Spec: `specs/300426-scheduler-completion-and-lane-resume.md`
     Why now: Resume candidates are keyed by task id and prompt fallback, so changed task bodies, dependencies, verification text, branch, or base commit can be resumed as if they were the same assignment.
@@ -427,7 +427,7 @@
     Estimated scope: M
     Completion signal: lane resume is bound to the current task contract, not just a task id.
 
-- [ ] `SCHED-003` Add scheduler safety verdict and loop-parallel ready-set parity
+- [x] `SCHED-003` Add scheduler safety verdict and loop-parallel ready-set parity
 
     Spec: `specs/300426-scheduler-completion-and-lane-resume.md`
     Why now: Operators need one launch/resume/land safety verdict, and serial and parallel execution should choose the same ready task set from the same validated root plan.
@@ -452,7 +452,7 @@
     Estimated scope: M
     Completion signal: scheduler status tells operators whether to launch, resume, recover, or stop.
 
-- [ ] `CHECK-004` Scheduler dispatch and resume checkpoint
+- [x] `CHECK-004` Scheduler dispatch and resume checkpoint
 
     Spec: `specs/300426-scheduler-completion-and-lane-resume.md`
     Why now: Scheduler changes can strand or resume lane work incorrectly, so release/verdict work should wait until dispatch, resume, and status safety are reviewed.
@@ -477,7 +477,7 @@
     Estimated scope: XS
     Completion signal: scheduler state is ready for release-gate hardening or explicitly blocked.
 
-- [ ] `REL-001` Share exact terminal verdict parsing across report gates
+- [x] `REL-001` Share exact terminal verdict parsing across report gates
 
     Spec: `specs/300426-release-gate-and-verdict-parser.md`
     Why now: Design, audit, and book reports currently use local any-line checks for positive verdicts, so mixed or duplicate verdict reports can pass in one surface while failing in another.
@@ -502,7 +502,7 @@
     Estimated scope: M
     Completion signal: report verdicts fail closed consistently across model-backed gates.
 
-- [ ] `REL-002` Rerun ship readiness after sync and model iterations
+- [x] `REL-002` Rerun ship readiness after sync and model iterations
 
     Spec: `specs/300426-release-gate-and-verdict-parser.md`
     Why now: `auto ship` evaluates the release gate before checkpoint/remote sync and does not rerun it after model-driven edits, so current-tree release readiness can go stale inside the ship flow.
@@ -527,7 +527,7 @@
     Estimated scope: M
     Completion signal: `auto ship` readiness is evaluated against the current tree at every release decision point.
 
-- [ ] `LIFE-001` Settle Nemesis report-only and audit-pass contract
+- [x] `LIFE-001` Settle Nemesis report-only and audit-pass contract
 
     Spec: `specs/300426-audit-nemesis-and-report-only-lifecycle.md`
     Why now: `auto nemesis --report-only` skips implementation but can still sync root specs and append root plan rows, while `--audit-passes` is advertised without a tested multi-pass or fail-fast contract.
@@ -552,7 +552,7 @@
     Estimated scope: M
     Completion signal: Nemesis lifecycle flags no longer surprise operators.
 
-- [ ] `LIFE-002` Add model-free lifecycle fixture and evidence-label smoke coverage
+- [x] `LIFE-002` Add model-free lifecycle fixture and evidence-label smoke coverage
 
     Spec: `specs/300426-audit-nemesis-and-report-only-lifecycle.md`
     Why now: Lifecycle commands should prove what they read, wrote, skipped, and blocked without relying on live model behavior or unlabeled model observations.
@@ -577,7 +577,7 @@
     Estimated scope: M
     Completion signal: lifecycle honesty has model-free regression coverage.
 
-- [ ] `DX-001` Extend doctor with active planning and queue health
+- [x] `DX-001` Extend doctor with active planning and queue health
 
     Spec: `specs/300426-first-run-dx-observability-and-performance.md`
     Why now: `auto doctor` is already a no-model first success, but it stops before reporting whether the active planning root, corpus shape, root queue, and generated snapshot state are usable.
@@ -602,7 +602,7 @@
     Estimated scope: M
     Completion signal: first-run doctor reduces uncertainty before model-backed workflows start.
 
-- [ ] `CTRL-001` Choose the production-control promotion artifact
+- [x] `CTRL-001` Choose the production-control promotion artifact
 
     Spec: `specs/300426-production-control-and-planning-primacy.md`
     Why now: The generated snapshot has been reviewed into root queue truth for this execution gate, but future production-control campaigns still need a durable promotion artifact policy so implementation does not assume root edits, `PROMOTION.md`, or `.auto/super` manifests without a recorded decision.
@@ -627,7 +627,7 @@
     Estimated scope: S
     Completion signal: production-control promotion has a reviewed artifact before queue promotion happens.
 
-- [ ] `PROMO-001` Gate generated queue promotion and release decision
+- [x] `PROMO-001` Gate generated queue promotion and release decision
 
     Spec: `specs/300426-release-decision-gate-and-queue-promotion.md`
     Why now: The current generated snapshot has been promoted into the root implementation queue for worker launch, and release readiness remains NO-GO until the safety, evidence, scheduler, lifecycle, and DX clusters are closed or waived.
@@ -654,7 +654,7 @@
 
 ## Follow-On Work
 
-- [ ] `QSEC-004` Implement decided Kimi and PI prompt transport policy
+- [x] `QSEC-004` Implement decided Kimi and PI prompt transport policy
 
     Spec: `specs/300426-quota-backend-and-credential-safety.md`
     Why now: Prompt transport is high-risk but depends on the documented provider capability decision from `QSEC-003`; implementation should follow that evidence instead of guessing.
@@ -679,7 +679,7 @@
     Estimated scope: M
     Completion signal: Kimi/PI prompt handling follows documented provider capability instead of speculation.
 
-- [ ] `EVID-004` Formalize receipt schema and directory artifact hash limits
+- [x] `EVID-004` Formalize receipt schema and directory artifact hash limits
 
     Spec: `specs/300426-receipt-artifact-and-evidence-binding.md`
     Why now: Receipt fields are now important to both completion and release gates, but the JSON contract is implicit in Rust structs and the writer script, and directory hashing has no measured bound.
@@ -704,7 +704,7 @@
     Estimated scope: S
     Completion signal: receipt JSON is a documented contract, not an incidental writer shape.
 
-- [ ] `DX-002` Add measured large-status performance fixtures
+- [x] `DX-002` Add measured large-status performance fixtures
 
     Spec: `specs/300426-first-run-dx-observability-and-performance.md`
     Why now: The first-run spec asks for scale evidence, but exact performance targets should come only after deterministic large-plan and audit-status measurements exist.
@@ -729,7 +729,7 @@
     Estimated scope: S
     Completion signal: first-run and status performance claims are grounded in measured fixtures.
 
-- [ ] `CTRL-002` Decide whether super defaults should snapshot before root sync
+- [x] `CTRL-002` Decide whether super defaults should snapshot before root sync
 
     Spec: `specs/300426-production-control-and-planning-primacy.md`
     Why now: `auto super` currently runs the production-race pipeline through generation and gates, while the generated spec recommends treating snapshots as subordinate until reviewed promotion; changing the default needs an operator-facing decision.

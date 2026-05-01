@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::codex_exec::run_codex_exec;
+use crate::task_parser::validate_execution_rows;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
@@ -159,6 +160,7 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         );
     }
     verify_steward_deliverables(&output_dir)?;
+    verify_steward_promoted_queue(&repo_root)?;
     println!(
         "steward:     {} deliverables under {}",
         STEWARD_DELIVERABLES.len(),
@@ -302,6 +304,18 @@ fn verify_steward_deliverables(output_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn verify_steward_promoted_queue(repo_root: &Path) -> Result<()> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(());
+    }
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    validate_execution_rows(&plan)
+        .with_context(|| "steward promotion rejected invalid execution row")
+        .map(|_| ())
 }
 
 fn build_steward_prompt(
@@ -790,6 +804,21 @@ mod tests {
         assert!(prompt.contains(&other.display().to_string()));
         fs::remove_dir_all(temp).expect("cleanup");
         fs::remove_dir_all(other).expect("cleanup other");
+    }
+
+    #[test]
+    fn steward_promotion_rejects_invalid_execution_row() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp");
+        fs::write(
+            temp.join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] `TASK-1` Invalid\n  Spec: `specs/task.md`\n  Dependencies: after steward review\n",
+        )
+        .expect("write plan");
+
+        let err = super::verify_steward_promoted_queue(&temp).expect_err("invalid row rejected");
+        assert!(format!("{err:#}").contains("steward promotion rejected invalid execution row"));
+        fs::remove_dir_all(temp).ok();
     }
 
     #[test]

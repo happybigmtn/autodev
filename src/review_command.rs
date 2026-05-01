@@ -10,7 +10,9 @@ use crate::codex_exec::run_codex_exec_max_context;
 use crate::codex_stream::CLAUDE_FUTILITY_THRESHOLD_REVIEW;
 use crate::completion_artifacts::review_contains_task;
 use crate::qa_only_command::print_final_status_block;
-use crate::task_parser::{parse_task_header as parse_shared_task_header, TaskStatus};
+use crate::task_parser::{
+    parse_task_header as parse_shared_task_header, validate_execution_rows, TaskStatus,
+};
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
     git_status_short_filtered, git_stdout, push_branch_with_remote_sync, sync_branch_with_remote,
@@ -486,6 +488,8 @@ fn harvest_completed_plan_items_for_review(
 
     let plan_text = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    validate_execution_rows(&plan_text)
+        .with_context(|| "review queue write rejected invalid execution row")?;
     let (updated_plan, completed_items) = extract_completed_plan_items(&plan_text);
     if completed_items.is_empty() {
         return Ok(PlanReviewHarvestResult::default());
@@ -1897,6 +1901,23 @@ mod tests {
         assert!(plan.contains("Original REVIEW.md item"));
 
         fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn review_queue_write_rejects_invalid_execution_row() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).expect("create temp dir");
+        fs::write(
+            temp.join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] `TASK-1` Invalid\n  Spec: `specs/task.md`\n  Dependencies: after the audit\n",
+        )
+        .expect("write plan");
+
+        let err =
+            harvest_completed_plan_items_for_review(&temp, true).expect_err("invalid row rejected");
+        assert!(format!("{err:#}").contains("review queue write rejected invalid execution row"));
+
+        fs::remove_dir_all(temp).ok();
     }
 
     #[test]

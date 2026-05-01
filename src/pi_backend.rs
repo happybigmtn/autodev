@@ -83,6 +83,11 @@ pub(crate) fn resolve_pi_bin(configured: &Path) -> PathBuf {
     PathBuf::from("pi")
 }
 
+#[cfg(test)]
+pub(crate) fn pi_prompt_transport_label() -> &'static str {
+    "argv -p"
+}
+
 pub(crate) fn parse_pi_error(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
@@ -168,7 +173,7 @@ fn map_minimax_model_name(model: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pi_error, PiProvider};
+    use super::{parse_pi_error, pi_prompt_transport_label, PiProvider};
 
     #[test]
     fn minimax_alias_defaults_to_m27_highspeed() {
@@ -200,6 +205,11 @@ mod tests {
             PiProvider::Kimi.resolve_model("kimi-k2.6-code-preview", "gpt-5.5"),
             "kimi-coding/k2p6"
         );
+    }
+
+    #[test]
+    fn pi_prompt_transport_matches_decision() {
+        assert_eq!(pi_prompt_transport_label(), "argv -p");
     }
 
     #[test]

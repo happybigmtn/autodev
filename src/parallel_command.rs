@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTILITY_EXIT_MARKER};
@@ -22,7 +24,7 @@ use crate::linear_tracker::LinearTracker;
 use crate::symphony_command::run_sync;
 use crate::task_parser::{
     parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks,
-    PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
+    LaneKind, PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
@@ -57,6 +59,7 @@ Repo-specific direct `REVIEW.md` handoff:
 - Do not edit `REVIEW.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, or `ARCHIVED.md` from a lane.
 - Preserve blocker or completion evidence in your committed code/tests and command output; the host will reconcile queue and review docs after landing."#;
 const LANE_TASK_ID_FILE: &str = "task-id";
+const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
@@ -525,6 +528,7 @@ struct LoopTask {
     dependencies: Vec<String>,
     estimated_scope: Option<String>,
     completion_path_target: Option<String>,
+    lane_kind: LaneKind,
     markdown: String,
 }
 
@@ -678,6 +682,7 @@ fn finalize_task(task: SharedPlanTask) -> LoopTask {
         status,
         dependencies,
         completion_path_target,
+        lane_kind,
         markdown,
         ..
     } = task;
@@ -701,7 +706,35 @@ fn finalize_task(task: SharedPlanTask) -> LoopTask {
         dependencies,
         estimated_scope: task_field_line_value(&markdown, "Estimated scope:"),
         completion_path_target,
+        lane_kind: lane_kind.unwrap_or_else(|| infer_lane_kind(&title, &markdown)),
         markdown,
+    }
+}
+
+fn infer_lane_kind(title: &str, markdown: &str) -> LaneKind {
+    let text = format!("{title}\n{markdown}").to_ascii_lowercase();
+    if text.contains("operator action")
+        || text.contains("operator-action")
+        || text.contains("operator queue")
+        || text.contains("operator must")
+        || text.contains("ssh ")
+        || text.contains("admin envelope")
+        || text.contains("quorum")
+        || text.contains("mainnet")
+        || text.contains("real-rbtc")
+        || text.contains("real rbtc")
+    {
+        LaneKind::Operator
+    } else if text.contains("evidence only")
+        || text.contains("evidence-only")
+        || text.contains("verification only")
+        || text.contains("receipt refresh")
+        || text.contains("review handoff")
+        || text.contains("proof-only")
+    {
+        LaneKind::Evidence
+    } else {
+        LaneKind::Code
     }
 }
 
@@ -865,6 +898,16 @@ struct LaneResumeCandidate {
     stderr_log_path: PathBuf,
     worker_pid_path: PathBuf,
     host_recovery_note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaneAssignmentMetadata {
+    task_id: String,
+    target_branch: String,
+    base_commit: String,
+    task_hash: u64,
+    dependency_hash: u64,
+    verification_hash: u64,
 }
 
 #[derive(Debug)]
@@ -1533,6 +1576,18 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         {
             println!("frontier:    {frontier}");
         }
+        println!(
+            "safety verdict: {}",
+            parallel_status_safety_verdict(
+                &plan,
+                &active_task_ids,
+                &shelved,
+                &deferred,
+                no_live_parallel_host,
+                &active_recovery_lanes,
+                &stale_recovery_lanes,
+            )
+        );
     }
     println!(
         "health:      {}",
@@ -1544,6 +1599,78 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         )
     );
     Ok(())
+}
+
+fn parallel_status_safety_verdict(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    no_live_parallel_host: bool,
+    active_recovery_lanes: &[String],
+    stale_recovery_lanes: &[String],
+) -> String {
+    if !active_recovery_lanes.is_empty() {
+        return "STOP: active lane recovery is in progress; do not launch another host".to_string();
+    }
+    if no_live_parallel_host && !stale_recovery_lanes.is_empty() {
+        return "RECOVER: stale lane recovery exists; preserve task work, clear stale lane metadata, then resume".to_string();
+    }
+    if !active_tasks.is_empty() {
+        return format!(
+            "MONITOR: live lane work in progress for {}",
+            active_tasks.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let ready = ready_parallel_tasks(plan, active_tasks, shelved_tasks, deferred_partial_tasks);
+    let operator_ready = ready
+        .iter()
+        .filter(|task| is_operator_task(task))
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    let code_ready = ready
+        .iter()
+        .filter(|task| !is_operator_task(task) && !is_evidence_lane_task(task))
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    let evidence_ready = ready
+        .iter()
+        .filter(|task| !is_operator_task(task) && is_evidence_lane_task(task))
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        "NO-GO: no dependency-ready tasks remain for this run".to_string()
+    } else if code_ready.is_empty() && !operator_ready.is_empty() {
+        format!(
+            "OPERATOR: no code lanes ready; operator queue: {}{}",
+            operator_ready.join(", "),
+            if evidence_ready.is_empty() {
+                String::new()
+            } else {
+                format!("; evidence queue: {}", evidence_ready.join(", "))
+            }
+        )
+    } else if code_ready.is_empty() && !evidence_ready.is_empty() {
+        format!(
+            "EVIDENCE: no code lanes ready; evidence queue: {}",
+            evidence_ready.join(", ")
+        )
+    } else {
+        format!(
+            "GO: safe to launch or resume; code lanes ready: {}{}{}",
+            code_ready.join(", "),
+            if evidence_ready.is_empty() {
+                String::new()
+            } else {
+                format!("; evidence queue: {}", evidence_ready.join(", "))
+            },
+            if operator_ready.is_empty() {
+                String::new()
+            } else {
+                format!("; operator queue: {}", operator_ready.join(", "))
+            }
+        )
+    }
 }
 
 pub(crate) async fn run_parallel_inline(args: ParallelArgs) -> Result<()> {
@@ -1998,6 +2125,7 @@ async fn run_parallel_loop(
     parallel_logger: &ParallelEventLogger,
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
+    repair_parallel_canonical_before_dispatch(repo_root, parallel_logger)?;
     let mut join_set = JoinSet::<LaneAttemptResult>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
@@ -2035,7 +2163,7 @@ async fn run_parallel_loop(
         &plan,
         parallel_logger,
     )
-    .await;
+    .await?;
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
     let mut rediscovered_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
     preserve_resume_recovery_notes(&mut rediscovered_lanes, &resumable_lanes);
@@ -2044,6 +2172,9 @@ async fn run_parallel_loop(
 
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes);
+        if active_lanes.is_empty() {
+            repair_parallel_canonical_before_dispatch(repo_root, parallel_logger)?;
+        }
         plan = refresh_parallel_plan_or_last_good(
             repo_root,
             linear_tracker,
@@ -2051,7 +2182,7 @@ async fn run_parallel_loop(
             &plan,
             parallel_logger,
         )
-        .await;
+        .await?;
         try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
@@ -2250,12 +2381,39 @@ async fn run_parallel_loop(
                 }
                 break;
             }
-            let (verification_only, executable_ready): (Vec<_>, Vec<_>) =
-                ready.into_iter().partition(is_verification_only_task);
+            let mut operator_ready = Vec::new();
+            let mut evidence_ready = Vec::new();
+            let mut executable_ready = Vec::new();
+            for task in ready {
+                if is_operator_task(&task) {
+                    operator_ready.push(task);
+                } else if is_evidence_lane_task(&task) {
+                    evidence_ready.push(task);
+                } else {
+                    executable_ready.push(task);
+                }
+            }
+            if !operator_ready.is_empty() {
+                match write_operator_actions_for_ready_tasks(run_root, &operator_ready) {
+                    Ok(path) => parallel_logger.info(format!(
+                        "operator-queue: {} item(s) require operator action before code lanes can unblock; see {}",
+                        operator_ready.len(),
+                        path.display()
+                    )),
+                    Err(err) => parallel_logger.warn(format!(
+                        "warning: failed writing operator action queue: {err:#}"
+                    )),
+                }
+            }
             if executable_ready.is_empty() {
                 let message = format!(
-                    "no executable dependency-ready tasks remain; manual verification-only checkpoints must be cleared before continuing: {}",
-                    verification_only
+                    "no executable dependency-ready code tasks remain; evidence queue: {} operator queue: {}",
+                    evidence_ready
+                        .iter()
+                        .map(|task| task.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    operator_ready
                         .iter()
                         .map(|task| task.id.as_str())
                         .collect::<Vec<_>>()
@@ -2356,6 +2514,25 @@ async fn run_parallel_loop(
                     ));
                 }
                 break;
+            }
+
+            let recovered = recover_shelved_tasks_from_canonical_evidence(
+                repo_root,
+                target_branch,
+                &mut shelved_tasks,
+                parallel_logger,
+            )?;
+            if recovered > 0 {
+                plan = refresh_parallel_plan_or_last_good(
+                    repo_root,
+                    linear_tracker,
+                    &mut linear_auto_sync_state,
+                    &plan,
+                    parallel_logger,
+                )
+                .await?;
+                last_idle_summary = None;
+                continue;
             }
 
             parallel_logger.info(no_dependency_ready_stop_message(
@@ -2672,7 +2849,7 @@ async fn run_parallel_loop(
                 &plan,
                 parallel_logger,
             )
-            .await;
+            .await?;
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -3131,6 +3308,51 @@ fn git_path(repo_root: &Path, path: &str) -> Option<PathBuf> {
     })
 }
 
+fn repair_parallel_canonical_before_dispatch(
+    repo_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<()> {
+    let rebase_merge = git_path(repo_root, "rebase-merge");
+    if let Some(path) = rebase_merge.as_ref().filter(|path| path.exists()) {
+        let issue = lane_repo_rebase_recovery_issue(repo_root);
+        if issue.is_some() {
+            let _ = run_git(repo_root, ["rebase", "--abort"]);
+            if path.exists() {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to remove stale {}", path.display()))?;
+            }
+            parallel_logger.warn(format!(
+                "repair: removed stale canonical rebase metadata before dispatch ({})",
+                issue.unwrap_or_else(|| "rebase-merge".to_string())
+            ));
+        } else {
+            bail!(
+                "canonical repo has active rebase metadata at {}; resolve it before dispatch",
+                path.display()
+            );
+        }
+    }
+    if let Some(path) = git_path(repo_root, "index.lock").filter(|path| path.exists()) {
+        bail!(
+            "canonical repo has an active git index lock at {}; remove it only after confirming no git process is using it",
+            path.display()
+        );
+    }
+    let dirty = git_stdout(repo_root, ["status", "--short", "--untracked-files=all"])?;
+    let dirty_paths = dirty
+        .lines()
+        .filter_map(parse_parallel_status_path)
+        .filter(|path| !parallel_dispatch_path_is_ignored(path))
+        .collect::<Vec<_>>();
+    if !dirty_paths.is_empty() {
+        bail!(
+            "canonical repo has dirty tracked dispatch paths before auto parallel dispatch: {}. Commit, stash, or revert them before launching lanes",
+            dirty_paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn environment_blocker_recovery_note(reason: &str, preflight_report: &str) -> String {
     let preflight = if preflight_report.trim().is_empty() {
         "No host preflight details were recorded.".to_string()
@@ -3215,6 +3437,25 @@ fn no_dependency_ready_stop_message(
         deferred_suffix,
         frontier_suffix
     )
+}
+
+fn write_operator_actions_for_ready_tasks(run_root: &Path, tasks: &[LoopTask]) -> Result<PathBuf> {
+    let path = run_root.join("operator-actions.md");
+    let mut body = String::from("# Operator Actions\n\n");
+    body.push_str(
+        "These dependency-ready tasks require an operator or live external authority. They are not dispatched to code workers.\n\n",
+    );
+    for task in tasks {
+        body.push_str(&format!("## `{}` {}\n", task.id, task.title));
+        body.push_str("- Lane kind: operator\n");
+        body.push_str("- Expected operator action: run the task's live commands or capture the named external evidence, then rerun `auto parallel`.\n\n");
+        body.push_str("```markdown\n");
+        body.push_str(&task.markdown);
+        body.push_str("\n```\n\n");
+    }
+    atomic_write(&path, body.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
 }
 
 fn write_parallel_salvage_record(
@@ -3662,7 +3903,7 @@ async fn refresh_parallel_plan_or_last_good(
     linear_auto_sync_state: &mut LinearAutoSyncState,
     last_good_plan: &LoopPlanSnapshot,
     parallel_logger: &ParallelEventLogger,
-) -> LoopPlanSnapshot {
+) -> Result<LoopPlanSnapshot> {
     match refresh_parallel_plan(
         repo_root,
         linear_tracker,
@@ -3671,12 +3912,13 @@ async fn refresh_parallel_plan_or_last_good(
     )
     .await
     {
-        Ok(plan) => plan,
+        Ok(plan) => Ok(plan),
         Err(err) => {
             parallel_logger.warn(format!(
-                "warning: failed to refresh IMPLEMENTATION_PLAN.md; continuing with the last good queue snapshot: {err:#}"
+                "warning: failed to refresh IMPLEMENTATION_PLAN.md; failing closed instead of reusing the last good queue snapshot: {err:#}"
             ));
-            last_good_plan.clone()
+            let _ = last_good_plan;
+            Err(err.context("failed to refresh current queue snapshot; auto parallel fails closed outside explicit recovery paths"))
         }
     }
 }
@@ -4028,6 +4270,9 @@ fn redact_parallel_live_log_message(message: &str) -> String {
 }
 
 fn classify_task_execution_kind(task: &LoopTask) -> &'static str {
+    if task.lane_kind != LaneKind::Code {
+        return task.lane_kind.label();
+    }
     let text = format!("{} {}", task.id, task.title).to_ascii_uppercase();
     if text.contains("DEPLOY") || text.contains("MONITOR") || text.contains("OPS") {
         "ops"
@@ -4042,6 +4287,14 @@ fn classify_task_execution_kind(task: &LoopTask) -> &'static str {
     }
 }
 
+fn is_operator_task(task: &LoopTask) -> bool {
+    task.lane_kind == LaneKind::Operator
+}
+
+fn is_evidence_lane_task(task: &LoopTask) -> bool {
+    task.lane_kind == LaneKind::Evidence || is_verification_only_task(task)
+}
+
 fn describe_parallel_idle_state(
     plan: &LoopPlanSnapshot,
     active_tasks: &BTreeSet<String>,
@@ -4049,17 +4302,28 @@ fn describe_parallel_idle_state(
     deferred_partial_tasks: &BTreeSet<String>,
 ) -> String {
     let ready = ready_parallel_tasks(plan, active_tasks, shelved_tasks, deferred_partial_tasks);
-    let (verification_only, executable_ready): (Vec<_>, Vec<_>) =
-        ready.into_iter().partition(is_verification_only_task);
+    let operator_ready = ready.iter().filter(|task| is_operator_task(task)).count();
+    let (verification_only, executable_ready): (Vec<_>, Vec<_>) = ready
+        .into_iter()
+        .filter(|task| !is_operator_task(task))
+        .partition(is_evidence_lane_task);
     if executable_ready.is_empty() && !verification_only.is_empty() {
         return format!(
-            "manual verification-only checkpoints are ready: {}",
+            "manual/evidence checkpoints are ready: {}{}",
             verification_only
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            if operator_ready == 0 {
+                String::new()
+            } else {
+                format!("; operator queue: {operator_ready}")
+            }
         );
+    }
+    if executable_ready.is_empty() && operator_ready > 0 {
+        return format!("operator queue has {operator_ready} item(s); no code lanes are ready");
     }
 
     let waiting_on = unresolved_frontier_dependency_ids(
@@ -4534,6 +4798,12 @@ fn prepare_parallel_lane_assignment(
 ) -> Result<ActiveLaneAssignment> {
     if let Some(candidate) = resume_candidate {
         write_lane_task_id(&candidate.lane_root, &task.id)?;
+        write_lane_assignment_metadata(
+            &candidate.lane_root,
+            target_branch,
+            &candidate.base_commit,
+            &task,
+        )?;
         return Ok(ActiveLaneAssignment {
             lane_index: candidate.lane_index,
             attempts: 0,
@@ -4557,6 +4827,7 @@ fn prepare_parallel_lane_assignment(
     clone_loop_lane_repo(repo_root, target_branch, &lane_repo_root)?;
     let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?;
     write_lane_task_id(&lane_root, &task.id)?;
+    write_lane_assignment_metadata(&lane_root, target_branch, base_commit.trim(), &task)?;
     Ok(ActiveLaneAssignment {
         lane_index,
         attempts: 0,
@@ -4708,6 +4979,13 @@ fn discover_resume_candidates(
         let Some(task) = pending_tasks.get(&task_id).cloned() else {
             continue;
         };
+        if let Err(err) = validate_lane_assignment_metadata(&lane_root, target_branch, &task) {
+            eprintln!(
+                "warning: skipping resumable lane-{} `{}` because assignment metadata is stale or missing: {err:#}",
+                lane_index, task_id
+            );
+            continue;
+        }
 
         let stdout_log_path = lane_root.join("stdout.log");
         let stderr_log_path = lane_root.join("stderr.log");
@@ -5278,6 +5556,80 @@ fn write_lane_task_id(lane_root: &Path, task_id: &str) -> Result<()> {
     })
 }
 
+fn write_lane_assignment_metadata(
+    lane_root: &Path,
+    target_branch: &str,
+    base_commit: &str,
+    task: &LoopTask,
+) -> Result<()> {
+    let metadata = LaneAssignmentMetadata {
+        task_id: task.id.clone(),
+        target_branch: target_branch.to_string(),
+        base_commit: base_commit.to_string(),
+        task_hash: hash_stable(&task.markdown),
+        dependency_hash: hash_stable(&task.dependencies),
+        verification_hash: hash_stable(&task_field_body(
+            &task.markdown,
+            "Verification:",
+            "Required tests:",
+        )),
+    };
+    let json = serde_json::to_vec_pretty(&metadata)?;
+    atomic_write(&lane_root.join(LANE_ASSIGNMENT_FILE), &json).with_context(|| {
+        format!(
+            "failed to write {}",
+            lane_root.join(LANE_ASSIGNMENT_FILE).display()
+        )
+    })
+}
+
+fn validate_lane_assignment_metadata(
+    lane_root: &Path,
+    target_branch: &str,
+    task: &LoopTask,
+) -> Result<LaneAssignmentMetadata> {
+    let metadata_path = lane_root.join(LANE_ASSIGNMENT_FILE);
+    let text = fs::read_to_string(&metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let metadata: LaneAssignmentMetadata = serde_json::from_str(&text)
+        .with_context(|| format!("invalid {}", metadata_path.display()))?;
+    if metadata.task_id != task.id {
+        bail!(
+            "task id changed from `{}` to `{}`",
+            metadata.task_id,
+            task.id
+        );
+    }
+    if metadata.target_branch != target_branch {
+        bail!(
+            "target branch changed from `{}` to `{target_branch}`",
+            metadata.target_branch
+        );
+    }
+    if metadata.verification_hash
+        != hash_stable(&task_field_body(
+            &task.markdown,
+            "Verification:",
+            "Required tests:",
+        ))
+    {
+        bail!("verification text hash changed");
+    }
+    if metadata.task_hash != hash_stable(&task.markdown) {
+        bail!("task body hash changed");
+    }
+    if metadata.dependency_hash != hash_stable(&task.dependencies) {
+        bail!("dependency hash changed");
+    }
+    Ok(metadata)
+}
+
+fn hash_stable<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn read_lane_task_id(lane_root: &Path) -> Result<Option<String>> {
     let task_id_path = lane_root.join(LANE_TASK_ID_FILE);
     if task_id_path.exists() {
@@ -5663,6 +6015,11 @@ fn reconcile_parallel_clean_no_commit(
     assignment: &ActiveLaneAssignment,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<bool> {
+    write_clean_no_commit_verdict(
+        assignment,
+        "needs-human-triage",
+        "lane exited cleanly without a local commit; canonical evidence will be inspected before shelving",
+    )?;
     let evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     let review_can_complete_evidence = !evidence_before.has_review_handoff
@@ -5707,9 +6064,92 @@ fn reconcile_parallel_clean_no_commit(
                 ));
             }
         }
+    } else {
+        let message = format!(
+            "{}: {} evidence closeout",
+            repo_name(repo_root),
+            assignment.task.id
+        );
+        run_git(repo_root, ["commit", "--allow-empty", "-m", &message])?;
+        if push_branch_with_remote_sync(repo_root, target_branch)? {
+            parallel_logger.info(format!(
+                "remote sync: rebased onto origin/{} after empty evidence closeout",
+                target_branch
+            ));
+        }
     }
+    write_clean_no_commit_verdict(
+        assignment,
+        "task-already-done",
+        "canonical review, receipt, and declared artifact evidence are complete; host created an evidence closeout",
+    )?;
 
     Ok(true)
+}
+
+fn recover_shelved_tasks_from_canonical_evidence(
+    repo_root: &Path,
+    target_branch: &str,
+    shelved_tasks: &mut BTreeMap<String, String>,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<usize> {
+    let mut recovered = Vec::new();
+    for (task_id, markdown) in shelved_tasks.clone() {
+        let evidence = inspect_task_completion_evidence(repo_root, &task_id, &markdown);
+        if !evidence.is_fully_evidenced() {
+            continue;
+        }
+        let review_added = ensure_host_review_handoff(repo_root, &task_id, &[], &evidence)?;
+        let plan_updated = update_task_completion_in_plan(repo_root, &task_id, LoopTaskStatus::Done)?;
+        if review_added {
+            run_git(repo_root, ["add", "REVIEW.md"])?;
+        }
+        if plan_updated {
+            run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+        }
+        let message = format!("{}: {} evidence recovery", repo_name(repo_root), task_id);
+        if repo_has_staged_queue_updates(repo_root)? {
+            run_git(repo_root, ["commit", "-m", &message])?;
+        } else {
+            run_git(repo_root, ["commit", "--allow-empty", "-m", &message])?;
+        }
+        recovered.push(task_id);
+    }
+
+    if recovered.is_empty() {
+        return Ok(0);
+    }
+    if push_branch_with_remote_sync(repo_root, target_branch)? {
+        parallel_logger.info(format!(
+            "remote sync: rebased onto origin/{} after shelved evidence recovery",
+            target_branch
+        ));
+    }
+    for task_id in &recovered {
+        shelved_tasks.remove(task_id);
+    }
+    parallel_logger.info(format!(
+        "self-heal: recovered {} shelved task(s) from canonical evidence before NO-GO ({})",
+        recovered.len(),
+        recovered.join(", ")
+    ));
+    Ok(recovered.len())
+}
+
+fn write_clean_no_commit_verdict(
+    assignment: &ActiveLaneAssignment,
+    verdict: &str,
+    reason: &str,
+) -> Result<()> {
+    let path = assignment.lane_root.join("clean-no-commit-verdict.json");
+    let payload = serde_json::json!({
+        "task_id": assignment.task.id,
+        "lane_index": assignment.lane_index,
+        "verdict": verdict,
+        "reason": reason,
+    });
+    let text = serde_json::to_vec_pretty(&payload)?;
+    atomic_write(&path, &text).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn reconcile_parallel_landed_task(
@@ -6288,17 +6728,18 @@ mod tests {
         lane_repo_recovery_note, lane_repo_status_summary, lane_scope_budget, lane_status_task_id,
         last_parallel_stop_state, maybe_disable_linear_auto_sync_for_run,
         next_parallel_unblock_candidate, no_dependency_ready_stop_message,
-        parallel_blocker_frontier, parallel_run_root, parallel_tmux_command,
-        parallel_tmux_session_name, parse_loop_plan, parse_parallel_stop_ids,
-        preflight_warning_names, prepare_lane_landing_recovery, prepare_parallel_startup,
-        prepared_landing_recovery_note, preserve_resume_recovery_notes,
+        parallel_blocker_frontier, parallel_run_root, parallel_status_safety_verdict,
+        parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
+        parse_parallel_stop_ids, preflight_warning_names, prepare_lane_landing_recovery,
+        prepare_parallel_startup, prepared_landing_recovery_note, preserve_resume_recovery_notes,
         prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
         recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
         render_parallel_health_summary, repo_forbids_legacy_review_trackers,
         reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
         salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
         tmux_status_line_has_live_worker, try_checkpoint_parallel_host_queue_changes,
-        update_task_completion_in_plan_text, ActiveLaneAssignment, CherryPickFailurePolicy,
+        update_task_completion_in_plan_text, validate_lane_assignment_metadata,
+        write_lane_assignment_metadata, ActiveLaneAssignment, CherryPickFailurePolicy,
         LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LinearAutoSyncState,
         LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind, ParallelEventLogger,
         ParallelPreflightNeeds, ParallelStartupPrep, ParallelUnblockCandidateKind,
@@ -6860,6 +7301,47 @@ mod tests {
     }
 
     #[test]
+    fn parallel_status_prints_launch_resume_land_safety_verdict() {
+        let plan = parse_loop_plan(
+            "# IMPLEMENTATION_PLAN\n\n- [ ] `TASK-1` Ready\nDependencies: none\n\n- [ ] `TASK-2` Blocked\nDependencies: `TASK-1`\n",
+        );
+
+        let go = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            &[],
+            &[],
+        );
+        assert!(go.starts_with("GO:"), "{go}");
+        assert!(go.contains("TASK-1"), "{go}");
+
+        let recover = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            &[],
+            &["lane-2 TASK-2".to_string()],
+        );
+        assert!(recover.starts_with("RECOVER:"), "{recover}");
+
+        let stop = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            &["lane-1 TASK-1".to_string()],
+            &[],
+        );
+        assert!(stop.starts_with("STOP:"), "{stop}");
+    }
+
+    #[test]
     fn preflight_classification_does_not_treat_rbtc_mainnet_as_regtest() {
         let repo = unique_temp_dir("parallel-preflight-mainnet");
         fs::create_dir_all(&repo).expect("failed to create temp repo");
@@ -7009,6 +7491,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: "- [ ] `TASK-CLEAN` clean recovery\n".to_string(),
             },
             resumed: false,
@@ -7129,6 +7612,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: "- [ ] `TASK-CONFLICT` conflict recovery\n".to_string(),
             },
             resumed: false,
@@ -7273,6 +7757,83 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("--cargo-build-jobs"));
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_task_body() {
+        let lane_root = unique_temp_dir("lane-assignment-body");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
+        };
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+            .expect("metadata should write");
+
+        let mut changed = task.clone();
+        changed.markdown.push_str("Extra body\n");
+        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
+            .expect_err("changed body rejected");
+        assert!(format!("{err:#}").contains("task body hash changed"));
+        fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_dependencies() {
+        let lane_root = unique_temp_dir("lane-assignment-deps");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec!["TASK-000".to_string()],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: `TASK-000`\n".to_string(),
+        };
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+            .expect("metadata should write");
+
+        let mut changed = task.clone();
+        changed.dependencies = vec![];
+        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
+            .expect_err("changed dependencies rejected");
+        assert!(format!("{err:#}").contains("dependency hash changed"));
+        fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_verification_text() {
+        let lane_root = unique_temp_dir("lane-assignment-verification");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
+        };
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+            .expect("metadata should write");
+
+        let mut changed = task.clone();
+        changed.markdown = changed
+            .markdown
+            .replace("cargo test task_one", "cargo test task_two");
+        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
+            .expect_err("changed verification rejected");
+        assert!(format!("{err:#}").contains("verification text hash changed"));
+        fs::remove_dir_all(lane_root).ok();
     }
 
     #[test]
@@ -7457,6 +8018,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: String::new(),
             },
             LoopTask {
@@ -7466,6 +8028,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: String::new(),
             },
         ];
@@ -7574,6 +8137,7 @@ mod tests {
             dependencies: Vec::new(),
             estimated_scope: Some("XS".to_string()),
             completion_path_target: None,
+            lane_kind: LaneKind::Code,
             markdown: String::new(),
         };
         let medium = LoopTask {
@@ -7583,6 +8147,7 @@ mod tests {
             dependencies: Vec::new(),
             estimated_scope: Some("M".to_string()),
             completion_path_target: None,
+            lane_kind: LaneKind::Code,
             markdown: String::new(),
         };
 
@@ -7601,6 +8166,7 @@ mod tests {
             dependencies: vec!["WEB-CRAPS-B".to_string()],
             estimated_scope: Some("S".to_string()),
             completion_path_target: None,
+            lane_kind: LaneKind::Code,
             markdown: "- [ ] `WEB-CRAPS-C` Checkpoint\n  Scope boundary: verification only.\n  Acceptance criteria:\n    - pass".to_string(),
         };
         let normal = LoopTask {
@@ -7610,6 +8176,7 @@ mod tests {
             dependencies: vec!["WEB-CRAPS-C".to_string()],
             estimated_scope: Some("M".to_string()),
             completion_path_target: None,
+            lane_kind: LaneKind::Code,
             markdown: "- [ ] `WEB-CRAPS-D` Real work\n  Scope boundary: state source only.\n  Acceptance criteria:\n    - ship".to_string(),
         };
 
@@ -7930,6 +8497,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: "- [ ] `TASK-001`\n  Owns: `src.txt`\n".to_string(),
             },
             LoopTask {
@@ -7939,6 +8507,7 @@ mod tests {
                 dependencies: Vec::new(),
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
+                lane_kind: LaneKind::Code,
                 markdown: "- [ ] `TASK-002`\n  Owns: `docs/proof.md`\n".to_string(),
             },
         ];

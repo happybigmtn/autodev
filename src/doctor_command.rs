@@ -5,6 +5,9 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 
+use crate::corpus::load_planning_corpus;
+use crate::state::load_state;
+use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::git_repo_root;
 
 const AUTODEV_REQUIRED_LAYOUT: &[&str] = &["Cargo.toml", "src/main.rs", "README.md", "AGENTS.md"];
@@ -108,6 +111,7 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
                 action: None,
             });
             report.required.extend(check_repo_checkout(&repo_root));
+            report.required.extend(check_planning_health(&repo_root));
         }
         Err(err) => report.required.push(RequiredCheck {
             name: "repo root".to_string(),
@@ -139,6 +143,100 @@ fn check_repo_checkout(repo_root: &Path) -> Vec<RequiredCheck> {
         Ok(None) => vec![check_project_checkout_layout(repo_root)],
         Err(check) => vec![check],
     }
+}
+
+fn check_planning_health(repo_root: &Path) -> Vec<RequiredCheck> {
+    let mut checks = Vec::new();
+    let state = load_state(repo_root).unwrap_or_default();
+    let planning_root = state
+        .planning_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join("genesis"));
+    let planning_source = if state.planning_root.is_some() {
+        "saved state"
+    } else {
+        "default genesis"
+    };
+    match load_planning_corpus(&planning_root) {
+        Ok(corpus) => checks.push(RequiredCheck {
+            name: "planning root".to_string(),
+            passed: true,
+            detail: format!(
+                "{} from {planning_source}; {} primary plan(s)",
+                planning_root.display(),
+                corpus.primary_plans.len()
+            ),
+            action: None,
+        }),
+        Err(err) => checks.push(RequiredCheck {
+            name: "planning root".to_string(),
+            passed: false,
+            detail: format!("{} from {planning_source}: {err}", planning_root.display()),
+            action: Some(
+                "run auto corpus or pass --planning-root to model-backed commands".to_string(),
+            ),
+        }),
+    }
+
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    match std::fs::read_to_string(&plan_path) {
+        Ok(plan) => {
+            let tasks = parse_tasks(&plan);
+            let pending = tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Pending)
+                .count();
+            let partial = tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Partial)
+                .count();
+            let blocked = tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Blocked)
+                .count();
+            let done = tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Done)
+                .count();
+            checks.push(RequiredCheck {
+                name: "queue health".to_string(),
+                passed: !tasks.is_empty(),
+                detail: format!(
+                    "{} task(s): {pending} pending, {partial} partial, {blocked} blocked, {done} done",
+                    tasks.len()
+                ),
+                action: tasks
+                    .is_empty()
+                    .then(|| "restore IMPLEMENTATION_PLAN.md task rows before running auto parallel".to_string()),
+            });
+        }
+        Err(err) => checks.push(RequiredCheck {
+            name: "queue health".to_string(),
+            passed: false,
+            detail: format!("failed to read {}: {err}", plan_path.display()),
+            action: Some("restore IMPLEMENTATION_PLAN.md before running auto parallel".to_string()),
+        }),
+    }
+
+    let snapshot = state
+        .latest_output_dir
+        .as_ref()
+        .map(|path| {
+            if path.exists() {
+                format!("latest generated snapshot exists at {}", path.display())
+            } else {
+                format!("latest generated snapshot is missing at {}", path.display())
+            }
+        })
+        .unwrap_or_else(|| "no generated snapshot recorded".to_string());
+    checks.push(RequiredCheck {
+        name: "generated snapshot".to_string(),
+        passed: true,
+        detail: snapshot,
+        action: None,
+    });
+
+    checks
 }
 
 fn check_autodev_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {
@@ -467,9 +565,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_optional_tool_checks, check_help_surfaces_with, check_repo_checkout,
-        check_version_probe, format_auto_args, render_doctor_report, CapabilityCheck, CommandProbe,
-        DoctorReport, RequiredCheck, HELP_SURFACES,
+        build_optional_tool_checks, check_help_surfaces_with, check_planning_health,
+        check_repo_checkout, check_version_probe, format_auto_args, render_doctor_report,
+        CapabilityCheck, CommandProbe, DoctorReport, RequiredCheck, HELP_SURFACES,
     };
 
     #[test]
@@ -529,6 +627,36 @@ mod tests {
         );
         assert_eq!(checks.len(), HELP_SURFACES.len());
         assert!(checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn doctor_reports_active_planning_and_queue_health() {
+        let repo = temp_repo("planning-health");
+        fs::create_dir_all(repo.join("genesis/plans")).expect("failed to create corpus");
+        fs::write(repo.join("genesis/plans/001-build.md"), "# Build\n")
+            .expect("failed to write plan");
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [ ] `TASK-1` Pending\nDependencies: none\n\n- [~] `TASK-2` Partial\nDependencies: none\n\n- [!] `TASK-3` Blocked\nDependencies: `TASK-1`\n\n- [x] `TASK-4` Done\nDependencies: none\n",
+        )
+        .expect("failed to write queue");
+
+        let checks = check_planning_health(&repo);
+        let planning = checks
+            .iter()
+            .find(|check| check.name == "planning root")
+            .expect("planning check should exist");
+        let queue = checks
+            .iter()
+            .find(|check| check.name == "queue health")
+            .expect("queue check should exist");
+
+        assert!(planning.passed);
+        assert!(planning.detail.contains("1 primary plan"));
+        assert!(queue.passed);
+        assert!(queue
+            .detail
+            .contains("1 pending, 1 partial, 1 blocked, 1 done"));
     }
 
     #[test]

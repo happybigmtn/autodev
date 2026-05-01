@@ -14,6 +14,7 @@ use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
+use crate::verdict::{exact_terminal_verdict, terminal_verdict_is};
 use crate::{DesignArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, SuperArgs};
 
 const DESIGN_ARTIFACTS: [&str; 6] = [
@@ -854,10 +855,7 @@ fn verify_design_artifacts(output_dir: &Path) -> Result<()> {
     let report_path = output_dir.join("DESIGN-REPORT.md");
     let report = fs::read_to_string(&report_path)
         .with_context(|| format!("failed to read {}", report_path.display()))?;
-    if !report
-        .lines()
-        .any(|line| matches!(line.trim(), "Verdict: GO" | "Verdict: NO-GO"))
-    {
+    if exact_terminal_verdict(&report, &["Verdict: GO", "Verdict: NO-GO"])?.is_none() {
         bail!(
             "{} must contain `Verdict: GO` or `Verdict: NO-GO`",
             report_path.display()
@@ -881,7 +879,11 @@ fn design_report_is_go(output_dir: &Path) -> Result<bool> {
     let report_path = output_dir.join("DESIGN-REPORT.md");
     let report = fs::read_to_string(&report_path)
         .with_context(|| format!("failed to read {}", report_path.display()))?;
-    Ok(report.lines().any(|line| line.trim() == "Verdict: GO"))
+    Ok(terminal_verdict_is(
+        &report,
+        "Verdict: GO",
+        &["Verdict: GO", "Verdict: NO-GO"],
+    ))
 }
 
 fn require_nonempty_file(path: &Path) -> Result<()> {

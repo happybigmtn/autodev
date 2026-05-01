@@ -2,6 +2,10 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::{bail, Context, Result};
+
+use crate::verification_lint::verify_commands_are_runnable;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskStatus {
     Pending,
@@ -21,6 +25,33 @@ pub(crate) struct PlanTask {
     pub(crate) verification_text: Option<String>,
     pub(crate) completion_artifacts: Vec<String>,
     pub(crate) completion_path_target: Option<String>,
+    pub(crate) lane_kind: Option<LaneKind>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LaneKind {
+    Code,
+    Operator,
+    Evidence,
+}
+
+impl LaneKind {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "code" => Some(Self::Code),
+            "operator" | "operator-action" | "operator action" => Some(Self::Operator),
+            "evidence" | "evidence-only" | "proof" | "proof-only" => Some(Self::Evidence),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Operator => "operator",
+            Self::Evidence => "evidence",
+        }
+    }
 }
 
 pub(crate) fn parse_tasks(plan: &str) -> Vec<PlanTask> {
@@ -75,6 +106,7 @@ fn finalize_task(lines: &[String]) -> Option<PlanTask> {
         .filter(|value| !value.trim().is_empty()),
         completion_artifacts: parse_completion_artifacts(&markdown),
         completion_path_target: parse_task_completion_path(&markdown),
+        lane_kind: parse_lane_kind(&markdown),
         markdown,
         body,
     })
@@ -253,6 +285,16 @@ fn parse_task_completion_path(markdown: &str) -> Option<String> {
     })
 }
 
+fn parse_lane_kind(markdown: &str) -> Option<LaneKind> {
+    let value = task_field_body_until_any(markdown, "Lane kind:", TASK_FIELD_BOUNDARIES)?;
+    let first = value
+        .lines()
+        .map(strip_list_bullet)
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    LaneKind::parse(first)
+}
+
 pub(crate) const PLAN_TASK_REQUIRED_FIELDS: &[&str] = &[
     "Spec:",
     "Why now:",
@@ -273,6 +315,7 @@ pub(crate) const PLAN_TASK_REQUIRED_FIELDS: &[&str] = &[
     "Cross-surface tests:",
     "Review/closeout:",
     "Completion artifacts:",
+    "Lane kind:",
     "Dependencies:",
     "Estimated scope:",
     "Completion signal:",
@@ -345,6 +388,328 @@ pub(crate) fn task_field_body_until_any(
         }
     }
     collecting.then(|| body.join("\n"))
+}
+
+pub(crate) fn validate_execution_row(task: &PlanTask, all_task_ids: &BTreeSet<&str>) -> Result<()> {
+    let header = task.markdown.lines().next().unwrap_or_default();
+    let (status, header_id, title) = parse_task_header(header)
+        .with_context(|| format!("task `{}` header did not parse", task.id))?;
+    if status != task.status || header_id != task.id || title.trim().is_empty() {
+        bail!(
+            "task `{}` header must parse to its task id, status, and a non-empty title",
+            task.id
+        );
+    }
+
+    for &field in PLAN_TASK_REQUIRED_FIELDS {
+        let body = execution_row_field_body(task, field)?;
+        if body.trim().is_empty() {
+            bail!("task `{}` has empty required field `{field}`", task.id);
+        }
+    }
+
+    validate_execution_row_dependencies(task, all_task_ids)?;
+    validate_execution_row_estimated_scope(task)?;
+    validate_execution_row_completion_artifacts(task)?;
+    validate_execution_row_process_fields(task)?;
+    validate_execution_row_commands(task)?;
+    validate_execution_row_concrete_ownership(task)?;
+    validate_execution_row_lane_kind(task)?;
+    validate_execution_row_field_boundaries(task, "Verification:")?;
+    validate_execution_row_field_boundaries(task, "Required tests:")?;
+    Ok(())
+}
+
+pub(crate) fn validate_execution_rows(plan: &str) -> Result<Vec<PlanTask>> {
+    let tasks = parse_tasks(plan);
+    let all_task_ids = tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for task in tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Partial))
+    {
+        validate_execution_row(task, &all_task_ids)?;
+    }
+    Ok(tasks)
+}
+
+pub(crate) fn execution_row_field_body(task: &PlanTask, field: &str) -> Result<String> {
+    task_field_body_until_any(&task.markdown, field, TASK_FIELD_BOUNDARIES)
+        .with_context(|| format!("task `{}` missing `{field}`", task.id))
+}
+
+pub(crate) fn execution_row_first_field_line<'a>(
+    task: &'a PlanTask,
+    field: &str,
+) -> Result<String> {
+    let body = execution_row_field_body(task, field)?;
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("task `{}` has no value for `{field}`", task.id))
+}
+
+fn validate_execution_row_dependencies(
+    task: &PlanTask,
+    all_task_ids: &BTreeSet<&str>,
+) -> Result<()> {
+    let body = execution_row_field_body(task, "Dependencies:")?;
+    let meaningful_lines = body
+        .lines()
+        .map(strip_list_bullet)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if meaningful_lines.is_empty() {
+        bail!("task `{}` has empty `Dependencies:`", task.id);
+    }
+
+    let joined = meaningful_lines.join(" ");
+    if joined.eq_ignore_ascii_case("none") {
+        if !task.dependencies.is_empty() {
+            bail!(
+                "task `{}` says `Dependencies: none` but parser found {:?}",
+                task.id,
+                task.dependencies
+            );
+        }
+        return Ok(());
+    }
+    reject_dependency_prose(task, &joined)?;
+
+    let mut explicit = Vec::new();
+    for line in meaningful_lines {
+        for part in line.split(',') {
+            let token = part.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some(unwrapped) = token
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+            else {
+                bail!(
+                    "task `{}` `Dependencies:` must contain only backticked task IDs or `none`; got `{token}`",
+                    task.id
+                );
+            };
+            explicit.push(unwrapped.to_string());
+        }
+    }
+    explicit.sort();
+    explicit.dedup();
+    let mut parsed = task.dependencies.clone();
+    parsed.sort();
+    if explicit != parsed {
+        bail!(
+            "task `{}` dependencies are not parser-stable; explicit {:?}, parsed {:?}",
+            task.id,
+            explicit,
+            parsed
+        );
+    }
+    for dependency in &task.dependencies {
+        if dependency == &task.id {
+            bail!("task `{}` cannot depend on itself", task.id);
+        }
+        if !all_task_ids.contains(dependency.as_str()) {
+            bail!(
+                "task `{}` depends on `{dependency}`, which is not a parseable task in the plan",
+                task.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_dependency_prose(task: &PlanTask, text: &str) -> Result<()> {
+    let lower = text.to_ascii_lowercase();
+    for phrase in [
+        "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external", "(", ")",
+        ".", ";", ":",
+    ] {
+        if lower.contains(phrase) {
+            bail!(
+                "task `{}` `Dependencies:` must be machine-readable IDs only; remove prose phrase `{phrase}`",
+                task.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_row_estimated_scope(task: &PlanTask) -> Result<()> {
+    let scope = execution_row_first_field_line(task, "Estimated scope:")?;
+    if !matches!(scope.as_str(), "XS" | "S" | "M") {
+        bail!(
+            "task `{}` must use `Estimated scope: XS`, `S`, or `M`; got `{scope}`",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_execution_row_lane_kind(task: &PlanTask) -> Result<()> {
+    let Some(body) = task_field_body_until_any(&task.markdown, "Lane kind:", TASK_FIELD_BOUNDARIES)
+    else {
+        return Ok(());
+    };
+    let first = body
+        .lines()
+        .map(strip_list_bullet)
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if LaneKind::parse(first).is_none() {
+        bail!(
+            "task `{}` has invalid `Lane kind:` `{first}`; expected code, operator, or evidence",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_execution_row_completion_artifacts(task: &PlanTask) -> Result<()> {
+    let body = execution_row_field_body(task, "Completion artifacts:")?;
+    let first = body
+        .lines()
+        .map(strip_list_bullet)
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if first == "none" {
+        return Ok(());
+    }
+    if task.completion_artifacts.is_empty() {
+        bail!(
+            "task `{}` `Completion artifacts:` must be `none` or concrete repo-relative paths",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
+    for &field in PLAN_TASK_PROCESS_FIELDS {
+        let value = execution_row_first_field_line(task, field)?;
+        let lowercase = value.to_ascii_lowercase();
+        for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
+            if lowercase.contains(forbidden) {
+                bail!(
+                    "task `{}` has vague `{field}` content `{forbidden}`",
+                    task.id
+                );
+            }
+        }
+    }
+
+    let ui_consumers = execution_row_first_field_line(task, "UI consumers:")?;
+    let has_ui = !field_value_is_none(&ui_consumers);
+    let cross_surface = execution_row_first_field_line(task, "Cross-surface tests:")?;
+    if has_ui && field_value_is_none(&cross_surface) {
+        bail!(
+            "task `{}` names UI consumers but has no `Cross-surface tests:` proof",
+            task.id
+        );
+    }
+
+    let generated_artifacts = execution_row_first_field_line(task, "Generated artifacts:")?;
+    let contract_generation = execution_row_first_field_line(task, "Contract generation:")?;
+    if !field_value_is_none(&generated_artifacts) && field_value_is_none(&contract_generation) {
+        bail!(
+            "task `{}` names generated artifacts but has no `Contract generation:` command",
+            task.id
+        );
+    }
+
+    let review_closeout = execution_row_first_field_line(task, "Review/closeout:")?;
+    let review_lower = review_closeout.to_ascii_lowercase();
+    if review_lower == "cargo check" || review_lower.contains("cargo check only") {
+        bail!(
+            "task `{}` cannot use only cargo check for `Review/closeout:`",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+fn field_value_is_none(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower == "none"
+        || lower.starts_with("none ")
+        || lower.starts_with("none --")
+        || lower.starts_with("none -")
+}
+
+fn validate_execution_row_commands(task: &PlanTask) -> Result<()> {
+    verify_commands_are_runnable(
+        task.id.as_str(),
+        "Verification:",
+        &execution_row_field_body(task, "Verification:")?,
+    )?;
+    verify_commands_are_runnable(
+        task.id.as_str(),
+        "Required tests:",
+        &execution_row_field_body(task, "Required tests:")?,
+    )?;
+    Ok(())
+}
+
+fn validate_execution_row_concrete_ownership(task: &PlanTask) -> Result<()> {
+    let owns = execution_row_field_body(task, "Owns:")?;
+    if !contains_path_like_token(&owns) {
+        bail!("task `{}` has non-concrete `Owns:` field", task.id);
+    }
+    Ok(())
+}
+
+fn contains_path_like_token(body: &str) -> bool {
+    body.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')'))
+        .map(|token| token.trim_matches(|ch: char| matches!(ch, '`' | '\'' | '"' | ':' | '.')))
+        .any(|token| {
+            token.contains('/')
+                || token.starts_with("refs/")
+                || [
+                    "src",
+                    "docs",
+                    "specs",
+                    "tests",
+                    "scripts",
+                    "README.md",
+                    "IMPLEMENTATION_PLAN.md",
+                ]
+                .contains(&token)
+                || [
+                    ".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".sh", ".ts", ".tsx", ".js",
+                ]
+                .iter()
+                .any(|extension| token.ends_with(extension))
+        })
+}
+
+fn validate_execution_row_field_boundaries(task: &PlanTask, field: &str) -> Result<()> {
+    let body = execution_row_field_body(task, field)?;
+    for boundary in TASK_FIELD_BOUNDARIES
+        .iter()
+        .filter(|boundary| **boundary != field)
+    {
+        if body
+            .lines()
+            .map(strip_list_bullet)
+            .map(str::trim)
+            .any(|line| line.starts_with(boundary))
+        {
+            bail!(
+                "task `{}` `{field}` body swallowed metadata boundary `{boundary}`",
+                task.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn strip_list_bullet(line: &str) -> &str {
@@ -452,8 +817,8 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_task_id_like, parse_task_header, parse_tasks, TaskStatus, PLAN_TASK_PROCESS_FIELDS,
-        PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
+        is_task_id_like, parse_task_header, parse_tasks, validate_execution_row, TaskStatus,
+        PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
     };
 
     #[test]
@@ -707,5 +1072,65 @@ mod tests {
         assert!(tasks[0].dependencies.is_empty());
         assert_eq!(tasks[1].status, TaskStatus::Pending);
         assert_eq!(tasks[1].completion_path_target, None);
+    }
+
+    fn rich_execution_row_plan() -> String {
+        r#"
+- [ ] `TASK-001` Runtime backed UI fix
+
+  Spec: `specs/runtime-ui.md`
+  Why now: closes runtime/UI drift before parallel implementation.
+  Codebase evidence: `src/runtime.rs` and `web/App.tsx`.
+  Source of truth: `src/runtime.rs`
+  Runtime owner: `src/runtime.rs`
+  UI consumers: `web/App.tsx`
+  Generated artifacts: `bindings/schema.json`
+  Fixture boundary: fixtures only in `tests/fixtures`.
+  Retired surfaces: none
+  Owns: `src/runtime.rs`, `web/App.tsx`
+  Integration touchpoints: `bindings/schema.json`
+  Scope boundary: keep changes inside runtime and UI readback.
+  Acceptance criteria: UI renders runtime-produced status.
+  Verification: `cargo test runtime_ui_readback`
+  Required tests: `cargo test runtime_ui_readback`
+  Contract generation: `cargo run -p xtask -- codegen`
+  Cross-surface tests: `cargo test runtime_ui_readback`
+  Review/closeout: REVIEW.md records runtime-to-UI proof.
+  Completion artifacts: `REVIEW.md`
+  Dependencies: none
+  Estimated scope: S
+  Completion signal: local tests and review handoff pass.
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn execution_row_validator_accepts_rich_generated_contract() {
+        let plan = rich_execution_row_plan();
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        validate_execution_row(&tasks[0], &ids).expect("rich row should validate");
+    }
+
+    #[test]
+    fn execution_row_validator_rejects_missing_required_field_with_task_id() {
+        let plan = rich_execution_row_plan().replace("  Runtime owner: `src/runtime.rs`\n", "");
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        let err = validate_execution_row(&tasks[0], &ids).expect_err("missing field rejected");
+        assert!(format!("{err:#}").contains("TASK-001"));
+        assert!(format!("{err:#}").contains("Runtime owner:"));
+    }
+
+    #[test]
+    fn execution_row_validator_rejects_prose_only_dependencies() {
+        let plan = rich_execution_row_plan().replace(
+            "  Dependencies: none\n",
+            "  Dependencies: after the runtime work lands\n",
+        );
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        let err = validate_execution_row(&tasks[0], &ids).expect_err("prose rejected");
+        assert!(format!("{err:#}").contains("machine-readable"));
     }
 }

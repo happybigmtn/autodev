@@ -10,10 +10,7 @@ use crate::design_command;
 use crate::generation;
 use crate::parallel_command;
 use crate::state::load_state;
-use crate::task_parser::{
-    task_field_body_until_any, PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS,
-    TASK_FIELD_BOUNDARIES,
-};
+use crate::task_parser::{parse_tasks, validate_execution_row, PLAN_TASK_PROCESS_FIELDS};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
@@ -723,8 +720,13 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
     if unchecked.is_empty() {
         bail!("{} has no unchecked executable tasks", plan_path.display());
     }
+    let shared_tasks = parse_tasks(&markdown);
+    let all_task_ids = shared_tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     for task in &unchecked {
-        verify_super_task(task)?;
+        verify_super_task(task, &all_task_ids)?;
     }
 
     Ok(DeterministicGateSummary {
@@ -740,24 +742,22 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
     })
 }
 
-fn verify_super_task(task: &SuperTaskBlock) -> Result<()> {
-    for &field in PLAN_TASK_REQUIRED_FIELDS {
-        let body = super_task_field_body(task, field)
-            .with_context(|| format!("task `{}` is missing `{field}`", task.task_id))?;
-        if body.trim().is_empty() {
-            bail!("task `{}` has empty required field `{field}`", task.task_id);
-        }
-    }
-    verify_super_task_process_fields(task)?;
+fn verify_super_task(
+    task: &SuperTaskBlock,
+    all_task_ids: &std::collections::BTreeSet<&str>,
+) -> Result<()> {
+    let parsed_task = parse_tasks(&task.markdown)
+        .into_iter()
+        .find(|candidate| candidate.id == task.task_id)
+        .with_context(|| {
+            format!(
+                "task `{}` is not parseable by shared task parser",
+                task.task_id
+            )
+        })?;
+    validate_execution_row(&parsed_task, all_task_ids)
+        .with_context(|| format!("task `{}` failed execution-row validation", task.task_id))?;
 
-    let scope = task_field_value(task, "Estimated scope:")
-        .with_context(|| format!("task `{}` missing `Estimated scope:`", task.task_id))?;
-    if !matches!(scope, "XS" | "S" | "M") {
-        bail!(
-            "task `{}` must use `Estimated scope: XS`, `S`, or `M`; got `{scope}`",
-            task.task_id
-        );
-    }
     for forbidden in [
         "TBD",
         "TODO",
@@ -771,20 +771,10 @@ fn verify_super_task(task: &SuperTaskBlock) -> Result<()> {
             );
         }
     }
-    let verification = super_task_field_body(task, "Verification:").unwrap_or_default();
-    if verification_looks_broad_or_malformed(&verification) {
-        bail!(
-            "task `{}` has broad or malformed verification; tighten it before parallel execution",
-            task.task_id
-        );
-    }
-    let owns = super_task_field_body(task, "Owns:").unwrap_or_default();
-    if !contains_path_like_token(&owns) {
-        bail!("task `{}` has non-concrete `Owns:` field", task.task_id);
-    }
     Ok(())
 }
 
+#[allow(dead_code)]
 fn verify_super_task_process_fields(task: &SuperTaskBlock) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
         let value = first_super_task_field_line(task, field)
@@ -833,11 +823,13 @@ fn verify_super_task_process_fields(task: &SuperTaskBlock) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn field_value_is_none(value: &str) -> bool {
     let lower = value.trim().to_ascii_lowercase();
     lower == "none" || lower.starts_with("none ") || lower.starts_with("none --")
 }
 
+#[allow(dead_code)]
 fn verification_looks_broad_or_malformed(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("cargo test --all")
@@ -846,6 +838,7 @@ fn verification_looks_broad_or_malformed(body: &str) -> bool {
         || lower.lines().any(|line| line.trim() == "cargo --lib")
 }
 
+#[allow(dead_code)]
 fn cargo_test_line_is_package_wide(line: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix("cargo test") else {
@@ -885,6 +878,7 @@ fn cargo_test_line_is_package_wide(line: &str) -> bool {
     true
 }
 
+#[allow(dead_code)]
 fn contains_path_like_token(body: &str) -> bool {
     body.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')'))
         .map(|token| token.trim_matches(|ch: char| matches!(ch, '`' | '\'' | '"' | ':' | '.')))
@@ -990,6 +984,7 @@ fn parse_super_task_header(line: &str) -> Option<(bool, String)> {
     Some((checked, rest[..tick].trim().to_string()))
 }
 
+#[allow(dead_code)]
 fn task_field_value<'a>(task: &'a SuperTaskBlock, field: &str) -> Option<&'a str> {
     task.markdown
         .lines()
@@ -1002,10 +997,6 @@ fn first_super_task_field_line<'a>(task: &'a SuperTaskBlock, field: &str) -> Opt
         .lines()
         .find_map(|line| line.trim_start().strip_prefix(field).map(str::trim))
         .filter(|value| !value.is_empty())
-}
-
-fn super_task_field_body(task: &SuperTaskBlock, field: &str) -> Option<String> {
-    task_field_body_until_any(&task.markdown, field, TASK_FIELD_BOUNDARIES)
 }
 
 fn require_nonempty_file(path: &Path) -> Result<()> {
@@ -1069,9 +1060,7 @@ mod tests {
         let plan = root.join(IMPLEMENTATION_PLAN);
         fs::write(&plan, valid_plan("cargo test")).unwrap();
         let error = verify_parallel_ready_plan(&plan).expect_err("expected broad test rejection");
-        assert!(error
-            .to_string()
-            .contains("broad or malformed verification"));
+        assert!(error.to_string().contains("package-wide cargo test"));
     }
 
     #[test]
@@ -1133,7 +1122,7 @@ mod tests {
     Scope boundary: do not launch workers.
     Acceptance criteria: scoped plan passes.
     Verification: {verification}
-    Required tests: `deterministic_gate_accepts_scoped_unfinished_task`
+    Required tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
     Contract generation: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
     Cross-surface tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
     Review/closeout: reviewer checks super and generation task contracts stay aligned.

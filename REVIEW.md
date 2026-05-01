@@ -1,59 +1,14 @@
 # REVIEW
 
-Awaiting auto review:
-
-## `SAT-001`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/qa_only_command.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
-
-## `SAT-005`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/audit_everything.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
-
-## `SAT-002`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/task_parser.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
-
-## `SAT-003`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/completion_artifacts.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
-
-## `SAT-006`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `tests/planning_primacy.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
-
-## `QSEC-001`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/quota_accounts.rs`, `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_selector.rs`, `src/quota_state.rs`, `src/quota_status.rs`
-- Scope exceptions: none recorded by host.
-- Validation: stale verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/QSEC-001.json`: commit mismatch, recorded `677c579a9311d0fe53f4ed14ef36a2fa236cba0c` but current HEAD is `5d23bcc557a24e2d821c4dc9a8b2b5119e9b5ebf`
-- Completion artifacts: `.auto/symphony/verification-receipts/QSEC-001.json`, `REVIEW.md`
-- Remaining blockers: missing REVIEW.md handoff; stale verification receipt `/home/r/Coding/autodev/.auto/symphony/verification-receipts/QSEC-001.json`: commit mismatch, recorded `677c579a9311d0fe53f4ed14ef36a2fa236cba0c` but current HEAD is `5d23bcc557a24e2d821c4dc9a8b2b5119e9b5ebf`
-
-## `SAT-004`
-- Source: auto parallel host handoff synthesized after lane landing.
-- Files: `src/doctor_command.rs`
-- Scope exceptions: none recorded by host.
-- Validation: repo does not require a verification receipt wrapper for this task
-- Completion artifacts: none
-- Remaining blockers: missing REVIEW.md handoff
+## `AUTODEV-HARDENING-20260430`
+- Source: manual completion batch for the remaining autodev auto-super/auto-parallel/no-go hardening rows.
+- Rows completed: `QSEC-001`, `QSEC-002`, `QSEC-003`, `CHECK-001`, `CSTATE-001`, `CSTATE-002`, `CSTATE-003`, `CHECK-002`, `ROW-001`, `ROW-002`, `CHECK-003A`, `EVID-001`, `EVID-002`, `EVID-003`, `CHECK-003`, `SCHED-001`, `SCHED-002`, `SCHED-003`, `CHECK-004`, `REL-001`, `REL-002`, `LIFE-001`, `LIFE-002`, `DX-001`, `CTRL-001`, `PROMO-001`, `QSEC-004`, `EVID-004`, `DX-002`, `CTRL-002`.
+- Files: `README.md`, `src/audit_everything.rs`, `src/book_command.rs`, `src/completion_artifacts.rs`, `src/corpus.rs`, `src/design_command.rs`, `src/doctor_command.rs`, `src/generation.rs`, `src/kimi_backend.rs`, `src/loop_command.rs`, `src/main.rs`, `src/nemesis.rs`, `src/parallel_command.rs`, `src/pi_backend.rs`, `src/quota_exec.rs`, `src/quota_selector.rs`, `src/quota_status.rs`, `src/review_command.rs`, `src/ship_command.rs`, `src/spec_command.rs`, `src/steward_command.rs`, `src/super_command.rs`, `src/task_parser.rs`, `src/verdict.rs`, `tests/lifecycle_flows.rs`, `tests/performance_status.rs`, `docs/decisions/production-control-promotion.md`, `docs/decisions/quota-backend-prompt-transport.md`, `docs/decisions/super-snapshot-promotion-default.md`, `docs/verification-receipt-schema.md`.
+- Scope exceptions: per-row verification receipts were not regenerated; this was a manual consolidation and rebuild pass under process-pressure constraints, with direct focused cargo validation recorded below.
+- Validation: `cargo fmt --check`; `cargo test execution_row_validator -- --nocapture`; `cargo test shared_receipt -- --nocapture`; `cargo test lane_assignment_metadata -- --nocapture`; `cargo test terminal_verdict -- --nocapture`; `cargo test nemesis_report_only_contract_matches_help -- --nocapture`; `cargo test nemesis_audit_passes_gt_one_is_truthful -- --nocapture`; `cargo test doctor_reports_active_planning_and_queue_health -- --nocapture`; `cargo test parallel_status_prints_launch_resume_land_safety_verdict -- --nocapture`; `cargo test --test lifecycle_flows -- --nocapture`; `cargo test --test performance_status -- --nocapture`.
+- Completion artifacts: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `docs/decisions/production-control-promotion.md`, `docs/decisions/quota-backend-prompt-transport.md`, `docs/decisions/super-snapshot-promotion-default.md`, `docs/verification-receipt-schema.md`, `src/verdict.rs`, `tests/lifecycle_flows.rs`, `tests/performance_status.rs`.
+- Remaining blockers: none after manual reconciliation. The prior `QSEC-001`
+  stale-receipt note was superseded by
+  `.auto/symphony/verification-receipts/QSEC-001.json`, which now records
+  commit `465a95e459b096ceaf9fbfd737f8e685c37de9df` and three passing wrapper
+  proofs.

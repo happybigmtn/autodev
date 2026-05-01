@@ -101,6 +101,11 @@ Provider notes:
   `kimi-cli`; set `FABRO_KIMI_CLI_BIN` or `FABRO_KIMI_CLI_MODEL` when needed.
 - `minimax` and `minimax/*` route through `pi`; set `FABRO_PI_BIN` when the
   binary is not on `PATH`.
+- Kimi and PI/MiniMax currently keep their established prompt transport. The
+  quota safety decision in
+  `docs/decisions/quota-backend-prompt-transport.md` treats argv prompt
+  delivery as an explicit operator-visible limitation until current provider
+  help output or primary documentation proves stdin or prompt-file support.
 - Claude remains an explicit harness for `auto loop`, `auto parallel`, and
   `auto review` via `--claude`; generation-style commands route Claude-like
   names through their Claude authoring path.
@@ -176,6 +181,12 @@ before workers can act on inconsistent doctrine.
 Use `auto gen --snapshot-only` when you want to inspect the generated `gen-*`
 output before syncing root specs and the root plan. Use `auto gen --sync-only
 --output-dir <gen-dir>` to promote an accepted snapshot.
+
+The production-control promotion artifact is the root ledger:
+`IMPLEMENTATION_PLAN.md`, `REVIEW.md`, promoted `specs/*.md`, and release
+evidence such as `SHIP.md`, `QA.md`, and `HEALTH.md`. Generated snapshots stay
+subordinate until explicitly promoted; see
+`docs/decisions/production-control-promotion.md`.
 
 #### 3. Perfect Design And Runtime/UI Contracts
 
@@ -921,6 +932,9 @@ Useful flags:
 - `--output-dir <dir>` to change the disposable audit destination
 - `--prompt-file <path>` to override the prompt template
 - `--report-only` to stop after audit and synthesis without running the implementation pass
+- `--audit-passes <n>` for multi-pass execution; report-only mode remains a
+  single-pass audit/synthesis contract and does not claim remediation/finalizer
+  execution
 - `--branch <name>` to require a specific checked-out branch for implementation
 - `--dry-run` to preview without invoking models
 - `--codex-bin` and `--pi-bin` to point at non-default executables
@@ -1191,6 +1205,10 @@ What it writes:
 
 - `QA.md`
 - logs under `.auto/qa-only/` and `.auto/logs/`
+
+Report-only commands may write only their named report and allowed `.auto/*`
+logs. Source, tests, build config, and unrelated docs are write-boundary
+violations for report-only lifecycle claims.
 
 What it actually does:
 

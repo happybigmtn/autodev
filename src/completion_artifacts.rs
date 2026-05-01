@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -505,6 +505,7 @@ fn verification_step_looks_external(step: &str) -> bool {
         "hcloud",
         "github ui",
         "grafana import",
+        "inspect live",
         "reference host",
         "loom host",
         "staging alertmanager",
@@ -751,6 +752,28 @@ fn inspect_verification_receipt(
     (true, None)
 }
 
+pub(crate) fn shared_receipt_freshness_problem(
+    repo_root: &Path,
+    verification_receipt_path: &Path,
+    receipt_text: &str,
+    expected_commands: &[String],
+    declared_artifacts: &[String],
+) -> Result<Option<String>> {
+    let receipt = serde_json::from_str::<VerificationReceipt>(receipt_text).with_context(|| {
+        format!(
+            "invalid verification receipt `{}`",
+            verification_receipt_path.display()
+        )
+    })?;
+    Ok(verification_receipt_freshness_problem(
+        repo_root,
+        verification_receipt_path,
+        &receipt,
+        expected_commands,
+        declared_artifacts,
+    ))
+}
+
 fn verification_receipt_command_passed(entry: &VerificationReceiptCommand) -> bool {
     entry.status.as_deref() == Some("passed") && entry.exit_code == Some(0)
 }
@@ -931,6 +954,9 @@ fn current_declared_artifact_hashes(
 }
 
 fn declared_artifact_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
+    if !declared_artifact_relative_path_is_safe(relative) {
+        return None;
+    }
     let direct = repo_root.join(relative);
     if direct.exists() {
         return Some(direct);
@@ -939,6 +965,14 @@ fn declared_artifact_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
         .strip_prefix(".auto/symphony/verification-receipts/")
         .map(|file_name| verification_receipt_root(repo_root).join(file_name))
         .filter(|path| path.exists())
+}
+
+fn declared_artifact_relative_path_is_safe(relative: &str) -> bool {
+    let path = Path::new(relative);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1221,6 +1255,22 @@ Dependencies: none
                 ".auto/local-proof.json".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn completion_artifact_paths_reject_parent_escape() {
+        let root = temp_dir("artifact-path-escape");
+        fs::create_dir_all(root.join("docs")).expect("failed to create docs");
+        fs::write(root.join("docs/proof.md"), "proof\n").expect("failed to write proof");
+        let outside = root.parent().unwrap().join("outside-proof.md");
+        fs::write(&outside, "outside\n").expect("failed to write outside proof");
+
+        assert!(super::declared_artifact_path(&root, "docs/proof.md").is_some());
+        assert!(super::declared_artifact_path(&root, "../outside-proof.md").is_none());
+        assert!(super::declared_artifact_path(&root, outside.to_str().unwrap()).is_none());
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_file(outside).ok();
     }
 
     #[test]
@@ -1740,6 +1790,105 @@ Dependencies: none
                 "expected `{problem}` to contain `{expected_problem}`"
             );
         }
+    }
+
+    #[test]
+    fn receipt_schema_requires_current_metadata() {
+        let schema = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/verification-receipt-schema.md"),
+        )
+        .expect("schema should exist");
+        for field in [
+            "commit",
+            "dirty_state.fingerprint",
+            "plan_hash",
+            "expected_argv",
+            "declared_artifacts",
+        ] {
+            assert!(schema.contains(field), "schema should mention `{field}`");
+        }
+    }
+
+    #[test]
+    fn directory_artifact_hashing_respects_documented_limit() {
+        let schema = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/verification-receipt-schema.md"),
+        )
+        .expect("schema should exist");
+        assert!(schema.contains("Directory Hash Limit"));
+
+        let root = temp_dir("directory-artifact-hash");
+        fs::create_dir_all(root.join("artifact/sub")).expect("failed to create artifact dir");
+        fs::write(root.join("artifact/sub/proof.txt"), "proof\n")
+            .expect("failed to write artifact");
+        let first =
+            super::artifact_hash(&root.join("artifact")).expect("directory hash should compute");
+        fs::write(root.join("artifact/sub/proof.txt"), "proof changed\n")
+            .expect("failed to update artifact");
+        let second =
+            super::artifact_hash(&root.join("artifact")).expect("directory hash should compute");
+        assert_ne!(first, second);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn shared_receipt_inspector_rejects_stale_commit() {
+        let root = temp_dir("shared-stale-receipt");
+        init_git_repo(&root);
+        let stale_commit = git_head(&root);
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "# changed\n")
+            .expect("failed to update plan");
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "IMPLEMENTATION_PLAN.md"])
+            .output()
+            .expect("git add failed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "-m", "changed"])
+            .output()
+            .expect("git commit failed");
+        let receipt_path = root.join(".auto/symphony/verification-receipts/TASK.json");
+        let receipt_text = format!(
+            r#"{{"commit":"{stale_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::shared_receipt","expected_argv":["cargo","test","completion_artifacts::tests::shared_receipt"],"exit_code":0,"status":"passed"}}]}}"#
+        );
+        let problem = super::shared_receipt_freshness_problem(
+            &root,
+            &receipt_path,
+            &receipt_text,
+            &["cargo test completion_artifacts::tests::shared_receipt".to_string()],
+            &[],
+        )
+        .expect("receipt should parse")
+        .expect("stale commit rejected");
+        assert!(problem.contains("commit mismatch"));
+    }
+
+    #[test]
+    fn checked_row_empty_review_uses_explicit_evidence_class() {
+        let evidence = TaskCompletionEvidence {
+            has_review_handoff: false,
+            verification_receipt_present: true,
+            ..TaskCompletionEvidence::default()
+        };
+        let assessment = assess_task_completion_gap(
+            "- [x] `TASK-EXT` External proof\nVerification: inspect live deploy\n",
+            &evidence,
+        );
+        assert_eq!(assessment.kind, CompletionGapKind::ExternalOrLiveFollowUp);
+    }
+
+    #[test]
+    fn archive_backed_checked_row_is_fully_evidenced() {
+        let evidence = TaskCompletionEvidence {
+            has_review_handoff: true,
+            verification_receipt_present: true,
+            declared_completion_artifacts: vec!["audit/archive/TASK.md".to_string()],
+            ..TaskCompletionEvidence::default()
+        };
+        assert!(evidence.is_fully_evidenced());
     }
 
     #[test]

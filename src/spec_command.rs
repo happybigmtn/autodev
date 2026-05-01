@@ -6,11 +6,10 @@ use chrono::Local;
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
-    parse_task_header, parse_tasks, task_field_body_until_any, TaskStatus,
-    PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
+    execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
+    TaskStatus,
 };
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
-use crate::verification_lint::verify_commands_are_runnable;
 use crate::SpecArgs;
 
 const SPEC_REQUIRED_SECTIONS: [&str; 12] = [
@@ -328,18 +327,14 @@ fn verify_auto_spec_plan_task(
         );
     }
 
-    for &field in PLAN_TASK_REQUIRED_FIELDS {
-        let body = task_field_body(task, field)?;
-        if body.trim().is_empty() {
-            bail!(
-                "auto spec task `{}` in {} has empty required field `{field}`",
-                task.id,
-                plan_path.display()
-            );
-        }
-    }
+    validate_execution_row(task, all_task_ids).with_context(|| {
+        format!(
+            "auto spec task `{}` failed execution-row validation",
+            task.id
+        )
+    })?;
 
-    let spec_value = first_field_line(task, "Spec:")?;
+    let spec_value = execution_row_first_field_line(task, "Spec:")?;
     if !spec_value.contains(spec_ref) && !spec_value.contains(absolute_spec_ref) {
         bail!(
             "auto spec task `{}` `Spec:` field must point at {}; got `{spec_value}`",
@@ -347,192 +342,7 @@ fn verify_auto_spec_plan_task(
             spec_path.display()
         );
     }
-
-    verify_scheduler_dependencies(task, all_task_ids)?;
-    verify_estimated_scope(task)?;
-    verify_completion_artifacts(task)?;
-    verify_field_did_not_swallow_metadata(task, "Verification:")?;
-    verify_field_did_not_swallow_metadata(task, "Required tests:")?;
-    verify_commands_are_runnable(
-        task.id.as_str(),
-        "Verification:",
-        &task_field_body(task, "Verification:")?,
-    )?;
-    verify_commands_are_runnable(
-        task.id.as_str(),
-        "Required tests:",
-        &task_field_body(task, "Required tests:")?,
-    )?;
     Ok(())
-}
-
-fn task_field_body(task: &crate::task_parser::PlanTask, field: &str) -> Result<String> {
-    task_field_body_until_any(&task.markdown, field, TASK_FIELD_BOUNDARIES)
-        .with_context(|| format!("task `{}` missing `{field}`", task.id))
-}
-
-fn first_field_line(task: &crate::task_parser::PlanTask, field: &str) -> Result<String> {
-    let body = task_field_body(task, field)?;
-    body.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
-        .with_context(|| format!("task `{}` has no value for `{field}`", task.id))
-}
-
-fn verify_scheduler_dependencies(
-    task: &crate::task_parser::PlanTask,
-    all_task_ids: &std::collections::BTreeSet<&str>,
-) -> Result<()> {
-    let body = task_field_body(task, "Dependencies:")?;
-    let meaningful_lines = body
-        .lines()
-        .map(strip_plan_bullet)
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if meaningful_lines.is_empty() {
-        bail!("auto spec task `{}` has empty `Dependencies:`", task.id);
-    }
-
-    let joined = meaningful_lines.join(" ");
-    if joined.eq_ignore_ascii_case("none") {
-        if !task.dependencies.is_empty() {
-            bail!(
-                "auto spec task `{}` says `Dependencies: none` but parser found {:?}",
-                task.id,
-                task.dependencies
-            );
-        }
-        return Ok(());
-    }
-    reject_dependency_prose(task, &joined)?;
-
-    let mut explicit = Vec::new();
-    for line in meaningful_lines {
-        for part in line.split(',') {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let Some(unwrapped) = token
-                .strip_prefix('`')
-                .and_then(|rest| rest.strip_suffix('`'))
-            else {
-                bail!(
-                    "auto spec task `{}` `Dependencies:` must contain only backticked task IDs or `none`; got `{token}`",
-                    task.id
-                );
-            };
-            explicit.push(unwrapped.to_string());
-        }
-    }
-    explicit.sort();
-    explicit.dedup();
-    let mut parsed = task.dependencies.clone();
-    parsed.sort();
-    if explicit != parsed {
-        bail!(
-            "auto spec task `{}` dependencies are not parser-stable; explicit {:?}, parsed {:?}",
-            task.id,
-            explicit,
-            parsed
-        );
-    }
-    for dependency in &task.dependencies {
-        if dependency == &task.id {
-            bail!("auto spec task `{}` cannot depend on itself", task.id);
-        }
-        if !all_task_ids.contains(dependency.as_str()) {
-            bail!(
-                "auto spec task `{}` depends on `{dependency}`, which is not a parseable task in the plan",
-                task.id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn reject_dependency_prose(task: &crate::task_parser::PlanTask, text: &str) -> Result<()> {
-    let lower = text.to_ascii_lowercase();
-    for phrase in [
-        "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external", "(", ")",
-        ".", ";", ":",
-    ] {
-        if lower.contains(phrase) {
-            bail!(
-                "auto spec task `{}` `Dependencies:` must be machine-readable IDs only; remove prose phrase `{phrase}`",
-                task.id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn verify_estimated_scope(task: &crate::task_parser::PlanTask) -> Result<()> {
-    let scope = first_field_line(task, "Estimated scope:")?;
-    if !matches!(scope.as_str(), "XS" | "S" | "M") {
-        bail!(
-            "auto spec task `{}` must use `Estimated scope: XS`, `S`, or `M`; got `{scope}`",
-            task.id
-        );
-    }
-    Ok(())
-}
-
-fn verify_completion_artifacts(task: &crate::task_parser::PlanTask) -> Result<()> {
-    let body = task_field_body(task, "Completion artifacts:")?;
-    let first = body
-        .lines()
-        .map(strip_plan_bullet)
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if first == "none" {
-        return Ok(());
-    }
-    if task.completion_artifacts.is_empty() {
-        bail!(
-            "auto spec task `{}` `Completion artifacts:` must be `none` or concrete repo-relative paths",
-            task.id
-        );
-    }
-    Ok(())
-}
-
-fn verify_field_did_not_swallow_metadata(
-    task: &crate::task_parser::PlanTask,
-    field: &str,
-) -> Result<()> {
-    let body = task_field_body(task, field)?;
-    for boundary in TASK_FIELD_BOUNDARIES
-        .iter()
-        .filter(|boundary| **boundary != field)
-    {
-        if body
-            .lines()
-            .map(strip_plan_bullet)
-            .map(str::trim)
-            .any(|line| line.starts_with(boundary))
-        {
-            bail!(
-                "auto spec task `{}` `{field}` body swallowed metadata boundary `{boundary}`",
-                task.id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn strip_plan_bullet(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    for bullet in ["- ", "* ", "+ "] {
-        if let Some(rest) = trimmed.strip_prefix(bullet) {
-            return rest;
-        }
-    }
-    trimmed
 }
 
 fn section_has_body(markdown: &str, header: &str) -> bool {
@@ -589,7 +399,7 @@ mod tests {
     Verification: `cargo test -p app runtime_foundation`
     Required tests: `cargo test -p app runtime_foundation`
     Contract generation: none -- no generated contract
-    Cross-surface tests: `npm test -- runtime-readback`
+    Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks runtime-to-UI readback proof.
     Completion artifacts: `docs/proof/runtime-foundation.md`
     Dependencies: none
@@ -611,10 +421,10 @@ mod tests {
     Integration touchpoints: `src/runtime.rs`
     Scope boundary: UI readback only.
     Acceptance criteria: UI displays runtime payload without local catalogs.
-    Verification: `npm test -- runtime-readback`
-    Required tests: `npm test -- runtime-readback`
+    Verification: `cargo test -p app runtime_readback`
+    Required tests: `cargo test -p app runtime_readback`
     Contract generation: none -- no generated contract
-    Cross-surface tests: `npm test -- runtime-readback`
+    Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks no duplicated truth in UI.
     Completion artifacts: `docs/proof/ui-readback.md`
     Dependencies: {dependency_line}

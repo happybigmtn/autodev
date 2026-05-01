@@ -56,6 +56,12 @@ pub(crate) fn load_planning_corpus(planning_root: &Path) -> Result<PlanningCorpu
     )?;
     primary_paths.sort();
     support_paths.sort();
+    if primary_paths.is_empty() {
+        bail!(
+            "planning root {} has no primary plan files; expected at least one plans/NNN-*.md file",
+            planning_root.display()
+        );
+    }
 
     let mut primary_plans = Vec::new();
     for path in primary_paths {
@@ -167,11 +173,11 @@ fn collect_plan_paths(
 }
 
 fn is_primary_plan_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|v| v.to_str())
-        .and_then(|name| name.chars().next())
-        .map(|ch| ch.is_ascii_digit())
-        .unwrap_or(false)
+    let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.len() > 4 && bytes[..3].iter().all(|byte| byte.is_ascii_digit()) && bytes[3] == b'-'
 }
 
 fn load_spec_documents(planning_root: &Path) -> Result<Vec<CorpusSpecDocument>> {
@@ -269,4 +275,57 @@ fn extract_title(markdown: &str) -> Option<String> {
         .lines()
         .find_map(|line| line.strip_prefix("# "))
         .map(|title| title.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_planning_corpus;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("autodev-corpus-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn load_planning_corpus_rejects_empty_primary_plan_set() {
+        let root = temp_root("empty-primary");
+        fs::create_dir_all(root.join("plans")).expect("failed to create plans dir");
+        fs::write(root.join("SPEC.md"), "# Spec\n").expect("failed to write spec");
+
+        let error = load_planning_corpus(&root).expect_err("empty primary set should fail");
+        assert!(error.to_string().contains("no primary plan files"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn load_planning_corpus_rejects_support_only_plan_set() {
+        let root = temp_root("support-only");
+        fs::create_dir_all(root.join("plans/support")).expect("failed to create support dir");
+        fs::write(root.join("plans/1-not-primary.md"), "# Support\n")
+            .expect("failed to write loose support");
+        fs::write(root.join("plans/support/001-support.md"), "# Support\n")
+            .expect("failed to write nested support");
+
+        let error = load_planning_corpus(&root).expect_err("support-only corpus should fail");
+        assert!(error.to_string().contains("plans/NNN-*.md"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn load_planning_corpus_accepts_numbered_primary_plan_shape() {
+        let root = temp_root("primary-shape");
+        fs::create_dir_all(root.join("plans")).expect("failed to create plans dir");
+        fs::write(root.join("plans/001-build.md"), "# Build\n").expect("failed to write plan");
+
+        let corpus = load_planning_corpus(&root).expect("primary plan should load");
+        assert_eq!(corpus.primary_plans.len(), 1);
+        assert_eq!(corpus.primary_plans[0].path, "plans/001-build.md");
+        fs::remove_dir_all(root).ok();
+    }
 }

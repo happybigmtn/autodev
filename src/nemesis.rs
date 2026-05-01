@@ -399,6 +399,7 @@ pub(crate) async fn run_nemesis(args: NemesisArgs) -> Result<()> {
         args.report_only,
         &args,
     )?;
+    validate_nemesis_execution_contract(&args)?;
     let previous_snapshot =
         maybe_prepare_output_dir(&repo_root, &output_dir, args.dry_run, args.resume)?;
 
@@ -805,6 +806,18 @@ fn validate_nemesis_backend_binaries(
     if !report_only {
         validate_backend_binary("Nemesis implementation backend", fix_backend)?;
         ensure_executable_available("Nemesis finalizer backend", &args.codex_bin)?;
+    }
+    Ok(())
+}
+
+fn validate_nemesis_execution_contract(args: &NemesisArgs) -> Result<()> {
+    if args.report_only && args.audit_passes > 1 {
+        bail!(
+            "auto nemesis --report-only cannot claim multi-pass audit execution; run without --report-only to execute remediation/finalizer phases"
+        );
+    }
+    if args.audit_passes == 0 {
+        bail!("auto nemesis --audit-passes must be at least 1");
     }
     Ok(())
 }
@@ -2666,6 +2679,29 @@ Spec: specs/020426-nemesis-audit.md
             effort: "high".to_string(),
         };
         assert!(ensure_nemesis_phase_config("nemesis", &config).is_err());
+    }
+
+    #[test]
+    fn nemesis_report_only_contract_matches_help() {
+        let args = sample_args("gpt-5.5");
+        super::validate_nemesis_execution_contract(&args).expect("normal execution accepted");
+
+        let mut report_only = args.clone();
+        report_only.report_only = true;
+        super::validate_nemesis_execution_contract(&report_only)
+            .expect("single-pass report-only is truthful");
+    }
+
+    #[test]
+    fn nemesis_audit_passes_gt_one_is_truthful() {
+        let mut args = sample_args("gpt-5.5");
+        args.audit_passes = 2;
+        super::validate_nemesis_execution_contract(&args).expect("multi-pass execution accepted");
+
+        args.report_only = true;
+        let err = super::validate_nemesis_execution_contract(&args)
+            .expect_err("report-only multi-pass claim rejected");
+        assert!(err.to_string().contains("--report-only"));
     }
 
     #[test]

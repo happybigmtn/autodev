@@ -8,6 +8,7 @@ use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, list_markdown_files,
     timestamp_slug,
 };
+use crate::verdict::terminal_verdict_is;
 use crate::BookArgs;
 
 struct BookRun {
@@ -400,9 +401,11 @@ fn book_quality_review_path(run: &BookRun) -> PathBuf {
 fn quality_review_is_pass(path: &Path) -> Result<bool> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("Verdict: PASS")))
+    Ok(terminal_verdict_is(
+        &text,
+        "Verdict: PASS",
+        &["Verdict: PASS", "Verdict: NO-GO"],
+    ))
 }
 
 fn markdown_under(root: &Path, repo_root: &Path) -> Result<Vec<String>> {

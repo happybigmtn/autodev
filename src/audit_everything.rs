@@ -21,6 +21,7 @@ use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, git_stdout, run_git,
     timestamp_slug,
 };
+use crate::verdict::{exact_terminal_verdict, terminal_verdict_is};
 use crate::{AuditArgs, AuditEverythingPhase};
 
 const PROFESSIONAL_AUDIT_DIR: &str = ".auto/audit-everything";
@@ -3919,7 +3920,7 @@ fn mark_merge_skipped(
 fn final_review_is_go(paths: &RunPaths) -> bool {
     let path = final_review_markdown_path(paths);
     fs::read_to_string(path)
-        .map(|text| text.lines().any(|line| line.trim() == "Verdict: GO"))
+        .map(|text| terminal_verdict_is(&text, "Verdict: GO", &["Verdict: GO", "Verdict: NO-GO"]))
         .unwrap_or(false)
 }
 
@@ -3928,7 +3929,7 @@ fn final_review_has_actionable_blockers(paths: &RunPaths) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    if !text.lines().any(|line| line.trim() == "Verdict: NO-GO") {
+    if !terminal_verdict_is(&text, "Verdict: NO-GO", &["Verdict: GO", "Verdict: NO-GO"]) {
         return false;
     }
     let Some(section) = markdown_section(&text, "Required blockers before merge") else {
@@ -3977,9 +3978,9 @@ fn actionable_blocker_line(line: &str) -> bool {
 }
 
 fn first_verdict_line(text: &str) -> Option<String> {
-    text.lines()
-        .find(|line| line.trim().starts_with("Verdict:"))
-        .map(|line| line.trim().to_string())
+    exact_terminal_verdict(text, &["Verdict: GO", "Verdict: NO-GO"])
+        .ok()
+        .flatten()
 }
 
 fn print_status(paths: &RunPaths, manifest: &EverythingManifest) {
