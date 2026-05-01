@@ -3350,9 +3350,12 @@ fn repair_parallel_canonical_before_dispatch(
         .collect::<Vec<_>>();
     if !dirty_paths.is_empty() {
         let dirty_summary = dirty_paths.join(", ");
-        if let Some(commit) =
-            auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
-        {
+        if let Some(commit) = checkpoint_parallel_dispatch_paths(
+            repo_root,
+            target_branch,
+            &dirty_paths,
+            "auto parallel checkpoint",
+        )? {
             parallel_logger.info(format!(
                 "checkpoint: committed dirty canonical dispatch paths at {commit} before dispatch ({dirty_summary})"
             ));
@@ -3373,6 +3376,45 @@ fn repair_parallel_canonical_before_dispatch(
         }
     }
     Ok(())
+}
+
+fn checkpoint_parallel_dispatch_paths(
+    repo_root: &Path,
+    target_branch: &str,
+    dirty_paths: &[String],
+    message_suffix: &str,
+) -> Result<Option<String>> {
+    if dirty_paths.is_empty() {
+        return Ok(None);
+    }
+    let current_branch = git_stdout(repo_root, ["branch", "--show-current"])?;
+    let current_branch = current_branch.trim();
+    if current_branch.is_empty() {
+        bail!("refusing to checkpoint dirty dispatch paths from detached HEAD");
+    }
+    if current_branch != target_branch {
+        bail!(
+            "refusing to checkpoint branch `{target_branch}` while checked out on `{current_branch}`; checkout `{target_branch}` or pass the current branch explicitly"
+        );
+    }
+    let mut add_args = vec!["add".to_string(), "--all".to_string(), "--".to_string()];
+    add_args.extend(dirty_paths.iter().cloned());
+    run_git(repo_root, add_args.iter().map(|arg| arg.as_str()))?;
+    let staged = git_stdout(repo_root, ["diff", "--cached", "--name-only"])?;
+    if staged.trim().is_empty() {
+        return Ok(None);
+    }
+    let message = format!("{}: {message_suffix}", repo_name(repo_root));
+    run_git(repo_root, ["commit", "-m", &message])?;
+    let commit = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    let commit = commit.trim().to_string();
+    if let Err(err) = push_branch_with_remote_sync(repo_root, target_branch) {
+        bail!(
+            "created checkpoint commit {} but failed to sync/push: {err}",
+            commit
+        );
+    }
+    Ok(Some(commit))
 }
 
 fn environment_blocker_recovery_note(reason: &str, preflight_report: &str) -> String {
@@ -4559,19 +4601,25 @@ fn repo_dirty_paths_for_parallel_dispatch(repo_root: &Path) -> BTreeSet<String> 
 }
 
 fn parse_parallel_status_path(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with("##") {
+    let line = line.trim_end();
+    if line.trim().is_empty() || line.starts_with("##") {
         return None;
     }
-    let path = trimmed.get(3..)?.trim();
+    let path = line.get(3..)?.trim();
     let path = path.rsplit_once(" -> ").map(|(_, rhs)| rhs).unwrap_or(path);
     let path = path.trim_matches('"').trim();
     (!path.is_empty()).then(|| path.to_string())
 }
 
 fn parallel_dispatch_path_is_ignored(path: &str) -> bool {
+    if path.starts_with(".auto/symphony/verification-receipts/")
+        || path.starts_with("auto/symphony/verification-receipts/")
+    {
+        return false;
+    }
     let first_segment = path.split('/').next().unwrap_or(path);
     first_segment == ".auto"
+        || first_segment == "auto"
         || first_segment == "bug"
         || first_segment == "nemesis"
         || first_segment.starts_with("gen-")
@@ -7401,6 +7449,29 @@ mod tests {
         assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
         let log = run_git_in(&worker, ["log", "--format=%s", "-1"]);
         assert_eq!(log.trim(), "worker: auto parallel checkpoint");
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn repair_parallel_canonical_checkpoints_verification_receipts() {
+        let (root, _remote, _upstream, worker) =
+            init_remote_and_clones("parallel-repair-receipts", "trunk");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let receipt_dir = worker.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create receipts dir");
+        fs::write(receipt_dir.join("TASK-1.json"), "{\"status\":\"passed\"}\n")
+            .expect("failed to write receipt");
+
+        repair_parallel_canonical_before_dispatch(&worker, "trunk", &logger)
+            .expect("dirty receipt should be checkpointed");
+
+        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        let log = run_git_in(&worker, ["log", "--format=%s", "-1"]);
+        assert_eq!(log.trim(), "worker: auto parallel checkpoint");
+        let committed = run_git_in(&worker, ["show", "--name-only", "--format=", "HEAD"]);
+        assert!(committed.contains(".auto/symphony/verification-receipts/TASK-1.json"));
         fs::remove_dir_all(&root).expect("failed to remove temp root");
     }
 

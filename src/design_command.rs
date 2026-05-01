@@ -12,7 +12,8 @@ use crate::qa_only_command::{
 };
 use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::{
-    atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, binary_provenance_line, ensure_repo_layout,
+    git_repo_root, git_stdout, timestamp_slug,
 };
 use crate::verdict::{exact_terminal_verdict, terminal_verdict_is};
 use crate::{DesignArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, SuperArgs};
@@ -362,7 +363,36 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
     let report = last_report
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| output_root.display().to_string());
+    if kind == DesignRunKind::SuperResolve {
+        try_checkpoint_final_design_resolve_state(&repo_root, args.branch.as_deref());
+    }
     bail!("design resolve did not reach `Verdict: GO` after {max_passes} pass(es); latest report: {report}")
+}
+
+fn try_checkpoint_final_design_resolve_state(repo_root: &Path, branch: Option<&str>) {
+    let target_branch = branch
+        .map(str::to_string)
+        .or_else(|| {
+            git_stdout(repo_root, ["branch", "--show-current"])
+                .ok()
+                .map(|branch| branch.trim().to_string())
+        })
+        .unwrap_or_default();
+    if target_branch.is_empty() {
+        eprintln!(
+            "warning: design resolve ended NO-GO with possible repo edits, but no checked-out branch was available for checkpointing"
+        );
+        return;
+    }
+    match auto_checkpoint_if_needed(repo_root, &target_branch, "design resolve NO-GO checkpoint") {
+        Ok(Some(commit)) => eprintln!(
+            "checkpoint: committed final design resolve state at {commit} before reporting NO-GO"
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!(
+            "warning: failed to checkpoint final design resolve state before reporting NO-GO: {err:#}"
+        ),
+    }
 }
 
 fn root_queue_has_dependency_ready_repair_tasks(repo_root: &Path) -> Result<bool> {
