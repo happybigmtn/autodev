@@ -1145,18 +1145,20 @@ fn verification_receipt_freshness_problem_for_source(
     let current_commit = current_git_commit(repo_root);
     let current_dirty_fingerprint = current_dirty_state_fingerprint(repo_root);
     let current_plan_hash = current_plan_hash(repo_root);
-    let requires_current_metadata = source == VerificationReceiptSource::JsonFile
-        && (current_commit.is_some()
-            || current_dirty_fingerprint.is_some()
-            || current_plan_hash.is_some());
+    let mut json_receipt_commit_is_current = false;
 
     if source == VerificationReceiptSource::JsonFile {
         if let Some(current) = current_commit {
             match receipt.commit.as_deref() {
-                Some(recorded) if recorded == current => {}
+                Some(recorded) if recorded == current => {
+                    json_receipt_commit_is_current = true;
+                }
+                Some(recorded) if git_commit_is_ancestor(repo_root, recorded, &current) => {
+                    json_receipt_commit_is_current = false;
+                }
                 Some(recorded) => {
                     return Some(format!(
-                        "commit mismatch, recorded `{recorded}` but current HEAD is `{current}`"
+                        "commit mismatch, recorded `{recorded}` is not current HEAD `{current}` or an ancestor"
                     ))
                 }
                 None => return Some("missing current commit metadata".to_string()),
@@ -1164,7 +1166,7 @@ fn verification_receipt_freshness_problem_for_source(
         }
     }
 
-    if source == VerificationReceiptSource::JsonFile {
+    if source == VerificationReceiptSource::JsonFile && json_receipt_commit_is_current {
         if let Some(current) = current_dirty_fingerprint {
             match receipt
                 .dirty_state
@@ -1182,7 +1184,7 @@ fn verification_receipt_freshness_problem_for_source(
         }
     }
 
-    if source == VerificationReceiptSource::JsonFile {
+    if source == VerificationReceiptSource::JsonFile && json_receipt_commit_is_current {
         if let Some(current) = current_plan_hash {
             match receipt.plan_hash.as_deref() {
                 Some(recorded) if recorded == current => {}
@@ -1215,7 +1217,7 @@ fn verification_receipt_freshness_problem_for_source(
         }
     }
 
-    if requires_current_metadata {
+    if source == VerificationReceiptSource::JsonFile && json_receipt_commit_is_current {
         for expected_command in expected_commands {
             if let Some(problem) = verification_command_argv_problem(receipt, expected_command) {
                 return Some(problem);
@@ -1270,6 +1272,16 @@ fn current_plan_hash(repo_root: &Path) -> Option<String> {
         .map(|bytes| sha256_hex(&bytes))
 }
 
+fn git_commit_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn command_stdout<const N: usize>(repo_root: &Path, args: [&str; N]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -1291,6 +1303,9 @@ fn current_declared_artifact_hashes(
     declared_artifacts
         .iter()
         .filter_map(|relative| {
+            if declared_artifact_hash_is_mutable_handoff(relative) {
+                return None;
+            }
             let path = declared_artifact_path(repo_root, relative)?;
             if same_path(&path, verification_receipt_path) {
                 return None;
@@ -1298,6 +1313,18 @@ fn current_declared_artifact_hashes(
             artifact_hash(&path).map(|hash| (relative.clone(), hash))
         })
         .collect()
+}
+
+fn declared_artifact_hash_is_mutable_handoff(relative: &str) -> bool {
+    matches!(
+        relative,
+        "REVIEW.md"
+            | "IMPLEMENTATION_PLAN.md"
+            | "COMPLETED.md"
+            | "WORKLIST.md"
+            | "ARCHIVED.md"
+            | "RECEIPTS-DRIFT.md"
+    )
 }
 
 fn declared_artifact_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
@@ -2045,10 +2072,10 @@ Dependencies: none
     }
 
     #[test]
-    fn inspect_task_completion_evidence_rejects_stale_commit_receipt() {
-        let root = temp_dir("stale-commit-receipt");
+    fn inspect_task_completion_evidence_accepts_historical_ancestor_json_receipt() {
+        let root = temp_dir("historical-ancestor-json-receipt");
         init_git_repo(&root);
-        let stale_commit = git_head(&root);
+        let historical_commit = git_head(&root);
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), "# plan changed\n")
             .expect("failed to change plan");
         Command::new("git")
@@ -2069,10 +2096,34 @@ Dependencies: none
         fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
             .expect("failed to create receipts dir");
         fs::write(
-            root.join(".auto/symphony/verification-receipts/TASK-STALE.json"),
+            root.join(".auto/symphony/verification-receipts/TASK-HISTORICAL.json"),
             format!(
-                r#"{{"commit":"{stale_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::some_filter","expected_argv":["cargo","test","completion_artifacts::tests::some_filter"],"exit_code":0,"status":"passed"}}]}}"#
+                r#"{{"commit":"{historical_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::some_filter","exit_code":0,"status":"passed"}}]}}"#
             ),
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-HISTORICAL",
+            "- [ ] `TASK-HISTORICAL` Example\nVerification:\n  - `cargo test completion_artifacts::tests::some_filter`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_rejects_non_ancestor_json_receipt() {
+        let root = temp_dir("non-ancestor-json-receipt");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-STALE.json"),
+            r#"{"commit":"1111111111111111111111111111111111111111","commands":[{"command":"cargo test completion_artifacts::tests::some_filter","exit_code":0,"status":"passed"}]}"#,
         )
         .expect("failed to write receipt");
 
@@ -2207,6 +2258,56 @@ Dependencies: none
     }
 
     #[test]
+    fn verification_receipt_freshness_ignores_mutable_handoff_artifact_hashes() {
+        let root = temp_dir("mutable-handoff-artifact-hash");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(root.join("REVIEW.md"), "# REVIEW\n\nold\n").expect("failed to write review");
+        let receipt_path = root.join(".auto/symphony/verification-receipts/SAT-004.json");
+        fs::write(&receipt_path, "{}\n").expect("failed to write receipt placeholder");
+        let expected_command = "cargo test completion_artifacts::tests::mutable_review".to_string();
+        let expected_argv = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "completion_artifacts::tests::mutable_review".to_string(),
+        ];
+        let mut receipt = VerificationReceipt {
+            task_id: Some("TASK-MUTABLE".to_string()),
+            commit: super::current_git_commit(&root),
+            dirty_state: Some(VerificationDirtyState {
+                fingerprint: super::current_dirty_state_fingerprint(&root),
+            }),
+            plan_hash: super::current_plan_hash(&root),
+            declared_artifacts: vec![VerificationReceiptArtifact {
+                path: "REVIEW.md".to_string(),
+                sha256: Some("not-the-current-review-hash".to_string()),
+            }],
+            commands: vec![VerificationReceiptCommand {
+                command: expected_command.clone(),
+                expected_argv: Some(expected_argv),
+                exit_code: Some(0),
+                status: Some("passed".to_string()),
+                ..VerificationReceiptCommand::default()
+            }],
+        };
+        receipt.dirty_state = Some(VerificationDirtyState {
+            fingerprint: super::current_dirty_state_fingerprint(&root),
+        });
+
+        assert_eq!(
+            verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &receipt,
+                std::slice::from_ref(&expected_command),
+                &["REVIEW.md".to_string()],
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn receipt_schema_requires_current_metadata() {
         let schema = fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/verification-receipt-schema.md"),
@@ -2246,27 +2347,13 @@ Dependencies: none
     }
 
     #[test]
-    fn shared_receipt_inspector_rejects_stale_commit() {
-        let root = temp_dir("shared-stale-receipt");
+    fn shared_receipt_inspector_rejects_non_ancestor_commit() {
+        let root = temp_dir("shared-non-ancestor-receipt");
         init_git_repo(&root);
-        let stale_commit = git_head(&root);
-        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "# changed\n")
-            .expect("failed to update plan");
-        Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["add", "IMPLEMENTATION_PLAN.md"])
-            .output()
-            .expect("git add failed");
-        Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["commit", "-m", "changed"])
-            .output()
-            .expect("git commit failed");
         let receipt_path = root.join(".auto/symphony/verification-receipts/TASK.json");
         let receipt_text = format!(
-            r#"{{"commit":"{stale_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::shared_receipt","expected_argv":["cargo","test","completion_artifacts::tests::shared_receipt"],"exit_code":0,"status":"passed"}}]}}"#
+            r#"{{"commit":"{}","commands":[{{"command":"cargo test completion_artifacts::tests::shared_receipt","expected_argv":["cargo","test","completion_artifacts::tests::shared_receipt"],"exit_code":0,"status":"passed"}}]}}"#,
+            "1111111111111111111111111111111111111111"
         );
         let problem = super::shared_receipt_freshness_problem(
             &root,
@@ -2276,7 +2363,7 @@ Dependencies: none
             &[],
         )
         .expect("receipt should parse")
-        .expect("stale commit rejected");
+        .expect("non-ancestor commit rejected");
         assert!(problem.contains("commit mismatch"));
     }
 
