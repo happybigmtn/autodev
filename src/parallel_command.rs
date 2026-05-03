@@ -53,6 +53,7 @@ const HOST_QUEUE_STATE_FILES: [&str; 6] = [
 const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(15);
 const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
+const STALE_GIT_INDEX_LOCK_GRACE: Duration = Duration::from_secs(30);
 const SALVAGE_DIR: &str = "salvage";
 const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
@@ -3336,12 +3337,7 @@ fn repair_parallel_canonical_before_dispatch(
             );
         }
     }
-    if let Some(path) = git_path(repo_root, "index.lock").filter(|path| path.exists()) {
-        bail!(
-            "canonical repo has an active git index lock at {}; remove it only after confirming no git process is using it",
-            path.display()
-        );
-    }
+    repair_stale_git_index_lock(repo_root, parallel_logger, "before dispatch")?;
     let dirty = git_stdout(repo_root, ["status", "--short", "--untracked-files=all"])?;
     let dirty_paths = dirty
         .lines()
@@ -3375,6 +3371,40 @@ fn repair_parallel_canonical_before_dispatch(
             );
         }
     }
+    Ok(())
+}
+
+fn repair_stale_git_index_lock(
+    repo_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+    context: &str,
+) -> Result<()> {
+    let Some(path) = git_path(repo_root, "index.lock").filter(|path| path.exists()) else {
+        return Ok(());
+    };
+    let metadata =
+        fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    let safe_to_remove =
+        metadata.len() == 0 && age.is_some_and(|age| age >= STALE_GIT_INDEX_LOCK_GRACE);
+    if !safe_to_remove {
+        bail!(
+            "canonical repo has an active git index lock at {}; size={} age_secs={} context={}; remove it only after confirming no git process is using it",
+            path.display(),
+            metadata.len(),
+            age.map(|age| age.as_secs().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            context,
+        );
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    parallel_logger.warn(format!(
+        "repair: removed stale canonical git index lock {} ({context})",
+        path.display()
+    ));
     Ok(())
 }
 
@@ -3701,6 +3731,7 @@ fn checkpoint_parallel_host_queue_changes(
     target_branch: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<Option<String>> {
+    repair_stale_git_index_lock(repo_root, parallel_logger, "before host queue sync")?;
     let queue_files = host_queue_state_files_for_repo(repo_root);
     if queue_files.is_empty() {
         return Ok(None);
@@ -6914,9 +6945,9 @@ mod tests {
 
     use super::{
         audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
-        cherry_pick_lane_range, classify_parallel_preflight_needs,
-        clear_partial_follow_up_tracking, default_cargo_build_jobs_for,
-        dirty_worktree_recovery_note, discover_sibling_git_repos,
+        checkpoint_parallel_host_queue_changes, cherry_pick_lane_range,
+        classify_parallel_preflight_needs, clear_partial_follow_up_tracking,
+        default_cargo_build_jobs_for, dirty_worktree_recovery_note, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, environment_blocker_reason,
         host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
         is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
@@ -7472,6 +7503,100 @@ mod tests {
         assert_eq!(log.trim(), "worker: auto parallel checkpoint");
         let committed = run_git_in(&worker, ["show", "--name-only", "--format=", "HEAD"]);
         assert!(committed.contains(".auto/symphony/verification-receipts/TASK-1.json"));
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn repair_parallel_canonical_removes_stale_zero_byte_index_lock() {
+        let (root, _remote, _upstream, worker) =
+            init_remote_and_clones("parallel-repair-stale-index-lock", "trunk");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let lock = worker.join(".git").join("index.lock");
+        fs::write(&lock, "").expect("failed to write stale index lock");
+        set_file_mtime_epoch(&lock);
+
+        repair_parallel_canonical_before_dispatch(&worker, "trunk", &logger)
+            .expect("stale zero-byte index lock should be repaired");
+
+        assert!(!lock.exists(), "stale index lock should be removed");
+        let live_log =
+            fs::read_to_string(run_root.join("live.log")).expect("live log should be readable");
+        assert!(live_log.contains("removed stale canonical git index lock"));
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn repair_parallel_canonical_refuses_fresh_zero_byte_index_lock() {
+        let (root, _remote, _upstream, worker) =
+            init_remote_and_clones("parallel-repair-fresh-index-lock", "trunk");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let lock = worker.join(".git").join("index.lock");
+        fs::write(&lock, "").expect("failed to write fresh index lock");
+
+        let err = repair_parallel_canonical_before_dispatch(&worker, "trunk", &logger)
+            .expect_err("fresh index lock should require operator confirmation");
+
+        assert!(lock.exists(), "fresh index lock should remain in place");
+        let message = err.to_string();
+        assert!(message.contains("active git index lock"));
+        assert!(message.contains("context=before dispatch"));
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn repair_parallel_canonical_refuses_non_empty_stale_index_lock() {
+        let (root, _remote, _upstream, worker) =
+            init_remote_and_clones("parallel-repair-nonempty-index-lock", "trunk");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let lock = worker.join(".git").join("index.lock");
+        fs::write(&lock, "git pid maybe alive\n").expect("failed to write non-empty index lock");
+        set_file_mtime_epoch(&lock);
+
+        let err = repair_parallel_canonical_before_dispatch(&worker, "trunk", &logger)
+            .expect_err("non-empty index lock should not be auto-removed");
+
+        assert!(lock.exists(), "non-empty index lock should remain in place");
+        let message = err.to_string();
+        assert!(message.contains("active git index lock"));
+        assert!(message.contains("size=20"));
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn host_queue_checkpoint_removes_stale_zero_byte_index_lock_before_status() {
+        let (root, _remote, _upstream, worker) =
+            init_remote_and_clones("parallel-host-queue-stale-index-lock", "trunk");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        fs::write(worker.join("IMPLEMENTATION_PLAN.md"), "# plan\n").expect("failed to write plan");
+        run_git_in(&worker, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&worker, ["commit", "-m", "plan"]);
+        run_git_in(&worker, ["push", "origin", "trunk"]);
+        fs::write(
+            worker.join("IMPLEMENTATION_PLAN.md"),
+            "# plan\n\n- [x] done\n",
+        )
+        .expect("failed to dirty plan");
+        let lock = worker.join(".git").join("index.lock");
+        fs::write(&lock, "").expect("failed to write stale index lock");
+        set_file_mtime_epoch(&lock);
+
+        let commit = checkpoint_parallel_host_queue_changes(&worker, "trunk", &logger)
+            .expect("stale index lock should be repaired before queue sync")
+            .expect("queue sync should create a commit");
+
+        assert!(!commit.is_empty());
+        assert!(!lock.exists(), "stale index lock should be removed");
+        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        let log = run_git_in(&worker, ["log", "--format=%s", "-1"]);
+        assert_eq!(log.trim(), "worker: parallel host queue sync");
         fs::remove_dir_all(&root).expect("failed to remove temp root");
     }
 
@@ -9118,5 +9243,14 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    fn set_file_mtime_epoch(path: &std::path::Path) {
+        let status = Command::new("touch")
+            .args(["-d", "@1"])
+            .arg(path)
+            .status()
+            .expect("failed to run touch");
+        assert!(status.success(), "touch should update test file mtime");
     }
 }
