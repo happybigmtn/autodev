@@ -8,11 +8,13 @@ mod codex_exec;
 mod codex_stream;
 mod completion_artifacts;
 mod corpus;
+mod cost_command;
 mod design_command;
 mod doctor_command;
 mod generation;
 mod health_command;
 mod kimi_backend;
+mod lane_events;
 mod linear_tracker;
 mod loop_command;
 mod nemesis;
@@ -115,6 +117,8 @@ enum Command {
     Quota(QuotaArgs),
     /// Sync implementation-plan items into Linear and run the local Symphony runtime
     Symphony(SymphonyArgs),
+    /// Aggregate token usage and cost across recorded `*.usage.json` sidecars
+    Cost(cost_command::CostArgs),
 }
 
 #[derive(Args, Clone)]
@@ -944,6 +948,8 @@ pub(crate) struct ParallelArgs {
 pub(crate) enum ParallelAction {
     /// Print host, tmux, and lane health for the current repo's parallel run.
     Status,
+    /// Tail the per-lane structured event stream (events.jsonl) in real time.
+    Watch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1630,6 +1636,7 @@ async fn main() -> Result<()> {
             },
         },
         Command::Symphony(args) => symphony_command::run_symphony(args).await,
+        Command::Cost(args) => cost_command::run_cost(args),
     }
 }
 
@@ -1644,7 +1651,7 @@ mod tests {
         let expected = [
             "corpus", "gen", "spec", "design", "super", "reverse", "bug", "loop", "parallel", "qa",
             "qa-only", "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis",
-            "quota", "symphony",
+            "quota", "symphony", "cost",
         ];
         let cli_command = Cli::command();
         let actual = cli_command

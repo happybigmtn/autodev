@@ -20,6 +20,7 @@ use crate::completion_artifacts::{
     assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
     verification_plan, verification_receipt_commit_footer, CompletionGapKind,
 };
+use crate::lane_events::{self, LaneEventLogger};
 use crate::linear_tracker::LinearTracker;
 use crate::symphony_command::run_sync;
 use crate::task_parser::{
@@ -67,6 +68,9 @@ const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
         return run_parallel_status(&args);
+    }
+    if args.action == Some(ParallelAction::Watch) {
+        return run_parallel_watch(&args).await;
     }
 
     if args.max_concurrent_workers == 0 {
@@ -1027,6 +1031,16 @@ fn append_lane_host_event(log_path: &Path, lane_index: usize, task_id: &str, mes
             log_path.display()
         );
     }
+    if let Some(lane_root) = log_path.parent() {
+        let logger = LaneEventLogger::for_lane(lane_root, lane_index);
+        let event = lane_events::classify_host_event(message);
+        let task_arg = if task_id.is_empty() || task_id == "[idle]" {
+            None
+        } else {
+            Some(task_id)
+        };
+        logger.emit(task_arg, event);
+    }
 }
 
 fn append_lane_log_line(log_path: &Path, line: &str) -> Result<()> {
@@ -1603,6 +1617,37 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         )
     );
     Ok(())
+}
+
+async fn run_parallel_watch(args: &ParallelArgs) -> Result<()> {
+    let repo_root = git_repo_root()?;
+    let run_root = args
+        .run_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join(".auto").join("parallel"));
+
+    println!(
+        "auto parallel watch -- following {}/lanes/*/events.jsonl (Ctrl-C to stop)",
+        run_root.display()
+    );
+
+    let mut seen: usize = 0;
+    let initial = lane_events::read_all_events(&run_root)?;
+    for envelope in &initial {
+        println!("{}", lane_events::render_for_terminal(envelope));
+    }
+    seen = seen.saturating_add(initial.len());
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let next = lane_events::read_all_events(&run_root)?;
+        if next.len() > seen {
+            for envelope in &next[seen..] {
+                println!("{}", lane_events::render_for_terminal(envelope));
+            }
+            seen = next.len();
+        }
+    }
 }
 
 fn parallel_status_safety_verdict(
@@ -4327,6 +4372,7 @@ fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Result<String>
         parts.push(
             match action {
                 ParallelAction::Status => "status",
+                ParallelAction::Watch => "watch",
             }
             .to_string(),
         );

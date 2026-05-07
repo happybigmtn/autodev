@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use console::Style;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::oneshot;
@@ -35,11 +36,71 @@ struct ExecCallState {
     output: String,
 }
 
-#[derive(Default)]
-struct UsageSummary {
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct UsageSummary {
+    #[serde(default)]
+    pub(crate) input_tokens: u64,
+    #[serde(default)]
+    pub(crate) cached_input_tokens: u64,
+    #[serde(default)]
+    pub(crate) output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cost_usd: Option<f64>,
+}
+
+impl UsageSummary {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.output_tokens == 0
+            && self.cost_usd.unwrap_or(0.0) == 0.0
+    }
+}
+
+/// Sidecar file persisted alongside a rendered log path.
+///
+/// When a streaming function is given `rendered_log_path = /path/to/stdout.log`,
+/// it writes the final per-invocation token usage to `/path/to/stdout.log.usage.json`.
+/// `auto cost` walks `.auto/` looking for files matching `*.usage.json`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct UsageSidecar {
+    pub(crate) harness: String,
+    #[serde(default)]
+    pub(crate) recorded_at: String,
+    pub(crate) usage: UsageSummary,
+}
+
+pub(crate) fn write_usage_sidecar(
+    rendered_log_path: Option<&Path>,
+    harness: &str,
+    usage: &UsageSummary,
+) -> Result<()> {
+    let Some(path) = rendered_log_path else {
+        return Ok(());
+    };
+    if usage.is_empty() {
+        return Ok(());
+    }
+    let sidecar_path = usage_sidecar_path(path);
+    if let Some(parent) = sidecar_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let payload = UsageSidecar {
+        harness: harness.to_string(),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+        usage: usage.clone(),
+    };
+    let body = serde_json::to_vec_pretty(&payload).context("serialize usage sidecar")?;
+    std::fs::write(&sidecar_path, &body)
+        .with_context(|| format!("failed to write {}", sidecar_path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn usage_sidecar_path(rendered_log_path: &Path) -> PathBuf {
+    let mut buf = rendered_log_path.as_os_str().to_owned();
+    buf.push(".usage.json");
+    PathBuf::from(buf)
 }
 
 #[derive(Default)]
@@ -60,6 +121,7 @@ struct ClaudeRenderState {
     /// futility. Defaults to `CLAUDE_FUTILITY_THRESHOLD`; review mode raises
     /// this because reviewer runs are read-heavy by design.
     futility_threshold: usize,
+    usage: UsageSummary,
 }
 
 impl Default for ClaudeRenderState {
@@ -72,6 +134,7 @@ impl Default for ClaudeRenderState {
             consecutive_search_misses: 0,
             futility_detected: false,
             futility_threshold: CLAUDE_FUTILITY_THRESHOLD,
+            usage: UsageSummary::default(),
         }
     }
 }
@@ -190,6 +253,9 @@ where
             }
         }
     }
+    if let Err(err) = write_usage_sidecar(rendered_log_path, "codex", &state.usage) {
+        eprintln!("warning: failed writing Codex usage sidecar: {err:#}");
+    }
     Ok(raw)
 }
 
@@ -230,6 +296,9 @@ where
                 let _ = tx.send(());
             }
         }
+    }
+    if let Err(err) = write_usage_sidecar(rendered_log_path, "claude", &state.usage) {
+        eprintln!("warning: failed writing Claude usage sidecar: {err:#}");
     }
     Ok(())
 }
@@ -894,6 +963,11 @@ fn render_claude_stream_line(line: &str, state: &mut ClaudeRenderState) -> Strin
                 .get("total_output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            state.usage.input_tokens = input_tokens;
+            state.usage.output_tokens = output_tokens;
+            if cost > 0.0 {
+                state.usage.cost_usd = Some(cost);
+            }
             push_plain_line(&mut out, "");
             push_plain_line(&mut out, "========================================");
             push_styled_line(
