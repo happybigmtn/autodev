@@ -18,7 +18,8 @@ use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTI
 use crate::codex_exec::run_codex_exec_with_env;
 use crate::completion_artifacts::{
     assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
-    verification_plan, verification_receipt_commit_footer, CompletionGapKind,
+    legacy_verification_receipt_backfill_footer, verification_plan,
+    verification_receipt_commit_footer, CompletionGapKind,
 };
 use crate::linear_tracker::LinearTracker;
 use crate::symphony_command::run_sync;
@@ -54,6 +55,7 @@ const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(15);
 const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
 const STALE_GIT_INDEX_LOCK_GRACE: Duration = Duration::from_secs(30);
+const MIN_AUTONOMOUS_UNBLOCK_ATTEMPTS: usize = 4;
 const SALVAGE_DIR: &str = "salvage";
 const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
@@ -721,12 +723,9 @@ fn infer_lane_kind(title: &str, markdown: &str) -> LaneKind {
         || text.contains("operator-action")
         || text.contains("operator queue")
         || text.contains("operator must")
-        || text.contains("ssh ")
-        || text.contains("admin envelope")
-        || text.contains("quorum")
-        || text.contains("mainnet")
-        || text.contains("real-rbtc")
-        || text.contains("real rbtc")
+        || text.contains("operator approval")
+        || text.contains("human approval")
+        || text.contains("real human")
     {
         LaneKind::Operator
     } else if text.contains("evidence only")
@@ -1501,6 +1500,7 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
 
     let preflight_warnings = preflight_warning_names(&run_root);
     let recent_host_warnings = recent_parallel_host_warnings(&run_root, 200);
+    let receipt_drift = receipt_drift_status_summary(&repo_root);
     let stop_state = last_parallel_stop_state(&run_root);
     let mut active_recovery_lanes = Vec::new();
     let mut stale_recovery_lanes = Vec::new();
@@ -1512,21 +1512,24 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_else(|| "[unknown]".to_string());
-        let (worker_running, pid_state) = match read_worker_pid(&lane_root.join("worker.pid")) {
-            Ok(Some(pid)) => match worker_pid_is_alive(pid) {
-                Ok(true) => {
-                    active_task_ids.insert(stored_task_id.clone());
-                    (true, format!("running pid {pid}"))
-                }
-                Ok(false) => (false, format!("stale pid {pid}")),
-                Err(err) => (false, format!("pid {pid} liveness unknown: {err:#}")),
-            },
-            Ok(None) => (false, "no worker pid".to_string()),
-            Err(err) => (false, format!("worker pid unreadable: {err:#}")),
-        };
-        let repo_root = lane_root.join("repo");
-        let recovery_active = lane_repo_has_active_cherry_pick(&repo_root)
-            || lane_repo_has_rebase_recovery(&repo_root);
+        let lane_repo_root = lane_root.join("repo");
+        let (worker_running, pid_state) = lane_worker_status(&lane_root, &lane_repo_root)
+            .unwrap_or_else(|err| {
+                (
+                    false,
+                    format!("worker liveness check failed for lane repo: {err:#}"),
+                )
+            });
+        if worker_running {
+            active_task_ids.insert(stored_task_id.clone());
+        }
+        let superseded_recovery =
+            superseded_lane_cherry_pick_recovery(&repo_root, &lane_repo_root, &stored_task_id)
+                .ok()
+                .flatten();
+        let recovery_active = superseded_recovery.is_none()
+            && (lane_repo_has_active_cherry_pick(&lane_repo_root)
+                || lane_repo_has_rebase_recovery(&lane_repo_root));
         if recovery_active {
             if no_live_parallel_host && !worker_running {
                 stale_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
@@ -1534,17 +1537,23 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
                 active_recovery_lanes.push(format!("lane-{lane_index} {stored_task_id}"));
             }
         }
-        let repo_status = lane_repo_status_summary(&repo_root);
+        let repo_status = lane_repo_status_summary(&lane_repo_root);
         let (log_age, log_line) = latest_lane_log_line(&lane_root);
         let task_id = lane_status_task_id(&stored_task_id, worker_running, log_line.as_deref());
         println!(
             "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
         );
+        if let Some(reason) = superseded_recovery {
+            println!(
+                "    recovery: superseded duplicate ({}); next host resume can retire it",
+                reason.summary()
+            );
+        }
         if recovery_active && no_live_parallel_host && !worker_running {
             println!(
                 "    recovery: stale recovery (no host pid or tmux session); not active progress"
             );
-            println!("    recovery artifact: {}", repo_root.display());
+            println!("    recovery artifact: {}", lane_repo_root.display());
             println!(
                 "    reset command: rm -rf {} # after preserving task-owned work",
                 shell_quote(&lane_root.display().to_string())
@@ -1598,6 +1607,7 @@ fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         render_parallel_health_summary(
             &preflight_warnings,
             &recent_host_warnings,
+            receipt_drift.as_deref(),
             &active_recovery_lanes,
             &stale_recovery_lanes,
         )
@@ -1805,6 +1815,7 @@ fn recent_parallel_host_warnings(run_root: &Path, max_lines: usize) -> Vec<Strin
 fn render_parallel_health_summary(
     preflight_warnings: &[String],
     recent_host_warnings: &[String],
+    receipt_drift: Option<&str>,
     active_recovery_lanes: &[String],
     stale_recovery_lanes: &[String],
 ) -> String {
@@ -1820,6 +1831,9 @@ fn render_parallel_health_summary(
             "recent host warnings: {}",
             recent_host_warnings.join(" | ")
         ));
+    }
+    if let Some(receipt_drift) = receipt_drift.filter(|summary| !summary.trim().is_empty()) {
+        issues.push(format!("receipt drift: {receipt_drift}"));
     }
     if !active_recovery_lanes.is_empty() {
         issues.push(format!(
@@ -1838,6 +1852,50 @@ fn render_parallel_health_summary(
     } else {
         format!("degraded ({})", issues.join("; "))
     }
+}
+
+fn receipt_drift_status_summary(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join("RECEIPTS-DRIFT.md");
+    let content = fs::read_to_string(&path).ok()?;
+    if content.contains("No repo-local receipt drift detected.") {
+        return None;
+    }
+    let mut completed = 0usize;
+    let mut candidates = 0usize;
+    let mut section = None::<&str>;
+    for line in content.lines() {
+        match line.trim() {
+            "## Completed Tasks With Drift" => {
+                section = Some("completed");
+                continue;
+            }
+            "## Manual Closeout Candidates" => {
+                section = Some("candidates");
+                continue;
+            }
+            _ => {}
+        }
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("- [") || trimmed == "- None" {
+            continue;
+        }
+        match section {
+            Some("completed") => completed += 1,
+            Some("candidates") => candidates += 1,
+            _ => {}
+        }
+    }
+    if completed == 0 && candidates == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if completed > 0 {
+        parts.push(format!("{completed} completed task(s)"));
+    }
+    if candidates > 0 {
+        parts.push(format!("{candidates} manual closeout candidate(s)"));
+    }
+    Some(format!("{}; see RECEIPTS-DRIFT.md", parts.join(", ")))
 }
 
 fn latest_lane_log_line(lane_root: &Path) -> (String, Option<String>) {
@@ -2136,11 +2194,13 @@ async fn run_parallel_loop(
     let mut shelved_tasks = BTreeMap::<String, String>::new();
     let mut attempted_partial_followups = BTreeSet::<String>::new();
     let mut deferred_partial_tasks = BTreeSet::<String>::new();
-    let mut unblock_attempted_tasks = BTreeSet::<String>::new();
+    let mut unblock_attempt_counts = BTreeMap::<String, usize>::new();
+    let max_autonomous_unblock_attempts = autonomous_unblock_attempt_limit(args.max_retries);
     let mut linear_auto_sync_state = LinearAutoSyncState::default();
     let mut landed = 0usize;
     let mut plan = refresh_parallel_plan(
         repo_root,
+        target_branch,
         linear_tracker,
         &mut linear_auto_sync_state,
         parallel_logger,
@@ -2149,7 +2209,8 @@ async fn run_parallel_loop(
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
-    let mut resumable_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    let mut resumable_lanes =
+        discover_resume_candidates(repo_root, run_root, target_branch, &plan, parallel_logger)?;
     landed += harvest_resumable_lane_results(
         repo_root,
         target_branch,
@@ -2162,6 +2223,7 @@ async fn run_parallel_loop(
     .await?;
     plan = refresh_parallel_plan_or_last_good(
         repo_root,
+        target_branch,
         linear_tracker,
         &mut linear_auto_sync_state,
         &plan,
@@ -2169,7 +2231,8 @@ async fn run_parallel_loop(
     )
     .await?;
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
-    let mut rediscovered_lanes = discover_resume_candidates(run_root, target_branch, &plan)?;
+    let mut rediscovered_lanes =
+        discover_resume_candidates(repo_root, run_root, target_branch, &plan, parallel_logger)?;
     preserve_resume_recovery_notes(&mut rediscovered_lanes, &resumable_lanes);
     resumable_lanes = rediscovered_lanes;
     let mut last_idle_summary = None::<String>;
@@ -2181,6 +2244,7 @@ async fn run_parallel_loop(
         }
         plan = refresh_parallel_plan_or_last_good(
             repo_root,
+            target_branch,
             linear_tracker,
             &mut linear_auto_sync_state,
             &plan,
@@ -2205,6 +2269,12 @@ async fn run_parallel_loop(
                 .iter()
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.status == LoopTaskStatus::Partial)
+        });
+        unblock_attempt_counts.retain(|task_id, _| {
+            plan.tasks
+                .iter()
+                .find(|task| task.id == *task_id)
+                .is_some_and(|task| task.status != LoopTaskStatus::Done)
         });
 
         if args
@@ -2254,7 +2324,8 @@ async fn run_parallel_loop(
                     &shelved_tasks,
                     &deferred_partial_tasks,
                     &resumable_lanes,
-                    &unblock_attempted_tasks,
+                    &unblock_attempt_counts,
+                    max_autonomous_unblock_attempts,
                 ) {
                     let (lane_index, resume_candidate) = if let Some((
                         lane_index,
@@ -2272,18 +2343,23 @@ async fn run_parallel_loop(
                             None,
                         )
                     };
+                    let attempt_count = unblock_attempt_counts
+                        .entry(candidate.task.id.clone())
+                        .or_insert(0);
+                    *attempt_count += 1;
                     parallel_logger.info(format!(
-                        "unblock:     lane-{} -> {} [{}] because the normal ready queue is empty; downstream: {}",
+                        "unblock:     lane-{} -> {} [{} attempt {}/{}] because the normal ready queue is empty; downstream: {}",
                         lane_index,
                         candidate.task.id,
                         candidate.kind.label(),
+                        *attempt_count,
+                        max_autonomous_unblock_attempts,
                         if candidate.downstream.is_empty() {
                             "none".to_string()
                         } else {
                             candidate.downstream.join(", ")
                         }
                     ));
-                    unblock_attempted_tasks.insert(candidate.task.id.clone());
                     match candidate.kind {
                         ParallelUnblockCandidateKind::ShelvedResume => {
                             shelved_tasks.remove(&candidate.task.id);
@@ -2408,6 +2484,8 @@ async fn run_parallel_loop(
                         "warning: failed writing operator action queue: {err:#}"
                     )),
                 }
+            } else {
+                clear_stale_operator_actions(run_root, parallel_logger);
             }
             if executable_ready.is_empty() {
                 let message = format!(
@@ -2529,6 +2607,7 @@ async fn run_parallel_loop(
             if recovered > 0 {
                 plan = refresh_parallel_plan_or_last_good(
                     repo_root,
+                    target_branch,
                     linear_tracker,
                     &mut linear_auto_sync_state,
                     &plan,
@@ -2545,6 +2624,8 @@ async fn run_parallel_loop(
                 &queue,
                 &shelved_tasks,
                 &deferred_partial_tasks,
+                &unblock_attempt_counts,
+                max_autonomous_unblock_attempts,
             ));
             break;
         }
@@ -2636,6 +2717,9 @@ async fn run_parallel_loop(
                                 &mut attempted_partial_followups,
                                 &mut deferred_partial_tasks,
                             );
+                            if completion_status == LoopTaskStatus::Done {
+                                unblock_attempt_counts.remove(&assignment.task.id);
+                            }
                             let result_label = if auto_repaired {
                                 "landed-with-host-repair-after-nonzero"
                             } else if completion_status == LoopTaskStatus::Partial {
@@ -2848,6 +2932,7 @@ async fn run_parallel_loop(
             );
             let plan_for_prompt = refresh_parallel_plan_or_last_good(
                 repo_root,
+                target_branch,
                 linear_tracker,
                 &mut linear_auto_sync_state,
                 &plan,
@@ -2946,6 +3031,7 @@ async fn run_parallel_loop(
                         landed += 1;
                         attempted_partial_followups.remove(&assignment.task.id);
                         deferred_partial_tasks.remove(&assignment.task.id);
+                        unblock_attempt_counts.remove(&assignment.task.id);
                         parallel_logger.info(format!(
                             "self-heal:   [{}] {} closed from canonical evidence after lane-{} exited cleanly without a commit (total landed: {})",
                             classify_task_execution_kind(&assignment.task),
@@ -3008,6 +3094,9 @@ async fn run_parallel_loop(
                             &mut attempted_partial_followups,
                             &mut deferred_partial_tasks,
                         );
+                        if completion_status == LoopTaskStatus::Done {
+                            unblock_attempt_counts.remove(&assignment.task.id);
+                        }
                         let result_label = if auto_repaired {
                             "landed-with-host-repair"
                         } else if completion_status == LoopTaskStatus::Partial {
@@ -3289,6 +3378,144 @@ fn lane_repo_has_active_cherry_pick(lane_repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupersededLaneRecovery {
+    cherry_pick_head: String,
+    superseding_commit: String,
+}
+
+impl SupersededLaneRecovery {
+    fn summary(&self) -> String {
+        if self.cherry_pick_head == self.superseding_commit {
+            format!(
+                "cherry-pick commit {} is already reachable from canonical HEAD",
+                short_commit(&self.cherry_pick_head)
+            )
+        } else {
+            format!(
+                "cherry-pick commit {} is superseded by canonical task commit {}",
+                short_commit(&self.cherry_pick_head),
+                short_commit(&self.superseding_commit)
+            )
+        }
+    }
+}
+
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(10).collect()
+}
+
+fn superseded_lane_cherry_pick_recovery(
+    repo_root: &Path,
+    lane_repo_root: &Path,
+    task_id: &str,
+) -> Result<Option<SupersededLaneRecovery>> {
+    if !lane_repo_has_active_cherry_pick(lane_repo_root) || task_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let cherry_pick_head = git_stdout(lane_repo_root, ["rev-parse", "CHERRY_PICK_HEAD"])?;
+    let cherry_pick_head = cherry_pick_head.trim().to_string();
+    if cherry_pick_head.is_empty() {
+        return Ok(None);
+    }
+    let cherry_message = git_stdout(
+        lane_repo_root,
+        ["show", "-s", "--format=%B", "CHERRY_PICK_HEAD"],
+    )?;
+    if !cherry_message.contains(task_id) {
+        return Ok(None);
+    }
+
+    if git_commit_exists(repo_root, &cherry_pick_head)
+        && git_ref_is_ancestor(repo_root, &cherry_pick_head, "HEAD")?
+    {
+        return Ok(Some(SupersededLaneRecovery {
+            cherry_pick_head: cherry_pick_head.clone(),
+            superseding_commit: cherry_pick_head,
+        }));
+    }
+
+    let lane_recovery_base = git_stdout(lane_repo_root, ["rev-parse", "HEAD"])?;
+    let lane_recovery_base = lane_recovery_base.trim().to_string();
+    if lane_recovery_base.is_empty() {
+        return Ok(None);
+    }
+    let Some(superseding_commit) =
+        latest_canonical_task_commit_not_reachable_from(repo_root, task_id, &lane_recovery_base)?
+    else {
+        return Ok(None);
+    };
+    if superseding_commit == cherry_pick_head {
+        return Ok(None);
+    }
+    Ok(Some(SupersededLaneRecovery {
+        cherry_pick_head,
+        superseding_commit,
+    }))
+}
+
+fn retire_superseded_lane_cherry_pick_recovery(
+    repo_root: &Path,
+    lane_repo_root: &Path,
+    task_id: &str,
+) -> Result<Option<SupersededLaneRecovery>> {
+    let Some(superseded) =
+        superseded_lane_cherry_pick_recovery(repo_root, lane_repo_root, task_id)?
+    else {
+        return Ok(None);
+    };
+    run_git(lane_repo_root, ["cherry-pick", "--abort"])?;
+    let status = git_stdout(lane_repo_root, ["status", "--short"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "retired superseded cherry-pick recovery in {} but lane is still dirty:\n{}",
+            lane_repo_root.display(),
+            status.trim()
+        );
+    }
+    Ok(Some(superseded))
+}
+
+fn git_commit_exists(repo_root: &Path, commit: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn latest_canonical_task_commit_not_reachable_from(
+    repo_root: &Path,
+    task_id: &str,
+    base_ref: &str,
+) -> Result<Option<String>> {
+    let commits = git_stdout(
+        repo_root,
+        [
+            "log",
+            "--fixed-strings",
+            "--format=%H",
+            "--grep",
+            task_id,
+            "-n",
+            "20",
+            "HEAD",
+        ],
+    )?;
+    for commit in commits
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !git_ref_is_ancestor(repo_root, commit, base_ref)? {
+            return Ok(Some(commit.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 fn git_path(repo_root: &Path, path: &str) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
@@ -3476,6 +3703,8 @@ fn no_dependency_ready_stop_message(
     queue: &LoopQueueSnapshot,
     shelved_tasks: &BTreeMap<String, String>,
     deferred_partial_tasks: &BTreeSet<String>,
+    unblock_attempt_counts: &BTreeMap<String, usize>,
+    max_autonomous_unblock_attempts: usize,
 ) -> String {
     let blocked = if queue.blocked_ids.is_empty() {
         "none".to_string()
@@ -3491,6 +3720,12 @@ fn no_dependency_ready_stop_message(
     )
     .map(|summary| format!(" frontier: {summary}"))
     .unwrap_or_default();
+    let exhausted_suffix = exhausted_autonomous_unblock_suffix(
+        shelved_tasks,
+        deferred_partial_tasks,
+        unblock_attempt_counts,
+        max_autonomous_unblock_attempts,
+    );
     let deferred = if deferred_partial_tasks.is_empty() {
         None
     } else {
@@ -3505,17 +3740,19 @@ fn no_dependency_ready_stop_message(
     if shelved_tasks.is_empty() {
         if let Some(deferred) = deferred {
             return format!(
-                "no dependency-ready tasks remain to dispatch; stopping with partial follow-up tasks deferred for the rest of this run. pending: {} blocked: {} deferred: {}{}",
+                "no dependency-ready tasks remain to dispatch; stopping with partial follow-up tasks after autonomous unblock attempts. pending: {} blocked: {} deferred: {}{}{}",
                 queue.pending_ids.join(", "),
                 blocked,
                 deferred,
+                exhausted_suffix,
                 frontier_suffix
             );
         }
         return format!(
-            "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}{}",
+            "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}{}{}",
             queue.pending_ids.join(", "),
             blocked,
+            exhausted_suffix,
             frontier_suffix
         );
     }
@@ -3524,13 +3761,40 @@ fn no_dependency_ready_stop_message(
         .map(|deferred| format!(" deferred: {deferred}"))
         .unwrap_or_default();
     format!(
-        "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: {} blocked: {} shelved: {}{}{}",
+        "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: {} blocked: {} shelved: {}{}{}{}",
         queue.pending_ids.join(", "),
         blocked,
         shelved,
         deferred_suffix,
+        exhausted_suffix,
         frontier_suffix
     )
+}
+
+fn autonomous_unblock_attempt_limit(max_retries: usize) -> usize {
+    MIN_AUTONOMOUS_UNBLOCK_ATTEMPTS.max(max_retries.saturating_add(2))
+}
+
+fn exhausted_autonomous_unblock_suffix(
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    unblock_attempt_counts: &BTreeMap<String, usize>,
+    max_autonomous_unblock_attempts: usize,
+) -> String {
+    let exhausted = shelved_tasks
+        .keys()
+        .chain(deferred_partial_tasks.iter())
+        .filter_map(|task_id| {
+            let attempts = unblock_attempt_counts.get(task_id).copied().unwrap_or(0);
+            (attempts >= max_autonomous_unblock_attempts)
+                .then(|| format!("{task_id}={attempts}/{max_autonomous_unblock_attempts}"))
+        })
+        .collect::<Vec<_>>();
+    if exhausted.is_empty() {
+        String::new()
+    } else {
+        format!(" exhausted-unblock-attempts: {}", exhausted.join(", "))
+    }
 }
 
 fn write_operator_actions_for_ready_tasks(run_root: &Path, tasks: &[LoopTask]) -> Result<PathBuf> {
@@ -3550,6 +3814,23 @@ fn write_operator_actions_for_ready_tasks(run_root: &Path, tasks: &[LoopTask]) -
     atomic_write(&path, body.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+fn clear_stale_operator_actions(run_root: &Path, parallel_logger: &ParallelEventLogger) {
+    let path = run_root.join("operator-actions.md");
+    if !path.exists() {
+        return;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => parallel_logger.info(format!(
+            "operator-queue: cleared stale operator action queue at {}",
+            path.display()
+        )),
+        Err(err) => parallel_logger.warn(format!(
+            "warning: failed clearing stale operator action queue {}: {err:#}",
+            path.display()
+        )),
+    }
 }
 
 fn write_parallel_salvage_record(
@@ -3851,12 +4132,15 @@ struct ReceiptDriftTriageEntry {
 
 fn audit_parallel_completion_drift(
     repo_root: &Path,
+    target_branch: &str,
     plan_text: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<String> {
     let snapshot = parse_loop_plan(plan_text);
+    let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
-    let mut manual_closeout_candidates = Vec::new();
+    let mut backfilled_receipts = Vec::new();
+    let mut closed_partial_receipts = Vec::new();
 
     for task in snapshot
         .tasks
@@ -3867,12 +4151,20 @@ fn audit_parallel_completion_drift(
         if evidence.is_fully_evidenced() {
             continue;
         }
-        completed_drift.push(ReceiptDriftTriageEntry {
+        if backfill_completed_legacy_receipt_footer(repo_root, task, &evidence)? {
+            let refreshed = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+            if refreshed.is_fully_evidenced() {
+                backfilled_receipts.push(task.id.clone());
+                continue;
+            }
+        }
+        let entry = ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
             status: task.status,
             reasons: evidence.missing_reasons(),
-        });
+        };
+        completed_drift.push(entry);
     }
 
     for task in snapshot
@@ -3884,24 +4176,43 @@ fn audit_parallel_completion_drift(
         if !evidence.is_fully_evidenced() {
             continue;
         }
-        manual_closeout_candidates.push(ReceiptDriftTriageEntry {
-            task_id: task.id.clone(),
-            title: task.title.clone(),
-            status: task.status,
-            reasons: vec![
-                "repo-local evidence appears complete; manual queue closeout may be appropriate"
-                    .to_string(),
-            ],
-        });
+        updated_plan_text =
+            update_task_completion_in_plan_text(&updated_plan_text, &task.id, LoopTaskStatus::Done);
+        closed_partial_receipts.push(task.id.clone());
     }
 
-    if !completed_drift.is_empty()
-        || !manual_closeout_candidates.is_empty()
-        || repo_root.join("RECEIPTS-DRIFT.md").exists()
-    {
-        write_receipts_drift_triage(repo_root, &completed_drift, &manual_closeout_candidates)?;
+    if updated_plan_text != plan_text {
+        let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+        atomic_write(&plan_path, updated_plan_text.as_bytes())
+            .with_context(|| format!("failed to write {}", plan_path.display()))?;
     }
-    if !completed_drift.is_empty() {
+    let triage_changed =
+        if !completed_drift.is_empty() || repo_root.join("RECEIPTS-DRIFT.md").exists() {
+            write_receipts_drift_triage(repo_root, completed_drift.as_slice(), &[])?
+        } else {
+            false
+        };
+    if !backfilled_receipts.is_empty() {
+        if push_branch_with_remote_sync(repo_root, target_branch)? {
+            parallel_logger.info(format!(
+                "remote sync: rebased onto origin/{} after receipt footer backfill",
+                target_branch
+            ));
+        }
+        parallel_logger.info(format!(
+            "receipt-backfill: footerized {} completed task receipt(s) ({})",
+            backfilled_receipts.len(),
+            backfilled_receipts.join(", ")
+        ));
+    }
+    if !closed_partial_receipts.is_empty() {
+        parallel_logger.info(format!(
+            "receipt-closeout: closed {} partial task(s) from canonical repo-local evidence ({})",
+            closed_partial_receipts.len(),
+            closed_partial_receipts.join(", ")
+        ));
+    }
+    if triage_changed && !completed_drift.is_empty() {
         parallel_logger.warn(format!(
             "warning: repo-local completion evidence drifted for {} completed task(s); wrote RECEIPTS-DRIFT.md and left IMPLEMENTATION_PLAN.md unchanged ({})",
             completed_drift.len(),
@@ -3912,33 +4223,67 @@ fn audit_parallel_completion_drift(
                 .join(", ")
         ));
     }
-    if !manual_closeout_candidates.is_empty() {
-        parallel_logger.info(format!(
-            "triage: {} partial task(s) appear fully evidenced; wrote RECEIPTS-DRIFT.md and left IMPLEMENTATION_PLAN.md unchanged ({})",
-            manual_closeout_candidates.len(),
-            manual_closeout_candidates
-                .iter()
-                .map(|entry| entry.task_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
+    Ok(updated_plan_text)
+}
 
-    Ok(plan_text.to_string())
+fn backfill_completed_legacy_receipt_footer(
+    repo_root: &Path,
+    task: &LoopTask,
+    evidence: &crate::completion_artifacts::TaskCompletionEvidence,
+) -> Result<bool> {
+    if !evidence.has_review_handoff
+        || !evidence.missing_completion_artifacts.is_empty()
+        || !evidence.unresolved_audit_findings.is_empty()
+    {
+        return Ok(false);
+    }
+    let Some(footer) =
+        legacy_verification_receipt_backfill_footer(repo_root, &task.id, &task.markdown)?
+    else {
+        return Ok(false);
+    };
+    if repo_has_staged_queue_updates(repo_root)? {
+        return Ok(false);
+    }
+    let message = format!(
+        "{}: {} receipt footer backfill",
+        repo_name(repo_root),
+        task.id
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("commit")
+        .arg("--allow-empty")
+        .arg("-m")
+        .arg(&message)
+        .arg("-m")
+        .arg(&footer)
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    bail!(
+        "git command failed in {}: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 fn write_receipts_drift_triage(
     repo_root: &Path,
     completed_drift: &[ReceiptDriftTriageEntry],
     manual_closeout_candidates: &[ReceiptDriftTriageEntry],
-) -> Result<()> {
+) -> Result<bool> {
     let path = repo_root.join("RECEIPTS-DRIFT.md");
     let body = render_receipts_drift_triage(completed_drift, manual_closeout_candidates);
     if fs::read_to_string(&path).is_ok_and(|existing| existing == body) {
-        return Ok(());
+        return Ok(false);
     }
     atomic_write(&path, body.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
 }
 
 fn render_receipts_drift_triage(
@@ -3997,12 +4342,14 @@ fn render_receipts_drift_entry(entry: &ReceiptDriftTriageEntry) -> String {
 
 async fn refresh_parallel_plan(
     repo_root: &Path,
+    target_branch: &str,
     linear_tracker: &mut Option<LinearTracker>,
     linear_auto_sync_state: &mut LinearAutoSyncState,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
-    plan_text = audit_parallel_completion_drift(repo_root, &plan_text, parallel_logger)?;
+    plan_text =
+        audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)?;
     if let Some(tracker) = linear_tracker.as_mut() {
         if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
             if !maybe_disable_linear_auto_sync_for_run(
@@ -4089,6 +4436,7 @@ async fn refresh_parallel_plan(
 
 async fn refresh_parallel_plan_or_last_good(
     repo_root: &Path,
+    target_branch: &str,
     linear_tracker: &mut Option<LinearTracker>,
     linear_auto_sync_state: &mut LinearAutoSyncState,
     last_good_plan: &LoopPlanSnapshot,
@@ -4096,6 +4444,7 @@ async fn refresh_parallel_plan_or_last_good(
 ) -> Result<LoopPlanSnapshot> {
     match refresh_parallel_plan(
         repo_root,
+        target_branch,
         linear_tracker,
         linear_auto_sync_state,
         parallel_logger,
@@ -4203,9 +4552,18 @@ enum TmuxLaunchStatus {
 }
 
 fn should_launch_parallel_tmux(args: &ParallelArgs) -> bool {
+    // Skip self-bootstrap when we're already inside a tmux session.
+    // Detached sessions (`tmux new-session -d`) don't always propagate
+    // TMUX_PANE, but they always set TMUX (the canonical tmux env var).
+    // Checking both prevents the orphan-session class of bug observed
+    // 2026-05-07: supervisor scripts launching parallel inside their own
+    // tmux session would still trigger this bootstrap, creating an
+    // untracked sibling session that broke session-end detection.
+    let inside_tmux = env::var_os("TMUX").is_some_and(|v| !v.is_empty())
+        || env::var_os("TMUX_PANE").is_some_and(|v| !v.is_empty());
     args.max_concurrent_workers > 1
         && env::var_os("AUTO_PARALLEL_TMUX_BOOTSTRAPPED").is_none()
-        && env::var_os("TMUX_PANE").is_none_or(|pane| pane.is_empty())
+        && !inside_tmux
 }
 
 fn parallel_host_stdout_log_path(run_root: &Path) -> PathBuf {
@@ -4646,7 +5004,7 @@ fn parallel_dispatch_path_is_ignored(path: &str) -> bool {
     if path.starts_with(".auto/symphony/verification-receipts/")
         || path.starts_with("auto/symphony/verification-receipts/")
     {
-        return false;
+        return true;
     }
     let first_segment = path.split('/').next().unwrap_or(path);
     first_segment == ".auto"
@@ -4867,7 +5225,7 @@ fn completion_status_suffix(
                 " [~ evidence gap remains; follow-up pass queued]"
             }
             PartialFollowUpDisposition::ParkForRestOfRun => {
-                " [~ evidence gap remains; parked after follow-up]"
+                " [~ evidence gap remains; queued for autonomous unblock]"
             }
         },
         LoopTaskStatus::Pending | LoopTaskStatus::Blocked => "",
@@ -4902,12 +5260,16 @@ fn next_parallel_unblock_candidate(
     shelved_tasks: &BTreeMap<String, String>,
     deferred_partial_tasks: &BTreeSet<String>,
     resumable_lanes: &BTreeMap<usize, LaneResumeCandidate>,
-    unblock_attempted_tasks: &BTreeSet<String>,
+    unblock_attempt_counts: &BTreeMap<String, usize>,
+    max_autonomous_unblock_attempts: usize,
 ) -> Option<ParallelUnblockCandidate> {
     let mut candidates = plan
         .ready_tasks(active_tasks)
         .into_iter()
-        .filter(|task| !unblock_attempted_tasks.contains(&task.id))
+        .filter(|task| {
+            unblock_attempt_counts.get(&task.id).copied().unwrap_or(0)
+                < max_autonomous_unblock_attempts
+        })
         .filter_map(|task| {
             let downstream = plan.direct_unfinished_dependents(&task.id);
             if shelved_tasks.contains_key(&task.id) {
@@ -5126,9 +5488,11 @@ fn prepare_parallel_lane_assignment_with_fallback(
 }
 
 fn discover_resume_candidates(
+    repo_root: &Path,
     run_root: &Path,
     target_branch: &str,
     plan: &LoopPlanSnapshot,
+    parallel_logger: &ParallelEventLogger,
 ) -> Result<BTreeMap<usize, LaneResumeCandidate>> {
     let lanes_root = run_root.join("lanes");
     if !lanes_root.exists() {
@@ -5228,6 +5592,25 @@ fn discover_resume_candidates(
                     lane_index
                 );
                 continue;
+            }
+        }
+
+        match retire_superseded_lane_cherry_pick_recovery(repo_root, &lane_repo_root, &task_id) {
+            Ok(Some(superseded)) => {
+                parallel_logger.info(format!(
+                    "recovery-retire: lane-{} `{}` had stale duplicate landing recovery; {}",
+                    lane_index,
+                    task_id,
+                    superseded.summary()
+                ));
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                parallel_logger.warn(format!(
+                    "warning: lane-{} `{}` stale-recovery retirement check failed; keeping lane resumable: {err:#}",
+                    lane_index, task_id
+                ));
             }
         }
 
@@ -5882,6 +6265,88 @@ fn lane_status_task_id(
     stored_task_id.to_string()
 }
 
+fn lane_worker_status(lane_root: &Path, lane_repo_root: &Path) -> Result<(bool, String)> {
+    let pid_path = lane_root.join("worker.pid");
+    let pid_state = match read_worker_pid(&pid_path) {
+        Ok(Some(pid)) => match worker_pid_is_alive(pid) {
+            Ok(true) => return Ok((true, format!("running pid {pid}"))),
+            Ok(false) => Some(format!("stale pid {pid}")),
+            Err(err) => Some(format!("pid liveness unknown: {err:#}")),
+        },
+        Ok(None) => None,
+        Err(err) => Some(format!("worker pid unreadable: {err:#}")),
+    };
+
+    let descendant_pids = lane_repo_process_pids(lane_repo_root)?;
+    if !descendant_pids.is_empty() {
+        return Ok((
+            true,
+            format!(
+                "running descendant pid(s) {}{}",
+                descendant_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                pid_state
+                    .map(|state| format!(" ({state})"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+
+    Ok((
+        false,
+        pid_state.unwrap_or_else(|| "no worker pid".to_string()),
+    ))
+}
+
+fn lane_repo_process_pids(lane_repo_root: &Path) -> Result<Vec<u32>> {
+    if !lane_repo_root.exists() {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,command="])
+        .output()
+        .context("failed to inspect process table")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_lane_repo_process_pids(
+        lane_repo_root,
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+fn parse_lane_repo_process_pids(lane_repo_root: &Path, ps_output: &str) -> Vec<u32> {
+    let needle = lane_repo_root.display().to_string();
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (pid, command) = trimmed.split_once(char::is_whitespace)?;
+            if !command.contains(&needle) {
+                return None;
+            }
+            let command = command.trim_start();
+            let executable = command
+                .split_whitespace()
+                .next()
+                .and_then(|word| Path::new(word).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if matches!(executable, "rg" | "grep")
+                || command.starts_with("auto parallel status")
+                || command.contains(" auto parallel status")
+                || command.contains("/auto parallel status")
+            {
+                return None;
+            }
+            pid.parse::<u32>().ok()
+        })
+        .collect()
+}
+
 fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
     let stem = file_name.strip_suffix("-prompt.md")?;
     let (task_id, attempt) = stem.rsplit_once("-attempt-")?;
@@ -6006,7 +6471,7 @@ fn build_parallel_lane_prompt(
         verification.narrative_guidance.join(" | ")
     };
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit or commit `.auto/symphony/verification-receipts/*.json`. Receipt JSON is staging evidence; the host embeds durable proof in closeout commit footers.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
@@ -6525,6 +6990,7 @@ fn cherry_pick_lane_range(
         return Ok(());
     }
 
+    scrub_parallel_receipt_staging(repo_root)?;
     let range = format!("{base_commit}..{head_ref}");
     let output = Command::new("git")
         .arg("-C")
@@ -6546,6 +7012,28 @@ fn cherry_pick_lane_range(
         repo_root.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
+}
+
+fn scrub_parallel_receipt_staging(repo_root: &Path) -> Result<()> {
+    let receipt_dir = repo_root.join(".auto/symphony/verification-receipts");
+    if !receipt_dir.exists() {
+        return Ok(());
+    }
+    let _ = run_git(
+        repo_root,
+        [
+            "restore",
+            "--staged",
+            "--worktree",
+            "--",
+            ".auto/symphony/verification-receipts",
+        ],
+    );
+    let _ = run_git(
+        repo_root,
+        ["clean", "-fd", "--", ".auto/symphony/verification-receipts"],
+    );
+    Ok(())
 }
 
 fn landing_error_suggests_dirty_canonical_worktree(err: &anyhow::Error) -> bool {
@@ -6630,17 +7118,30 @@ fn mark_task_header_status(line: &str, status: LoopTaskStatus) -> String {
     } else {
         ""
     };
-    let line = line.trim_end_matches('\n').trim_end_matches('\r');
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let trimmed = line.trim_start();
-    let rest = trimmed
-        .strip_prefix("- [ ] ")
-        .or_else(|| trimmed.strip_prefix("- [!] "))
-        .or_else(|| trimmed.strip_prefix("- [~] "))
-        .or_else(|| trimmed.strip_prefix("- [x] "))
-        .or_else(|| trimmed.strip_prefix("- [X] "))
-        .unwrap_or(trimmed);
+    let stripped = line.trim_end_matches('\n').trim_end_matches('\r');
+    let indent_len = stripped.len() - stripped.trim_start().len();
+    let indent = &stripped[..indent_len];
+    let trimmed = stripped.trim_start();
+    let (existing_done, rest) = if let Some(rest) = trimmed.strip_prefix("- [x] ") {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [X] ") {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        (false, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [!] ") {
+        (false, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("- [~] ") {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    // Completion is monotonic forward: once a task header is marked [x], an
+    // automated reconcile pass must not demote it. This guards against
+    // duplicate-ID rows in IMPLEMENTATION_PLAN.md where landing one row would
+    // otherwise rewrite a sibling [x] row that shares the same task ID.
+    if existing_done && status != LoopTaskStatus::Done {
+        return line.to_string();
+    }
     let marker = match status {
         LoopTaskStatus::Pending => "- [ ]",
         LoopTaskStatus::Blocked => "- [!]",
@@ -6956,14 +7457,16 @@ mod tests {
         last_parallel_stop_state, maybe_disable_linear_auto_sync_for_run,
         next_parallel_unblock_candidate, no_dependency_ready_stop_message,
         parallel_blocker_frontier, parallel_run_root, parallel_status_safety_verdict,
-        parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
-        parse_parallel_stop_ids, preflight_warning_names, prepare_lane_landing_recovery,
-        prepare_parallel_startup, prepared_landing_recovery_note, preserve_resume_recovery_notes,
-        prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
-        recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
-        render_parallel_health_summary, repair_parallel_canonical_before_dispatch,
-        repo_forbids_legacy_review_trackers, reset_parallel_lane_root, resolve_loop_worker_env,
-        resolve_reference_repos, salvage_recovery_note, take_resume_candidate_for_task,
+        parallel_tmux_command, parallel_tmux_session_name, parse_lane_repo_process_pids,
+        parse_loop_plan, parse_parallel_stop_ids, preflight_warning_names,
+        prepare_lane_landing_recovery, prepare_parallel_startup, prepared_landing_recovery_note,
+        preserve_resume_recovery_notes, prioritize_ready_parallel_tasks, read_lane_task_id,
+        ready_parallel_tasks, receipt_drift_status_summary, recent_parallel_host_warnings,
+        record_partial_follow_up, render_default_parallel_prompt, render_parallel_health_summary,
+        repair_parallel_canonical_before_dispatch, repo_forbids_legacy_review_trackers,
+        reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
+        retire_superseded_lane_cherry_pick_recovery, salvage_recovery_note,
+        superseded_lane_cherry_pick_recovery, take_resume_candidate_for_task,
         task_id_from_prompt_filename, tmux_status_line_has_live_worker,
         try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
         validate_lane_assignment_metadata, write_lane_assignment_metadata,
@@ -7325,13 +7828,22 @@ mod tests {
         shelved.insert("TASK-4".to_string(), "- [ ] `TASK-4`".to_string());
         let deferred = BTreeSet::from(["TASK-5".to_string()]);
 
-        let message =
-            no_dependency_ready_stop_message(&plan, &BTreeSet::new(), &queue, &shelved, &deferred);
+        let attempts = BTreeMap::from([("TASK-5".to_string(), 4usize)]);
+        let message = no_dependency_ready_stop_message(
+            &plan,
+            &BTreeSet::new(),
+            &queue,
+            &shelved,
+            &deferred,
+            &attempts,
+            4,
+        );
         assert!(message.contains("stopping with unresolved shelved tasks"));
         assert!(message.contains("pending: TASK-1, TASK-2"));
         assert!(message.contains("blocked: TASK-9"));
         assert!(message.contains("shelved: TASK-3, TASK-4"));
         assert!(message.contains("deferred: TASK-5"));
+        assert!(message.contains("exhausted-unblock-attempts: TASK-5=4/4"));
         assert!(message.contains("frontier: TASK-3 [shelved]"));
     }
 
@@ -7402,11 +7914,54 @@ mod tests {
             &shelved,
             &deferred,
             &resumable,
-            &BTreeSet::new(),
+            &BTreeMap::new(),
+            4,
         )
         .expect("expected an unblock candidate");
         assert_eq!(candidate.task.id, "TASK-S");
         assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+    }
+
+    #[test]
+    fn next_parallel_unblock_candidate_retries_until_attempt_limit() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-A` blocked by partial
+  Dependencies: `TASK-P`
+- [~] `TASK-P` partial blocker
+  Dependencies: none
+"#,
+        );
+        let deferred = BTreeSet::from(["TASK-P".to_string()]);
+        let mut attempts = BTreeMap::from([("TASK-P".to_string(), 3usize)]);
+
+        let candidate = next_parallel_unblock_candidate(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &deferred,
+            &BTreeMap::new(),
+            &attempts,
+            4,
+        )
+        .expect("attempt 4 should still be eligible");
+        assert_eq!(candidate.task.id, "TASK-P");
+        assert_eq!(
+            candidate.kind,
+            ParallelUnblockCandidateKind::DeferredPartialCloseout
+        );
+
+        attempts.insert("TASK-P".to_string(), 4);
+        assert!(next_parallel_unblock_candidate(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &deferred,
+            &BTreeMap::new(),
+            &attempts,
+            4,
+        )
+        .is_none());
     }
 
     #[test]
@@ -7638,6 +8193,7 @@ mod tests {
         let summary = render_parallel_health_summary(
             &preflight,
             &host_warnings,
+            Some("2 completed task(s); see RECEIPTS-DRIFT.md"),
             &["lane-1 TASK-1".to_string(), "lane-3 TASK-3".to_string()],
             &["lane-2 TASK-2".to_string()],
         );
@@ -7657,10 +8213,26 @@ mod tests {
         assert!(summary.contains("degraded"));
         assert!(summary.contains("preflight warnings: agent-browser, docker compose"));
         assert!(summary.contains("recent host warnings: live.log"));
+        assert!(summary.contains("receipt drift: 2 completed task(s); see RECEIPTS-DRIFT.md"));
         assert!(summary.contains("active recovery lanes: lane-1 TASK-1, lane-3 TASK-3"));
         assert!(summary.contains("stale recovery lanes: lane-2 TASK-2"));
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn lane_repo_process_parser_finds_orphaned_codex_descendants() {
+        let lane_repo = PathBuf::from("/tmp/repo/.auto/parallel/lanes/lane-3/repo");
+        let ps = r#"
+  100 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.5
+  101 node /home/r/.npm-global/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.5
+  102 rg /tmp/repo/.auto/parallel/lanes/lane-3/repo
+  103 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-4/repo -m gpt-5.5
+"#;
+
+        let pids = parse_lane_repo_process_pids(&lane_repo, ps);
+
+        assert_eq!(pids, vec![100, 101]);
     }
 
     #[test]
@@ -8012,6 +8584,105 @@ mod tests {
         let resumed = lane_repo_recovery_note(&lane, "main", status.trim());
         assert!(resumed.contains("in-progress landing-recovery cherry-pick"));
         assert!(resumed.contains("shared.txt"));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn superseded_lane_recovery_is_retired_after_newer_task_commit_lands() {
+        let (root, remote, upstream, _worker) =
+            init_remote_and_clones("parallel-superseded-recovery", "main");
+        let lane = root.join("lane-superseded");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane, ["config", "user.email", "autodev@example.com"]);
+        run_git_in(&lane, ["remote", "rename", "origin", "canonical"]);
+
+        let base_commit = git_output(&lane, ["rev-parse", "HEAD"]);
+        fs::write(lane.join("manifest.json"), "{\"result\":\"old\"}\n")
+            .expect("failed to write lane manifest");
+        run_git_in(&lane, ["add", "manifest.json"]);
+        run_git_in(
+            &lane,
+            ["commit", "-m", "repo: TASK-001 refresh proof manifest"],
+        );
+
+        fs::write(upstream.join("manifest.json"), "{\"result\":\"main\"}\n")
+            .expect("failed to write upstream manifest");
+        run_git_in(&upstream, ["add", "manifest.json"]);
+        run_git_in(&upstream, ["commit", "-m", "main conflicting edit"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+        let recovery_base = git_output(&upstream, ["rev-parse", "HEAD"]);
+
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 4,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-001".to_string(),
+                title: "superseded proof".to_string(),
+                status: LoopTaskStatus::Partial,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: "- [~] `TASK-001` superseded proof\n".to_string(),
+            },
+            resumed: true,
+            lane_root: root.join("lane-superseded-root"),
+            lane_repo_root: lane.clone(),
+            base_commit: base_commit.clone(),
+            stdout_log_path: root.join("lane-superseded.stdout.log"),
+            stderr_log_path: root.join("lane-superseded.stderr.log"),
+            worker_pid_path: root.join("lane-superseded.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let prep = prepare_lane_landing_recovery(
+            &mut assignment,
+            "main",
+            &base_commit,
+            "git cherry-pick failed",
+        )
+        .expect("landing recovery should prepare");
+        assert!(matches!(
+            prep,
+            LaneLandingRecoveryPrep::NeedsWorkerResolution(_)
+        ));
+        assert_eq!(assignment.base_commit, recovery_base);
+        assert!(lane_repo_has_active_cherry_pick(&lane));
+
+        fs::write(upstream.join("manifest.json"), "{\"result\":\"newer\"}\n")
+            .expect("failed to write newer upstream manifest");
+        run_git_in(&upstream, ["add", "manifest.json"]);
+        run_git_in(
+            &upstream,
+            ["commit", "-m", "repo: TASK-001 publish newer proof"],
+        );
+        let newer_commit = git_output(&upstream, ["rev-parse", "HEAD"]);
+
+        let superseded = superseded_lane_cherry_pick_recovery(&upstream, &lane, "TASK-001")
+            .expect("superseded check should succeed")
+            .expect("expected superseded recovery");
+        assert_eq!(superseded.superseding_commit, newer_commit);
+
+        let retired = retire_superseded_lane_cherry_pick_recovery(&upstream, &lane, "TASK-001")
+            .expect("retirement should succeed")
+            .expect("expected retired recovery");
+        assert_eq!(retired.superseding_commit, newer_commit);
+        assert!(!lane_repo_has_active_cherry_pick(&lane));
+        assert_eq!(run_git_in(&lane, ["status", "--short"]), "");
+        assert_eq!(git_output(&lane, ["rev-parse", "HEAD"]), recovery_base);
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
@@ -8586,6 +9257,37 @@ mod tests {
     }
 
     #[test]
+    fn inferred_mainnet_autonomous_gate_remains_dispatchable_code() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `LIVE-001` Autonomous loom mainnet canary
+  Verification: `LAUNCH_GATE_AUTHORIZE_REAL_RBTC=1 bash scripts/e2e/canary.sh`
+  Scope boundary: fail-closed live mainnet proof; emits AUTO_ENV_BLOCKER when credentials or authorization are absent.
+  Dependencies: none
+
+- [ ] `OPS-001` Human signoff ceremony
+  Verification: `ssh root@loom true`
+  Review/closeout: requires operator approval before any live run.
+  Dependencies: none
+"#,
+        );
+        assert_eq!(plan.task("LIVE-001").unwrap().lane_kind, LaneKind::Code);
+        assert_eq!(plan.task("OPS-001").unwrap().lane_kind, LaneKind::Operator);
+
+        let verdict = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            &[],
+            &[],
+        );
+        assert!(verdict.contains("code lanes ready: LIVE-001"));
+        assert!(verdict.contains("operator queue: OPS-001"));
+    }
+
+    #[test]
     fn operator_actions_file_records_full_task_contract() {
         let run_root = unique_temp_dir("operator-actions");
         fs::create_dir_all(&run_root).expect("failed to create run root");
@@ -9016,6 +9718,31 @@ mod tests {
     }
 
     #[test]
+    fn update_task_completion_in_plan_text_does_not_demote_existing_done_rows() {
+        // Two rows share the same task ID (duplicate-ID harvest residue). When
+        // a lane lands the still-pending row and reconcile writes Partial, the
+        // already-completed sibling must remain `[x]`.
+        let plan = r#"- [x] `AUDIT-94` Already completed sibling
+  Dependencies: none
+  Estimated scope: small
+- [ ] `AUDIT-94` Newly assigned duplicate-id row
+  Dependencies: none
+  Estimated scope: small
+"#;
+
+        let updated = update_task_completion_in_plan_text(plan, "AUDIT-94", LoopTaskStatus::Partial);
+
+        assert!(
+            updated.contains("- [x] `AUDIT-94` Already completed sibling"),
+            "completed sibling must not be demoted: {updated}"
+        );
+        assert!(
+            updated.contains("- [~] `AUDIT-94` Newly assigned duplicate-id row"),
+            "still-pending duplicate must be marked partial: {updated}"
+        );
+    }
+
+    #[test]
     fn audit_parallel_completion_drift_warns_without_demoting_plan() {
         let repo = unique_temp_dir("parallel-drift-audit");
         let run_root = unique_temp_dir("parallel-drift-audit-run");
@@ -9027,6 +9754,7 @@ mod tests {
 
         let updated = audit_parallel_completion_drift(
             &repo,
+            "main",
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
             &logger,
         )
@@ -9036,10 +9764,106 @@ mod tests {
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
         assert_eq!(persisted, plan);
-        let triage =
-            fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).expect("triage should persist");
-        assert!(triage.contains("- [x] `TASK-001` First task"));
-        assert!(triage.contains("missing REVIEW.md handoff"));
+        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
+        assert!(
+            triage.contains("TASK-001") && triage.contains("Completed Tasks With Drift"),
+            "receipt drift should be report-only, not scheduler work"
+        );
+        let live_log = fs::read_to_string(run_root.join("live.log"))
+            .expect("receipt repair should write host log");
+        assert!(live_log.contains("left IMPLEMENTATION_PLAN.md unchanged"));
+    }
+
+    #[test]
+    fn audit_parallel_completion_drift_logs_only_changed_triage() {
+        let repo = unique_temp_dir("parallel-drift-audit-stable-log");
+        let run_root = unique_temp_dir("parallel-drift-audit-stable-log-run");
+        fs::create_dir_all(&repo).expect("failed to create repo dir");
+        fs::create_dir_all(&run_root).expect("failed to create run dir");
+        let plan = "- [x] `TASK-001` First task\n  Dependencies: none\n  Estimated scope: S\n";
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), plan).expect("failed to write plan");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        let updated = audit_parallel_completion_drift(&repo, "main", plan, &logger)
+            .expect("first drift audit should succeed");
+        assert_eq!(updated, plan);
+        let first_log =
+            fs::read_to_string(run_root.join("live.log")).expect("first audit should log drift");
+        assert!(first_log.contains("left IMPLEMENTATION_PLAN.md unchanged"));
+
+        audit_parallel_completion_drift(&repo, "main", &updated, &logger)
+            .expect("second drift audit should succeed");
+        let second_log =
+            fs::read_to_string(run_root.join("live.log")).expect("second audit should keep log");
+        assert_eq!(
+            second_log, first_log,
+            "unchanged receipt drift should stay visible in RECEIPTS-DRIFT.md without appending another fresh host warning"
+        );
+
+        assert!(
+            receipt_drift_status_summary(&repo)
+                .is_some_and(|summary| summary.contains("1 completed task(s)")),
+            "completed receipt drift should remain status noise, not scheduler work"
+        );
+    }
+
+    #[test]
+    fn audit_parallel_completion_drift_backfills_safe_legacy_receipt_footer() {
+        let (_root, _remote, repo, _worker) =
+            init_remote_and_clones("parallel-drift-backfill", "trunk");
+        let run_root = unique_temp_dir("parallel-drift-backfill-run");
+        fs::create_dir_all(&run_root).expect("failed to create run dir");
+        let plan = "- [x] `TASK-001` First task\n  Verification: `cargo test task_001`\n  Dependencies: none\n  Estimated scope: S\n";
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), plan).expect("failed to write plan");
+        fs::write(repo.join("REVIEW.md"), "## `TASK-001`\n\nComplete.\n")
+            .expect("failed to write review");
+        let receipt_dir = repo.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
+        fs::write(
+            receipt_dir.join("TASK-001.json"),
+            r#"{"commands":[{"command":"cargo test task_001","exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("failed to write legacy receipt");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md", "REVIEW.md"]);
+        run_git_in(&repo, ["commit", "-m", "completed task"]);
+        run_git_in(&repo, ["push", "origin", "trunk"]);
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        let updated = audit_parallel_completion_drift(&repo, "trunk", plan, &logger)
+            .expect("drift audit should backfill receipt footer");
+
+        assert_eq!(updated, plan);
+        assert!(!repo.join("RECEIPTS-DRIFT.md").exists());
+        let log = git_output(&repo, ["log", "-1", "--format=%B"]);
+        assert!(log.contains("Auto-Verification-Receipt-Task: TASK-001"));
+        let live_log =
+            fs::read_to_string(run_root.join("live.log")).expect("backfill should write host log");
+        assert!(live_log.contains("receipt-backfill: footerized 1 completed task receipt(s)"));
+    }
+
+    #[test]
+    fn repair_parallel_canonical_before_dispatch_ignores_receipt_json_staging() {
+        let repo = unique_temp_dir("parallel-ignore-receipt-json");
+        let run_root = unique_temp_dir("parallel-ignore-receipt-json-run");
+        init_git_repo(&repo);
+        fs::create_dir_all(&run_root).expect("failed to create run dir");
+        run_git_in(&repo, ["branch", "-M", "trunk"]);
+        fs::write(repo.join("README.md"), "# repo\n").expect("failed to write README");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        let receipt_dir = repo.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
+        fs::write(receipt_dir.join("TASK-001.json"), "{}\n").expect("failed to write receipt");
+        let before = git_output(&repo, ["rev-parse", "HEAD"]);
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        repair_parallel_canonical_before_dispatch(&repo, "trunk", &logger)
+            .expect("receipt JSON staging should not force a checkpoint");
+
+        let after = git_output(&repo, ["rev-parse", "HEAD"]);
+        assert_eq!(after, before);
+        let status = git_output(&repo, ["status", "--short", "--untracked-files=all"]);
+        assert!(status.contains(".auto/symphony/verification-receipts/TASK-001.json"));
     }
 
     #[test]
@@ -9056,19 +9880,24 @@ mod tests {
 
         let updated = audit_parallel_completion_drift(
             &repo,
+            "main",
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
             &logger,
         )
         .expect("drift audit should succeed");
 
-        assert_eq!(updated, plan);
+        assert!(updated.starts_with("- [x] `TASK-001`"));
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
-        assert_eq!(persisted, plan);
-        let triage =
-            fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).expect("triage should persist");
-        assert!(triage.contains("## Manual Closeout Candidates"));
-        assert!(triage.contains("- [~] `TASK-001` First task"));
+        assert_eq!(persisted, updated);
+        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
+        assert!(
+            triage.is_empty() || triage.contains("No repo-local receipt drift detected."),
+            "closeout should not leave actionable receipt drift"
+        );
+        let live_log =
+            fs::read_to_string(run_root.join("live.log")).expect("closeout should write host log");
+        assert!(live_log.contains("receipt-closeout: closed 1 partial task(s)"));
     }
 
     #[test]

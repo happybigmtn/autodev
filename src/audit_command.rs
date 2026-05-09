@@ -3715,6 +3715,7 @@ diff --git a/README.md b/README.md
             remediation_threads: 1,
             first_pass_model: "gpt-5.5".to_string(),
             first_pass_effort: "low".to_string(),
+            first_pass_retries: 3,
             synthesis_model: "gpt-5.5".to_string(),
             synthesis_effort: "high".to_string(),
             remediation_model: "gpt-5.5".to_string(),
