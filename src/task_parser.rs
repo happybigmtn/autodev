@@ -530,10 +530,17 @@ fn validate_execution_row_dependencies(
 }
 
 fn reject_dependency_prose(task: &PlanTask, text: &str) -> Result<()> {
-    let lower = text.to_ascii_lowercase();
+    // Strip parenthesized clarifications and trailing punctuation before
+    // checking for prose phrases. LLM authors (and humans) naturally write
+    // dependencies like `\`DEP-1\` (waits on the pooled posture)` or
+    // `\`DEP-1\`, \`DEP-2\`.` -- these are clarifying annotations, not
+    // ambiguous prose, and should not block validation. The keyword checks
+    // below still reject actual prose like "after wave 2" that would create
+    // dependency-resolution ambiguity.
+    let stripped = strip_dependency_annotations(text);
+    let lower = stripped.to_ascii_lowercase();
     for phrase in [
-        "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external", "(", ")",
-        ".", ";", ":",
+        "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external",
     ] {
         if lower.contains(phrase) {
             bail!(
@@ -543,6 +550,21 @@ fn reject_dependency_prose(task: &PlanTask, text: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn strip_dependency_annotations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth: u32 = 0;
+    for ch in text.chars() {
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            '.' | ';' | ':' if depth == 0 => continue,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn validate_execution_row_estimated_scope(task: &PlanTask) -> Result<()> {
