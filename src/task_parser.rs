@@ -315,7 +315,11 @@ pub(crate) const PLAN_TASK_REQUIRED_FIELDS: &[&str] = &[
     "Cross-surface tests:",
     "Review/closeout:",
     "Completion artifacts:",
-    "Lane kind:",
+    // `Lane kind:` is optional. When absent, parallel dispatch defaults to
+    // the code lane and validate_execution_row_lane_kind accepts the missing
+    // field. Requiring it here would force every author (including LLM
+    // generators) to emit it on every task even when the default is correct,
+    // and would reject otherwise-valid older plans.
     "Dependencies:",
     "Estimated scope:",
     "Completion signal:",

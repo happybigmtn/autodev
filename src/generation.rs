@@ -1051,6 +1051,12 @@ async fn run_logged_codex_review(
     codex_bin: &Path,
     report_path: &Path,
 ) -> Result<CodexReviewRunSummary> {
+    // The function name is historical: it now routes to Claude when the
+    // operator picks an opus/sonnet/claude alias for `--review-model`. The
+    // codex path still applies for gpt-5.5 and explicit codex models.
+    if author_phase_uses_claude_model(model) {
+        return run_logged_claude_review(repo_root, phase_slug, prompt, model, reasoning_effort, report_path);
+    }
     let prompt_path = repo_root
         .join(".auto")
         .join("logs")
@@ -1089,6 +1095,64 @@ async fn run_logged_codex_review(
             "independent review phase `{phase_slug}` failed with status {status}; see {}",
             stderr_log_path.display()
         );
+    }
+    verify_codex_review_report(report_path)?;
+    Ok(CodexReviewRunSummary {
+        prompt_path,
+        stderr_log_path,
+        report_path: report_path.to_path_buf(),
+    })
+}
+
+fn run_logged_claude_review(
+    repo_root: &Path,
+    phase_slug: &str,
+    prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    report_path: &Path,
+) -> Result<CodexReviewRunSummary> {
+    let prompt_path = repo_root
+        .join(".auto")
+        .join("logs")
+        .join(format!("{phase_slug}-{}-prompt.md", timestamp_slug()));
+    let stderr_log_path = prompt_path.with_file_name(
+        prompt_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("claude-review-prompt.md")
+            .replace("-prompt.md", "-stderr.log"),
+    );
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    println!("phase:       {phase_slug}");
+    println!("model:       {model} (claude)");
+    println!("effort:      {reasoning_effort}");
+    println!("context:     max");
+    println!("prompt log:  {}", prompt_path.display());
+    println!("stderr log:  {}", stderr_log_path.display());
+    println!("report path: {}", report_path.display());
+
+    // Claude reviews can be longer than authoring; give them generous turns.
+    let response = run_claude_prompt(
+        repo_root,
+        prompt,
+        model,
+        reasoning_effort,
+        500,
+        phase_slug,
+        &prompt_path,
+    )?;
+    if !response.trim().is_empty() {
+        let response_path = prompt_path.with_file_name(
+            prompt_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("claude-review-prompt.md")
+                .replace("-prompt.md", "-response.txt"),
+        );
+        atomic_write(&response_path, response.as_bytes())
+            .with_context(|| format!("failed to write {}", response_path.display()))?;
     }
     verify_codex_review_report(report_path)?;
     Ok(CodexReviewRunSummary {
