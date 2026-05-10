@@ -4836,7 +4836,14 @@ fn classify_task_execution_kind(task: &LoopTask) -> &'static str {
 }
 
 fn is_operator_task(task: &LoopTask) -> bool {
-    task.lane_kind == LaneKind::Operator
+    // Autonomous-execution mode: tasks tagged `Lane kind: operator` are
+    // dispatched as code lanes alongside everything else. The historical
+    // operator-queue concept (which shelved these tasks waiting on a human
+    // operator to run live commands) is retired -- the worker handles
+    // them with full tool access. Keep the parsed LaneKind value for
+    // observability but don't use it to gate dispatch.
+    let _ = task;
+    false
 }
 
 fn is_evidence_lane_task(task: &LoopTask) -> bool {
