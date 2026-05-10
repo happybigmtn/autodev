@@ -10,8 +10,9 @@ Preserve the planning pipeline contract: `auto corpus` rebuilds a disposable `ge
 
 - `src/main.rs:54-59` declares `Corpus`, `Gen`, and `Reverse`. `Gen` and `Reverse` share the `GenerationArgs` type (`src/main.rs:57,59`).
 - `src/main.rs` sets `corpus`, `gen`, and `reverse` authoring defaults to Codex `gpt-5.5` with effort `xhigh`. The independent Codex review pass also defaults to `gpt-5.5` with effort `xhigh`, and both Codex authoring/review paths request the maximum model context window.
+- `auto spec` is a single-prompt authoring path with a separate default: Claude Opus through the installed `opus` alias, effort `xhigh`, and provider-maximum context; Codex overrides still use the max-context Codex execution path.
 - `src/corpus.rs:10-23` defines `PlanningCorpus` with explicit output paths: `assessment_path`, `design_path`, `focus_path`, `idea_path`, `report_path`, `plans_index_path`, `spec_path`, `specs_index_path`, `spec_documents`, `primary_plans`, `support_documents`.
-- Plan-level constants in `src/generation.rs:108-116` declare `# IMPLEMENTATION_PLAN` plus `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`; `src/generation.rs:1752-1768` is the prompt contract requiring generated specs to include `## Objective`, `## Evidence Status`, `## Acceptance Criteria`, `## Verification`, and `## Open Questions`.
+- Plan-level constants in `src/generation.rs:108-116` declare `# IMPLEMENTATION_PLAN` plus `## Priority Work`, `## Follow-On Work`, and `## Completed / Already Satisfied`; generated/spec-command prompts require specs to include product experience, source-of-truth, evidence, runtime/UI, fixture, retired-surface, acceptance, verification, review, and open-question sections.
 - Spec filename pattern is `ddmmyy-<topic-slug>[-<counter>].md` (`src/generation.rs:1754` path formatter).
 - Spec sync results are tracked by `SpecSyncSummary { appended_paths, skipped_count }` at `src/generation.rs:55`.
 - `auto reverse` does not rewrite the root `IMPLEMENTATION_PLAN.md`; gen does. Corpus claim: "Reverse treats the codebase as truth, specs as documentation-only" (`corpus/SPEC.md` row for `reverse`).

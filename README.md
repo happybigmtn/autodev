@@ -12,7 +12,8 @@ The local CLI command is `auto`.
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
-- `auto spec` turns a prompt into a conformant spec plus matching implementation-plan items.
+- `auto spec` turns a prompt into a conformant, product-experience-first spec plus matching
+  implementation-plan items. It defaults to Claude Opus (`opus`) with `xhigh` effort.
 - `auto design` perfects frontend/design doctrine with runtime/UI contract and QA proof.
 - `auto super` runs the all-in-one CEO production-race workflow: corpus, design gate, functional reviews, gen, gates, then parallel.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
@@ -600,13 +601,18 @@ What it writes:
 
 What it enforces:
 
-- The same spec sections and plan-task fields required by `auto gen`
+- The shared execution-row fields used by `auto gen` / `auto parallel`, plus the stricter
+  auto-spec spec section contract
+- A product experience contract before source inventory: surface plates/mockups, visual hierarchy,
+  state storyboard, and observable UX acceptance for any UI/TUI/browser/CLI/operator surface
 - Runtime/API source-of-truth ownership before UI consumer work
 - Generated-artifact regeneration commands when contracts change
 - Fixture/demo/sample-data quarantine for production surfaces
 - Retired or superseded surfaces named explicitly instead of left as active doctrine
 - Cross-surface runtime-to-UI/readback proof when UI consumers are affected
 - Independent review/closeout proof that can catch the original drift returning
+- Default author: Claude Opus via the installed `opus` alias, `xhigh`, using the provider's maximum
+  context. Codex/Kimi/MiniMax overrides remain available; Codex overrides use the max-context path.
 
 Example:
 

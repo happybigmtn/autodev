@@ -468,6 +468,69 @@ pub(crate) fn verification_receipt_commit_footer(
     )))
 }
 
+pub(crate) fn legacy_verification_receipt_backfill_footer(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+) -> Result<Option<String>> {
+    let verification = verification_plan(task_markdown);
+    if verification.executable_commands.is_empty() {
+        return Ok(None);
+    }
+
+    let review_text = fs::read_to_string(repo_root.join("REVIEW.md")).unwrap_or_default();
+    if !review_contains_task(&review_text, task_id) {
+        return Ok(None);
+    }
+
+    let declared_artifacts = declared_completion_artifacts(task_markdown);
+    if declared_artifacts
+        .iter()
+        .any(|relative| declared_artifact_path(repo_root, relative).is_none())
+    {
+        return Ok(None);
+    }
+    if !unresolved_owned_audit_findings(repo_root, task_id, task_markdown).is_empty() {
+        return Ok(None);
+    }
+
+    let receipt_path = verification_receipt_path(repo_root, task_id);
+    let receipt_text = match fs::read_to_string(&receipt_path) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    let receipt = match serde_json::from_str::<VerificationReceipt>(&receipt_text) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(None),
+    };
+
+    if verification_receipt_content_problem(
+        &receipt_path,
+        &receipt,
+        &verification.executable_commands,
+    )
+    .is_some()
+    {
+        return Ok(None);
+    }
+
+    for (path, current_hash) in
+        current_declared_artifact_hashes(repo_root, &receipt_path, &declared_artifacts)
+    {
+        let matches = receipt
+            .declared_artifacts
+            .iter()
+            .find(|artifact| artifact.path == path)
+            .and_then(|artifact| artifact.sha256.as_deref())
+            .is_some_and(|recorded| recorded == current_hash);
+        if !matches {
+            return Ok(None);
+        }
+    }
+
+    verification_receipt_commit_footer(repo_root, task_id)
+}
+
 pub(crate) fn latest_verification_receipt_footer(
     repo_root: &Path,
     task_id: &str,

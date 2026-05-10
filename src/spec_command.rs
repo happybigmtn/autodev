@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 
+use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
     execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
@@ -12,8 +13,9 @@ use crate::task_parser::{
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
 use crate::SpecArgs;
 
-const SPEC_REQUIRED_SECTIONS: [&str; 12] = [
+const SPEC_REQUIRED_SECTIONS: [&str; 13] = [
     "## Objective",
+    "## Product Experience Contract",
     "## Source Of Truth",
     "## Evidence Status",
     "## Runtime Contract",
@@ -50,6 +52,13 @@ pub(crate) async fn run_spec(args: SpecArgs) -> Result<()> {
     fs::create_dir_all(&log_root)
         .with_context(|| format!("failed to create {}", log_root.display()))?;
     let prompt_path = log_root.join(format!("spec-{}-prompt.md", timestamp_slug()));
+    let stdout_log_path = prompt_path.with_file_name(
+        prompt_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("spec-prompt.md")
+            .replace("-prompt.md", "-stdout.log"),
+    );
     let stderr_log_path = prompt_path.with_file_name(
         prompt_path
             .file_name()
@@ -67,23 +76,46 @@ pub(crate) async fn run_spec(args: SpecArgs) -> Result<()> {
     println!("plan path:  {}", plan_path.display());
     println!("model:      {}", args.model);
     println!("effort:     {}", args.reasoning_effort);
+    println!(
+        "context:    {}",
+        if spec_author_uses_claude_model(&args.model) {
+            "provider maximum"
+        } else {
+            "max"
+        }
+    );
     println!("prompt log: {}", prompt_path.display());
+    println!("stdout log: {}", stdout_log_path.display());
     if args.dry_run {
         println!("\n{full_prompt}");
         return Ok(());
     }
 
-    let status = run_codex_exec_max_context(
-        &repo_root,
-        &full_prompt,
-        &args.model,
-        &args.reasoning_effort,
-        &args.codex_bin,
-        &stderr_log_path,
-        None,
-        "auto-spec",
-    )
-    .await?;
+    let status = if spec_author_uses_claude_model(&args.model) {
+        run_claude_exec(
+            &repo_root,
+            &full_prompt,
+            &args.model,
+            &args.reasoning_effort,
+            Some(args.max_turns),
+            &stderr_log_path,
+            Some(&stdout_log_path),
+            "auto-spec",
+        )
+        .await?
+    } else {
+        run_codex_exec_max_context(
+            &repo_root,
+            &full_prompt,
+            &args.model,
+            &args.reasoning_effort,
+            &args.codex_bin,
+            &stderr_log_path,
+            Some(&stdout_log_path),
+            "auto-spec",
+        )
+        .await?
+    };
     if !status.success() {
         bail!(
             "auto spec authoring failed with status {status}; see {}",
@@ -129,6 +161,18 @@ fn default_spec_filename(prompt: &str) -> String {
     format!("{date}-{slug}.md")
 }
 
+fn spec_author_uses_claude_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized == "opus"
+        || normalized == "sonnet"
+        || normalized == "haiku"
+        || normalized.contains("claude")
+        || normalized.contains("opus")
+        || normalized.contains("sonnet")
+        || normalized.contains("haiku")
+}
+
 fn build_spec_prompt(repo_root: &Path, prompt: &str, spec_path: &Path, plan_path: &Path) -> String {
     format!(
         r#"You are running `auto spec` for the repository at `{repo_root}`.
@@ -151,6 +195,7 @@ Spec contract for `{spec_path}`:
 - First line must be `# Specification: <short title>`.
 - Include these exact non-empty sections:
   - `## Objective`
+  - `## Product Experience Contract`
   - `## Source Of Truth`
   - `## Evidence Status`
   - `## Runtime Contract`
@@ -162,7 +207,14 @@ Spec contract for `{spec_path}`:
   - `## Verification`
   - `## Review And Closeout`
   - `## Open Questions`
-- `## Source Of Truth` must name runtime owner modules/APIs, UI consumers, generated artifacts, and retired/superseded surfaces. Use `none` only after checking.
+- `## Product Experience Contract` is mandatory and must come before source inventory. It is the product-manager/designer gate:
+  - If the request affects a UI, TUI, CLI user surface, browser route, report, operator workflow, or viewer experience, start this section with actual surface design, not prose about process.
+  - Name the user promise, the first read, the second read, the third read, and why that hierarchy matters.
+  - Include concrete surface plates/mockups. For TUI work, include breakpoint plates such as `80x24`, `120x32`, and `160x48` when relevant. For browser/app work, include desktop and mobile first-viewport plates. For report/CLI/operator workflows, include the exact command/status/output surface a user sees.
+  - Include a state storyboard for empty/loading/degraded/live/error/success states that the implementation must render.
+  - Describe visual hierarchy and copy budget with Bloomberg-terminal-level specificity: what occupies the dominant region, what sits in rails/tapes/drawers, what is intentionally omitted, and what proof/source labels must remain visible.
+  - If there is truly no user-facing surface, write exactly `none -- no user-facing surface` and do not pad it with boilerplate.
+- `## Source Of Truth` must name runtime owner modules/APIs, UI consumers, generated artifacts, and retired/superseded surfaces. Use `none` only after checking. This section must not appear before the product experience contract.
 - `## Evidence Status` must separate verified code facts, recommendations, hypotheses, and unresolved questions.
 - `## Runtime Contract` must state which engine/runtime/API owns canonical facts and what must fail closed when data is missing.
 - `## UI Contract` must state how UI consumes runtime truth without duplicating catalogs, constants, settlement math, eligibility rules, risk classifications, or sample fallback truth.
@@ -170,6 +222,7 @@ Spec contract for `{spec_path}`:
 - `## Fixture Policy` must quarantine sample/demo/test data away from production runtime components.
 - `## Retired / Superseded Surfaces` must name old specs/files/contracts that must not be implemented from, or `none`.
 - `## Acceptance Criteria` must be concrete observable bullets.
+- UI/product acceptance criteria must describe observable surfaces: named screen/route/pane, first-read hierarchy, required state variants, breakpoint/screenshot/readback proof, and rejected anti-patterns. Do not use criteria like "improve polish", "make beautiful", or "add tests" without saying what must be seen.
 - `## Verification` must list narrow commands or runtime checks.
 - `## Review And Closeout` must say how `auto review` or a human reviewer independently verifies each plan item, including grep/assertion proof where simple tests are insufficient.
 
@@ -200,6 +253,7 @@ Plan item contract for `{plan_path}`:
   - `Cross-surface tests:`
   - `Review/closeout:`
   - `Completion artifacts:`
+  - `Lane kind:`
   - `Dependencies:`
   - `Estimated scope:`
   - `Completion signal:`
@@ -212,6 +266,7 @@ Plan item contract for `{plan_path}`:
 - `Contract generation:` names the generation/check command or `none -- no generated contract`.
 - `Cross-surface tests:` names a runtime-to-UI/readback proof when UI is affected, or `none -- no UI/runtime boundary`.
 - `Review/closeout:` must describe independent proof for the original requirement, not just `cargo check`.
+- `Lane kind:` must be exactly `code`, `operator`, or `evidence`.
 - `Dependencies:` is scheduler input, not prose. It must be exactly `none` or only comma-separated/backticked task IDs already present in `{plan_path}` (for example ``Dependencies: `TASK-001`, `TASK-002` `` or one `- `TASK-ID`` per line). Do not include parentheticals, wave notes, "parallel with", "after", "blocked by", "depends on", or explanatory text in this field.
 - `Estimated scope:` must be `XS`, `S`, or `M`; split larger work.
 - `Verification:` and `Required tests:` must contain scoped executable commands or explicit non-executable proof. Do not let metadata fields appear inside them.
@@ -219,6 +274,7 @@ Plan item contract for `{plan_path}`:
 - Every new task must be parseable by the same shared task parser used by `auto parallel`; do not rely on prose-only gates, compact follow-on rows, or markdown tables.
 
 Process rules to encode in the spec and task split:
+- Product/user value comes before artifact production. A spec is not ready if it starts as a source inventory, test list, schema list, or implementation decomposition before saying what the user will actually experience.
 - Runtime owns facts; UI renders facts.
 - Implement runtime/engine/API changes before UI changes.
 - Regenerate contracts before adapting consumers.
@@ -226,6 +282,7 @@ Process rules to encode in the spec and task split:
 - For UI changes, include at least one runtime-output-to-UI-readback acceptance path.
 - Retire/delete/tombstone superseded surfaces as first-class work, not optional cleanup.
 - A task is not done until the original requirement cannot reappear without a guard, test, grep assertion, or review check failing.
+- For product/UI work, at least one first task must lock the actual design plates and the later implementation tasks must cite those plates. Do not ask engineers to infer layout, visual hierarchy, copy, or state design from generic acceptance criteria.
 "#,
         repo_root = repo_root.display(),
         prompt = prompt,
@@ -247,6 +304,39 @@ fn verify_spec_output(spec_path: &Path) -> Result<()> {
         if !section_has_body(&text, section) {
             bail!(
                 "auto spec output {} is missing non-empty `{section}`",
+                spec_path.display()
+            );
+        }
+    }
+    verify_product_experience_contract(&text, spec_path)?;
+    Ok(())
+}
+
+fn verify_product_experience_contract(markdown: &str, spec_path: &Path) -> Result<()> {
+    let body = section_body(markdown, "## Product Experience Contract").unwrap_or_default();
+    let normalized = body.trim().to_ascii_lowercase();
+    if normalized == "none -- no user-facing surface" {
+        return Ok(());
+    }
+
+    let required: [(&str, &[&str]); 3] = [
+        (
+            "surface plate",
+            &["surface plate", "mockup", "wireframe", "viewport"],
+        ),
+        (
+            "visual hierarchy",
+            &["visual hierarchy", "first read", "second read"],
+        ),
+        (
+            "state storyboard",
+            &["state storyboard", "empty", "degraded", "live"],
+        ),
+    ];
+    for (label, needles) in required {
+        if !needles.iter().any(|needle| normalized.contains(needle)) {
+            bail!(
+                "auto spec output {} has a Product Experience Contract but lacks {label} detail; include actual plates/mockups, visual hierarchy, and state storyboard or write exactly `none -- no user-facing surface`",
                 spec_path.display()
             );
         }
@@ -346,8 +436,12 @@ fn verify_auto_spec_plan_task(
 }
 
 fn section_has_body(markdown: &str, header: &str) -> bool {
+    section_body(markdown, header).is_some_and(|body| !body.trim().is_empty())
+}
+
+fn section_body<'a>(markdown: &'a str, header: &str) -> Option<&'a str> {
     let Some(start) = markdown.find(header) else {
-        return false;
+        return None;
     };
     let body_start = start + header.len();
     let after = &markdown[body_start..];
@@ -355,12 +449,12 @@ fn section_has_body(markdown: &str, header: &str) -> bool {
         .find("\n## ")
         .map(|offset| body_start + offset)
         .unwrap_or(markdown.len());
-    !markdown[body_start..body_end].trim().is_empty()
+    Some(&markdown[body_start..body_end])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::verify_plan_output;
+    use super::{spec_author_uses_claude_model, verify_plan_output, verify_spec_output};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -402,6 +496,7 @@ mod tests {
     Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks runtime-to-UI readback proof.
     Completion artifacts: `docs/proof/runtime-foundation.md`
+    Lane kind: code
     Dependencies: none
     Estimated scope: S
     Completion signal: proof recorded and tests pass.
@@ -427,6 +522,7 @@ mod tests {
     Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks no duplicated truth in UI.
     Completion artifacts: `docs/proof/ui-readback.md`
+    Lane kind: code
     Dependencies: {dependency_line}
     Estimated scope: M
     Completion signal: proof recorded and tests pass.
@@ -464,9 +560,11 @@ mod tests {
         .expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("prose rejected");
-        assert!(error
-            .to_string()
-            .contains("Dependencies:` must be machine-readable IDs only"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Dependencies:` must be machine-readable IDs only"),
+            "{message}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -485,9 +583,11 @@ mod tests {
         .expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("prose rejected");
-        assert!(error
-            .to_string()
-            .contains("Dependencies:` must be machine-readable IDs only"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Dependencies:` must be machine-readable IDs only"),
+            "{message}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -503,7 +603,8 @@ mod tests {
         fs::write(&plan_path, plan).expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("verification rejected");
-        assert!(error.to_string().contains("multi-filter cargo test"));
+        let message = format!("{error:#}");
+        assert!(message.contains("multi-filter cargo test"), "{message}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -519,7 +620,8 @@ mod tests {
         fs::write(&plan_path, plan).expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("verification rejected");
-        assert!(error.to_string().contains("malformed grep verification"));
+        let message = format!("{error:#}");
+        assert!(message.contains("malformed grep verification"), "{message}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -538,6 +640,174 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must use canonical unchecked header"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_routes_opus_defaults_to_claude_author() {
+        assert!(spec_author_uses_claude_model("opus"));
+        assert!(spec_author_uses_claude_model("claude-opus-4-7"));
+        assert!(!spec_author_uses_claude_model("gpt-5.5"));
+    }
+
+    #[test]
+    fn auto_spec_requires_product_experience_contract() {
+        let root = temp_root("missing-product-contract");
+        let spec_path = root.join("specs/300426-ui.md");
+        fs::write(
+            &spec_path,
+            r#"# Specification: UI polish
+
+## Objective
+Improve the UI.
+
+## Source Of Truth
+`src/ui.rs`
+
+## Evidence Status
+verified: current UI exists.
+
+## Runtime Contract
+none
+
+## UI Contract
+The UI renders the state.
+
+## Generated Artifacts
+none
+
+## Fixture Policy
+none
+
+## Retired / Superseded Surfaces
+none
+
+## Acceptance Criteria
+- UI improves.
+
+## Verification
+`cargo test`
+
+## Review And Closeout
+reviewer checks it.
+
+## Open Questions
+none
+"#,
+        )
+        .expect("write spec");
+
+        let error = verify_spec_output(&spec_path).expect_err("missing section rejected");
+        assert!(error.to_string().contains("Product Experience Contract"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_rejects_ui_contract_without_actual_design_plates() {
+        let root = temp_root("weak-product-contract");
+        let spec_path = root.join("specs/300426-ui.md");
+        fs::write(
+            &spec_path,
+            r#"# Specification: UI polish
+
+## Objective
+Improve the UI.
+
+## Product Experience Contract
+Users need a better dashboard with cleaner visual polish and stronger hierarchy.
+
+## Source Of Truth
+`src/ui.rs`
+
+## Evidence Status
+verified: current UI exists.
+
+## Runtime Contract
+none
+
+## UI Contract
+The UI renders the state.
+
+## Generated Artifacts
+none
+
+## Fixture Policy
+none
+
+## Retired / Superseded Surfaces
+none
+
+## Acceptance Criteria
+- UI improves.
+
+## Verification
+`cargo test`
+
+## Review And Closeout
+reviewer checks it.
+
+## Open Questions
+none
+"#,
+        )
+        .expect("write spec");
+
+        let error = verify_spec_output(&spec_path).expect_err("weak design rejected");
+        assert!(error.to_string().contains("lacks surface plate detail"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_accepts_none_product_experience_for_non_surface_work() {
+        let root = temp_root("none-product-contract");
+        let spec_path = root.join("specs/300426-runtime.md");
+        fs::write(
+            &spec_path,
+            r#"# Specification: Runtime cleanup
+
+## Objective
+Clean the runtime path.
+
+## Product Experience Contract
+none -- no user-facing surface
+
+## Source Of Truth
+`src/runtime.rs`
+
+## Evidence Status
+verified: runtime path exists.
+
+## Runtime Contract
+`src/runtime.rs` owns the invariant.
+
+## UI Contract
+none
+
+## Generated Artifacts
+none
+
+## Fixture Policy
+production code cannot import fixture/demo/sample data.
+
+## Retired / Superseded Surfaces
+none
+
+## Acceptance Criteria
+- Runtime invariant is enforced.
+
+## Verification
+`cargo test runtime_cleanup`
+
+## Review And Closeout
+reviewer checks the invariant.
+
+## Open Questions
+none
+"#,
+        )
+        .expect("write spec");
+
+        verify_spec_output(&spec_path).expect("non-surface spec validates");
         let _ = fs::remove_dir_all(root);
     }
 }

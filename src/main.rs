@@ -113,6 +113,10 @@ enum Command {
     Nemesis(NemesisArgs),
     /// Manage quota-aware account multiplexing for Claude and Codex
     Quota(QuotaArgs),
+    /// Harvest findings from a completed `auto audit --everything` run into
+    /// IMPLEMENTATION_PLAN.md as actionable task rows so `auto parallel`
+    /// proceeds to actually address them.
+    AuditHarvest(AuditHarvestArgs),
     /// Sync implementation-plan items into Linear and run the local Symphony runtime
     Symphony(SymphonyArgs),
 }
@@ -535,13 +539,17 @@ pub(crate) struct SpecArgs {
     #[arg(long)]
     plan_path: Option<PathBuf>,
 
-    /// Model used for spec authoring
-    #[arg(long, default_value = "gpt-5.5")]
+    /// Model used for spec authoring. Default `opus` resolves to the installed Claude Opus 4.7 alias.
+    #[arg(long, default_value = "opus")]
     model: String,
 
     /// Reasoning effort used for spec authoring
     #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
+
+    /// Maximum Claude turns when the spec authoring model is Claude/Opus
+    #[arg(long, default_value_t = 200)]
+    max_turns: usize,
 
     /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
@@ -718,9 +726,73 @@ pub(crate) struct SuperArgs {
     #[arg(long, default_value_t = 3)]
     design_resolve_passes: usize,
 
+    /// Run `auto audit --everything` after gen, then harvest its findings
+    /// into IMPLEMENTATION_PLAN.md so the parallel stage actually addresses
+    /// the issues the audit identifies. The audit runs with the same model
+    /// stack that powers the rest of super; failure rounds are retried per
+    /// `--audit-first-pass-retries`.
+    #[arg(long)]
+    with_audit: bool,
+
+    /// Maximum concurrent first-pass / synthesis Codex workers when
+    /// --with-audit is set. Same semantics as `auto audit --everything-threads`.
+    #[arg(long, default_value_t = 10)]
+    audit_threads: usize,
+
+    /// Number of retry rounds for files that fail the audit's first pass
+    /// when --with-audit is set. Each round only re-runs files still missing
+    /// their `analysis.md` artifact.
+    #[arg(long, default_value_t = 3)]
+    audit_first_pass_retries: usize,
+
+    /// Reuse an existing audit run-id under `.auto/audit-everything/` instead
+    /// of starting a new one. Use to resume a partial audit when --with-audit
+    /// is set; otherwise super creates a fresh run-id per invocation.
+    #[arg(long)]
+    audit_run_id: Option<String>,
+
     /// Preview the planned super workflow without invoking models or launching workers
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct AuditHarvestArgs {
+    /// `auto audit --everything` run-id to harvest. Defaults to the latest
+    /// run under `.auto/audit-everything/`.
+    #[arg(long)]
+    pub(crate) run_id: Option<String>,
+
+    /// Codex model used to translate findings into IMPLEMENTATION_PLAN.md rows.
+    #[arg(long, default_value = "gpt-5.5")]
+    pub(crate) model: String,
+
+    /// Codex reasoning effort.
+    #[arg(long, default_value = "xhigh")]
+    pub(crate) reasoning_effort: String,
+
+    /// Codex executable.
+    #[arg(long, default_value = "codex")]
+    pub(crate) codex_bin: PathBuf,
+
+    /// Maximum number of findings to harvest, ranked by lowest score first.
+    /// 0 means no cap. Each finding is compressed to its actionable subset
+    /// (path, score, summary, recommended_actions, top deletion candidate)
+    /// before going to codex, so thousands of findings fit in context.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) max_findings: usize,
+
+    /// Inclusive minimum audit score to include. Use with `--score-max` to
+    /// scope a harvest pass to a specific cohort (e.g. `--score-min 0
+    /// --score-max 7` for the acute drift, then `--score-min 8 --score-max
+    /// 8` for the broad-mild drift).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) score_min: i64,
+
+    /// Inclusive maximum audit score to include. Defaults to 8 — score-9+
+    /// files are already strong and don't need plan rows.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) score_max: i64,
 }
 
 #[derive(Args, Clone)]
@@ -1115,6 +1187,13 @@ pub(crate) struct AuditArgs {
     /// Reasoning effort for professional audit first-pass file analysis.
     #[arg(long, default_value = "low")]
     first_pass_effort: String,
+
+    /// Number of retry rounds for first-pass files that fail to produce
+    /// `analysis.md` (silent codex timeouts, transient API errors). Each
+    /// retry only re-runs files still missing their analysis artifact, so
+    /// completed work is preserved. Default 3 rounds.
+    #[arg(long, default_value_t = 3)]
+    first_pass_retries: usize,
 
     /// Model for professional audit cross-file synthesis.
     #[arg(long, default_value = "gpt-5.5")]
@@ -1604,6 +1683,7 @@ async fn main() -> Result<()> {
         Command::Review(args) => review_command::run_review(args).await,
         Command::Steward(args) => steward_command::run_steward(args).await,
         Command::Audit(args) => audit_command::run_audit(args).await,
+        Command::AuditHarvest(args) => super_command::run_audit_harvest_standalone(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
         Command::Quota(args) => match args.command {

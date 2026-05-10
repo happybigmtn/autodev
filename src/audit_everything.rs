@@ -713,6 +713,41 @@ async fn run_first_pass_phase(
     paths: &RunPaths,
     manifest: &mut EverythingManifest,
 ) -> Result<()> {
+    let total_attempts = args.first_pass_retries.saturating_add(1).max(1);
+    let mut last_failures: Vec<String> = Vec::new();
+    for attempt in 1..=total_attempts {
+        last_failures = run_first_pass_phase_once(args, paths, manifest).await?;
+        if last_failures.is_empty() {
+            return Ok(());
+        }
+        if attempt < total_attempts {
+            eprintln!(
+                "first pass: {} file(s) failed; retrying (round {} of {})",
+                last_failures.len(),
+                attempt + 1,
+                total_attempts,
+            );
+        }
+    }
+    for failure in &last_failures {
+        eprintln!("first pass failure: {failure}");
+    }
+    bail!(
+        "first pass failed for {} file(s) after {} attempt(s)",
+        last_failures.len(),
+        total_attempts,
+    );
+}
+
+/// Run a single round of first-pass workers and return the list of failure
+/// messages. The function is idempotent: it filters `pending` by
+/// `status != Complete`, so successive rounds only re-process still-failed
+/// files. Callers wrap this in a retry loop driven by `--first-pass-retries`.
+async fn run_first_pass_phase_once(
+    args: &AuditArgs,
+    paths: &RunPaths,
+    manifest: &mut EverythingManifest,
+) -> Result<Vec<String>> {
     reconcile_file_inventory(&paths.worktree_root, &paths.report_root, manifest)?;
     let pending = manifest
         .files
@@ -722,7 +757,7 @@ async fn run_first_pass_phase(
         .collect::<Vec<_>>();
     if pending.is_empty() {
         println!("first pass:  complete (resume)");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let context = read_context_bundle(paths)?;
@@ -768,14 +803,8 @@ async fn run_first_pass_phase(
             active += 1;
         }
     }
-    if !failures.is_empty() {
-        for failure in &failures {
-            eprintln!("first pass failure: {failure}");
-        }
-        bail!("first pass failed for {} file(s)", failures.len());
-    }
     write_manifest(paths, manifest)?;
-    Ok(())
+    Ok(failures)
 }
 
 async fn run_synthesis_phase(

@@ -36,7 +36,8 @@ Define the operator-facing contract for `genesis/`, `auto corpus`, `auto gen`, `
 
 - A snapshot-only generation path writes markdown specs only under the requested output directory and does not modify root `specs/`, root `IMPLEMENTATION_PLAN.md`, `genesis/`, or source files.
 - Generated spec filenames match `^[0-9]{6}-[a-z0-9-]+\.md$` and use the snapshot date as the leading `ddmmyy` value.
-- Every generated spec starts with `# Specification:` and contains `## Objective`, `## Evidence Status`, `## Acceptance Criteria`, `## Verification`, and `## Open Questions`.
+- Every generated spec starts with `# Specification:` and contains the full shared spec contract, including `## Product Experience Contract`, `## Source Of Truth`, `## Evidence Status`, `## Runtime Contract`, `## UI Contract`, `## Generated Artifacts`, `## Fixture Policy`, `## Retired / Superseded Surfaces`, `## Acceptance Criteria`, `## Verification`, `## Review And Closeout`, and `## Open Questions`.
+- Product/UI specs include surface plates/mockups, visual hierarchy, and state storyboard details instead of leaving layout and first-read decisions for implementation workers to infer.
 - Each `## Evidence Status` section has separate subsections for verified facts, recommendations, and hypotheses or unresolved questions.
 - Any current-state fact about commands, defaults, files, metrics, tests, or behavior includes a file path with line number, command, or primary-source citation.
 - A generated plan merge preserves `[ ]`, `[~]`, and `[!]` existing tasks unless the replacement task with the same ID is explicitly present in the generated plan.

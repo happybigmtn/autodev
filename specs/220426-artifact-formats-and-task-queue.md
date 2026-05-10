@@ -52,14 +52,15 @@ Lock the shared on-disk contract every command reads or writes: the `- [ ]` / `-
 - The file starts with `# IMPLEMENTATION_PLAN` at the top of the document.
 - The file contains the three top-level headers in this order: `## Priority Work`, `## Follow-On Work`, `## Completed / Already Satisfied`.
 - Task rows use exactly one of the four markers: `- [ ]` (pending), `- [!]` (blocked), `- [x]` (completed), `- [~]` (partial / historical).
-- Task bodies contain labeled metadata blocks that the command set recognizes: at minimum `Spec:`, `Acceptance:`, `Verification:`, `Dependencies:`, `Completion signal:`. Other labels (for example, `Owned surfaces:`, `Scope:`, `Evidence:`, `Estimated scope:`) may appear and must not break parsing.
+- Task bodies contain labeled metadata blocks that the command set recognizes. New auto-generated rows use the shared execution-row schema, including `Spec:`, source/runtime/UI/generated/fixture/retired-surface fields, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Review/closeout:`, `Completion artifacts:`, `Lane kind:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
 - A task marked `- [!]` is never auto-converted to `- [ ]` or `- [x]` by `auto loop` or `auto parallel`; only the operator (or an explicit unblock pass) may transition it.
 - A task marked `- [~]` is re-visitable by subsequent `auto loop` / `auto parallel` runs without being treated as completed.
 
 ### Spec format (`specs/*.md`)
 
 - Each spec file starts with `# Specification:` as its first heading.
-- Each spec file contains every required section: `## Objective`, `## Acceptance Criteria`, `## Verification`, `## Evidence Status`, `## Open Questions`.
+- Each spec file contains every required section: `## Objective`, `## Product Experience Contract`, `## Source Of Truth`, `## Evidence Status`, `## Runtime Contract`, `## UI Contract`, `## Generated Artifacts`, `## Fixture Policy`, `## Retired / Superseded Surfaces`, `## Acceptance Criteria`, `## Verification`, `## Review And Closeout`, `## Open Questions`.
+- `## Product Experience Contract` appears before source inventory. It is exactly `none -- no user-facing surface` for non-surface work; otherwise it contains actual plates/mockups, visual hierarchy, and state storyboard details.
 - Acceptance criteria are flat bullets, not prose paragraphs.
 - Filename pattern matches `ddmmyy-<topic-slug>[-<counter>].md`.
 - Same-day same-slug collisions are either deduplicated (no re-write) or get a `-<counter>` suffix.
