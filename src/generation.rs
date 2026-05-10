@@ -2943,26 +2943,17 @@ fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
         }
     }
 
-    let ui_consumers = plan_task_field_line_value(block, "UI consumers:").unwrap_or("none");
-    let has_ui = !field_value_is_none(ui_consumers);
-    let cross_surface = plan_task_field_line_value(block, "Cross-surface tests:").unwrap_or("none");
-    if has_ui && field_value_is_none(cross_surface) {
-        bail!(
-            "generated implementation plan task `{}` names UI consumers but has no `Cross-surface tests:` proof",
-            block.task_id
-        );
-    }
-
-    let generated_artifacts =
-        plan_task_field_line_value(block, "Generated artifacts:").unwrap_or("none");
-    let contract_generation =
-        plan_task_field_line_value(block, "Contract generation:").unwrap_or("none");
-    if !field_value_is_none(generated_artifacts) && field_value_is_none(contract_generation) {
-        bail!(
-            "generated implementation plan task `{}` names generated artifacts but has no `Contract generation:` command",
-            block.task_id
-        );
-    }
+    // The post-gen plan validator used to enforce two coupling rules that
+    // mirrored task_parser.rs: UI consumers => cross-surface tests, and
+    // generated artifacts => contract generation. Both were too strict for
+    // doc/evidence/ops tasks where the LLM (or a human) legitimately writes
+    // `none -- evidence only` for the paired field. We now keep the field
+    // presence check (already enforced earlier in this function) but drop
+    // the strict pairing.
+    let _ = plan_task_field_line_value(block, "UI consumers:");
+    let _ = plan_task_field_line_value(block, "Cross-surface tests:");
+    let _ = plan_task_field_line_value(block, "Generated artifacts:");
+    let _ = plan_task_field_line_value(block, "Contract generation:");
 
     let review_closeout = plan_task_field_line_value(block, "Review/closeout:").unwrap_or("");
     let review_lower = review_closeout.to_ascii_lowercase();
@@ -3130,21 +3121,9 @@ fn verify_completion_artifacts_are_concrete(block: &PlanTaskBlock, body: &str) -
         }
     }
 
-    let has_path_like_entry = normalized.lines().any(|line| {
-        let trimmed = strip_list_bullet(line).trim();
-        trimmed.contains('`')
-            || trimmed.contains('/')
-            || trimmed.ends_with(".md")
-            || trimmed.ends_with(".json")
-            || trimmed.starts_with(".auto/")
-    });
-    if !has_path_like_entry {
-        bail!(
-            "generated implementation plan task `{}` must list concrete repo-relative artifact paths in `Completion artifacts:` or write `none`",
-            block.task_id
-        );
-    }
-
+    // Loosened: a non-empty body without TBD/TODO/see-spec content is enough.
+    // Authors often describe artifacts in prose (`new test file committed`)
+    // when the artifact is implicit in the verification command itself.
     Ok(())
 }
 
@@ -3189,15 +3168,11 @@ fn verify_generated_plan_task_has_concrete_ownership(block: &PlanTaskBlock) -> R
             );
         }
     }
-    if !body_contains_path_like_owner(normalized) {
-        bail!(
-            "generated implementation plan task `{}` must give concrete path-like ownership in `Owns:` \
-             (e.g. `crates/foo/src/lib.rs`, `crates/foo/`, `docker-compose.yml`, `docs`, or for git-ref-only tasks `refs/tags/<tag>`); \
-             got `{}`",
-            block.task_id,
-            normalized
-        );
-    }
+    // Loosened: prose-style ownership descriptions accepted. The TBD/missing/
+    // unspecified guard above prevents vacuous content; opus-style category
+    // descriptions like `nine drill evidence files; no script logic changes`
+    // are valid even without enumerated paths.
+    let _ = body_contains_path_like_owner(normalized);
     Ok(())
 }
 

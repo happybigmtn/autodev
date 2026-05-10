@@ -234,13 +234,38 @@ fn grep_file_operands(argv: &[String]) -> Vec<&str> {
 }
 
 fn operand_looks_like_directory(operand: &str) -> bool {
-    operand.ends_with('/')
-        || (!operand.contains('*')
-            && !operand.contains('?')
-            && !operand.contains('.')
-            && !operand.starts_with('$')
-            && !operand.starts_with('<')
-            && !operand.starts_with('>'))
+    if operand.ends_with('/') {
+        return true;
+    }
+    // Common extension-less filenames that the simple "no-dot heuristic"
+    // misclassifies as directories. Add new conventional names here as they
+    // come up.
+    let basename = operand.rsplit('/').next().unwrap_or(operand);
+    if matches!(
+        basename,
+        "Dockerfile"
+            | "Makefile"
+            | "Justfile"
+            | "LICENSE"
+            | "README"
+            | "AGENTS"
+            | "AUTONOMOUS"
+            | "CHANGELOG"
+            | "PRODUCT_CONTRACT"
+            | "DESIGN"
+            | "VERSION"
+    ) || basename.starts_with("Dockerfile.")
+        || basename.starts_with("Justfile.")
+        || basename.starts_with("Makefile.")
+    {
+        return false;
+    }
+    !operand.contains('*')
+        && !operand.contains('?')
+        && !operand.contains('.')
+        && !operand.starts_with('$')
+        && !operand.starts_with('<')
+        && !operand.starts_with('>')
 }
 
 fn strip_plan_bullet(line: &str) -> &str {
