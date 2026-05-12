@@ -6535,8 +6535,19 @@ fn reconcile_parallel_landed_task(
         changed_files,
         &evidence_before,
     )?;
-    let evidence_after =
+    let mut evidence_after =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let gap_after = assess_task_completion_gap(&assignment.task.markdown, &evidence_after);
+    if !evidence_after.is_fully_evidenced()
+        && gap_after.kind == CompletionGapKind::LocalRepairable
+        && run_host_verification_receipt(repo_root, &assignment.task.id, &assignment.task.markdown)?
+    {
+        evidence_after = inspect_task_completion_evidence(
+            repo_root,
+            &assignment.task.id,
+            &assignment.task.markdown,
+        );
+    }
     let completion_status = if evidence_after.is_fully_evidenced() {
         LoopTaskStatus::Done
     } else {
@@ -7133,8 +7144,8 @@ mod tests {
         parse_parallel_stop_ids, partial_follow_up_attempt_budget, preflight_warning_names,
         prepare_lane_landing_recovery, prepare_parallel_startup, prepared_landing_recovery_note,
         preserve_resume_recovery_notes, prioritize_ready_parallel_tasks, read_lane_task_id,
-        ready_parallel_tasks, recent_parallel_host_warnings, record_partial_follow_up,
-        render_default_parallel_prompt, render_parallel_health_summary,
+        ready_parallel_tasks, recent_parallel_host_warnings, reconcile_parallel_landed_task,
+        record_partial_follow_up, render_default_parallel_prompt, render_parallel_health_summary,
         repair_parallel_canonical_before_dispatch, repo_forbids_legacy_review_trackers,
         reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
         salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
@@ -8105,6 +8116,76 @@ mod tests {
         assert!(!lane_repo_has_active_cherry_pick(&worker));
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn reconcile_landed_task_self_heals_missing_wrapper_receipt() {
+        let repo = unique_temp_dir("parallel-landed-host-verification");
+        init_git_repo(&repo);
+        fs::write(repo.join(".gitignore"), "/.auto/\n").expect("failed to write gitignore");
+        fs::create_dir_all(repo.join("docs")).expect("failed to create docs dir");
+        fs::write(repo.join("docs/proof.md"), "proof\n").expect("failed to write proof");
+        let task_markdown = "- [~] `TASK-HOST` Host closeout\n\
+Verification:\n  - `bash -lc \"test -f docs/proof.md\"`\n\
+Completion artifacts: `docs/proof.md`\n\
+Dependencies: none\n\
+Estimated scope: S\n";
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), task_markdown)
+            .expect("failed to write plan");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-HOST`\n",
+        )
+        .expect("failed to write review");
+        run_git_in(
+            &repo,
+            [
+                "add",
+                ".gitignore",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "docs/proof.md",
+            ],
+        );
+        run_git_in(&repo, ["commit", "-m", "task evidence"]);
+        let base_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+        let assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-HOST".to_string(),
+                title: "Host closeout".to_string(),
+                status: LoopTaskStatus::Partial,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: task_markdown.to_string(),
+            },
+            resumed: false,
+            lane_root: repo.join(".auto/parallel/lanes/lane-1"),
+            lane_repo_root: repo.clone(),
+            base_commit,
+            stdout_log_path: repo.join(".auto/parallel/lanes/lane-1/stdout.log"),
+            stderr_log_path: repo.join(".auto/parallel/lanes/lane-1/stderr.log"),
+            worker_pid_path: repo.join(".auto/parallel/lanes/lane-1/worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let status = reconcile_parallel_landed_task(&repo, &assignment, &["docs/proof.md".into()])
+            .expect("landed reconciliation should self-heal local verification");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert!(fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md"))
+            .expect("plan should persist")
+            .contains("- [x] `TASK-HOST` Host closeout"));
+        assert!(repo
+            .join(".auto/symphony/verification-receipts/TASK-HOST.json")
+            .exists());
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
 
     #[test]
