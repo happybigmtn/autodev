@@ -18,7 +18,8 @@ use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTI
 use crate::codex_exec::run_codex_exec_with_env;
 use crate::completion_artifacts::{
     assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
-    verification_plan, verification_receipt_commit_footer, CompletionGapKind,
+    run_host_verification_receipt, verification_plan, verification_receipt_commit_footer,
+    CompletionGapKind,
 };
 use crate::lane_events::{self, LaneEventLogger};
 use crate::linear_tracker::LinearTracker;
@@ -6363,8 +6364,23 @@ fn reconcile_parallel_clean_no_commit(
         "needs-human-triage",
         "lane exited cleanly without a local commit; canonical evidence will be inspected before shelving",
     )?;
-    let evidence_before =
+    let mut evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let gap_before = assess_task_completion_gap(&assignment.task.markdown, &evidence_before);
+    if !evidence_before.is_fully_evidenced()
+        && gap_before.kind == CompletionGapKind::LocalRepairable
+        && run_host_verification_receipt(repo_root, &assignment.task.id, &assignment.task.markdown)?
+    {
+        parallel_logger.info(format!(
+            "self-heal: ran host verification for clean no-commit lane-{} `{}`",
+            assignment.lane_index, assignment.task.id
+        ));
+        evidence_before = inspect_task_completion_evidence(
+            repo_root,
+            &assignment.task.id,
+            &assignment.task.markdown,
+        );
+    }
     let review_can_complete_evidence = !evidence_before.has_review_handoff
         && evidence_before.verification_receipt_present
         && evidence_before.missing_completion_artifacts.is_empty()
@@ -6438,7 +6454,17 @@ fn recover_shelved_tasks_from_canonical_evidence(
 ) -> Result<usize> {
     let mut recovered = Vec::new();
     for (task_id, markdown) in shelved_tasks.clone() {
-        let evidence = inspect_task_completion_evidence(repo_root, &task_id, &markdown);
+        let mut evidence = inspect_task_completion_evidence(repo_root, &task_id, &markdown);
+        let gap = assess_task_completion_gap(&markdown, &evidence);
+        if !evidence.is_fully_evidenced()
+            && gap.kind == CompletionGapKind::LocalRepairable
+            && run_host_verification_receipt(repo_root, &task_id, &markdown)?
+        {
+            parallel_logger.info(format!(
+                "self-heal: ran host verification for shelved `{task_id}` before evidence recovery"
+            ));
+            evidence = inspect_task_completion_evidence(repo_root, &task_id, &markdown);
+        }
         if !evidence.is_fully_evidenced() {
             continue;
         }

@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use shlex::split as shell_split;
 
@@ -168,6 +168,99 @@ pub(crate) fn inspect_task_completion_evidence(
         missing_completion_artifacts,
         unresolved_audit_findings,
     }
+}
+
+pub(crate) fn run_host_verification_receipt(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+) -> Result<bool> {
+    let verification = verification_plan(task_markdown);
+    if verification.executable_commands.is_empty() {
+        return Ok(false);
+    }
+    if verification
+        .steps
+        .iter()
+        .any(|step| verification_step_looks_external(step))
+    {
+        return Ok(false);
+    }
+
+    let evidence = inspect_task_completion_evidence(repo_root, task_id, task_markdown);
+    if evidence.verification_receipt_present
+        || !evidence.missing_completion_artifacts.is_empty()
+        || !evidence.unresolved_audit_findings.is_empty()
+    {
+        return Ok(false);
+    }
+
+    let receipt_path = verification_receipt_path(repo_root, task_id);
+    if let Some(parent) = receipt_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut commands = Vec::new();
+    for command in &verification.executable_commands {
+        let output = Command::new("bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(repo_root)
+            .output()
+            .with_context(|| format!("failed to launch host verification command `{command}`"))?;
+        let stdout_tail = output_tail(&output.stdout, 4096);
+        let stderr_tail = output_tail(&output.stderr, 4096);
+        let combined = format!("{stdout_tail}\n{stderr_tail}");
+        let expected_argv = shell_split(command).unwrap_or_default();
+        let exit_code = output.status.code().unwrap_or(-1);
+        commands.push(json!({
+            "command": command,
+            "argv": expected_argv,
+            "expected_argv": expected_argv,
+            "exit_code": exit_code,
+            "status": if output.status.success() { "passed" } else { "failed" },
+            "runner_summary": {
+                "zero_test_detected": command_output_indicates_zero_tests(&combined),
+            },
+            "output_summary": {
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "stdout_bytes": output.stdout.len(),
+                "stderr_bytes": output.stderr.len(),
+            },
+        }));
+    }
+
+    let declared_artifacts = declared_completion_artifacts(task_markdown)
+        .into_iter()
+        .filter_map(|path| {
+            if declared_artifact_hash_is_mutable_handoff(&path) {
+                return None;
+            }
+            let hash =
+                declared_artifact_path(repo_root, &path).and_then(|path| artifact_hash(&path));
+            Some(json!({
+                "path": path,
+                "sha256": hash,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let receipt = json!({
+        "task_id": task_id,
+        "commit": current_git_commit(repo_root),
+        "dirty_state": {
+            "fingerprint": current_dirty_state_fingerprint(repo_root),
+        },
+        "plan_hash": current_plan_hash(repo_root),
+        "declared_artifacts": declared_artifacts,
+        "commands": commands,
+    });
+    let receipt_text = serde_json::to_vec_pretty(&receipt)?;
+    atomic_write(&receipt_path, &receipt_text)
+        .with_context(|| format!("failed to write {}", receipt_path.display()))?;
+    Ok(true)
 }
 
 pub(crate) fn ensure_host_review_handoff(
@@ -662,6 +755,20 @@ fn verification_step_looks_external(step: &str) -> bool {
     .any(|marker| step.contains(marker))
 }
 
+fn output_tail(bytes: &[u8], max_bytes: usize) -> String {
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).to_string()
+}
+
+fn command_output_indicates_zero_tests(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("running 0 tests")
+        || lower.contains("0 passed")
+        || lower.contains("collected 0 items")
+        || lower.contains("no tests ran")
+        || lower.contains("0 tests")
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 struct VerificationReceipt {
     #[serde(default)]
@@ -783,7 +890,7 @@ fn inspect_verification_receipt(
         }
         return (true, None);
     }
-    if !verification_wrapper_present {
+    if !verification_wrapper_present && !verification_receipt_path.exists() {
         return (
             false,
             Some(format!(
@@ -1551,7 +1658,7 @@ mod tests {
     use super::{
         assess_task_completion_gap, declared_completion_artifacts, ensure_host_review_handoff,
         inspect_task_completion_evidence, latest_verification_receipt_footer, review_contains_task,
-        verification_plan, verification_receipt_commit_footer,
+        run_host_verification_receipt, verification_plan, verification_receipt_commit_footer,
         verification_receipt_freshness_problem, CompletionGapKind, TaskCompletionEvidence,
         VerificationDirtyState, VerificationReceipt, VerificationReceiptArtifact,
         VerificationReceiptCommand,
@@ -1825,6 +1932,55 @@ Dependencies: none
             .missing_reasons()
             .join("\n")
             .contains("missing scripts/run-task-verification.sh"));
+    }
+
+    #[test]
+    fn host_verification_receipt_self_heals_missing_wrapper_for_local_commands() {
+        let root = temp_dir("host-verification-receipt");
+        init_git_repo(&root);
+        fs::write(root.join(".gitignore"), "/.auto/\n").expect("failed to write gitignore");
+        fs::create_dir_all(root.join("docs")).expect("failed to create docs dir");
+        fs::write(root.join("docs/proof.md"), "proof\n").expect("failed to write proof");
+        let task_markdown = "- [~] `TASK-HOST` Host closeout\n\
+Verification:\n  - `bash -lc \"test -f docs/proof.md\"`\n\
+Completion artifacts: `docs/proof.md`\n\
+Dependencies: none\n";
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), task_markdown)
+            .expect("failed to write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-HOST`\n",
+        )
+        .expect("failed to write review");
+        git_ok(
+            &root,
+            &[
+                "add",
+                ".gitignore",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "docs/proof.md",
+            ],
+        );
+        git_ok(&root, &["commit", "-m", "task evidence"]);
+
+        let before = inspect_task_completion_evidence(&root, "TASK-HOST", task_markdown);
+        assert!(!before.verification_receipt_present);
+        assert!(before
+            .missing_reasons()
+            .join("\n")
+            .contains("missing scripts/run-task-verification.sh"));
+
+        assert!(
+            run_host_verification_receipt(&root, "TASK-HOST", task_markdown)
+                .expect("host verification should run")
+        );
+        let after = inspect_task_completion_evidence(&root, "TASK-HOST", task_markdown);
+
+        assert!(after.is_fully_evidenced(), "{after:#?}");
+        assert!(root
+            .join(".auto/symphony/verification-receipts/TASK-HOST.json")
+            .exists());
     }
 
     #[test]
