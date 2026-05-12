@@ -111,14 +111,8 @@ def declared_completion_artifacts(root: Path, task_id: str) -> list[str]:
     if not plan_path.exists():
         return []
     lines = plan_path.read_text(encoding="utf-8").splitlines()
-    start = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if re.search(rf"`{re.escape(task_id)}`", line)
-        ),
-        None,
-    )
+    task_header = re.compile(rf"\s*-\s+\[[ x~!]\]\s+`{re.escape(task_id)}`(?:\s|$)")
+    start = next((index for index, line in enumerate(lines) if task_header.search(line)), None)
     if start is None:
         return []
     block: list[str] = []
