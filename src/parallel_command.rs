@@ -1692,9 +1692,9 @@ fn parallel_status_safety_verdict(
         .filter(|task| is_operator_task(task))
         .map(|task| task.id.as_str())
         .collect::<Vec<_>>();
-    let code_ready = ready
+    let execution_ready = ready
         .iter()
-        .filter(|task| !is_operator_task(task) && !is_evidence_lane_task(task))
+        .filter(|task| !is_operator_task(task))
         .map(|task| task.id.as_str())
         .collect::<Vec<_>>();
     let evidence_ready = ready
@@ -1704,29 +1704,19 @@ fn parallel_status_safety_verdict(
         .collect::<Vec<_>>();
     if ready.is_empty() {
         "NO-GO: no dependency-ready tasks remain for this run".to_string()
-    } else if code_ready.is_empty() && !operator_ready.is_empty() {
+    } else if execution_ready.is_empty() && !operator_ready.is_empty() {
         format!(
-            "OPERATOR: no code lanes ready; operator queue: {}{}",
-            operator_ready.join(", "),
-            if evidence_ready.is_empty() {
-                String::new()
-            } else {
-                format!("; evidence queue: {}", evidence_ready.join(", "))
-            }
-        )
-    } else if code_ready.is_empty() && !evidence_ready.is_empty() {
-        format!(
-            "EVIDENCE: no code lanes ready; evidence queue: {}",
-            evidence_ready.join(", ")
+            "OPERATOR: no executable lanes ready; operator queue: {}",
+            operator_ready.join(", ")
         )
     } else {
         format!(
-            "GO: safe to launch or resume; code lanes ready: {}{}{}",
-            code_ready.join(", "),
+            "GO: safe to launch or resume; executable lanes ready: {}{}{}",
+            execution_ready.join(", "),
             if evidence_ready.is_empty() {
                 String::new()
             } else {
-                format!("; evidence queue: {}", evidence_ready.join(", "))
+                format!("; evidence lanes: {}", evidence_ready.join(", "))
             },
             if operator_ready.is_empty() {
                 String::new()
@@ -2462,13 +2452,10 @@ async fn run_parallel_loop(
                 break;
             }
             let mut operator_ready = Vec::new();
-            let mut evidence_ready = Vec::new();
             let mut executable_ready = Vec::new();
             for task in ready {
                 if is_operator_task(&task) {
                     operator_ready.push(task);
-                } else if is_evidence_lane_task(&task) {
-                    evidence_ready.push(task);
                 } else {
                     executable_ready.push(task);
                 }
@@ -2487,12 +2474,7 @@ async fn run_parallel_loop(
             }
             if executable_ready.is_empty() {
                 let message = format!(
-                    "no executable dependency-ready code tasks remain; evidence queue: {} operator queue: {}",
-                    evidence_ready
-                        .iter()
-                        .map(|task| task.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    "no executable dependency-ready tasks remain; operator queue: {}",
                     operator_ready
                         .iter()
                         .map(|task| task.id.as_str())
@@ -4631,27 +4613,11 @@ fn describe_parallel_idle_state(
 ) -> String {
     let ready = ready_parallel_tasks(plan, active_tasks, shelved_tasks, deferred_partial_tasks);
     let operator_ready = ready.iter().filter(|task| is_operator_task(task)).count();
-    let (verification_only, executable_ready): (Vec<_>, Vec<_>) = ready
-        .into_iter()
-        .filter(|task| !is_operator_task(task))
-        .partition(is_evidence_lane_task);
-    if executable_ready.is_empty() && !verification_only.is_empty() {
+    let executable_ready = ready.iter().filter(|task| !is_operator_task(task)).count();
+    if executable_ready == 0 && operator_ready > 0 {
         return format!(
-            "manual/evidence checkpoints are ready: {}{}",
-            verification_only
-                .iter()
-                .map(|task| task.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            if operator_ready == 0 {
-                String::new()
-            } else {
-                format!("; operator queue: {operator_ready}")
-            }
+            "operator queue has {operator_ready} item(s); no executable lanes are ready"
         );
-    }
-    if executable_ready.is_empty() && operator_ready > 0 {
-        return format!("operator queue has {operator_ready} item(s); no code lanes are ready");
     }
 
     let waiting_on = unresolved_frontier_dependency_ids(
@@ -8876,9 +8842,36 @@ Estimated scope: S\n";
             &[],
             &[],
         );
-        assert!(verdict.contains("code lanes ready: CODE-001"));
-        assert!(verdict.contains("evidence queue: EVID-001"));
+        assert!(verdict.contains("executable lanes ready: EVID-001, CODE-001"));
+        assert!(verdict.contains("evidence lanes: EVID-001"));
         assert!(verdict.contains("operator queue: OPS-001"));
+    }
+
+    #[test]
+    fn evidence_only_ready_task_is_launchable() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `EVID-001` Refresh receipt
+  Lane kind: evidence
+  Scope boundary: evidence only.
+  Verification: `cargo test receipt_refresh`
+  Dependencies: none
+"#,
+        );
+
+        let verdict = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            verdict,
+            "GO: safe to launch or resume; executable lanes ready: EVID-001; evidence lanes: EVID-001"
+        );
     }
 
     #[test]
