@@ -561,6 +561,17 @@ pub(crate) fn verification_receipt_commit_footer(
     )))
 }
 
+pub(crate) fn verification_receipt_footer_from_text(
+    task_id: &str,
+    receipt_text: &str,
+) -> Result<String> {
+    let compact = compact_receipt_json_for_footer(receipt_text)?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compact.as_bytes());
+    Ok(format!(
+        "{RECEIPT_FOOTER_VERSION} 1\n{RECEIPT_FOOTER_TASK} {task_id}\n{RECEIPT_FOOTER_JSON} {encoded}"
+    ))
+}
+
 pub(crate) fn latest_verification_receipt_footer(
     repo_root: &Path,
     task_id: &str,

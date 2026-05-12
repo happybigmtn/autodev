@@ -18,8 +18,8 @@ use crate::claude_exec::{describe_claude_harness, run_claude_exec_with_env, FUTI
 use crate::codex_exec::run_codex_exec_with_env;
 use crate::completion_artifacts::{
     assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
-    run_host_verification_receipt, verification_plan, verification_receipt_commit_footer,
-    CompletionGapKind,
+    latest_verification_receipt_footer, run_host_verification_receipt, verification_plan,
+    verification_receipt_commit_footer, verification_receipt_footer_from_text, CompletionGapKind,
 };
 use crate::lane_events::{self, LaneEventLogger};
 use crate::linear_tracker::LinearTracker;
@@ -6536,6 +6536,25 @@ fn reconcile_parallel_landed_task(
             &assignment.task.markdown,
         );
     }
+    if !evidence_after.is_fully_evidenced() && assignment.task.status == LoopTaskStatus::Partial {
+        if let Some(imported_footer) =
+            import_completed_partial_footer_from_lane(repo_root, assignment, changed_files)?
+        {
+            let message = format!(
+                "{}: {} evidence closeout",
+                repo_name(repo_root),
+                assignment.task.id
+            );
+            commit_task_closeout_with_footer(
+                repo_root,
+                &assignment.task.id,
+                &message,
+                true,
+                Some(&imported_footer),
+            )?;
+            return Ok(LoopTaskStatus::Done);
+        }
+    }
     let completion_status = if evidence_after.is_fully_evidenced() {
         LoopTaskStatus::Done
     } else {
@@ -6561,6 +6580,50 @@ fn reconcile_parallel_landed_task(
     Ok(completion_status)
 }
 
+fn import_completed_partial_footer_from_lane(
+    repo_root: &Path,
+    assignment: &ActiveLaneAssignment,
+    changed_files: &[String],
+) -> Result<Option<String>> {
+    let Some(footer) =
+        latest_verification_receipt_footer(&assignment.lane_repo_root, &assignment.task.id)
+    else {
+        return Ok(None);
+    };
+    let lane_evidence = inspect_task_completion_evidence(
+        &assignment.lane_repo_root,
+        &assignment.task.id,
+        &assignment.task.markdown,
+    );
+    if !lane_evidence.is_fully_evidenced() {
+        return Ok(None);
+    }
+
+    let review_added = ensure_host_review_handoff(
+        repo_root,
+        &assignment.task.id,
+        changed_files,
+        &lane_evidence,
+    )?;
+    let plan_updated =
+        update_task_completion_in_plan(repo_root, &assignment.task.id, LoopTaskStatus::Done)?;
+    if review_added {
+        run_git(repo_root, ["add", "REVIEW.md"])?;
+    }
+    if plan_updated {
+        run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+    }
+
+    verification_receipt_footer_from_text(&assignment.task.id, &footer.receipt_text)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "failed importing verification receipt footer for `{}` from lane-{}",
+                assignment.task.id, assignment.lane_index
+            )
+        })
+}
+
 fn repo_has_staged_queue_updates(repo_root: &Path) -> Result<bool> {
     let output = git_stdout(repo_root, ["diff", "--cached", "--name-only"])?;
     Ok(output.lines().any(|line| !line.trim().is_empty()))
@@ -6572,14 +6635,28 @@ fn commit_task_closeout(
     message: &str,
     allow_empty: bool,
 ) -> Result<()> {
-    let footer = verification_receipt_commit_footer(repo_root, task_id)?;
+    commit_task_closeout_with_footer(repo_root, task_id, message, allow_empty, None)
+}
+
+fn commit_task_closeout_with_footer(
+    repo_root: &Path,
+    task_id: &str,
+    message: &str,
+    allow_empty: bool,
+    footer_override: Option<&str>,
+) -> Result<()> {
+    let generated_footer = if footer_override.is_none() {
+        verification_receipt_commit_footer(repo_root, task_id)?
+    } else {
+        None
+    };
     let mut command = Command::new("git");
     command.arg("-C").arg(repo_root).arg("commit");
     if allow_empty {
         command.arg("--allow-empty");
     }
     command.arg("-m").arg(message);
-    if let Some(footer) = footer {
+    if let Some(footer) = footer_override.or(generated_footer.as_deref()) {
         command.arg("-m").arg(footer);
     }
     let output = command
@@ -7112,6 +7189,10 @@ mod tests {
 
     use anyhow::anyhow;
 
+    use crate::completion_artifacts::{
+        inspect_task_completion_evidence, latest_verification_receipt_footer,
+        verification_receipt_commit_footer,
+    };
     use crate::task_parser::LaneKind;
     use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget};
 
@@ -7138,7 +7219,7 @@ mod tests {
         reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
         salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
         tmux_status_line_has_live_worker, try_checkpoint_parallel_host_queue_changes,
-        update_task_completion_in_plan_text, validate_lane_assignment_metadata,
+        update_task_completion_in_plan_text, validate_lane_assignment_metadata, verification_plan,
         write_lane_assignment_metadata, write_operator_actions_for_ready_tasks,
         ActiveLaneAssignment, CherryPickFailurePolicy, LaneLandingRecoveryPrep, LaneRepoProgress,
         LaneResumeCandidate, LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus,
@@ -9217,6 +9298,104 @@ Estimated scope: S\n";
             ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
             vec!["TASK-001", "TASK-002"]
         );
+    }
+
+    #[test]
+    fn reconcile_landed_partial_imports_empty_lane_receipt_footer() {
+        let canonical = unique_temp_dir("parallel-import-empty-footer-canonical");
+        let lane = unique_temp_dir("parallel-import-empty-footer-lane");
+        init_git_repo(&canonical);
+        init_git_repo(&lane);
+
+        let task_markdown = "- [~] `TASK-012` Evidence closeout\nVerification: `node --version`\nDependencies: none\nEstimated scope: S\n";
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("failed to write canonical plan");
+        fs::write(canonical.join("README.md"), "canonical\n")
+            .expect("failed to write canonical readme");
+        run_git_in(&canonical, ["add", "IMPLEMENTATION_PLAN.md", "README.md"]);
+        run_git_in(&canonical, ["commit", "-m", "initial"]);
+        let base_commit = git_output(&canonical, ["rev-parse", "HEAD"]);
+
+        fs::write(
+            lane.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("failed to write lane plan");
+        fs::write(
+            lane.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n\n## `TASK-012`\n",
+        )
+        .expect("failed to write lane review");
+        fs::create_dir_all(lane.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create lane receipt dir");
+        fs::write(
+            lane.join(".auto/symphony/verification-receipts/TASK-012.json"),
+            r#"{"task_id":"TASK-012","commands":[{"command":"node --version","argv":["node","--version"],"expected_argv":["node","--version"],"exit_code":0,"status":"passed","runner_summary":{"zero_test_detected":false}}]}"#,
+        )
+        .expect("failed to write lane receipt");
+        run_git_in(&lane, ["add", "IMPLEMENTATION_PLAN.md", "REVIEW.md"]);
+        run_git_in(&lane, ["commit", "-m", "initial"]);
+        let lane_footer = verification_receipt_commit_footer(&lane, "TASK-012")
+            .expect("footer generation should succeed")
+            .expect("footer should exist");
+        run_git_in(
+            &lane,
+            [
+                "commit",
+                "--allow-empty",
+                "-m",
+                "TASK-012 evidence closeout",
+                "-m",
+                &lane_footer,
+            ],
+        );
+
+        let task = LoopTask {
+            id: "TASK-012".to_string(),
+            title: "Evidence closeout".to_string(),
+            status: LoopTaskStatus::Partial,
+            dependencies: Vec::new(),
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: task_markdown.to_string(),
+        };
+        assert_eq!(
+            verification_plan(&task.markdown).executable_commands,
+            vec!["node --version".to_string()]
+        );
+        let assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 0,
+            task,
+            resumed: false,
+            lane_root: lane.clone(),
+            lane_repo_root: lane.clone(),
+            base_commit,
+            stdout_log_path: lane.join("stdout.log"),
+            stderr_log_path: lane.join("stderr.log"),
+            worker_pid_path: lane.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let status = reconcile_parallel_landed_task(&canonical, &assignment, &[])
+            .expect("reconciliation should succeed");
+        assert_eq!(status, LoopTaskStatus::Done);
+
+        let plan = fs::read_to_string(canonical.join("IMPLEMENTATION_PLAN.md"))
+            .expect("failed to read canonical plan");
+        assert!(plan.contains("- [x] `TASK-012` Evidence closeout"));
+        assert!(latest_verification_receipt_footer(&canonical, "TASK-012").is_some());
+        let evidence = inspect_task_completion_evidence(&canonical, "TASK-012", task_markdown);
+        assert!(evidence.is_fully_evidenced(), "{evidence:#?}");
+
+        fs::remove_dir_all(canonical).ok();
+        fs::remove_dir_all(lane).ok();
     }
 
     #[test]
