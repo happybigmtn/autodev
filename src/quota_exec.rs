@@ -148,6 +148,48 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn sync_newer_claude_credentials(profile_dir: &Path, active_dir: &Path) -> Result<()> {
+    let profile_creds = profile_dir.join(".credentials.json");
+    let active_creds = active_dir.join(".credentials.json");
+
+    let Some(profile_expires_at) = claude_oauth_expires_at(&profile_creds)? else {
+        return Ok(());
+    };
+    let Some(active_expires_at) = claude_oauth_expires_at(&active_creds)? else {
+        return Ok(());
+    };
+
+    if active_expires_at <= profile_expires_at {
+        return Ok(());
+    }
+
+    fs::copy(&active_creds, &profile_creds).with_context(|| {
+        format!(
+            "failed to refresh Claude profile credentials from {} -> {}",
+            active_creds.display(),
+            profile_creds.display()
+        )
+    })?;
+    eprintln!(
+        "[quota-router] synced newer Claude credentials from {} into profile {}",
+        active_creds.display(),
+        profile_creds.display()
+    );
+    Ok(())
+}
+
+fn claude_oauth_expires_at(path: &Path) -> Result<Option<i64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let creds: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(creds["claudeAiOauth"]["expiresAt"].as_i64())
+}
+
 fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result<()> {
     let target = provider.auth_source();
 
@@ -163,6 +205,7 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
             })?;
         }
         Provider::Claude => {
+            sync_newer_claude_credentials(profile_dir, &target)?;
             let home = dirs::home_dir().expect("cannot resolve home directory");
             let claude_json = home.join(".claude.json");
 
@@ -611,14 +654,14 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        quota_output_has_agent_progress, restore_credentials, run_with_quota, swap_credentials,
+        claude_oauth_expires_at, quota_output_has_agent_progress, restore_credentials,
+        run_with_quota, swap_credentials, sync_newer_claude_credentials,
     };
     use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
 
+    use std::fs;
     #[cfg(unix)]
     use std::ffi::OsString;
-    #[cfg(unix)]
-    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -723,6 +766,49 @@ mod tests {
             .permissions();
         permissions.set_mode(mode);
         fs::set_permissions(path, permissions).expect("failed to set file permissions");
+    }
+
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("autodev-quota-exec-{unique}"));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_claude_creds(dir: &std::path::Path, expires_at: i64, refresh_token: &str) {
+        let path = dir.join(".credentials.json");
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "access",
+                "refreshToken": refresh_token,
+                "expiresAt": expires_at,
+                "scopes": ["user:profile"],
+            }
+        });
+        fs::write(
+            path,
+            serde_json::to_vec(&body).expect("json should serialize"),
+        )
+        .expect("creds should write");
     }
 
     #[test]
@@ -1029,5 +1115,47 @@ mod tests {
         drop(guard);
 
         assert!(!active_auth.exists());
+    }
+
+    #[test]
+    fn sync_newer_claude_credentials_updates_stale_profile() {
+        let profile = TempDir::new();
+        let active = TempDir::new();
+        write_claude_creds(profile.path(), 100, "old-refresh");
+        write_claude_creds(active.path(), 200, "new-refresh");
+
+        sync_newer_claude_credentials(profile.path(), active.path()).expect("sync should succeed");
+
+        let profile_expires_at = claude_oauth_expires_at(&profile.path().join(".credentials.json"))
+            .expect("read should succeed");
+        assert_eq!(profile_expires_at, Some(200));
+
+        let synced: serde_json::Value = serde_json::from_slice(
+            &fs::read(profile.path().join(".credentials.json")).expect("profile creds should read"),
+        )
+        .expect("profile creds should parse");
+        assert_eq!(
+            synced["claudeAiOauth"]["refreshToken"].as_str(),
+            Some("new-refresh")
+        );
+    }
+
+    #[test]
+    fn sync_newer_claude_credentials_keeps_newer_profile() {
+        let profile = TempDir::new();
+        let active = TempDir::new();
+        write_claude_creds(profile.path(), 300, "profile-refresh");
+        write_claude_creds(active.path(), 200, "active-refresh");
+
+        sync_newer_claude_credentials(profile.path(), active.path()).expect("sync should succeed");
+
+        let synced: serde_json::Value = serde_json::from_slice(
+            &fs::read(profile.path().join(".credentials.json")).expect("profile creds should read"),
+        )
+        .expect("profile creds should parse");
+        assert_eq!(
+            synced["claudeAiOauth"]["refreshToken"].as_str(),
+            Some("profile-refresh")
+        );
     }
 }

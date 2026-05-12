@@ -182,13 +182,7 @@ async fn refresh_codex_if_needed(profile_dir: &Path) -> Result<()> {
 
 /// Check if a JWT access token is expired (or will expire within the buffer).
 fn jwt_expired(token: &str) -> bool {
-    let Some(payload_b64) = token.split('.').nth(1) else {
-        return true;
-    };
-    let Ok(payload_bytes) = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) else {
-        return true;
-    };
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
+    let Some(payload) = jwt_payload(token) else {
         return true;
     };
     let Some(exp) = payload["exp"].as_i64() else {
@@ -196,6 +190,16 @@ fn jwt_expired(token: &str) -> bool {
     };
     let now = chrono::Utc::now().timestamp();
     now >= exp - REFRESH_BUFFER_SECS
+}
+
+fn jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let Some(payload_b64) = token.split('.').nth(1) else {
+        return None;
+    };
+    let Ok(payload_bytes) = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) else {
+        return None;
+    };
+    serde_json::from_slice::<serde_json::Value>(&payload_bytes).ok()
 }
 
 // ── Fetch functions ────────────────────────────────────────────────────
