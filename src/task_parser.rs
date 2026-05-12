@@ -353,6 +353,7 @@ pub(crate) const TASK_FIELD_BOUNDARIES: &[&str] = &[
     "Cross-surface tests:",
     "Review/closeout:",
     "Completion artifacts:",
+    "Lane kind:",
     "Dependencies:",
     "Estimated scope:",
     "Completion signal:",
@@ -367,8 +368,7 @@ pub(crate) fn task_field_body_until_any(
     let mut collecting = false;
     let mut body = Vec::new();
     for line in markdown.lines() {
-        let unbulleted = strip_list_bullet(line);
-        if let Some(rest) = unbulleted.strip_prefix(field) {
+        if let Some(rest) = task_field_line_value(line, field) {
             collecting = true;
             if !rest.trim().is_empty() {
                 body.push(rest.trim().to_string());
@@ -379,7 +379,7 @@ pub(crate) fn task_field_body_until_any(
             && next_fields
                 .iter()
                 .filter(|next_field| **next_field != field)
-                .any(|next_field| unbulleted.starts_with(next_field))
+                .any(|next_field| task_field_line_value(line, next_field).is_some())
         {
             break;
         }
@@ -388,6 +388,22 @@ pub(crate) fn task_field_body_until_any(
         }
     }
     collecting.then(|| body.join("\n"))
+}
+
+fn task_field_line_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let unbulleted = strip_list_bullet(line).trim_start();
+    if let Some(rest) = unbulleted.strip_prefix(field) {
+        return Some(rest.trim());
+    }
+
+    let field_name = field.trim_end_matches(':');
+    let bold_field = format!("**{field_name}:**");
+    if let Some(rest) = unbulleted.strip_prefix(&bold_field) {
+        return Some(rest.trim());
+    }
+
+    let bold_name_field = format!("**{field_name}**:");
+    unbulleted.strip_prefix(&bold_name_field).map(str::trim)
 }
 
 pub(crate) fn validate_execution_row(task: &PlanTask, all_task_ids: &BTreeSet<&str>) -> Result<()> {
@@ -619,9 +635,16 @@ fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
 
     let generated_artifacts = execution_row_first_field_line(task, "Generated artifacts:")?;
     let contract_generation = execution_row_first_field_line(task, "Contract generation:")?;
+    validate_generated_artifact_semantics(task, &generated_artifacts, &contract_generation)?;
     if !field_value_is_none(&generated_artifacts) && field_value_is_none(&contract_generation) {
         bail!(
             "task `{}` names generated artifacts but has no `Contract generation:` command",
+            task.id
+        );
+    }
+    if field_value_is_none(&generated_artifacts) && !field_value_is_none(&contract_generation) {
+        bail!(
+            "task `{}` has `Contract generation:` command but `Generated artifacts:` is none; either name the generated outputs or use `none -- no generated contract`",
             task.id
         );
     }
@@ -634,7 +657,171 @@ fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
             task.id
         );
     }
+    if [
+        "human reviewer",
+        "manual review",
+        "human approval",
+        "ask the user",
+        "needs human",
+    ]
+    .iter()
+    .any(|needle| review_lower.contains(needle))
+    {
+        bail!(
+            "task `{}` `Review/closeout:` must be autonomous; convert human-only review into executable proof or an explicit external blocker",
+            task.id
+        );
+    }
     Ok(())
+}
+
+fn validate_generated_artifact_semantics(
+    task: &PlanTask,
+    generated_artifacts: &str,
+    contract_generation: &str,
+) -> Result<()> {
+    if field_value_is_none(generated_artifacts) {
+        return Ok(());
+    }
+
+    let body = execution_row_field_body(task, "Generated artifacts:")?;
+    let paths = body
+        .lines()
+        .flat_map(artifact_paths_from_line)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!(
+            "task `{}` `Generated artifacts:` must name concrete generated output paths or `none`",
+            task.id
+        );
+    }
+
+    for path in &paths {
+        if !looks_like_generated_artifact_path(path) {
+            bail!(
+                "task `{}` `Generated artifacts:` contains authored/non-generated artifact `{path}`; put authored docs, source, tests, screenshots, checkpoints, receipts, and runbooks in `Completion artifacts:`",
+                task.id
+            );
+        }
+    }
+
+    let lower_contract = contract_generation.to_ascii_lowercase();
+    let mentions_generation = [
+        "wrapper",
+        "build",
+        "compile",
+        "codegen",
+        "generate",
+        "gen ",
+        "schema",
+        "snapshot",
+        "manifest",
+        "report",
+        "coverage",
+        "baseline",
+        "mutation",
+        "fuzz",
+        "perf",
+        "cost",
+        "resource",
+        "openapi",
+        "protobuf",
+        "abi",
+        "freshness",
+        "stale",
+        "check",
+    ]
+    .iter()
+    .any(|needle| lower_contract.contains(needle));
+    if !mentions_generation {
+        bail!(
+            "task `{}` `Contract generation:` must name a real generator/check command for `Generated artifacts:`",
+            task.id
+        );
+    }
+    verify_commands_are_runnable(
+        task.id.as_str(),
+        "Contract generation:",
+        contract_generation,
+    )?;
+
+    Ok(())
+}
+
+fn looks_like_generated_artifact_path(path: &str) -> bool {
+    let lower = path.trim_matches('`').to_ascii_lowercase();
+    if lower.starts_with(".auto/") {
+        return false;
+    }
+    if looks_like_generated_report_artifact(&lower) {
+        return true;
+    }
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".md")
+    {
+        return lower.contains("generated") || lower.contains("/gen/");
+    }
+    if lower.starts_with("docs/")
+        || lower.starts_with("genesis/")
+        || lower.starts_with("app/src/")
+        || lower.starts_with("contracts/src/")
+        || lower.starts_with("contracts/tests/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("src/")
+        || lower.starts_with("scripts/")
+        || lower == "readme.md"
+        || lower == "review.md"
+        || lower == "changelog.md"
+    {
+        return false;
+    }
+    lower.contains(".gen.")
+        || lower.contains("/gen/")
+        || lower.starts_with("gen/")
+        || lower.starts_with("generated/")
+        || lower.starts_with("build/")
+        || lower.starts_with("dist/")
+        || lower.starts_with("wrappers/")
+        || lower.starts_with("contracts/wrappers/")
+        || lower.starts_with("wrappers-ts/")
+        || lower.contains("schema")
+        || lower.contains("abi")
+        || lower.ends_with(".json")
+}
+
+fn looks_like_generated_report_artifact(lower: &str) -> bool {
+    if lower.ends_with(".lcov") {
+        return true;
+    }
+    let artifact_dir = lower.contains("/artifacts/")
+        || lower.starts_with("artifacts/")
+        || lower.contains("/generated/")
+        || lower.starts_with("generated/");
+    if !artifact_dir {
+        return false;
+    }
+    [
+        "manifest",
+        "report",
+        "coverage",
+        "snapshot",
+        "baseline",
+        "mutation",
+        "fuzz",
+        "perf",
+        "cost",
+        "resource",
+        "abi",
+        "schema",
+        "interface",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn field_value_is_none(value: &str) -> bool {
@@ -817,8 +1004,8 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_task_id_like, parse_task_header, parse_tasks, validate_execution_row, TaskStatus,
-        PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
+        is_task_id_like, parse_task_header, parse_tasks, validate_execution_row, LaneKind,
+        TaskStatus, PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
     };
 
     #[test]
@@ -1097,6 +1284,7 @@ mod tests {
   Cross-surface tests: `cargo test runtime_ui_readback`
   Review/closeout: REVIEW.md records runtime-to-UI proof.
   Completion artifacts: `REVIEW.md`
+  Lane kind: code
   Dependencies: none
   Estimated scope: S
   Completion signal: local tests and review handoff pass.
@@ -1110,6 +1298,22 @@ mod tests {
         let tasks = parse_tasks(&plan);
         let ids = tasks.iter().map(|task| task.id.as_str()).collect();
         validate_execution_row(&tasks[0], &ids).expect("rich row should validate");
+    }
+
+    #[test]
+    fn execution_row_validator_accepts_generated_proof_reports() {
+        let plan = rich_execution_row_plan()
+            .replace(
+                "Generated artifacts: `bindings/schema.json`",
+                "Generated artifacts: `genesis/checkpoints/artifacts/interface-manifest.md`, `genesis/checkpoints/artifacts/coverage.lcov`, `genesis/checkpoints/artifacts/resource-baseline.json`, `genesis/checkpoints/artifacts/mutation-report.md`",
+            )
+            .replace(
+                "Contract generation: `cargo run -p xtask -- codegen`",
+                "Contract generation: `cargo run -p xtask -- check-generated-artifacts`",
+            );
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        validate_execution_row(&tasks[0], &ids).expect("generated proof reports should validate");
     }
 
     #[test]
@@ -1132,5 +1336,57 @@ mod tests {
         let ids = tasks.iter().map(|task| task.id.as_str()).collect();
         let err = validate_execution_row(&tasks[0], &ids).expect_err("prose rejected");
         assert!(format!("{err:#}").contains("machine-readable"));
+    }
+
+    #[test]
+    fn execution_row_validator_keeps_lane_kind_out_of_completion_artifacts() {
+        let plan = rich_execution_row_plan();
+        let tasks = parse_tasks(&plan);
+
+        assert_eq!(tasks[0].completion_artifacts, vec!["REVIEW.md"]);
+        assert_eq!(tasks[0].lane_kind, Some(LaneKind::Code));
+    }
+
+    #[test]
+    fn execution_row_validator_rejects_missing_lane_kind() {
+        let plan = rich_execution_row_plan().replace("  Lane kind: code\n", "");
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        let err = validate_execution_row(&tasks[0], &ids).expect_err("lane kind required");
+
+        assert!(format!("{err:#}").contains("Lane kind:"));
+    }
+
+    #[test]
+    fn execution_row_validator_rejects_authored_docs_as_generated_artifacts() {
+        let plan = rich_execution_row_plan().replace(
+            "Generated artifacts: `bindings/schema.json`",
+            "Generated artifacts: `docs/proof.md`, `genesis/checkpoints/proof.md`, `app/src/App.tsx`, `tests/proof.rs`",
+        );
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        let err = validate_execution_row(&tasks[0], &ids)
+            .expect_err("authored artifacts should not be generated artifacts");
+
+        assert!(format!("{err:#}").contains("Completion artifacts"));
+    }
+
+    #[test]
+    fn execution_row_validator_rejects_contract_generation_without_generated_artifacts() {
+        let plan = rich_execution_row_plan()
+            .replace(
+                "Generated artifacts: `bindings/schema.json`",
+                "Generated artifacts: none",
+            )
+            .replace(
+                "Contract generation: `cargo run -p xtask -- codegen`",
+                "Contract generation: `cargo run -p xtask -- codegen`",
+            );
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+        let err = validate_execution_row(&tasks[0], &ids)
+            .expect_err("contract generation without generated artifacts should fail");
+
+        assert!(format!("{err:#}").contains("Generated artifacts"));
     }
 }

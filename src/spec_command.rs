@@ -24,7 +24,7 @@ const SPEC_REQUIRED_SECTIONS: [&str; 12] = [
     "## Acceptance Criteria",
     "## Verification",
     "## Review And Closeout",
-    "## Open Questions",
+    "## Autonomous Defaults",
 ];
 
 pub(crate) async fn run_spec(args: SpecArgs) -> Result<()> {
@@ -161,17 +161,25 @@ Spec contract for `{spec_path}`:
   - `## Acceptance Criteria`
   - `## Verification`
   - `## Review And Closeout`
-  - `## Open Questions`
+  - `## Autonomous Defaults`
 - `## Source Of Truth` must name runtime owner modules/APIs, UI consumers, generated artifacts, and retired/superseded surfaces. Use `none` only after checking.
-- `## Evidence Status` must separate verified code facts, recommendations, hypotheses, and unresolved questions.
+- `## Evidence Status` must separate verified code facts, recommendations, hypotheses, and external blockers. Do not leave routine product/engineering choices as open questions when a conservative default can be chosen.
 - `## Runtime Contract` must state which engine/runtime/API owns canonical facts and what must fail closed when data is missing.
 - `## UI Contract` must state how UI consumes runtime truth without duplicating catalogs, constants, settlement math, eligibility rules, risk classifications, or sample fallback truth.
-- `## Generated Artifacts` must name bindings/schemas/docs/snapshots to regenerate, or `none`.
+- Keep metadata sections concise and path-specific. Put real implementation substance in `## Runtime Contract`, `## UI Contract`, `## Acceptance Criteria`, and `## Verification`, not in generic artifact/process boilerplate.
+- `## Generated Artifacts` is a generated-output inventory. Name generated bindings, schemas, ABI files, generated reports, snapshots, generated docs, or build metadata that require a regeneration/check command. Write `none` when the surface only creates authored docs, checkpoints, screenshots, ordinary tests, or source files.
+- `## Autonomous Defaults` must resolve questions using the best conservative default the agent can justify from code, docs, primary-source references, and repo direction. Use this section for chosen defaults and external blockers; do not emit unresolved question lists.
+- For app/product work, cover the end-to-end production path affected by the request: launch/configuration, auth or identity, security hardening, transaction/API smoke proof, visual regression or UX proof, observability, rollback/recovery, and first-run DX. Cite existing proof when already complete; add plan items when not.
+- For production app/system work, include generalized production-grade controls where applicable: existing reusable assets, explicit non-scope, data-flow/control-flow proof, global release gates, test coverage map, critical failure modes and recovery paths, and a worktree/parallelization strategy that gives independent agents disjoint ownership.
+- For generated interfaces or generated reports/snapshots, require a generated surface manifest, a regeneration/freshness command, and CI or local verification that fails on stale generated artifacts. This applies to generated clients, schemas, wrappers, SDK bindings, ABI/interface descriptors, build manifests, and generated proof reports in any stack.
+- For value-moving, security-sensitive, or externally integrated behavior, specify source/authentication validation, replay/idempotency handling, rollback/compensation or failure policy, resource/performance/cost budget snapshots, and adversarial/property/mutation/fault-injection coverage where the repo has a practical harness.
+- For user-facing UI, require state and accessibility proof for loading, empty, error, success, partial/stale, pending/locked/rejected, reduced-motion, responsive target breakpoints, keyboard/screen-reader/contrast behavior, and non-color-only cues where applicable.
+- Do not create specs whose main substance is boilerplate about artifacts or reviews. A production spec should make runtime behavior, UI behavior, integration behavior, or verification obligations precise enough for `auto parallel` to implement without guessing.
 - `## Fixture Policy` must quarantine sample/demo/test data away from production runtime components.
 - `## Retired / Superseded Surfaces` must name old specs/files/contracts that must not be implemented from, or `none`.
 - `## Acceptance Criteria` must be concrete observable bullets.
 - `## Verification` must list narrow commands or runtime checks.
-- `## Review And Closeout` must say how `auto review` or a human reviewer independently verifies each plan item, including grep/assertion proof where simple tests are insufficient.
+- `## Review And Closeout` must say how an autonomous agent independently verifies each plan item, including executable commands, grep/assertion proof, generated artifacts, or browser/test evidence where simple tests are insufficient.
 
 Plan item contract for `{plan_path}`:
 - Add dependency-ordered unchecked items under `## Priority Work` or `## Follow-On Work`.
@@ -200,18 +208,21 @@ Plan item contract for `{plan_path}`:
   - `Cross-surface tests:`
   - `Review/closeout:`
   - `Completion artifacts:`
+  - `Lane kind:`
   - `Dependencies:`
   - `Estimated scope:`
   - `Completion signal:`
 - `Source of truth:` must name the canonical runtime/API/doc owner.
 - `Runtime owner:` names the engine/runtime path or `none`.
 - `UI consumers:` names concrete UI paths/routes or `none`.
-- `Generated artifacts:` names bindings/schemas/docs to regenerate or `none`.
+- `Generated artifacts:` is only for generated outputs that require a generation/check command, such as bindings, schemas, ABI files, generated reports, snapshots, generated docs, or build metadata. Do not list ordinary authored docs, checkpoint markdown, screenshots captured by a worker, source files, or tests here; put those in `Completion artifacts:` instead. Use `Generated artifacts: none -- no generated artifact` when no generated output is owned by the task.
 - `Fixture boundary:` states production cannot import fixture/demo/sample data, or says why not applicable.
 - `Retired surfaces:` names stale specs/files/contracts to delete/archive/tombstone or `none`.
-- `Contract generation:` names the generation/check command or `none -- no generated contract`.
+- `Contract generation:` names the generation/check command for affected generated artifacts, or `none -- no generated contract` when `Generated artifacts:` is none.
 - `Cross-surface tests:` names a runtime-to-UI/readback proof when UI is affected, or `none -- no UI/runtime boundary`.
 - `Review/closeout:` must describe independent proof for the original requirement, not just `cargo check`.
+- The first `Acceptance criteria:` clause must name a production behavior, runtime contract, operator-visible result, or executable proof artifact. Do not use generic process completion as the first criterion.
+- `Lane kind:` must be exactly one of `code`, `operator`, or `evidence`. Use `code` for source/runtime/frontend implementation, `evidence` for docs/checkpoints/research/verification-only work, and `operator` for deploy, secrets, live infrastructure, credentials, or external operations that still have an executable runbook or explicit `AUTO_ENV_BLOCKER`.
 - `Dependencies:` is scheduler input, not prose. It must be exactly `none` or only comma-separated/backticked task IDs already present in `{plan_path}` (for example ``Dependencies: `TASK-001`, `TASK-002` `` or one `- `TASK-ID`` per line). Do not include parentheticals, wave notes, "parallel with", "after", "blocked by", "depends on", or explanatory text in this field.
 - `Estimated scope:` must be `XS`, `S`, or `M`; split larger work.
 - `Verification:` and `Required tests:` must contain scoped executable commands or explicit non-executable proof. Do not let metadata fields appear inside them.
@@ -223,6 +234,7 @@ Process rules to encode in the spec and task split:
 - Implement runtime/engine/API changes before UI changes.
 - Regenerate contracts before adapting consumers.
 - Fixture/sample/demo data belongs only in tests, story/demo harnesses, or explicit dev-only paths.
+- Do not leave human-only review or approval gates. Convert them into executable checks, autonomous closeout criteria, or explicit `AUTO_ENV_BLOCKER`/external-operation prerequisites when credentials, live infrastructure, or legal/account access is genuinely unavailable to the agent.
 - For UI changes, include at least one runtime-output-to-UI-readback acceptance path.
 - Retire/delete/tombstone superseded surfaces as first-class work, not optional cleanup.
 - A task is not done until the original requirement cannot reappear without a guard, test, grep assertion, or review check failing.
@@ -251,7 +263,149 @@ fn verify_spec_output(spec_path: &Path) -> Result<()> {
             );
         }
     }
+    if !spec_acceptance_criteria_has_bullet(&text) {
+        bail!(
+            "auto spec output {} must include `## Acceptance Criteria` with at least one bullet",
+            spec_path.display()
+        );
+    }
+    lint_spec_shape(spec_path, &text)?;
     Ok(())
+}
+
+fn spec_acceptance_criteria_has_bullet(markdown: &str) -> bool {
+    section_body(markdown, "## Acceptance Criteria")
+        .map(|body| {
+            body.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("- ") || trimmed.starts_with("* ")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn lint_spec_shape(spec_path: &Path, markdown: &str) -> Result<()> {
+    if markdown.contains("## Open Questions") {
+        bail!(
+            "auto spec output {} must use `## Autonomous Defaults`, not `## Open Questions`",
+            spec_path.display()
+        );
+    }
+    lint_spec_autonomous_defaults(
+        spec_path,
+        section_body(markdown, "## Autonomous Defaults").unwrap_or_default(),
+    )?;
+    lint_spec_generated_artifacts(
+        spec_path,
+        section_body(markdown, "## Generated Artifacts").unwrap_or_default(),
+    )?;
+    Ok(())
+}
+
+fn lint_spec_autonomous_defaults(spec_path: &Path, section_body: &str) -> Result<()> {
+    let body = section_body.trim();
+    if body.is_empty() {
+        bail!(
+            "auto spec output {} `## Autonomous Defaults` must choose defaults or name external blockers",
+            spec_path.display()
+        );
+    }
+    let lower = body.to_ascii_lowercase();
+    let weak_body = lower
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == '*' || ch == '.')
+        .trim();
+    if weak_body == "none" || weak_body == "n/a" || weak_body == "tbd" {
+        bail!(
+            "auto spec output {} `## Autonomous Defaults` cannot be only `{weak_body}`",
+            spec_path.display()
+        );
+    }
+    if body.contains('?')
+        || [
+            "open question",
+            "unresolved question",
+            "to be decided",
+            "tbd",
+            "todo",
+            "ask the user",
+            "needs human",
+            "human review",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        bail!(
+            "auto spec output {} `## Autonomous Defaults` must not contain unresolved-question or human-blocker language",
+            spec_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn lint_spec_generated_artifacts(spec_path: &Path, section_body: &str) -> Result<()> {
+    let lower = section_body.to_ascii_lowercase();
+    if lower.trim().is_empty() || spec_field_value_like_none(&lower) {
+        return Ok(());
+    }
+    let authored_markers = [
+        "docs/",
+        "review.md",
+        "readme.md",
+        "changelog.md",
+        "app/src/",
+        "src/",
+        "tests/",
+        "scripts/",
+        "screenshot",
+        "playwright",
+        "checkpoint",
+        "receipt",
+        "runbook",
+        "handoff",
+    ];
+    let generated_markers = [
+        "generated",
+        "/gen/",
+        "gen/",
+        "build/",
+        "dist/",
+        "wrapper",
+        "schema",
+        "abi",
+        "snapshot",
+        "manifest",
+        "report",
+        "coverage",
+        "baseline",
+        "mutation",
+        "fuzz",
+        "perf",
+        "cost",
+        "resource",
+        "interface",
+        "artifacts/",
+        "openapi",
+        "protobuf",
+    ];
+    if authored_markers.iter().any(|needle| lower.contains(needle))
+        && !generated_markers
+            .iter()
+            .any(|needle| lower.contains(needle))
+    {
+        bail!(
+            "auto spec output {} `## Generated Artifacts` appears to list authored proof/source artifacts; reserve it for generated outputs",
+            spec_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn spec_field_value_like_none(value: &str) -> bool {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == '*' || ch == '.')
+        .trim();
+    trimmed == "none" || trimmed.starts_with("none --")
 }
 
 fn verify_plan_output(plan_path: &Path, spec_path: &Path) -> Result<()> {
@@ -327,9 +481,9 @@ fn verify_auto_spec_plan_task(
         );
     }
 
-    validate_execution_row(task, all_task_ids).with_context(|| {
-        format!(
-            "auto spec task `{}` failed execution-row validation",
+    validate_execution_row(task, all_task_ids).map_err(|err| {
+        anyhow::anyhow!(
+            "auto spec task `{}` failed execution-row validation: {err:#}",
             task.id
         )
     })?;
@@ -346,8 +500,14 @@ fn verify_auto_spec_plan_task(
 }
 
 fn section_has_body(markdown: &str, header: &str) -> bool {
+    section_body(markdown, header)
+        .map(|body| !body.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn section_body<'a>(markdown: &'a str, header: &str) -> Option<&'a str> {
     let Some(start) = markdown.find(header) else {
-        return false;
+        return None;
     };
     let body_start = start + header.len();
     let after = &markdown[body_start..];
@@ -355,12 +515,12 @@ fn section_has_body(markdown: &str, header: &str) -> bool {
         .find("\n## ")
         .map(|offset| body_start + offset)
         .unwrap_or(markdown.len());
-    !markdown[body_start..body_end].trim().is_empty()
+    Some(&markdown[body_start..body_end])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::verify_plan_output;
+    use super::{verify_plan_output, verify_spec_output};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -402,6 +562,7 @@ mod tests {
     Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks runtime-to-UI readback proof.
     Completion artifacts: `docs/proof/runtime-foundation.md`
+    Lane kind: code
     Dependencies: none
     Estimated scope: S
     Completion signal: proof recorded and tests pass.
@@ -427,11 +588,108 @@ mod tests {
     Cross-surface tests: `cargo test -p app runtime_readback`
     Review/closeout: reviewer checks no duplicated truth in UI.
     Completion artifacts: `docs/proof/ui-readback.md`
+    Lane kind: code
     Dependencies: {dependency_line}
     Estimated scope: M
     Completion signal: proof recorded and tests pass.
 "#
         )
+    }
+
+    fn valid_spec() -> &'static str {
+        r#"# Specification: Runtime UI
+
+## Objective
+
+- Make runtime-owned facts visible to the UI.
+
+## Source Of Truth
+
+- Runtime owner: `src/runtime.rs`; UI consumers: `web/src/App.tsx`; generated artifacts: none; retired surfaces: none.
+
+## Evidence Status
+
+- Verified fact: `src/runtime.rs` owns the fixture runtime in this test repository.
+
+## Runtime Contract
+
+- `src/runtime.rs` returns canonical facts and fails closed when data is missing.
+
+## UI Contract
+
+- `web/src/App.tsx` renders runtime output and does not duplicate catalogs.
+
+## Generated Artifacts
+
+- none
+
+## Fixture Policy
+
+- Production code cannot import fixture/demo/sample data.
+
+## Retired / Superseded Surfaces
+
+- none
+
+## Acceptance Criteria
+
+- The runtime payload is rendered in the UI without a local fallback catalog.
+
+## Verification
+
+- `cargo test -p app runtime_readback`
+
+## Review And Closeout
+
+- Autonomous review reruns `cargo test -p app runtime_readback` and greps for duplicated catalogs.
+
+## Autonomous Defaults
+
+- Default to runtime-first implementation and explicit UI readback proof; no external blocker applies.
+"#
+    }
+
+    #[test]
+    fn auto_spec_output_accepts_production_shape() {
+        let root = temp_root("valid-spec");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(&spec_path, valid_spec()).expect("write spec");
+
+        verify_spec_output(&spec_path).expect("spec validates");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_output_rejects_missing_acceptance_bullets() {
+        let root = temp_root("missing-acceptance");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(
+            &spec_path,
+            valid_spec().replace(
+                "## Acceptance Criteria\n\n- The runtime payload is rendered in the UI without a local fallback catalog.",
+                "## Acceptance Criteria\n\nThe runtime payload is rendered.",
+            ),
+        )
+        .expect("write spec");
+
+        let error = verify_spec_output(&spec_path).expect_err("acceptance bullet rejected");
+        assert!(error.to_string().contains("Acceptance Criteria"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_output_rejects_open_questions_section() {
+        let root = temp_root("open-questions");
+        let spec_path = root.join("specs/300426-runtime-ui.md");
+        fs::write(
+            &spec_path,
+            valid_spec().replace("## Autonomous Defaults", "## Open Questions"),
+        )
+        .expect("write spec");
+
+        let error = verify_spec_output(&spec_path).expect_err("open questions rejected");
+        assert!(error.to_string().contains("Autonomous Defaults"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

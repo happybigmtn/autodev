@@ -969,6 +969,7 @@ mod tests {
     #[test]
     fn loop_rejects_invalid_execution_row() {
         let root = unique_temp_dir("loop-invalid-row");
+        fs::create_dir_all(&root).expect("create temp root");
         fs::write(
             root.join("IMPLEMENTATION_PLAN.md"),
             r#"- [ ] `TASK-1` Invalid task

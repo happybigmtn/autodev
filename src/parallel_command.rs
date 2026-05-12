@@ -634,14 +634,28 @@ impl LoopPlanSnapshot {
         self.completion_path_target(task).is_some()
     }
 
-    fn direct_unfinished_dependents(&self, task_id: &str) -> Vec<String> {
-        self.tasks
-            .iter()
-            .filter(|task| self.is_actionable_unfinished(task))
-            .filter(|task| task.id != task_id)
-            .filter(|task| task.dependencies.iter().any(|dep| dep == task_id))
-            .map(|task| task.id.clone())
-            .collect()
+    fn transitive_unfinished_dependents(&self, task_id: &str) -> Vec<String> {
+        let mut seen = BTreeSet::<String>::new();
+        let mut frontier = vec![task_id.to_string()];
+        while let Some(current) = frontier.pop() {
+            for dependent in self
+                .tasks
+                .iter()
+                .filter(|task| self.is_actionable_unfinished(task))
+                .filter(|task| task.id != task_id)
+                .filter(|task| task.dependencies.iter().any(|dep| dep == &current))
+            {
+                if seen.insert(dependent.id.clone()) {
+                    frontier.push(dependent.id.clone());
+                }
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    fn is_load_bearing_partial(&self, task: &LoopTask) -> bool {
+        task.status == LoopTaskStatus::Partial
+            && !self.transitive_unfinished_dependents(&task.id).is_empty()
     }
 }
 
@@ -2179,7 +2193,7 @@ async fn run_parallel_loop(
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
-    let mut attempted_partial_followups = BTreeSet::<String>::new();
+    let mut partial_followup_attempts = BTreeMap::<String, usize>::new();
     let mut deferred_partial_tasks = BTreeSet::<String>::new();
     let mut unblock_attempted_tasks = BTreeSet::<String>::new();
     let mut linear_auto_sync_state = LinearAutoSyncState::default();
@@ -2199,7 +2213,8 @@ async fn run_parallel_loop(
         repo_root,
         target_branch,
         &mut resumable_lanes,
-        &mut attempted_partial_followups,
+        &plan,
+        &mut partial_followup_attempts,
         &mut deferred_partial_tasks,
         linear_tracker,
         parallel_logger,
@@ -2239,7 +2254,7 @@ async fn run_parallel_loop(
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.markdown == *markdown)
         });
-        attempted_partial_followups.retain(|task_id| {
+        partial_followup_attempts.retain(|task_id, _| {
             plan.tasks
                 .iter()
                 .find(|task| task.id == *task_id)
@@ -2368,8 +2383,9 @@ async fn run_parallel_loop(
                     };
                     attach_partial_follow_up_note(
                         repo_root,
+                        &plan,
                         &mut assignment,
-                        &attempted_partial_followups,
+                        &partial_followup_attempts,
                     );
                     prepend_host_recovery_note(
                         &mut assignment,
@@ -2503,7 +2519,12 @@ async fn run_parallel_loop(
                     continue;
                 }
             };
-            attach_partial_follow_up_note(repo_root, &mut assignment, &attempted_partial_followups);
+            attach_partial_follow_up_note(
+                repo_root,
+                &plan,
+                &mut assignment,
+                &partial_followup_attempts,
+            );
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -2678,7 +2699,8 @@ async fn run_parallel_loop(
                             let status_suffix = completion_status_suffix(
                                 &assignment.task.id,
                                 completion_status,
-                                &mut attempted_partial_followups,
+                                &plan,
+                                &mut partial_followup_attempts,
                                 &mut deferred_partial_tasks,
                             );
                             let result_label = if auto_repaired {
@@ -2989,7 +3011,7 @@ async fn run_parallel_loop(
                             }
                         }
                         landed += 1;
-                        attempted_partial_followups.remove(&assignment.task.id);
+                        partial_followup_attempts.remove(&assignment.task.id);
                         deferred_partial_tasks.remove(&assignment.task.id);
                         parallel_logger.info(format!(
                             "self-heal:   [{}] {} closed from canonical evidence after lane-{} exited cleanly without a commit (total landed: {})",
@@ -3050,7 +3072,8 @@ async fn run_parallel_loop(
                         let status_suffix = completion_status_suffix(
                             &assignment.task.id,
                             completion_status,
-                            &mut attempted_partial_followups,
+                            &plan,
+                            &mut partial_followup_attempts,
                             &mut deferred_partial_tasks,
                         );
                         let result_label = if auto_repaired {
@@ -3536,6 +3559,10 @@ fn no_dependency_ready_stop_message(
     )
     .map(|summary| format!(" frontier: {summary}"))
     .unwrap_or_default();
+    let recommendation_suffix =
+        parallel_unblock_recommendation(plan, active_tasks, shelved_tasks, deferred_partial_tasks)
+            .map(|recommendation| format!(" next: {recommendation}"))
+            .unwrap_or_default();
     let deferred = if deferred_partial_tasks.is_empty() {
         None
     } else {
@@ -3550,18 +3577,20 @@ fn no_dependency_ready_stop_message(
     if shelved_tasks.is_empty() {
         if let Some(deferred) = deferred {
             return format!(
-                "no dependency-ready tasks remain to dispatch; stopping with partial follow-up tasks deferred for the rest of this run. pending: {} blocked: {} deferred: {}{}",
+                "no dependency-ready tasks remain to dispatch; stopping with partial follow-up tasks deferred for the rest of this run. pending: {} blocked: {} deferred: {}{}{}",
                 queue.pending_ids.join(", "),
                 blocked,
                 deferred,
-                frontier_suffix
+                frontier_suffix,
+                recommendation_suffix
             );
         }
         return format!(
-            "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}{}",
+            "no dependency-ready tasks remain to dispatch; stopping. pending: {} blocked: {}{}{}",
             queue.pending_ids.join(", "),
             blocked,
-            frontier_suffix
+            frontier_suffix,
+            recommendation_suffix
         );
     }
     let shelved = shelved_tasks.keys().cloned().collect::<Vec<_>>().join(", ");
@@ -3569,13 +3598,53 @@ fn no_dependency_ready_stop_message(
         .map(|deferred| format!(" deferred: {deferred}"))
         .unwrap_or_default();
     format!(
-        "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: {} blocked: {} shelved: {}{}{}",
+        "no dependency-ready tasks remain to dispatch; stopping with unresolved shelved tasks. pending: {} blocked: {} shelved: {}{}{}{}",
         queue.pending_ids.join(", "),
         blocked,
         shelved,
         deferred_suffix,
-        frontier_suffix
+        frontier_suffix,
+        recommendation_suffix
     )
+}
+
+fn parallel_unblock_recommendation(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+) -> Option<String> {
+    let blocker =
+        parallel_blocker_frontier(plan, active_tasks, shelved_tasks, deferred_partial_tasks)
+            .into_iter()
+            .next()?;
+    let downstream = if blocker.downstream.is_empty() {
+        "no downstream task".to_string()
+    } else {
+        format!("{} downstream task(s)", blocker.downstream.len())
+    };
+    Some(match blocker.kind {
+        ParallelBlockerKind::DeferredPartial => format!(
+            "close partial `{}` first; it gates {downstream} and likely needs verification/artifact evidence, not new implementation",
+            blocker.task_id
+        ),
+        ParallelBlockerKind::Shelved => format!(
+            "recover shelved `{}` first; inspect lane logs or salvage notes, land/verify the existing work, then rerun `auto parallel`",
+            blocker.task_id
+        ),
+        ParallelBlockerKind::Blocked => format!(
+            "resolve blocked `[!]` task `{}` or mark an explicit replacement/completion-path task",
+            blocker.task_id
+        ),
+        ParallelBlockerKind::InFlight => format!(
+            "wait for in-flight `{}` to land, then rerun dependency selection",
+            blocker.task_id
+        ),
+        ParallelBlockerKind::Pending => format!(
+            "run pending dependency `{}` before downstream work",
+            blocker.task_id
+        ),
+    })
 }
 
 fn write_operator_actions_for_ready_tasks(run_root: &Path, tasks: &[LoopTask]) -> Result<PathBuf> {
@@ -4624,11 +4693,15 @@ fn ready_parallel_tasks(
         .filter(|task| !shelved_tasks.contains_key(&task.id))
         .filter(|task| !deferred_partial_tasks.contains(&task.id))
         .collect::<Vec<_>>();
+    let (mut load_bearing_partials, ready): (Vec<_>, Vec<_>) = ready
+        .into_iter()
+        .partition(|task| plan.is_load_bearing_partial(task));
     let (mut pending, partials): (Vec<_>, Vec<_>) = ready
         .into_iter()
         .partition(|task| task.status == LoopTaskStatus::Pending);
-    pending.extend(partials);
-    pending
+    load_bearing_partials.append(&mut pending);
+    load_bearing_partials.extend(partials);
+    load_bearing_partials
 }
 
 fn prioritize_ready_parallel_tasks(repo_root: &Path, ready: Vec<LoopTask>) -> Vec<LoopTask> {
@@ -4755,7 +4828,7 @@ fn parallel_blocker_frontier(
                 _ => ParallelBlockerKind::Pending,
             }
         };
-        let downstream = plan.direct_unfinished_dependents(&task_id);
+        let downstream = plan.transitive_unfinished_dependents(&task_id);
         ParallelBlockerDetail {
             task_id,
             kind,
@@ -4786,7 +4859,7 @@ fn format_parallel_blocker_frontier(
             .take(max_items)
             .map(|detail| {
                 let downstream = if detail.downstream.is_empty() {
-                    "no direct unfinished dependents".to_string()
+                    "no unfinished dependents".to_string()
                 } else {
                     detail.downstream.join(", ")
                 };
@@ -4809,10 +4882,15 @@ enum PartialFollowUpDisposition {
 
 fn record_partial_follow_up(
     task_id: &str,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    partial_followup_attempts: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
+    max_attempts: usize,
 ) -> PartialFollowUpDisposition {
-    if attempted_partial_followups.insert(task_id.to_string()) {
+    let attempts = partial_followup_attempts
+        .entry(task_id.to_string())
+        .and_modify(|attempts| *attempts += 1)
+        .or_insert(1);
+    if *attempts <= max_attempts {
         deferred_partial_tasks.remove(task_id);
         PartialFollowUpDisposition::RetryLaterThisRun
     } else {
@@ -4823,17 +4901,18 @@ fn record_partial_follow_up(
 
 fn clear_partial_follow_up_tracking(
     task_id: &str,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    partial_followup_attempts: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
 ) {
-    attempted_partial_followups.remove(task_id);
+    partial_followup_attempts.remove(task_id);
     deferred_partial_tasks.remove(task_id);
 }
 
 fn attach_partial_follow_up_note(
     repo_root: &Path,
+    plan: &LoopPlanSnapshot,
     assignment: &mut ActiveLaneAssignment,
-    attempted_partial_followups: &BTreeSet<String>,
+    partial_followup_attempts: &BTreeMap<String, usize>,
 ) {
     if assignment.task.status != LoopTaskStatus::Partial || assignment.host_recovery_note.is_some()
     {
@@ -4843,10 +4922,20 @@ fn attach_partial_follow_up_note(
     let evidence =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     let assessment = assess_task_completion_gap(&assignment.task.markdown, &evidence);
-    let pass_label = if attempted_partial_followups.contains(&assignment.task.id) {
-        "This is the automatic evidence-repair pass for a task that already landed code earlier in this run."
+    let prior_attempts = partial_followup_attempts
+        .get(&assignment.task.id)
+        .copied()
+        .unwrap_or(0);
+    let pass_label = if prior_attempts > 0 {
+        "This is an automatic evidence-repair pass for a task that already landed code earlier in this run."
     } else {
         "This task is already marked `- [~]`; treat this lane as follow-up work to close the remaining evidence gap rather than redoing landed implementation."
+    };
+    let downstream = plan.transitive_unfinished_dependents(&assignment.task.id);
+    let downstream_note = if downstream.is_empty() {
+        "none recorded".to_string()
+    } else {
+        downstream.join(", ")
     };
     let gap_kind = match assessment.kind {
         CompletionGapKind::None => {
@@ -4885,29 +4974,39 @@ fn attach_partial_follow_up_note(
             .join("\n")
     };
     assignment.host_recovery_note = Some(format!(
-        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
+        "{pass_label}\n\nHost evidence summary:\n- Prior same-run partial follow-up attempts: {prior_attempts}\n- Downstream tasks currently blocked by this partial: {downstream_note}\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
     ));
+}
+
+fn partial_follow_up_attempt_budget(plan: &LoopPlanSnapshot, task_id: &str) -> usize {
+    if !plan.transitive_unfinished_dependents(task_id).is_empty() {
+        3
+    } else {
+        1
+    }
 }
 
 fn completion_status_suffix(
     task_id: &str,
     completion_status: LoopTaskStatus,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    plan: &LoopPlanSnapshot,
+    partial_followup_attempts: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
 ) -> &'static str {
     match completion_status {
         LoopTaskStatus::Done => {
             clear_partial_follow_up_tracking(
                 task_id,
-                attempted_partial_followups,
+                partial_followup_attempts,
                 deferred_partial_tasks,
             );
             ""
         }
         LoopTaskStatus::Partial => match record_partial_follow_up(
             task_id,
-            attempted_partial_followups,
+            partial_followup_attempts,
             deferred_partial_tasks,
+            partial_follow_up_attempt_budget(plan, task_id),
         ) {
             PartialFollowUpDisposition::RetryLaterThisRun => {
                 " [~ evidence gap remains; follow-up pass queued]"
@@ -4955,7 +5054,7 @@ fn next_parallel_unblock_candidate(
         .into_iter()
         .filter(|task| !unblock_attempted_tasks.contains(&task.id))
         .filter_map(|task| {
-            let downstream = plan.direct_unfinished_dependents(&task.id);
+            let downstream = plan.transitive_unfinished_dependents(&task.id);
             if shelved_tasks.contains_key(&task.id) {
                 resumable_lanes
                     .values()
@@ -5334,7 +5433,8 @@ async fn harvest_resumable_lane_results(
     repo_root: &Path,
     target_branch: &str,
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    plan: &LoopPlanSnapshot,
+    partial_followup_attempts: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
     linear_tracker: &mut Option<LinearTracker>,
     parallel_logger: &ParallelEventLogger,
@@ -5403,7 +5503,8 @@ async fn harvest_resumable_lane_results(
                 let status_suffix = completion_status_suffix(
                     &assignment.task.id,
                     completion_status,
-                    attempted_partial_followups,
+                    plan,
+                    partial_followup_attempts,
                     deferred_partial_tasks,
                 );
                 parallel_logger.info(format!(
@@ -6052,7 +6153,7 @@ fn build_parallel_lane_prompt(
         verification.narrative_guidance.join(" | ")
     };
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- Do not leave human-only review or approval as a blocker. Convert it into an executable check, autonomous closeout proof, or `AUTO_ENV_BLOCKER` only when missing credentials, live infrastructure, legal/account access, or other external control truly prevents completion.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit verification receipt files. They are execution evidence, not notes.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
@@ -7003,21 +7104,21 @@ mod tests {
         next_parallel_unblock_candidate, no_dependency_ready_stop_message,
         parallel_blocker_frontier, parallel_run_root, parallel_status_safety_verdict,
         parallel_tmux_command, parallel_tmux_session_name, parse_loop_plan,
-        parse_parallel_stop_ids, preflight_warning_names, prepare_lane_landing_recovery,
-        prepare_parallel_startup, prepared_landing_recovery_note, preserve_resume_recovery_notes,
-        prioritize_ready_parallel_tasks, read_lane_task_id, ready_parallel_tasks,
-        recent_parallel_host_warnings, record_partial_follow_up, render_default_parallel_prompt,
-        render_parallel_health_summary, repair_parallel_canonical_before_dispatch,
-        repo_forbids_legacy_review_trackers, reset_parallel_lane_root, resolve_loop_worker_env,
-        resolve_reference_repos, salvage_recovery_note, take_resume_candidate_for_task,
-        task_id_from_prompt_filename, tmux_status_line_has_live_worker,
-        try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
-        validate_lane_assignment_metadata, write_lane_assignment_metadata,
-        write_operator_actions_for_ready_tasks, ActiveLaneAssignment, CherryPickFailurePolicy,
-        LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LinearAutoSyncState,
-        LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind, ParallelEventLogger,
-        ParallelPreflightNeeds, ParallelStartupPrep, ParallelUnblockCandidateKind,
-        PartialFollowUpDisposition,
+        parse_parallel_stop_ids, partial_follow_up_attempt_budget, preflight_warning_names,
+        prepare_lane_landing_recovery, prepare_parallel_startup, prepared_landing_recovery_note,
+        preserve_resume_recovery_notes, prioritize_ready_parallel_tasks, read_lane_task_id,
+        ready_parallel_tasks, recent_parallel_host_warnings, record_partial_follow_up,
+        render_default_parallel_prompt, render_parallel_health_summary,
+        repair_parallel_canonical_before_dispatch, repo_forbids_legacy_review_trackers,
+        reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
+        salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
+        tmux_status_line_has_live_worker, try_checkpoint_parallel_host_queue_changes,
+        update_task_completion_in_plan_text, validate_lane_assignment_metadata,
+        write_lane_assignment_metadata, write_operator_actions_for_ready_tasks,
+        ActiveLaneAssignment, CherryPickFailurePolicy, LaneLandingRecoveryPrep, LaneRepoProgress,
+        LaneResumeCandidate, LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus,
+        ParallelBlockerKind, ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
+        ParallelUnblockCandidateKind, PartialFollowUpDisposition,
     };
 
     #[test]
@@ -8950,6 +9051,33 @@ mod tests {
     }
 
     #[test]
+    fn ready_parallel_tasks_prioritizes_load_bearing_partials() {
+        let plan = r#"
+- [~] `TASK-001` Evidence gap blocks downstream work
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-002` Fresh independent task
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-003` Downstream task
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-001", "TASK-002"]
+        );
+    }
+
+    #[test]
     fn prioritize_ready_parallel_tasks_avoids_canonical_dirty_paths() {
         let repo = unique_temp_dir("parallel-ready-priority");
         init_git_repo(&repo);
@@ -8991,27 +9119,75 @@ mod tests {
     }
 
     #[test]
-    fn record_partial_follow_up_gives_one_retry_then_parks() {
-        let mut attempted = BTreeSet::new();
+    fn record_partial_follow_up_respects_attempt_budget() {
+        let mut attempts = BTreeMap::new();
         let mut deferred = BTreeSet::new();
 
         assert_eq!(
-            record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
+            record_partial_follow_up("TASK-001", &mut attempts, &mut deferred, 2),
             PartialFollowUpDisposition::RetryLaterThisRun
         );
-        assert!(attempted.contains("TASK-001"));
+        assert_eq!(attempts.get("TASK-001"), Some(&1));
         assert!(!deferred.contains("TASK-001"));
 
         assert_eq!(
-            record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
+            record_partial_follow_up("TASK-001", &mut attempts, &mut deferred, 2),
+            PartialFollowUpDisposition::RetryLaterThisRun
+        );
+        assert_eq!(attempts.get("TASK-001"), Some(&2));
+        assert!(!deferred.contains("TASK-001"));
+
+        assert_eq!(
+            record_partial_follow_up("TASK-001", &mut attempts, &mut deferred, 2),
             PartialFollowUpDisposition::ParkForRestOfRun
         );
-        assert!(attempted.contains("TASK-001"));
+        assert_eq!(attempts.get("TASK-001"), Some(&3));
         assert!(deferred.contains("TASK-001"));
 
-        clear_partial_follow_up_tracking("TASK-001", &mut attempted, &mut deferred);
-        assert!(!attempted.contains("TASK-001"));
+        clear_partial_follow_up_tracking("TASK-001", &mut attempts, &mut deferred);
+        assert!(!attempts.contains_key("TASK-001"));
         assert!(!deferred.contains("TASK-001"));
+    }
+
+    #[test]
+    fn load_bearing_partial_budget_allows_extra_closeout_attempts() {
+        let plan = parse_loop_plan(
+            r#"
+- [~] `TASK-001` Evidence gap blocks downstream work
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-002` Downstream task
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#,
+        );
+        let mut attempts = BTreeMap::new();
+        let mut deferred = BTreeSet::new();
+
+        for expected_attempt in 1..=3 {
+            assert_eq!(
+                record_partial_follow_up(
+                    "TASK-001",
+                    &mut attempts,
+                    &mut deferred,
+                    partial_follow_up_attempt_budget(&plan, "TASK-001"),
+                ),
+                PartialFollowUpDisposition::RetryLaterThisRun
+            );
+            assert_eq!(attempts.get("TASK-001"), Some(&expected_attempt));
+            assert!(!deferred.contains("TASK-001"));
+        }
+
+        assert_eq!(
+            record_partial_follow_up(
+                "TASK-001",
+                &mut attempts,
+                &mut deferred,
+                partial_follow_up_attempt_budget(&plan, "TASK-001"),
+            ),
+            PartialFollowUpDisposition::ParkForRestOfRun
+        );
+        assert!(deferred.contains("TASK-001"));
     }
 
     #[test]

@@ -1624,7 +1624,7 @@ mod tests {
         fs::create_dir_all(&temp).expect("create temp dir");
         fs::write(
             temp.join("IMPLEMENTATION_PLAN.md"),
-            "# Plan\n\n- [x] `TASK-1` Done\n  - Verification: `cargo test one`\n\n- [ ] `TASK-2` Todo\n",
+            "# Plan\n\n- [x] `TASK-1` Done\n  - Verification: `cargo test one`\n",
         )
         .expect("write plan");
         fs::write(temp.join("REVIEW.md"), format!("{REVIEW_HEADER}\n\n")).expect("write review");

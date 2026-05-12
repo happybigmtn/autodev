@@ -1314,7 +1314,7 @@ mod tests {
     Source of truth: `src/super_command.rs`
     Runtime owner: `src/super_command.rs`
     UI consumers: terminal output
-    Generated artifacts: `.auto/super/*/DETERMINISTIC-GATE.json`
+    Generated artifacts: none -- no generated artifact
     Fixture boundary: production code parses the live root plan, not fixture rows.
     Retired surfaces: legacy active task rows without runtime/UI contract fields.
     Owns: `src/super_command.rs`
@@ -1323,10 +1323,10 @@ mod tests {
     Acceptance criteria: scoped plan passes.
     Verification: {verification}
     Required tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
-    Contract generation: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
+    Contract generation: none -- no generated contract
     Cross-surface tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`
     Review/closeout: reviewer checks super and generation task contracts stay aligned.
-    Completion artifacts: `src/super_command.rs`
+    Completion artifacts: `src/super_command.rs`, `.auto/super/*/DETERMINISTIC-GATE.json`
     Lane kind: code
     Dependencies: none
     Estimated scope: S

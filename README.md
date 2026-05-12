@@ -526,11 +526,19 @@ What it actually does:
   - `## Acceptance Criteria`
   - `## Verification`
   - `## Review And Closeout`
-  - `## Open Questions`
+  - `## Autonomous Defaults`
 - Refuses to accept generated specs that contradict each other on shared contracts such as message
   shapes, signature policy, or speculative future-phase behavior
+- Refuses legacy `## Open Questions`, acceptance sections with no bullets, and generated-artifact
+  sections that list authored docs, screenshots, tests, checkpoints, or source files as if they
+  were generated contract outputs
 - Generates a new implementation plan with dependency-ordered tasks
-- Pushes the generated plan toward explicit checkpoint and decision-gate tasks after risky clusters
+- Pushes app/product plans toward end-to-end production readiness: launch/config, identity,
+  security, transaction/API smoke proof, visual proof, observability, rollback, and first-run DX
+- Generalizes production gates across stacks: generated interface manifests and freshness checks,
+  stale-generated-artifact failures, resource/performance/cost snapshots, adversarial or mutation
+  proof for critical logic, failure-mode recovery, and UI state/accessibility evidence
+- Uses checkpoint and decision-gate tasks only when they close a real risk with executable evidence
 - Requires each active plan task to include real execution fields such as:
   - spec reference
   - why now
@@ -1094,14 +1102,23 @@ What it actually does:
 - Plan rows may declare `Lane kind: code`, `Lane kind: evidence`, or `Lane kind: operator`.
   Code lanes are dispatched to workers. Evidence lanes stay visible as proof/closeout work.
   Operator lanes are not sent to code workers; the host writes the full task contract to
-  `.auto/parallel/operator-actions.md` for live SSH, credential, quorum, funding, or other
-  human/operator-controlled actions.
+  `.auto/parallel/operator-actions.md` for live SSH, credentials, quorum, funding, or other
+  external operations. Tasks should convert review/approval into executable proof where possible
+  and use `AUTO_ENV_BLOCKER` only for genuinely unavailable external control.
 - Host reconciliation requires receipt-backed proof for executable `Verification:` commands. The
   verification wrapper writes JSON as a transient staging artifact; the host embeds compact
   `Auto-Verification-Receipt-*` footers in task closeout commits so proof travels with landed
   work. If a repo has executable verification but no `scripts/run-task-verification.sh` and no
   reachable footer receipt, the host leaves the task `[~]` instead of marking it complete from a
   prose handoff alone.
+- Partial `[~]` rows are treated as dependency blockers, not passive leftovers. A partial that
+  gates downstream work is dispatched before unrelated ready tasks, gets multiple same-run
+  evidence-repair attempts, and receives a lane prompt listing the remaining evidence gaps plus the
+  downstream tasks it is blocking. Non-load-bearing partials still get one follow-up pass and then
+  park for the run to avoid loops.
+- When the ready queue stalls, the host prints the blocker frontier and a concrete next action,
+  such as closing a deferred partial, recovering a shelved lane, resolving an explicit `[!]`
+  blocker, or waiting for an in-flight dependency.
 - Receipt drift is warning-only during sync. If a completed row's repo-local receipt, review
   handoff, or declared artifact evidence no longer matches, the host writes `RECEIPTS-DRIFT.md`
   with exact task IDs and reasons, but it does not demote `[x]` rows back to `[~]`. If a partial
