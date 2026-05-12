@@ -1784,7 +1784,21 @@ fn tmux_status_line_has_live_worker(line: &str) -> bool {
         .rsplit_once(":cmd=")
         .map(|(_, command)| command.trim())
         .unwrap_or_default();
-    !matches!(command, "" | "bash" | "sh" | "zsh" | "fish")
+    matches!(command, "tail" | "auto")
+}
+
+fn parallel_run_has_live_lane_workers(run_root: &Path) -> bool {
+    let lanes_root = run_root.join("lanes");
+    let Ok(entries) = fs::read_dir(&lanes_root) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        let pid_path = entry.path().join("worker.pid");
+        match read_worker_pid(&pid_path) {
+            Ok(Some(pid)) => worker_pid_is_alive(pid).unwrap_or(false),
+            _ => false,
+        }
+    })
 }
 
 fn process_line_cwd_matches_repo(line: &str, repo_root: &Path) -> bool {
@@ -4337,7 +4351,15 @@ fn launch_parallel_tmux_session(
     args: &ParallelArgs,
 ) -> Result<TmuxLaunchStatus> {
     if tmux_session_exists(session_name)? {
-        return Ok(TmuxLaunchStatus::AlreadyRunning);
+        let working_dir = env::current_dir().context("failed to resolve current directory")?;
+        let host_processes = parallel_host_processes_for_repo(&working_dir);
+        let live_lane_workers = parallel_run_has_live_lane_workers(run_root);
+        if !host_processes.is_empty() || live_lane_workers {
+            return Ok(TmuxLaunchStatus::AlreadyRunning);
+        }
+        run_tmux(["kill-session", "-t", session_name]).with_context(|| {
+            format!("failed to replace stale tmux session `{session_name}` before launch")
+        })?;
     }
 
     let command = parallel_tmux_command(run_root, args)?;
@@ -7175,6 +7197,25 @@ mod tests {
     }
 
     #[test]
+    fn tmux_status_line_live_worker_detection_ignores_stray_interactive_panes() {
+        assert!(tmux_status_line_has_live_worker(
+            "2:parallel-lane-1:dead=0:cmd=tail"
+        ));
+        assert!(tmux_status_line_has_live_worker(
+            "1:nullspaceton:dead=0:cmd=auto"
+        ));
+        assert!(!tmux_status_line_has_live_worker(
+            "4:parallel-lane-3:dead=0:cmd=node"
+        ));
+        assert!(!tmux_status_line_has_live_worker(
+            "3:parallel-lane-2:dead=0:cmd=bash"
+        ));
+        assert!(!tmux_status_line_has_live_worker(
+            "2:parallel-lane-1:dead=1:cmd=tail"
+        ));
+    }
+
+    #[test]
     fn default_prompt_lists_reference_repos_when_declared() {
         let prompt =
             render_default_parallel_prompt("main", &[PathBuf::from("/tmp/robopokermulti")]);
@@ -7262,7 +7303,8 @@ mod tests {
     #[test]
     fn tmux_status_worker_detection_ignores_parked_shells() {
         assert!(tmux_status_line_has_live_worker("0:host:dead=0:cmd=auto"));
-        assert!(tmux_status_line_has_live_worker(
+        assert!(tmux_status_line_has_live_worker("1:lane-1:dead=0:cmd=tail"));
+        assert!(!tmux_status_line_has_live_worker(
             "1:lane-1:dead=0:cmd=codex"
         ));
         assert!(!tmux_status_line_has_live_worker("0:host:dead=0:cmd=bash"));
