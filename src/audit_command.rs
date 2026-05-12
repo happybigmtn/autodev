@@ -56,7 +56,7 @@ use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
-use crate::prompt_ethos::with_autodev_prompt_ethos;
+use crate::prompt_ethos::with_autodev_prompt_context;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, run_git,
@@ -2765,7 +2765,10 @@ async fn run_auditor_labeled_with_env_and_timeout(
     extra_env: &[(String, String)],
     timeout_secs: u64,
 ) -> Result<String> {
-    let prompt = with_autodev_prompt_ethos(prompt);
+    let context = label
+        .map(|label| format!("auto audit {label}"))
+        .unwrap_or_else(|| "auto audit auditor".to_string());
+    let prompt = with_autodev_prompt_context(prompt, &context);
     if args.use_kimi_cli && is_kimi_model(&args.model) {
         run_auditor_kimi(repo_root, &prompt, args, extra_env, timeout_secs).await
     } else if is_kimi_model(&args.model) {

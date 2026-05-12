@@ -20,7 +20,7 @@ use crate::kimi_backend::{
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
-use crate::prompt_ethos::with_autodev_prompt_ethos;
+use crate::prompt_ethos::with_autodev_prompt_context;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, prune_pi_runtime_state, push_branch_with_remote_sync,
@@ -1441,7 +1441,7 @@ async fn run_backend_prompt(
     stream_label: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let prompt = with_autodev_prompt_ethos(prompt);
+    let prompt = with_autodev_prompt_context(prompt, stream_label);
     match backend {
         LlmBackend::Codex {
             model,

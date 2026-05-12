@@ -10,7 +10,7 @@ use crate::codex_stream;
 use crate::codex_stream::capture_pi_output;
 use crate::kimi_backend::{kimi_exec_args, parse_kimi_error, resolve_kimi_bin};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
-use crate::prompt_ethos::with_autodev_prompt_ethos;
+use crate::prompt_ethos::{with_autodev_prompt_context, GoalContract};
 use crate::quota_config::Provider;
 use crate::quota_exec;
 use crate::util::{atomic_write, opencode_agent_dir, timestamp_slug};
@@ -85,7 +85,9 @@ pub(crate) async fn run_codex_exec_with_env(
     worker_pid_path: Option<&Path>,
     model_context_window: Option<i64>,
 ) -> Result<std::process::ExitStatus> {
-    let full_prompt = with_autodev_prompt_ethos(full_prompt);
+    let goal = GoalContract::for_context(context_label);
+    write_goal_contract_log(stderr_log_path, &goal)?;
+    let full_prompt = with_autodev_prompt_context(full_prompt, context_label);
     let backend = select_shared_exec_backend(model, codex_bin);
     let (status, stderr_text) = match backend {
         SharedExecBackend::Codex { model, codex_bin } => {
@@ -376,6 +378,29 @@ fn write_stdout_log(stdout_log_path: Option<&Path>, stdout: &str) -> Result<()> 
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn write_goal_contract_log(stderr_log_path: &Path, goal: &GoalContract) -> Result<()> {
+    let path = goal_contract_log_path(stderr_log_path);
+    atomic_write(&path, goal.render().as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn goal_contract_log_path(stderr_log_path: &Path) -> std::path::PathBuf {
+    let file_name = stderr_log_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("stderr.log");
+    let goal_name = if file_name == "stderr.log" {
+        "GOAL.md".to_string()
+    } else if let Some(prefix) = file_name.strip_suffix("-stderr.log") {
+        format!("{prefix}-GOAL.md")
+    } else if let Some(prefix) = file_name.strip_suffix(".stderr.log") {
+        format!("{prefix}.GOAL.md")
+    } else {
+        format!("{file_name}.GOAL.md")
+    };
+    stderr_log_path.with_file_name(goal_name)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_codex(
     repo_root: &Path,
@@ -524,7 +549,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{log_stderr, select_shared_exec_backend, SharedExecBackend};
+    use super::{
+        goal_contract_log_path, log_stderr, select_shared_exec_backend, SharedExecBackend,
+    };
     use crate::util::timestamp_slug;
 
     #[test]
@@ -534,6 +561,18 @@ mod tests {
         let written = fs::read_to_string(&path).expect("read stderr log");
         assert!(written.contains("[no stderr captured]"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn goal_contract_log_path_tracks_stderr_log_shape() {
+        assert_eq!(
+            goal_contract_log_path(Path::new(".auto/logs/gen-stderr.log")),
+            PathBuf::from(".auto/logs/gen-GOAL.md")
+        );
+        assert_eq!(
+            goal_contract_log_path(Path::new(".auto/parallel/lanes/lane-1/stderr.log")),
+            PathBuf::from(".auto/parallel/lanes/lane-1/GOAL.md")
+        );
     }
 
     #[test]

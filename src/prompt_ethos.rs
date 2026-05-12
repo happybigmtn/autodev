@@ -1,4 +1,5 @@
 pub(crate) const AUTODEV_PROMPT_ETHOS_MARKER: &str = "## Autodev Builder Ethos";
+pub(crate) const AUTODEV_GOAL_CONTRACT_MARKER: &str = "## Autodev Goal Contract";
 
 const AUTODEV_PROMPT_ETHOS: &str = r#"## Autodev Builder Ethos
 
@@ -20,9 +21,82 @@ pub(crate) fn with_autodev_prompt_ethos(prompt: &str) -> String {
     format!("{AUTODEV_PROMPT_ETHOS}\n\n{prompt}")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GoalContract {
+    objective: String,
+    success_criteria: Vec<String>,
+    non_goals: Vec<String>,
+    stop_condition: String,
+    evidence: Vec<String>,
+}
+
+impl GoalContract {
+    pub(crate) fn for_context(context_label: &str) -> Self {
+        let context_label = context_label.trim();
+        let phase = if context_label.is_empty() {
+            "the current autodev phase"
+        } else {
+            context_label
+        };
+        Self {
+            objective: format!("Complete `{phase}` end to end without losing the operator's intended outcome."),
+            success_criteria: vec![
+                "Satisfy the assigned prompt, active plan/spec contract, and repo-local instructions.".to_string(),
+                "Prefer runtime/source-of-truth changes before presentation changes when both are in scope.".to_string(),
+                "Produce the required files, commits, reports, receipts, or queue updates named by the phase.".to_string(),
+                "Run the narrowest truthful validation available, and report exact blockers instead of claiming unverified success.".to_string(),
+            ],
+            non_goals: vec![
+                "Do not broaden into unrelated cleanup, refactors, features, or generated artifact churn.".to_string(),
+                "Do not replace durable autodev state such as manifests, implementation plans, review handoffs, receipts, or git history with conversational memory.".to_string(),
+                "Do not leave human-only review as the stopping condition when an executable proof or autonomous best answer is possible.".to_string(),
+            ],
+            stop_condition: "Stop only when the phase is complete with durable evidence, or when a precise external blocker is recorded with the next executable recovery step.".to_string(),
+            evidence: vec![
+                "Changed files or generated artifacts are present at their required paths.".to_string(),
+                "Validation commands, receipt files, review reports, or run logs support the completion claim.".to_string(),
+                "Mutating implementation lanes finish with a clean worktree and an intentional local commit unless the phase is explicitly report-only.".to_string(),
+            ],
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let success_criteria = render_bullets(&self.success_criteria);
+        let non_goals = render_bullets(&self.non_goals);
+        let evidence = render_bullets(&self.evidence);
+        format!(
+            "{AUTODEV_GOAL_CONTRACT_MARKER}\n\nObjective:\n{objective}\n\nSuccess criteria:\n{success_criteria}\nNon-goals:\n{non_goals}\nStop condition:\n{stop_condition}\n\nRequired evidence:\n{evidence}",
+            objective = self.objective,
+            stop_condition = self.stop_condition,
+        )
+    }
+}
+
+pub(crate) fn with_autodev_prompt_context(prompt: &str, context_label: &str) -> String {
+    let prompt = with_autodev_prompt_ethos(prompt);
+    if prompt.contains(AUTODEV_GOAL_CONTRACT_MARKER) {
+        return prompt;
+    }
+    let goal = GoalContract::for_context(context_label);
+    format!("{}\n\n{}", goal.render(), prompt)
+}
+
+fn render_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        return "- none\n".to_string();
+    }
+    items
+        .iter()
+        .map(|item| format!("- {}\n", item.trim()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{with_autodev_prompt_ethos, AUTODEV_PROMPT_ETHOS_MARKER};
+    use super::{
+        with_autodev_prompt_context, with_autodev_prompt_ethos, AUTODEV_GOAL_CONTRACT_MARKER,
+        AUTODEV_PROMPT_ETHOS_MARKER,
+    };
 
     #[test]
     fn ethos_is_prepended_once() {
@@ -32,6 +106,18 @@ mod tests {
         assert!(prompt.contains("Runtime truth before presentation"));
 
         let second = with_autodev_prompt_ethos(&prompt);
+        assert_eq!(second, prompt);
+    }
+
+    #[test]
+    fn goal_contract_wraps_prompt_once() {
+        let prompt = with_autodev_prompt_context("Do work.", "auto parallel lane-1 TASK-001");
+        assert!(prompt.starts_with(AUTODEV_GOAL_CONTRACT_MARKER));
+        assert!(prompt.contains(AUTODEV_PROMPT_ETHOS_MARKER));
+        assert!(prompt.contains("Complete `auto parallel lane-1 TASK-001`"));
+        assert!(prompt.contains("durable autodev state"));
+
+        let second = with_autodev_prompt_context(&prompt, "ignored");
         assert_eq!(second, prompt);
     }
 }

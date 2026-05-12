@@ -118,7 +118,17 @@ boil the lake when the operator asks for it, search before building, protect
 user sovereignty, prefer runtime truth over presentation, and demand evidence
 for claims. This is inspired by gstack `ETHOS.md`; the local copy is embedded
 in code so MiniMax, Kimi, Codex, and other model-routed agents receive the same
-doctrine.
+working doctrine.
+
+Codex-backed phases also receive an Autodev Goal Contract: a phase-specific
+objective, success criteria, non-goals, stop condition, and required evidence.
+Shared-runner phases also write a sibling `GOAL.md` or `*-GOAL.md` beside the
+phase stderr log; direct Codex pipelines keep their existing log layout. This
+is autodev's durable local equivalent of a long-horizon goal: it keeps agents
+oriented without replacing `IMPLEMENTATION_PLAN.md`, manifests, receipts,
+review handoffs, git commits, or other repo-owned completion evidence. If Codex
+exposes a documented noninteractive `/goal` transport, `src/codex_exec.rs` is
+the adapter point.
 
 #### 0. Preflight The Checkout
 

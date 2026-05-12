@@ -15,7 +15,7 @@ use crate::kimi_backend::{
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
-use crate::prompt_ethos::with_autodev_prompt_ethos;
+use crate::prompt_ethos::with_autodev_prompt_context;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
     git_stdout, opencode_agent_dir, push_branch_with_remote_sync, repo_name, run_git,
@@ -1081,7 +1081,7 @@ async fn run_nemesis_backend(
     backend: &NemesisBackend,
     codex_bin: &Path,
 ) -> Result<String> {
-    let prompt = with_autodev_prompt_ethos(prompt);
+    let prompt = with_autodev_prompt_context(prompt, &format!("auto nemesis {}", backend.label()));
     match backend {
         NemesisBackend::Codex {
             model,
