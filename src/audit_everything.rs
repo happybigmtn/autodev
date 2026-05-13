@@ -3952,7 +3952,8 @@ fn reconcile_file_inventory(
         // the per-file pass even if they happen to match a skip pattern.
         let is_context_file = path == "AGENTS.md" || path == "ARCHITECTURE.md";
         if !is_context_file && skip_pattern_matches(&path) {
-            skipped.push((path, skip_pattern_reason(&path)));
+            let reason = skip_pattern_reason(&path);
+            skipped.push((path, reason));
             continue;
         }
         let content = fs::read(&absolute_path)
@@ -5494,7 +5495,10 @@ mod tests {
         assert!(prompt.contains("`[leave_with_reason]`"));
         assert!(prompt.contains("`[none]`"));
         assert!(!prompt.contains("score_out_of_10"));
-        assert!(!prompt.contains("Coverage Note"));
+        // Coverage Note is mentioned only inside the explicit retirement
+        // instruction ("do not include a Coverage Note"), never as a section
+        // the worker is asked to author.
+        assert!(prompt.contains("do not include a Coverage Note"));
         assert!(!prompt.contains("best_version_assessment"));
         assert!(prompt.contains("Autodev Builder Ethos"));
         assert!(prompt.contains("Source-of-truth discipline"));
