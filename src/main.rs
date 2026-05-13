@@ -11,6 +11,7 @@ mod completion_artifacts;
 mod corpus;
 mod design_command;
 mod doctor_command;
+mod gc_command;
 mod generation;
 mod health_command;
 mod kimi_backend;
@@ -121,6 +122,9 @@ enum Command {
     AuditHarvest(AuditHarvestArgs),
     /// Sync implementation-plan items into Linear and run the local Symphony runtime
     Symphony(SymphonyArgs),
+    /// Archive durable audit evidence and prune regenerable per-lane repo clones
+    /// from `.auto/`. Without `--archive --prune` it is a read-only inspection.
+    Gc(gc_command::GcArgs),
 }
 
 #[derive(Args, Clone)]
@@ -1712,6 +1716,7 @@ async fn main() -> Result<()> {
             },
         },
         Command::Symphony(args) => symphony_command::run_symphony(args).await,
+        Command::Gc(args) => gc_command::run_gc(args),
     }
 }
 
