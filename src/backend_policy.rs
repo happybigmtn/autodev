@@ -5,6 +5,128 @@ use serde::Serialize;
 use crate::codex_exec::MAX_CODEX_MODEL_CONTEXT_WINDOW;
 use crate::kimi_backend::KIMI_CLI_DEFAULT_MODEL;
 
+/// Per-stage cost/quality posture. Lets call sites declare *intent* (cheap
+/// dedup vs final authorship) rather than hard-coding `"opus"` everywhere.
+///
+/// Historical state: `claude_exec.rs` defaulted to `"opus"` and every call site
+/// inherited that. The audit per-file pass alone fired 5,000+ opus calls per
+/// run -- single biggest dollar lever in the framework. Plumbing `PromptTier`
+/// into the per-file pass routes those to `Cheap` (Haiku).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptTier {
+    /// Bulk classification, mechanical reformatting, dedup. Haiku-class model.
+    Cheap,
+    /// Authorship, multi-step reasoning. Sonnet-class model.
+    Author,
+    /// Final review, design gate, synthesis. Opus-class model.
+    Final,
+}
+
+impl PromptTier {
+    /// Resolve to a Claude model alias. The env override
+    /// `AUTODEV_TIER_<TIER>_CLAUDE_MODEL` wins so operators can A/B test
+    /// without recompiling.
+    pub(crate) fn claude_model(self) -> String {
+        let env_key = match self {
+            PromptTier::Cheap => "AUTODEV_TIER_CHEAP_CLAUDE_MODEL",
+            PromptTier::Author => "AUTODEV_TIER_AUTHOR_CLAUDE_MODEL",
+            PromptTier::Final => "AUTODEV_TIER_FINAL_CLAUDE_MODEL",
+        };
+        if let Ok(model) = std::env::var(env_key) {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        match self {
+            PromptTier::Cheap => "haiku",
+            PromptTier::Author => "sonnet",
+            PromptTier::Final => "opus",
+        }
+        .to_string()
+    }
+
+    /// Resolve to a Codex model alias.
+    pub(crate) fn codex_model(self) -> String {
+        let env_key = match self {
+            PromptTier::Cheap => "AUTODEV_TIER_CHEAP_CODEX_MODEL",
+            PromptTier::Author => "AUTODEV_TIER_AUTHOR_CODEX_MODEL",
+            PromptTier::Final => "AUTODEV_TIER_FINAL_CODEX_MODEL",
+        };
+        if let Ok(model) = std::env::var(env_key) {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        match self {
+            PromptTier::Cheap => "gpt-5-mini",
+            PromptTier::Author => "gpt-5",
+            PromptTier::Final => "gpt-5",
+        }
+        .to_string()
+    }
+
+    /// Resolve to a reasoning-effort string for the model alias.
+    pub(crate) fn effort(self) -> &'static str {
+        match self {
+            PromptTier::Cheap => "medium",
+            PromptTier::Author => "high",
+            PromptTier::Final => "high",
+        }
+    }
+}
+
+/// Default tier per pipeline stage. Centralizing this lets one tweak alter
+/// behavior across all backends without hunting through call sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PipelineStage {
+    /// Per-file analysis during `auto audit --everything` first pass.
+    AuditPerFile,
+    /// Cross-file synthesis after the first pass.
+    AuditSynthesis,
+    /// Final review gate at audit close.
+    AuditFinalReview,
+    /// Harvest dedup + ranking that feeds IMPLEMENTATION_PLAN.md.
+    Harvest,
+    /// Corpus review / dedup pass.
+    CorpusReview,
+    /// `auto gen` authorship.
+    GenAuthor,
+    /// Lane worker in `auto parallel`.
+    LaneWorker,
+    /// Design perfection gate.
+    DesignGate,
+    /// `auto super` synthesis: CEO review + execution gate.
+    SuperSynthesis,
+    /// Bug repro + fix authorship.
+    BugAuthor,
+    /// Spec authorship.
+    SpecAuthor,
+    /// Mechanical rewrites (init-context pointer refresh, etc.) -- prefer no LLM.
+    MechanicalRewrite,
+}
+
+impl PipelineStage {
+    pub(crate) fn default_tier(self) -> PromptTier {
+        match self {
+            PipelineStage::AuditPerFile
+            | PipelineStage::Harvest
+            | PipelineStage::CorpusReview
+            | PipelineStage::MechanicalRewrite => PromptTier::Cheap,
+            PipelineStage::AuditSynthesis
+            | PipelineStage::GenAuthor
+            | PipelineStage::LaneWorker
+            | PipelineStage::SuperSynthesis
+            | PipelineStage::BugAuthor
+            | PipelineStage::SpecAuthor => PromptTier::Author,
+            PipelineStage::AuditFinalReview | PipelineStage::DesignGate => PromptTier::Final,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum QuotaRouting {

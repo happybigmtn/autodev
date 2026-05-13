@@ -18,6 +18,7 @@ mod loop_command;
 mod nemesis;
 mod parallel_command;
 mod pi_backend;
+mod prompt_builder;
 mod prompt_ethos;
 mod qa_command;
 mod qa_only_command;

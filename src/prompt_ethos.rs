@@ -20,9 +20,36 @@ pub(crate) fn with_autodev_prompt_ethos(prompt: &str) -> String {
     format!("{AUTODEV_PROMPT_ETHOS}\n\n{prompt}")
 }
 
+/// Stage doctrine: the seven invariants every lane/audit/super worker honors.
+///
+/// This block historically lived inline in `parallel_command.rs`, `audit_everything.rs`,
+/// and `super_command.rs`. Keeping it here as a single const means doctrine evolves
+/// in one place and prompts stay cache-friendly across calls.
+pub(crate) const LANE_DOCTRINE_BLOCK: &str = "- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.
+- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.
+- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.
+- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.
+- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.
+- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.
+- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.";
+
+pub(crate) const LANE_DOCTRINE_MARKER: &str = "Source-of-truth discipline:";
+
+/// Inject the lane doctrine block once. Idempotent: re-application is a no-op so
+/// callers can freely compose without checking.
+pub(crate) fn with_lane_doctrine(prompt: &str) -> String {
+    if prompt.contains(LANE_DOCTRINE_MARKER) {
+        return prompt.to_string();
+    }
+    format!("{prompt}\n\n{LANE_DOCTRINE_BLOCK}\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{with_autodev_prompt_ethos, AUTODEV_PROMPT_ETHOS_MARKER};
+    use super::{
+        with_autodev_prompt_ethos, with_lane_doctrine, AUTODEV_PROMPT_ETHOS_MARKER,
+        LANE_DOCTRINE_BLOCK, LANE_DOCTRINE_MARKER,
+    };
 
     #[test]
     fn ethos_is_prepended_once() {
@@ -32,6 +59,32 @@ mod tests {
         assert!(prompt.contains("Runtime truth before presentation"));
 
         let second = with_autodev_prompt_ethos(&prompt);
+        assert_eq!(second, prompt);
+    }
+
+    #[test]
+    fn lane_doctrine_contains_all_seven_invariants() {
+        for invariant in [
+            "Source-of-truth discipline",
+            "Runtime-first order",
+            "Fixture boundary",
+            "Contract generation",
+            "Cross-surface proof",
+            "Retire-first cleanup",
+            "Independent closeout",
+        ] {
+            assert!(
+                LANE_DOCTRINE_BLOCK.contains(invariant),
+                "doctrine missing invariant `{invariant}`"
+            );
+        }
+    }
+
+    #[test]
+    fn lane_doctrine_is_idempotent() {
+        let prompt = with_lane_doctrine("Worker brief.");
+        assert!(prompt.contains(LANE_DOCTRINE_MARKER));
+        let second = with_lane_doctrine(&prompt);
         assert_eq!(second, prompt);
     }
 }
