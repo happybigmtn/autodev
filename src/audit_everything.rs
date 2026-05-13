@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
+use crate::backend_policy::{PipelineStage, PromptTier};
 use crate::codex_exec::run_codex_exec_max_context;
+use crate::prompt_builder::{EthosPosture, PromptSpec};
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, git_stdout, run_git,
     timestamp_slug,
@@ -62,6 +64,38 @@ const DEFAULT_EXCLUDE_FILENAMES: [&str; 4] = [
     "package-lock.json",
     "bun.lockb",
 ];
+
+/// Path prefixes the per-file pass refuses to audit. These are evidence
+/// fixtures, generated artifacts, vendored deps, or build caches that the
+/// model spent ~17.8% of its calls re-reading on prior runs. Files matching
+/// these prefixes still appear in the run's `skipped.json` so coverage is
+/// auditable.
+const SKIP_PATH_PREFIXES: [&str; 7] = [
+    ".bitino/",
+    "ops/evidence/",
+    ".auto/",
+    "target/",
+    "gen-",
+    "node_modules/",
+    ".git/",
+];
+
+/// File extensions the per-file pass refuses to audit. JSON/log/binary
+/// fixtures dominate ~27% of historical first-pass calls.
+const SKIP_FILE_EXTENSIONS: [&str; 14] = [
+    ".json", ".log", ".jsonl", ".txt", ".enc", ".sse", ".tsv", ".snap", ".lock", ".pb", ".bin",
+    ".png", ".jpg", ".pdf",
+];
+
+/// Additional extension treated like `.map` sourcemap output.
+const SKIP_FILE_EXTENSION_MAP: &str = ".map";
+
+/// Line-count threshold below which files are batched by parent directory in
+/// a single model call. Cuts call volume ~40-50% in the historical corpus.
+const GROUP_BATCH_LOC: usize = 80;
+
+/// Maximum number of low-LOC files batched into a single per-file call.
+const GROUP_BATCH_MAX_FILES: usize = 20;
 
 const GSTACK_SKILL_POLICY: &str = r#"# GStack Skill Policy
 
@@ -843,7 +877,18 @@ async fn run_synthesis_phase(
         GroupPhase::Synthesis,
         manifest,
     )
-    .await
+    .await?;
+    // After every group lands, harvest DR entries into the canonical
+    // findings summary. Deterministic and idempotent.
+    let summary =
+        collect_audit_findings(&manifest.run_id, &timestamp_slug(), &paths.report_root)?;
+    let summary_path = write_audit_findings_summary(&paths.report_root, &summary)?;
+    println!(
+        "synthesis harvest: {} DR finding(s) -> {}",
+        summary.findings.len(),
+        summary_path.display()
+    );
+    Ok(())
 }
 
 async fn run_remediation_phase(
@@ -2908,118 +2953,579 @@ Do not edit source code in this phase. Do not run formatters across the repo.
     )
 }
 
-fn build_file_prompt(file: &FileState, context: &str, file_body: &str) -> String {
-    let skill_policy = selected_skill_policy_for_file(&file.path);
-    format!(
-        r#"You are running first-pass professional audit analysis for exactly one tracked file.
+/// Finding classification emitted by the per-file analysis pass. The legacy
+/// 9-section template (What This File Does / Architectural Fit / etc.) was
+/// retired because 93% of files saturated at 7-8/10 and the prose was
+/// repetitive; this enum drives a typed, machine-parseable schema instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FindingClass {
+    DeadCode,
+    Consolidate,
+    Deepen,
+    Simplify,
+    LeaveWithReason,
+    None,
+}
 
-Hard boundaries:
-- Analyze only the file named below.
+impl FindingClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FindingClass::DeadCode => "dead_code",
+            FindingClass::Consolidate => "consolidate",
+            FindingClass::Deepen => "deepen",
+            FindingClass::Simplify => "simplify",
+            FindingClass::LeaveWithReason => "leave_with_reason",
+            FindingClass::None => "none",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dead_code" | "safe_delete" | "deprecated_remove" => Some(FindingClass::DeadCode),
+            "consolidate" => Some(FindingClass::Consolidate),
+            "deepen" | "deepen_module" => Some(FindingClass::Deepen),
+            "simplify" => Some(FindingClass::Simplify),
+            "leave_with_reason" => Some(FindingClass::LeaveWithReason),
+            "none" => Some(FindingClass::None),
+            _ => None,
+        }
+    }
+}
+
+/// A single finding inside a per-file `analysis.json`. The legacy schema
+/// (`score_out_of_10`, `summary`, `best_version_assessment`, etc.) is still
+/// accepted by readers as one cycle of backward compatibility for archived
+/// runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AnalysisFinding {
+    pub(crate) class: FindingClass,
+    pub(crate) body: String,
+    #[serde(default)]
+    pub(crate) paths_implicated: Vec<String>,
+}
+
+/// Top-level per-file analysis emitted by the typed pass.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AnalysisJson {
+    pub(crate) path: String,
+    pub(crate) summary: String,
+    pub(crate) findings: Vec<AnalysisFinding>,
+}
+
+/// Returns `true` if `path` should be skipped by the per-file pass.
+pub(crate) fn skip_pattern_matches(path: &str) -> bool {
+    let trimmed = path.trim_start_matches("./");
+    if SKIP_PATH_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if SKIP_FILE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+        return true;
+    }
+    if lower.ends_with(SKIP_FILE_EXTENSION_MAP) {
+        return true;
+    }
+    false
+}
+
+/// Returns the human-readable reason a path was skipped.
+pub(crate) fn skip_pattern_reason(path: &str) -> &'static str {
+    let trimmed = path.trim_start_matches("./");
+    if SKIP_PATH_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return "skip_path_prefix";
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if SKIP_FILE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+        || lower.ends_with(SKIP_FILE_EXTENSION_MAP)
+    {
+        return "skip_file_extension";
+    }
+    "skip_pattern"
+}
+
+/// Partition `(path, line_count)` pairs into batches grouped by shared parent
+/// directory. Files at or above `GROUP_BATCH_LOC` are returned as singletons;
+/// smaller files are merged into batches up to `GROUP_BATCH_MAX_FILES`.
+pub(crate) fn partition_batches(files: &[(String, usize)]) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (path, line_count) in files {
+        if *line_count >= GROUP_BATCH_LOC {
+            batches.push(vec![path.clone()]);
+            continue;
+        }
+        let parent = parent_dir(path).to_string();
+        by_parent.entry(parent).or_default().push(path.clone());
+    }
+    for (_, mut group) in by_parent {
+        group.sort();
+        while !group.is_empty() {
+            let take = group.len().min(GROUP_BATCH_MAX_FILES);
+            let chunk: Vec<String> = group.drain(..take).collect();
+            batches.push(chunk);
+        }
+    }
+    batches.sort_by(|left, right| left[0].cmp(&right[0]));
+    batches
+}
+
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(idx) => &path[..idx],
+        None => "",
+    }
+}
+
+fn build_file_prompt(file: &FileState, context: &str, file_body: &str) -> String {
+    build_file_prompt_spec(file, context, file_body).render()
+}
+
+pub(crate) fn build_file_prompt_spec(
+    file: &FileState,
+    context: &str,
+    file_body: &str,
+) -> PromptSpec {
+    let skill_policy = selected_skill_policy_for_file(&file.path);
+    let role = format!(
+        "You are running first-pass professional audit analysis for exactly one tracked file. \
+         Tier: cheap (`{model}`). Pipeline stage: {stage:?}.",
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::AuditPerFile,
+    );
+    let edit_boundary = format!(
+        "- Analyze only `{path}`.
 - Do not edit repository source files.
 - Do not read neighboring source files in this first pass.
-- The only architectural context you may use is the injected context below.
-- Write outputs only in the artifact directory.
-- Apply only the selected gstack lenses below for this file's surface. Do not invoke tools in this first pass. Do not discuss unrelated lenses.
-- If the target file content below says it is omitted because the file is large, you must read the entire target file from its path in ordered chunks before writing artifacts. Do not sample. Do not rely on metadata only. If you cannot inspect every line, fail this file instead of writing artifacts.
-
-Injected context:
-{context}
-
-Selected gstack lenses:
-{skill_policy}
-
-Default-on codebase improvement policy:
-- Look for orphaned, deprecated, duplicated, transitional, overabstracted, or agent-generated filler in this file.
-- Apply the deletion test even in first pass: what references, exports, config, docs, generated bindings, tests, or runtime entrypoints would prove this file or part of it is still live?
-- Prefer architectural depth over micro-edits: identify whether this file owns a real invariant, belongs in this module, leaks responsibilities, or should consolidate with another owner.
-- Do not recommend deletion unless you can name the proof still needed or already visible from this file plus injected context.
-
-File under audit:
-- Path: `{path}`
+- Write outputs only in `{artifact_dir}`.
+- If the target file content below says it was omitted because the file is large, you must read the entire target file in ordered chunks before writing artifacts.",
+        path = file.path,
+        artifact_dir = file.artifact_dir,
+    );
+    let inputs_context = format!("{}\n\nSelected gstack lenses:\n{}", context, skill_policy);
+    let inputs_target = format!(
+        "- Path: `{path}`
 - Group: `{group}`
 - Content hash: `{hash}`
 - Artifact directory: `{artifact_dir}`
 
-Write these files:
-1. `{artifact_dir}/analysis.md`
-2. `{artifact_dir}/analysis.json`
-
-`analysis.md` must include:
-- `# {path}`
-- What this file does.
-- Important public types/functions/modules/configuration it owns.
-- How it appears to fit the architecture.
-- Whether it is the best version of itself it could be.
-- Orphan/deprecation signals, AI-slop signals, and simplification/deletion candidates with the evidence needed before removal.
-- Architecture/debt assessment: ownership, module depth, domain vocabulary, dependency direction, duplicated responsibilities, and whether this file appears to carry real substance.
-- A coverage note stating whether the full file content was provided inline or reviewed from disk in chunks.
-- If not 10/10, list expansions, deletions, revisions, clarifications, tests, code refactors, documentation moves, or retirement steps that would make it an idiomatic 10/10 work product.
-- Cross-file questions or likely relationships surfaced by this file, without resolving them from other source files in this pass.
-
-`analysis.json` must be valid JSON with:
-`path`, `group`, `score_out_of_10`, `summary`, `best_version_assessment`, `orphaned_or_deprecated_signals`, `ai_slop_signals`, `deletion_candidates`, `architecture_smells`, `behavior_preservation_needs`, `recommended_actions`, `cross_file_questions`, `coverage`, `confidence`.
-
-Target file content:
 ```text
 {file_body}
-```
-"#,
-        context = context,
-        skill_policy = skill_policy,
+```",
         path = file.path,
         group = file.group,
         hash = file.content_hash,
         artifact_dir = file.artifact_dir,
         file_body = file_body,
-    )
+    );
+    let outputs_md = format!(
+        "Write `{artifact_dir}/analysis.md` with exactly two sections:
+
+1. `# {path}`
+2. A single short paragraph stating what this file does and who owns it (runtime/UI/docs/test/etc.).
+3. A `## Findings` section listing zero or more findings. Each finding is a `-` bullet that starts with the literal tag in square brackets: `[dead_code]`, `[consolidate]`, `[deepen]`, `[simplify]`, `[leave_with_reason]`, or `[none]`. Write one finding per concrete observation; do not pad. If the file is fine as-is, write a single `[none]` bullet that says so.
+
+Do not include a score, do not include a Coverage Note, and do not include a Cross-File Questions section. Those rituals were retired; the synthesis pass handles cross-file linkage.",
+        artifact_dir = file.artifact_dir,
+        path = file.path,
+    );
+    let outputs_json = format!(
+        "Write `{artifact_dir}/analysis.json` with shape:
+
+```json
+{{
+  \"path\": \"{path}\",
+  \"summary\": \"<one paragraph: what + ownership>\",
+  \"findings\": [
+    {{
+      \"class\": \"dead_code | consolidate | deepen | simplify | leave_with_reason | none\",
+      \"body\": \"<concrete observation>\",
+      \"paths_implicated\": [\"<repo-relative paths if cross-file>\"]
+    }}
+  ]
+}}
+```
+
+The JSON must be valid. `class` must be exactly one of the six tags. Empty `findings` is invalid; emit `[{{\"class\": \"none\", \"body\": \"...\", \"paths_implicated\": []}}]` when the file is fine.",
+        artifact_dir = file.artifact_dir,
+        path = file.path,
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::Full)
+        .edit_boundary(edit_boundary)
+        .input("Injected context", inputs_context)
+        .input("File under audit", inputs_target)
+        .output("analysis.md", outputs_md)
+        .output("analysis.json", outputs_json)
+        .evidence_item("Every finding cites the file path or a specific construct inside it.")
+        .evidence_item("Cross-file claims list paths_implicated; do not invent files.")
+        .evidence_item("`dead_code` requires naming the proof needed before removal.")
+}
+
+pub(crate) fn build_batch_file_prompt(
+    files: &[FileState],
+    bodies: &[String],
+    context: &str,
+) -> String {
+    build_batch_file_prompt_spec(files, bodies, context).render()
+}
+
+pub(crate) fn build_batch_file_prompt_spec(
+    files: &[FileState],
+    bodies: &[String],
+    context: &str,
+) -> PromptSpec {
+    let role = format!(
+        "You are running first-pass professional audit analysis for a batch of {count} small \
+         files that share a parent directory. Tier: cheap (`{model}`). \
+         Pipeline stage: {stage:?}.",
+        count = files.len(),
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::AuditPerFile,
+    );
+
+    let mut edit_boundary = String::from(
+        "- Analyze each listed file independently. Do not co-mingle findings across files.
+- Do not edit repository source files.
+- Write outputs only in the per-file artifact directories listed below.
+- Emit one `analysis.md` + `analysis.json` per file. Do not write batch-level files.\n",
+    );
+    edit_boundary.push_str("- Files in this batch:\n");
+    for file in files {
+        edit_boundary.push_str(&format!(
+            "  - `{path}` -> `{artifact_dir}`\n",
+            path = file.path,
+            artifact_dir = file.artifact_dir,
+        ));
+    }
+
+    let skill_set: Vec<String> = files
+        .iter()
+        .flat_map(|file| selected_skill_names_for_file(&file.path))
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let inputs_context = format!(
+        "{}\n\nUnion of selected gstack lenses across the batch:\n{}",
+        context,
+        skill_set
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let mut inputs_files = String::new();
+    for (file, body) in files.iter().zip(bodies.iter()) {
+        inputs_files.push_str(&format!(
+            "\n### `{path}`\n- Group: `{group}`\n- Content hash: `{hash}`\n- Artifact directory: `{artifact_dir}`\n\n```text\n{body}\n```\n",
+            path = file.path,
+            group = file.group,
+            hash = file.content_hash,
+            artifact_dir = file.artifact_dir,
+            body = body,
+        ));
+    }
+
+    let outputs_per_file =
+        "For every file in the batch, emit the same `analysis.md` + `analysis.json` pair the per-file \
+         pass would produce, written into that file's artifact directory. Schema:
+
+`analysis.md`:
+1. `# <path>` heading.
+2. One-paragraph what + ownership.
+3. `## Findings` bullets tagged `[dead_code]`, `[consolidate]`, `[deepen]`, `[simplify]`, `[leave_with_reason]`, or `[none]`.
+
+`analysis.json`:
+```json
+{
+  \"path\": \"<repo-relative path>\",
+  \"summary\": \"<one paragraph>\",
+  \"findings\": [
+    {\"class\": \"<tag>\", \"body\": \"<observation>\", \"paths_implicated\": [\"...\"]}
+  ]
+}
+```
+
+If a file is fine, emit a single `[none]` finding rather than an empty `findings` array."
+            .to_string();
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::Full)
+        .edit_boundary(edit_boundary)
+        .input("Injected context", inputs_context)
+        .input("Files in batch", inputs_files)
+        .output("Per-file artifacts", outputs_per_file)
+        .evidence_item("Every finding cites the owning file.")
+        .evidence_item("Do not merge findings across files in the batch.")
+        .evidence_item("Empty findings arrays are invalid; use `[none]` when a file is clean.")
 }
 
 fn build_synthesis_prompt(paths: &RunPaths, group: &GroupState) -> String {
+    build_synthesis_prompt_spec(paths, group).render()
+}
+
+pub(crate) fn build_synthesis_prompt_spec(paths: &RunPaths, group: &GroupState) -> PromptSpec {
     let skill_policy = selected_skill_policy_for_group(group);
-    format!(
-        r#"You are the second-pass cross-file synthesis reviewer for one professional audit group.
-
-Repository root: `{repo}`
-Group: `{group}`
-Report: `{report}`
-
-Read the group report and the per-file first-pass analyses it references. You may now reason across files in this group and across the concise context docs (`AGENTS.md`, `ARCHITECTURE.md`, and `doctrine/` if present).
-
-The authoritative input set is the report plus the exact first-pass artifact paths referenced inside it. Do not glob or enumerate `{report_root}/files`; unreferenced artifact directories may be stale leftovers from interrupted or upgraded runs.
+    let role = format!(
+        "You are the second-pass cross-file synthesis reviewer for one professional audit group. \
+         Tier: author (`{model}`). Pipeline stage: {stage:?}. Edits no source code.",
+        model = PromptTier::Author.claude_model(),
+        stage = PipelineStage::AuditSynthesis,
+    );
+    let edit_boundary = format!(
+        "- Edit only `{report}` and notes adjacent to it inside `{report_root}`.
+- Do not edit repository source files.
+- Do not glob or enumerate `{report_root}/files`; the only authoritative inputs are the per-file analyses linked from the report.
+- The revised report must not concatenate or re-paste per-file analyses inline. Link to them by `First-pass artifact:` path instead. Re-pasting was 99.2% noise in prior runs.",
+        report = group.report_path,
+        report_root = paths.report_root.display(),
+    );
+    let inputs_scope = format!(
+        "- Repository root: `{repo}`
+- Group: `{group}`
+- Report: `{report}`
 
 Selected gstack lenses for this group:
-{skill_policy}
-
-Default-on codebase improvement policy:
-- Build or update a debt register for this group. Use the classes `safe_delete`, `deprecated_remove`, `consolidate`, `simplify`, `deepen_module`, and `leave_with_reason`.
-- Treat orphaned/deprecated code and AI-slop as first-class audit findings, not optional polish.
-- Prefer cross-file architecture fixes over isolated micro-edits when duplicated responsibility, shallow modules, or weak domain boundaries are the real problem.
-- Require proof before deletion: references/imports/exports, entrypoints, config, docs, generated bindings, tests, runtime paths, and behavior characterization where needed.
-- If proof is missing, record exactly what evidence would be needed instead of guessing.
-
-Revise `{report}` in place. Keep every file represented. Tighten or correct the first-pass assessments based on relationships surfaced between files:
-- duplicated responsibilities
-- unclear ownership or misplaced modules
-- missing invariants
-- dead code or files that should retire
-- deprecated paths, transitional scaffolding, and orphaned exports
-- AI-slop: generic wrappers, hollow abstractions, vague comments, repeated boilerplate, or docs that add words without operational value
-- test gaps
-- docs that should move into `AGENTS.md`, `ARCHITECTURE.md`, doctrine, or inline comments
-- cross-crate/API seams
-
-`{report}` must include a `## Debt Register` section. For each candidate, include path(s), class, recommended action, deletion/refactor proof found, proof still missing, behavior-preservation needs, and risk.
-
-Use the selected lenses as a compact prompt injection, not as permission to bulk-load unrelated skill files. Keep the output grounded in repository evidence.
-
-Do not edit source code in this phase. Only edit `{report}` and optional notes next to it.
-"#,
+{skill_policy}",
         repo = paths.worktree_root.display(),
         group = group.name,
         report = group.report_path,
-        report_root = paths.report_root.display(),
         skill_policy = skill_policy,
-    )
+    );
+
+    let outputs_report = format!(
+        "Rewrite `{report}` so it contains ONLY:
+
+1. A short synthesis prose section (top of file): what this group is, the cross-file invariants, the seams worth watching, and any architectural conclusions the linked analyses jointly support.
+2. A `## Debt Register` section. Use Debt Register IDs of the form `DR-<GROUP_SLUG>-NNN` (e.g. `DR-WEB-001`). For each entry write a fenced block with these fields exactly, one per line:
+   - `DR ID:` `DR-<GROUP_SLUG>-NNN`
+   - `Title:` short imperative
+   - `Class:` one of `dead_code`, `consolidate`, `deepen`, `simplify`, `leave_with_reason`
+   - `Paths:` comma-separated repo-relative paths
+   - `Cluster:` shared parent directory or subsystem label
+   - `Proof found:` evidence already gathered
+   - `Proof missing:` evidence still needed
+   - `Risk:` `low | med | high`
+   - `Complexity:` `single-row | cross-cutting-refactor | generator-level | external-state`
+
+Do not append per-file analyses below the Debt Register. Link to them as `First-pass artifact:` lines inside the synthesis prose, not as inlined content. If no debt exists, write `No actionable debt candidates found.`",
+        report = group.report_path,
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Synthesis scope", inputs_scope)
+        .output("Revised group report", outputs_report)
+        .evidence_item("Every DR entry cites at least one repo-relative path.")
+        .evidence_item("`dead_code` debt requires `Proof found:` evidence visible from this group's analyses.")
+        .evidence_item("Linked per-file analyses replace re-pasted content; the report stays small.")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AuditFinding {
+    pub(crate) dr_id: String,
+    pub(crate) title: String,
+    pub(crate) cluster: String,
+    pub(crate) paths: Vec<String>,
+    pub(crate) class: FindingClass,
+    pub(crate) complexity_hint: String,
+    pub(crate) proof_found: String,
+    pub(crate) proof_missing: String,
+    pub(crate) risk: String,
+    pub(crate) dedup_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AuditFindingsSummary {
+    pub(crate) run_id: String,
+    pub(crate) generated_at: String,
+    pub(crate) findings: Vec<AuditFinding>,
+}
+
+pub(crate) fn audit_finding_dedup_key(
+    cluster: &str,
+    class: FindingClass,
+    paths: &[String],
+) -> String {
+    let mut sorted: Vec<&str> = paths.iter().map(String::as_str).collect();
+    sorted.sort();
+    sorted.dedup();
+    let payload = format!("{}|{}|{}", cluster, class.as_str(), sorted.join(","));
+    let mut hasher = Sha256::new();
+    hasher.update(payload.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn parse_debt_register_entry(block: &str) -> Option<AuditFinding> {
+    let mut dr_id: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut class: Option<FindingClass> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut cluster: Option<String> = None;
+    let mut proof_found: Option<String> = None;
+    let mut proof_missing: Option<String> = None;
+    let mut risk: Option<String> = None;
+    let mut complexity: Option<String> = None;
+
+    for raw_line in block.lines() {
+        let line =
+            raw_line.trim_start_matches(|c: char| c == '-' || c == '*' || c.is_whitespace());
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_end_matches('`')
+            .trim_start_matches('`')
+            .trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            "dr id" | "dr_id" => dr_id = Some(value.to_string()),
+            "title" => title = Some(value.to_string()),
+            "class" => class = FindingClass::parse(value),
+            "paths" => {
+                paths = value
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('`').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "cluster" => cluster = Some(value.to_string()),
+            "proof found" | "proof_found" => proof_found = Some(value.to_string()),
+            "proof missing" | "proof_missing" => proof_missing = Some(value.to_string()),
+            "risk" => risk = Some(value.to_ascii_lowercase()),
+            "complexity" | "complexity_hint" => complexity = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    let dr_id = dr_id?;
+    let title = title?;
+    let class = class?;
+    let cluster = cluster.unwrap_or_default();
+    let dedup_key = audit_finding_dedup_key(&cluster, class, &paths);
+    Some(AuditFinding {
+        dr_id,
+        title,
+        cluster,
+        paths,
+        class,
+        complexity_hint: complexity.unwrap_or_else(|| "single-row".to_string()),
+        proof_found: proof_found.unwrap_or_default(),
+        proof_missing: proof_missing.unwrap_or_default(),
+        risk: risk.unwrap_or_else(|| "med".to_string()),
+        dedup_key,
+    })
+}
+
+pub(crate) fn collect_audit_findings(
+    run_id: &str,
+    generated_at: &str,
+    report_root: &Path,
+) -> Result<AuditFindingsSummary> {
+    let mut findings: Vec<AuditFinding> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let reports_dir = report_root.join("reports");
+    if reports_dir.is_dir() {
+        let mut report_files: Vec<PathBuf> = fs::read_dir(&reports_dir)
+            .with_context(|| format!("failed to read {}", reports_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("md"))
+            .collect();
+        report_files.sort();
+        for path in report_files {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            for finding in extract_findings_from_report(&text) {
+                if seen.insert(finding.dedup_key.clone()) {
+                    findings.push(finding);
+                }
+            }
+        }
+    }
+    findings.sort_by(|left, right| left.dr_id.cmp(&right.dr_id));
+    Ok(AuditFindingsSummary {
+        run_id: run_id.to_string(),
+        generated_at: generated_at.to_string(),
+        findings,
+    })
+}
+
+fn extract_findings_from_report(text: &str) -> Vec<AuditFinding> {
+    let mut findings = Vec::new();
+    let mut block = String::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if block.contains("DR ID") || block.contains("DR_ID") {
+                if let Some(finding) = parse_debt_register_entry(&block) {
+                    findings.push(finding);
+                }
+            }
+            block.clear();
+        } else {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    if block.contains("DR ID") || block.contains("DR_ID") {
+        if let Some(finding) = parse_debt_register_entry(&block) {
+            findings.push(finding);
+        }
+    }
+    findings
+}
+
+pub(crate) fn write_audit_findings_summary(
+    report_root: &Path,
+    summary: &AuditFindingsSummary,
+) -> Result<PathBuf> {
+    let harvest_dir = report_root.join("harvest");
+    fs::create_dir_all(&harvest_dir)
+        .with_context(|| format!("failed to create {}", harvest_dir.display()))?;
+    let path = harvest_dir.join("AUDIT-FINDINGS-SUMMARY.json");
+    let serialized = serde_json::to_vec_pretty(summary)
+        .with_context(|| format!("failed to serialize summary for {}", path.display()))?;
+    atomic_write(&path, &serialized)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+pub(crate) fn write_skipped_manifest(
+    report_root: &Path,
+    skipped: &[(String, &'static str)],
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_root)
+        .with_context(|| format!("failed to create {}", report_root.display()))?;
+    #[derive(Serialize)]
+    struct Entry<'a> {
+        path: &'a str,
+        reason: &'a str,
+    }
+    let entries: Vec<Entry<'_>> = skipped
+        .iter()
+        .map(|(path, reason)| Entry {
+            path: path.as_str(),
+            reason: *reason,
+        })
+        .collect();
+    let path = report_root.join("skipped.json");
+    let serialized = serde_json::to_vec_pretty(&entries)
+        .with_context(|| format!("failed to serialize skip list for {}", path.display()))?;
+    atomic_write(&path, &serialized)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
 }
 
 #[allow(dead_code)]
@@ -3436,9 +3942,17 @@ fn reconcile_file_inventory(
         .collect::<BTreeMap<_, _>>();
     let groups = classify_groups(worktree_root, &tracked);
     let mut files = Vec::new();
+    let mut skipped: Vec<(String, &'static str)> = Vec::new();
     for path in tracked {
         let absolute_path = worktree_root.join(&path);
         if !absolute_path.is_file() {
+            continue;
+        }
+        // Context whitelist: AGENTS.md and ARCHITECTURE.md must always reach
+        // the per-file pass even if they happen to match a skip pattern.
+        let is_context_file = path == "AGENTS.md" || path == "ARCHITECTURE.md";
+        if !is_context_file && skip_pattern_matches(&path) {
+            skipped.push((path, skip_pattern_reason(&path)));
             continue;
         }
         let content = fs::read(&absolute_path)
@@ -3470,6 +3984,10 @@ fn reconcile_file_inventory(
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     manifest.files = files;
+    if !skipped.is_empty() || report_root.join("skipped.json").exists() {
+        skipped.sort_by(|left, right| left.0.cmp(&right.0));
+        write_skipped_manifest(report_root, &skipped)?;
+    }
     rebuild_group_states(report_root, manifest);
     Ok(())
 }
@@ -3760,25 +4278,18 @@ fn build_initial_group_reports(paths: &RunPaths, manifest: &EverythingManifest) 
         body.push_str(&format!("# Audit Report: {}\n\n", group.name));
         body.push_str("## Scope\n\n");
         body.push_str("This report is assembled from first-pass one-file analyses. The synthesis pass may revise it based on cross-file relationships.\n\n");
-        body.push_str("The authoritative first-pass inputs are the artifact paths listed under each file below. Ignore unreferenced artifact directories; interrupted or upgraded runs may leave stale artifacts in `audit/everything/*/files`.\n\n");
-        body.push_str("## Debt Register\n\n");
-        body.push_str("Synthesis must classify debt candidates with `safe_delete`, `deprecated_remove`, `consolidate`, `simplify`, `deepen_module`, or `leave_with_reason`. Each item needs path(s), action, proof found, proof still missing, behavior-preservation needs, and risk. If no candidates exist, write `No actionable debt candidates found.`\n\n");
+        body.push_str("The authoritative first-pass inputs are the artifact paths listed below. Ignore unreferenced artifact directories; interrupted or upgraded runs may leave stale artifacts in `audit/everything/*/files`.\n\n");
+        body.push_str("## First-pass artifacts\n\n");
         for file_path in &group.files {
             if let Some(file) = manifest.files.iter().find(|file| &file.path == file_path) {
-                body.push_str(&format!("## `{}`\n\n", file.path));
-                let analysis = Path::new(&file.artifact_dir).join("analysis.md");
-                body.push_str(&format!("First-pass artifact: `{}`\n\n", file.artifact_dir));
-                if analysis.exists() {
-                    body.push_str(
-                        &fs::read_to_string(&analysis)
-                            .with_context(|| format!("failed to read {}", analysis.display()))?,
-                    );
-                    body.push_str("\n\n");
-                } else {
-                    body.push_str("_First-pass analysis missing._\n\n");
-                }
+                body.push_str(&format!(
+                    "- `{}` -> First-pass artifact: `{}`\n",
+                    file.path, file.artifact_dir
+                ));
             }
         }
+        body.push_str("\n## Debt Register\n\n");
+        body.push_str("Synthesis must list debt candidates as `DR-<GROUP_SLUG>-NNN` entries with these fields: `DR ID`, `Title`, `Class` (`dead_code`, `consolidate`, `deepen`, `simplify`, `leave_with_reason`), `Paths`, `Cluster`, `Proof found`, `Proof missing`, `Risk`, `Complexity`. Legacy classes `safe_delete` and `deprecated_remove` are accepted as aliases for `dead_code`. If no candidates exist, write `No actionable debt candidates found.`\n\n");
         atomic_write(&report_path, body.as_bytes())
             .with_context(|| format!("failed to write {}", report_path.display()))?;
     }
@@ -4965,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn first_pass_prompt_collects_debt_and_architecture_fields() {
+    fn first_pass_prompt_emits_typed_findings_schema() {
         let file = FileState {
             path: "src/lib.rs".to_string(),
             group: "src".to_string(),
@@ -4975,11 +5486,293 @@ mod tests {
         };
         let prompt = build_file_prompt(&file, "# Context\n", "pub fn live() {}\n");
 
-        assert!(prompt.contains("orphaned, deprecated, duplicated"));
-        assert!(prompt.contains("AI-slop signals"));
-        assert!(prompt.contains("deletion_candidates"));
-        assert!(prompt.contains("architecture_smells"));
-        assert!(prompt.contains("behavior_preservation_needs"));
+        assert!(prompt.contains("`findings`"));
+        assert!(prompt.contains("`[dead_code]`"));
+        assert!(prompt.contains("`[consolidate]`"));
+        assert!(prompt.contains("`[deepen]`"));
+        assert!(prompt.contains("`[simplify]`"));
+        assert!(prompt.contains("`[leave_with_reason]`"));
+        assert!(prompt.contains("`[none]`"));
+        assert!(!prompt.contains("score_out_of_10"));
+        assert!(!prompt.contains("Coverage Note"));
+        assert!(!prompt.contains("best_version_assessment"));
+        assert!(prompt.contains("Autodev Builder Ethos"));
+        assert!(prompt.contains("Source-of-truth discipline"));
+    }
+
+    #[test]
+    fn batch_file_prompt_groups_small_files_under_one_role() {
+        let files = vec![
+            FileState {
+                path: "src/util/a.rs".to_string(),
+                group: "src".to_string(),
+                content_hash: "ha".to_string(),
+                artifact_dir: "/tmp/run/files/a".to_string(),
+                status: StageStatus::Pending,
+            },
+            FileState {
+                path: "src/util/b.rs".to_string(),
+                group: "src".to_string(),
+                content_hash: "hb".to_string(),
+                artifact_dir: "/tmp/run/files/b".to_string(),
+                status: StageStatus::Pending,
+            },
+        ];
+        let bodies = vec!["pub fn a() {}".to_string(), "pub fn b() {}".to_string()];
+        let prompt = build_batch_file_prompt(&files, &bodies, "# Context\n");
+        assert!(prompt.contains("batch of 2 small"));
+        assert!(prompt.contains("src/util/a.rs"));
+        assert!(prompt.contains("src/util/b.rs"));
+        assert!(prompt.contains("/tmp/run/files/a"));
+        assert!(prompt.contains("/tmp/run/files/b"));
+        assert!(prompt.contains("one `analysis.md` + `analysis.json` per file"));
+    }
+
+    #[test]
+    fn skip_pattern_matches_known_skip_prefixes_and_extensions() {
+        assert!(skip_pattern_matches(".bitino/foo.rs"));
+        assert!(skip_pattern_matches("ops/evidence/run.json"));
+        assert!(skip_pattern_matches(".auto/run/x.txt"));
+        assert!(skip_pattern_matches("target/debug/app"));
+        assert!(skip_pattern_matches("gen-20260424/spec.md"));
+        assert!(skip_pattern_matches("node_modules/foo/index.js"));
+        assert!(skip_pattern_matches(".git/HEAD"));
+        assert!(skip_pattern_matches("any/where/file.json"));
+        assert!(skip_pattern_matches("any/where/file.log"));
+        assert!(skip_pattern_matches("any/where/file.snap"));
+        assert!(skip_pattern_matches("any/where/file.pdf"));
+        assert!(skip_pattern_matches("any/where/file.map"));
+        assert!(!skip_pattern_matches("src/lib.rs"));
+        assert!(!skip_pattern_matches("crates/bitino-house/src/lib.rs"));
+        assert_eq!(skip_pattern_reason(".bitino/x"), "skip_path_prefix");
+        assert_eq!(skip_pattern_reason("any.json"), "skip_file_extension");
+    }
+
+    #[test]
+    fn partition_batches_keeps_large_files_solo_and_groups_small_by_parent() {
+        let files = vec![
+            ("crates/a/big.rs".to_string(), 500),
+            ("crates/a/small1.rs".to_string(), 30),
+            ("crates/a/small2.rs".to_string(), 40),
+            ("crates/b/small.rs".to_string(), 20),
+            ("crates/a/threshold.rs".to_string(), GROUP_BATCH_LOC),
+        ];
+        let batches = partition_batches(&files);
+        let singletons: Vec<&Vec<String>> =
+            batches.iter().filter(|batch| batch.len() == 1).collect();
+        assert!(singletons.iter().any(|b| b[0] == "crates/a/big.rs"));
+        assert!(singletons.iter().any(|b| b[0] == "crates/a/threshold.rs"));
+        let small_batch = batches
+            .iter()
+            .find(|batch| batch.contains(&"crates/a/small1.rs".to_string()))
+            .expect("small batch present");
+        assert!(small_batch.contains(&"crates/a/small2.rs".to_string()));
+        let b_batch = batches
+            .iter()
+            .find(|batch| batch[0] == "crates/b/small.rs")
+            .expect("b batch present");
+        assert_eq!(b_batch.len(), 1);
+    }
+
+    #[test]
+    fn partition_batches_caps_at_max_files() {
+        let files: Vec<(String, usize)> = (0..50)
+            .map(|i| (format!("crates/a/file{i}.rs"), 10))
+            .collect();
+        let batches = partition_batches(&files);
+        let a_batches: Vec<&Vec<String>> = batches
+            .iter()
+            .filter(|batch| batch[0].starts_with("crates/a/"))
+            .collect();
+        assert!(a_batches.len() >= 3, "expected >= 3 batches: {a_batches:?}");
+        for batch in a_batches {
+            assert!(
+                batch.len() <= GROUP_BATCH_MAX_FILES,
+                "batch exceeded max: {batch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_class_round_trips_through_parse_and_aliases() {
+        for class in [
+            FindingClass::DeadCode,
+            FindingClass::Consolidate,
+            FindingClass::Deepen,
+            FindingClass::Simplify,
+            FindingClass::LeaveWithReason,
+            FindingClass::None,
+        ] {
+            assert_eq!(
+                FindingClass::parse(class.as_str()),
+                Some(class),
+                "round-trip {:?}",
+                class
+            );
+        }
+        assert_eq!(
+            FindingClass::parse("safe_delete"),
+            Some(FindingClass::DeadCode)
+        );
+        assert_eq!(
+            FindingClass::parse("deprecated_remove"),
+            Some(FindingClass::DeadCode)
+        );
+        assert_eq!(
+            FindingClass::parse("deepen_module"),
+            Some(FindingClass::Deepen)
+        );
+        assert_eq!(FindingClass::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn analysis_json_round_trips_typed_findings() {
+        let json = r#"{
+          "path": "src/lib.rs",
+          "summary": "Owns the public surface for the bitino crate.",
+          "findings": [
+            {"class": "consolidate", "body": "Merge helpers", "paths_implicated": ["src/util.rs"]},
+            {"class": "none", "body": "Otherwise clean", "paths_implicated": []}
+          ]
+        }"#;
+        let parsed: AnalysisJson = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.path, "src/lib.rs");
+        assert_eq!(parsed.findings.len(), 2);
+        assert_eq!(parsed.findings[0].class, FindingClass::Consolidate);
+        assert_eq!(parsed.findings[1].class, FindingClass::None);
+
+        let serialized = serde_json::to_string(&parsed).expect("serialize");
+        let reparsed: AnalysisJson = serde_json::from_str(&serialized).expect("reparse");
+        assert_eq!(reparsed.findings[0].class, FindingClass::Consolidate);
+        assert_eq!(reparsed.findings[0].paths_implicated, vec!["src/util.rs"]);
+    }
+
+    #[test]
+    fn audit_findings_dedup_key_is_stable_under_path_reorder() {
+        let key_one = audit_finding_dedup_key(
+            "web/client/routes",
+            FindingClass::Consolidate,
+            &[
+                "web/client/src/routes/foo.ts".to_string(),
+                "web/client/src/routes/bar.ts".to_string(),
+            ],
+        );
+        let key_two = audit_finding_dedup_key(
+            "web/client/routes",
+            FindingClass::Consolidate,
+            &[
+                "web/client/src/routes/bar.ts".to_string(),
+                "web/client/src/routes/foo.ts".to_string(),
+            ],
+        );
+        assert_eq!(key_one, key_two);
+        let different_class = audit_finding_dedup_key(
+            "web/client/routes",
+            FindingClass::DeadCode,
+            &["web/client/src/routes/foo.ts".to_string()],
+        );
+        assert_ne!(key_one, different_class);
+    }
+
+    #[test]
+    fn parse_debt_register_entry_extracts_fields() {
+        let block = "- DR ID: DR-WEB-001\n\
+                     - Title: Consolidate route helpers\n\
+                     - Class: consolidate\n\
+                     - Paths: web/client/src/routes/foo.ts, web/client/src/routes/bar.ts\n\
+                     - Cluster: web/client/routes\n\
+                     - Proof found: helpers duplicated in both files\n\
+                     - Proof missing: callers grep\n\
+                     - Risk: low\n\
+                     - Complexity: cross-cutting-refactor";
+        let finding = parse_debt_register_entry(block).expect("parses");
+        assert_eq!(finding.dr_id, "DR-WEB-001");
+        assert_eq!(finding.class, FindingClass::Consolidate);
+        assert_eq!(finding.paths.len(), 2);
+        assert_eq!(finding.cluster, "web/client/routes");
+        assert_eq!(finding.risk, "low");
+        assert_eq!(finding.complexity_hint, "cross-cutting-refactor");
+        assert!(!finding.dedup_key.is_empty());
+    }
+
+    #[test]
+    fn audit_findings_summary_serializes_with_schema_and_dedup_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "auto-audit-findings-summary-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("audit/everything/test-run");
+        let reports_dir = report_root.join("reports");
+        fs::create_dir_all(&reports_dir).expect("failed to create reports dir");
+        fs::write(
+            reports_dir.join("web.md"),
+            "# Audit Report: web\n\n## Debt Register\n\n\
+             - DR ID: DR-WEB-001\n\
+             - Title: Consolidate route helpers\n\
+             - Class: consolidate\n\
+             - Paths: web/client/src/routes/foo.ts, web/client/src/routes/bar.ts\n\
+             - Cluster: web/client/routes\n\
+             - Proof found: helpers duplicated\n\
+             - Proof missing: caller grep\n\
+             - Risk: low\n\
+             - Complexity: cross-cutting-refactor\n\n\
+             - DR ID: DR-WEB-002\n\
+             - Title: Retire deprecated handler\n\
+             - Class: dead_code\n\
+             - Paths: web/client/src/legacy.ts\n\
+             - Cluster: web/client/legacy\n\
+             - Proof found: no imports\n\
+             - Proof missing: runtime grep\n\
+             - Risk: med\n\
+             - Complexity: single-row\n",
+        )
+        .expect("failed to write report");
+
+        let summary = collect_audit_findings("test-run", "2026-05-13T00:00:00Z", &report_root)
+            .expect("collect findings");
+        assert_eq!(summary.findings.len(), 2);
+        assert_eq!(summary.findings[0].dr_id, "DR-WEB-001");
+        assert_eq!(summary.findings[1].dr_id, "DR-WEB-002");
+        assert!(!summary.findings[0].dedup_key.is_empty());
+        assert_ne!(
+            summary.findings[0].dedup_key,
+            summary.findings[1].dedup_key
+        );
+
+        let path = write_audit_findings_summary(&report_root, &summary).expect("write summary");
+        assert!(path.ends_with("harvest/AUDIT-FINDINGS-SUMMARY.json"));
+        let raw = fs::read_to_string(&path).expect("read summary");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(value["run_id"], "test-run");
+        assert_eq!(value["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(value["findings"][0]["class"], "consolidate");
+        assert_eq!(value["findings"][1]["class"], "dead_code");
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn skipped_manifest_records_path_reason_pairs() {
+        let dir = std::env::temp_dir().join(format!(
+            "auto-audit-skipped-manifest-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("audit/everything/test-run");
+        let skipped = vec![
+            (".bitino/run.json".to_string(), "skip_path_prefix"),
+            ("ops/evidence/a.log".to_string(), "skip_path_prefix"),
+            ("any.snap".to_string(), "skip_file_extension"),
+        ];
+        let path = write_skipped_manifest(&report_root, &skipped).expect("write");
+        let raw = fs::read_to_string(&path).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        let array = value.as_array().expect("array");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array[0]["path"], ".bitino/run.json");
+        assert_eq!(array[0]["reason"], "skip_path_prefix");
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
@@ -5036,7 +5829,8 @@ mod tests {
         assert!(report.contains("path-hash-content-hash"));
         assert!(report.contains("Ignore unreferenced artifact directories"));
         assert!(report.contains("## Debt Register"));
-        assert!(report.contains("safe_delete"));
+        assert!(report.contains("dead_code"));
+        assert!(!report.contains("A focused first-pass analysis."));
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
@@ -5063,12 +5857,15 @@ mod tests {
 
         let prompt = build_synthesis_prompt(&paths, &group);
 
-        assert!(prompt.contains("exact first-pass artifact paths referenced inside it"));
         assert!(prompt.contains("Do not glob or enumerate"));
         assert!(prompt.contains("/tmp/run/worktree/audit/everything/test-run/files"));
-        assert!(prompt.contains("Build or update a debt register"));
-        assert!(prompt.contains("AI-slop"));
+        assert!(prompt.contains("must not concatenate or re-paste"));
         assert!(prompt.contains("## Debt Register"));
+        assert!(prompt.contains("DR-<GROUP_SLUG>-NNN"));
+        assert!(prompt.contains("Complexity:"));
+        assert!(prompt.contains("Risk:"));
+        assert!(prompt.contains("Autodev Builder Ethos"));
+        assert!(!prompt.contains("Source-of-truth discipline"));
     }
 
     #[test]
