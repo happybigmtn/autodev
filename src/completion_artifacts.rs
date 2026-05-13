@@ -856,6 +856,51 @@ fn inspect_verification_receipt(
     if !verification_receipt_required {
         return (true, None);
     }
+    let mut json_receipt_status = None::<String>;
+    if verification_receipt_path.exists() {
+        let receipt_text = match fs::read_to_string(verification_receipt_path) {
+            Ok(text) => text,
+            Err(err) => {
+                json_receipt_status = Some(format!(
+                    "failed to read verification receipt `{}`: {err}",
+                    verification_receipt_path.display()
+                ));
+                String::new()
+            }
+        };
+        if !receipt_text.is_empty() {
+            match serde_json::from_str::<VerificationReceipt>(&receipt_text) {
+                Ok(receipt) => {
+                    if let Some(problem) = verification_receipt_freshness_problem(
+                        repo_root,
+                        verification_receipt_path,
+                        &receipt,
+                        expected_commands,
+                        declared_artifacts,
+                    ) {
+                        json_receipt_status = Some(format!(
+                            "stale verification receipt `{}`: {problem}",
+                            verification_receipt_path.display()
+                        ));
+                    } else if let Some(problem) = verification_receipt_content_problem(
+                        verification_receipt_path,
+                        &receipt,
+                        expected_commands,
+                    ) {
+                        json_receipt_status = Some(problem);
+                    } else {
+                        return (true, None);
+                    }
+                }
+                Err(err) => {
+                    json_receipt_status = Some(format!(
+                        "invalid verification receipt `{}`: {err}",
+                        verification_receipt_path.display()
+                    ));
+                }
+            }
+        }
+    }
     if let Some(footer) = latest_verification_receipt_footer(
         repo_root,
         task_id_from_receipt_path(verification_receipt_path)
@@ -914,166 +959,7 @@ fn inspect_verification_receipt(
             )),
         );
     }
-    if !verification_receipt_path.exists() {
-        return (false, None);
-    }
-
-    let receipt_text = match fs::read_to_string(verification_receipt_path) {
-        Ok(text) => text,
-        Err(err) => {
-            return (
-                false,
-                Some(format!(
-                    "failed to read verification receipt `{}`: {err}",
-                    verification_receipt_path.display()
-                )),
-            );
-        }
-    };
-    let receipt = match serde_json::from_str::<VerificationReceipt>(&receipt_text) {
-        Ok(receipt) => receipt,
-        Err(err) => {
-            return (
-                false,
-                Some(format!(
-                    "invalid verification receipt `{}`: {err}",
-                    verification_receipt_path.display()
-                )),
-            );
-        }
-    };
-
-    if let Some(problem) = verification_receipt_freshness_problem(
-        repo_root,
-        verification_receipt_path,
-        &receipt,
-        expected_commands,
-        declared_artifacts,
-    ) {
-        return (
-            false,
-            Some(format!(
-                "stale verification receipt `{}`: {problem}",
-                verification_receipt_path.display()
-            )),
-        );
-    }
-
-    let mut missing = expected_commands
-        .iter()
-        .filter(|command| {
-            !receipt
-                .commands
-                .iter()
-                .any(|entry| verification_receipt_command_matches(entry, command))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    missing.sort();
-    if !missing.is_empty() {
-        return (
-            false,
-            Some(format!(
-                "verification receipt `{}` is missing command(s): {}",
-                verification_receipt_path.display(),
-                missing
-                    .iter()
-                    .map(|command| format!("`{command}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        );
-    }
-
-    let mut failed = expected_commands
-        .iter()
-        .filter(|command| {
-            let matching_entries = receipt
-                .commands
-                .iter()
-                .filter(|entry| verification_receipt_command_matches(entry, command))
-                .collect::<Vec<_>>();
-            !matching_entries.is_empty()
-                && matching_entries.iter().all(|entry| {
-                    entry.status.as_deref() != Some("passed") || entry.exit_code != Some(0)
-                })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    failed.sort();
-    if !failed.is_empty() {
-        return (
-            false,
-            Some(format!(
-                "verification receipt `{}` has failed command(s): {}",
-                verification_receipt_path.display(),
-                failed
-                    .iter()
-                    .map(|command| format!("`{command}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        );
-    }
-
-    let mut zero_test = expected_commands
-        .iter()
-        .filter(|command| {
-            receipt
-                .commands
-                .iter()
-                .filter(|entry| verification_receipt_command_matches(entry, command))
-                .any(verification_receipt_reports_zero_tests)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    zero_test.sort();
-    if !zero_test.is_empty() {
-        return (
-            false,
-            Some(format!(
-                "verification receipt `{}` reported zero-test run(s): {}",
-                verification_receipt_path.display(),
-                zero_test
-                    .iter()
-                    .map(|command| format!("`{command}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        );
-    }
-
-    let mut unsuperseded_failed = receipt
-        .commands
-        .iter()
-        .filter(|entry| !verification_receipt_command_passed(entry))
-        .filter(|entry| {
-            !verification_receipt_failed_entry_is_superseded(
-                entry,
-                &receipt.commands,
-                expected_commands,
-            )
-        })
-        .map(|entry| entry.command.clone())
-        .collect::<Vec<_>>();
-    unsuperseded_failed.sort();
-    unsuperseded_failed.dedup();
-    if !unsuperseded_failed.is_empty() {
-        return (
-            false,
-            Some(format!(
-                "verification receipt `{}` has unsuperseded failed command(s): {}",
-                verification_receipt_path.display(),
-                unsuperseded_failed
-                    .iter()
-                    .map(|command| format!("`{command}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        );
-    }
-
-    (true, None)
+    (false, json_receipt_status)
 }
 
 fn task_id_from_receipt_path(path: &Path) -> Option<String> {

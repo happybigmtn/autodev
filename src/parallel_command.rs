@@ -4029,7 +4029,31 @@ fn audit_parallel_completion_drift(
         .iter()
         .filter(|task| task.status == LoopTaskStatus::Done)
     {
-        let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        let mut evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        let gap = assess_task_completion_gap(&task.markdown, &evidence);
+        if !evidence.is_fully_evidenced()
+            && gap.kind == CompletionGapKind::LocalRepairable
+            && run_host_verification_receipt(repo_root, &task.id, &task.markdown)?
+        {
+            parallel_logger.info(format!(
+                "self-heal: refreshed host verification receipt for completed `{}` during drift audit",
+                task.id
+            ));
+            evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        }
+        let review_can_complete_evidence = !evidence.has_review_handoff
+            && evidence.verification_receipt_present
+            && evidence.missing_completion_artifacts.is_empty()
+            && evidence.unresolved_audit_findings.is_empty();
+        if evidence.is_fully_evidenced() || review_can_complete_evidence {
+            if ensure_host_review_handoff(repo_root, &task.id, &[], &evidence)? {
+                parallel_logger.info(format!(
+                    "self-heal: added REVIEW.md handoff for completed `{}` during drift audit",
+                    task.id
+                ));
+            }
+            evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        }
         if evidence.is_fully_evidenced() {
             continue;
         }
@@ -9689,10 +9713,12 @@ Estimated scope: S\n";
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
         assert_eq!(persisted, plan);
-        let triage =
-            fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).expect("triage should persist");
-        assert!(triage.contains("- [x] `TASK-001` First task"));
-        assert!(triage.contains("missing REVIEW.md handoff"));
+        assert!(
+            !repo.join("RECEIPTS-DRIFT.md").exists(),
+            "self-healed review handoff should avoid drift triage"
+        );
+        let review = fs::read_to_string(repo.join("REVIEW.md")).expect("review should persist");
+        assert!(review.contains("## `TASK-001`"));
     }
 
     #[test]
