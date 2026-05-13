@@ -5114,7 +5114,7 @@ fn next_parallel_unblock_candidate(
     active_tasks: &BTreeSet<String>,
     shelved_tasks: &BTreeMap<String, String>,
     deferred_partial_tasks: &BTreeSet<String>,
-    resumable_lanes: &BTreeMap<usize, LaneResumeCandidate>,
+    _resumable_lanes: &BTreeMap<usize, LaneResumeCandidate>,
     unblock_attempted_tasks: &BTreeSet<String>,
 ) -> Option<ParallelUnblockCandidate> {
     let mut candidates = plan
@@ -5124,14 +5124,11 @@ fn next_parallel_unblock_candidate(
         .filter_map(|task| {
             let downstream = plan.transitive_unfinished_dependents(&task.id);
             if shelved_tasks.contains_key(&task.id) {
-                resumable_lanes
-                    .values()
-                    .any(|candidate| candidate.task.id == task.id)
-                    .then_some(ParallelUnblockCandidate {
-                        task,
-                        kind: ParallelUnblockCandidateKind::ShelvedResume,
-                        downstream,
-                    })
+                Some(ParallelUnblockCandidate {
+                    task,
+                    kind: ParallelUnblockCandidateKind::ShelvedResume,
+                    downstream,
+                })
             } else if deferred_partial_tasks.contains(&task.id) {
                 Some(ParallelUnblockCandidate {
                     task,
@@ -7761,6 +7758,34 @@ mod tests {
         .expect("expected an unblock candidate");
         assert_eq!(candidate.task.id, "TASK-S");
         assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+    }
+
+    #[test]
+    fn next_parallel_unblock_candidate_launches_fresh_goal_for_shelved_blocker() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-A` blocked by shelved
+  Dependencies: `TASK-S`
+- [ ] `TASK-S` ready shelved blocker
+  Dependencies: none
+"#,
+        );
+        let task_s = plan.task("TASK-S").expect("TASK-S should exist").clone();
+        let shelved = BTreeMap::from([("TASK-S".to_string(), task_s.markdown.clone())]);
+
+        let candidate = next_parallel_unblock_candidate(
+            &plan,
+            &BTreeSet::new(),
+            &shelved,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect("expected a fresh /goal unblock candidate");
+
+        assert_eq!(candidate.task.id, "TASK-S");
+        assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+        assert_eq!(candidate.downstream, vec!["TASK-A".to_string()]);
     }
 
     #[test]
