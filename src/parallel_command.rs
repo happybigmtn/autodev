@@ -2992,6 +2992,7 @@ async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::None => {
+                let mut clean_no_commit_evidence_error = None::<String>;
                 match reconcile_parallel_clean_no_commit(
                     repo_root,
                     target_branch,
@@ -3030,6 +3031,36 @@ async fn run_parallel_loop(
                     Err(err) => {
                         parallel_logger.warn(format!(
                             "warning: failed checking canonical evidence for clean no-commit lane-{} `{}`: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        ));
+                        clean_no_commit_evidence_error = Some(format!("{err:#}"));
+                    }
+                }
+                let recovery_note = clean_no_commit_goal_recovery_note(
+                    &assignment,
+                    clean_no_commit_evidence_error.as_deref(),
+                );
+                match try_spawn_lane_recovery_attempt(
+                    &mut join_set,
+                    &lane_config,
+                    prompt_template,
+                    &plan,
+                    &mut assignment,
+                    target_branch,
+                    args.max_retries,
+                    parallel_logger,
+                    "exited cleanly without a local commit or complete canonical evidence",
+                    recovery_note,
+                ) {
+                    Ok(true) => {
+                        active_tasks.insert(assignment.task.id.clone());
+                        active_lanes.insert(assignment.lane_index, assignment);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed restarting lane-{} `{}` for clean no-commit recovery: {err:#}; shelving for the rest of this run",
                             assignment.lane_index, assignment.task.id
                         ));
                     }
@@ -3287,6 +3318,30 @@ Required recovery:
 
 Dirty status seen by the host:
 {status}"#
+    )
+}
+
+fn clean_no_commit_goal_recovery_note(
+    assignment: &ActiveLaneAssignment,
+    evidence_error: Option<&str>,
+) -> String {
+    let evidence_error = evidence_error
+        .map(|error| format!("\n\nHost evidence inspection error:\n{error}"))
+        .unwrap_or_default();
+    format!(
+        r#"The previous attempt exited successfully, but it produced no local commit and the host could not close `{task_id}` from canonical evidence alone.
+
+Run this lane as a `/goal`-style closeout: stay on `{task_id}` until the shelved task is durably addressed.
+
+Required recovery:
+1. Re-read the task in `IMPLEMENTATION_PLAN.md`, its `REVIEW.md` entry, and any lane stdout/stderr notes.
+2. Inspect the already-started work before editing; if the implementation is present, do not redo it.
+3. Run the exact task verification command from the plan when it is local and executable.
+4. If verification passes and there are no source edits needed, create an intentional empty evidence commit with a verification receipt/footer or update `REVIEW.md`/`IMPLEMENTATION_PLAN.md` so the host has durable closeout evidence.
+5. If verification fails, fix the task-owned cause and commit the fix plus evidence.
+6. Stop only with a clean worktree and at least one local task/evidence commit, or write a precise `AUTO_ENV_BLOCKER` with the next executable recovery command.
+7. Do not push or edit shared queue files outside this task; the host still owns landing and queue reconciliation.{evidence_error}"#,
+        task_id = assignment.task.id
     )
 }
 
@@ -5101,11 +5156,11 @@ fn render_parallel_unblock_note(candidate: &ParallelUnblockCandidate) -> String 
     };
     match candidate.kind {
         ParallelUnblockCandidateKind::ShelvedResume => format!(
-            "This lane is a host-directed dependency-unblock attempt. The normal ready queue is empty because this previously shelved task is still load-bearing.\n\nDownstream tasks blocked by `{}`: {}\n\nFocus on salvaging and landing the already-started work instead of broadening scope.",
+            "This lane is a host-directed `/goal` dependency-unblock attempt. The normal ready queue is empty because this previously shelved task is still load-bearing.\n\nDownstream tasks blocked by `{}`: {}\n\nFocus on salvaging and landing the already-started work instead of broadening scope. Stop only with a clean worktree and a local task/evidence commit, or a precise `AUTO_ENV_BLOCKER` naming the next executable command.",
             candidate.task.id, downstream
         ),
         ParallelUnblockCandidateKind::DeferredPartialCloseout => format!(
-            "This lane is the final same-run closeout pass for a parked `[~]` task. The normal ready queue is empty and the remaining frontier depends on closing this task honestly.\n\nDownstream tasks blocked by `{}`: {}\n\nDo not redo landed implementation. Focus only on the remaining review/verification/artifact gap.",
+            "This lane is the final same-run `/goal` closeout pass for a parked `[~]` task. The normal ready queue is empty and the remaining frontier depends on closing this task honestly.\n\nDownstream tasks blocked by `{}`: {}\n\nDo not redo landed implementation. Focus only on the remaining review/verification/artifact gap. Stop only with durable evidence, a local closeout commit, or a precise `AUTO_ENV_BLOCKER`.",
             candidate.task.id, downstream
         ),
     }
@@ -7185,7 +7240,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::anyhow;
 
@@ -7199,8 +7254,9 @@ mod tests {
     use super::{
         audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
         checkpoint_parallel_host_queue_changes, cherry_pick_lane_range,
-        classify_parallel_preflight_needs, clear_partial_follow_up_tracking,
-        default_cargo_build_jobs_for, dirty_worktree_recovery_note, discover_sibling_git_repos,
+        classify_parallel_preflight_needs, clean_no_commit_goal_recovery_note,
+        clear_partial_follow_up_tracking, default_cargo_build_jobs_for,
+        dirty_worktree_recovery_note, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, environment_blocker_reason,
         host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
         is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
@@ -7215,15 +7271,16 @@ mod tests {
         preserve_resume_recovery_notes, prioritize_ready_parallel_tasks, read_lane_task_id,
         ready_parallel_tasks, recent_parallel_host_warnings, reconcile_parallel_landed_task,
         record_partial_follow_up, render_default_parallel_prompt, render_parallel_health_summary,
-        repair_parallel_canonical_before_dispatch, repo_forbids_legacy_review_trackers,
-        reset_parallel_lane_root, resolve_loop_worker_env, resolve_reference_repos,
-        salvage_recovery_note, take_resume_candidate_for_task, task_id_from_prompt_filename,
-        tmux_status_line_has_live_worker, try_checkpoint_parallel_host_queue_changes,
-        update_task_completion_in_plan_text, validate_lane_assignment_metadata, verification_plan,
-        write_lane_assignment_metadata, write_operator_actions_for_ready_tasks,
-        ActiveLaneAssignment, CherryPickFailurePolicy, LaneLandingRecoveryPrep, LaneRepoProgress,
-        LaneResumeCandidate, LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus,
-        ParallelBlockerKind, ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
+        render_parallel_unblock_note, repair_parallel_canonical_before_dispatch,
+        repo_forbids_legacy_review_trackers, reset_parallel_lane_root, resolve_loop_worker_env,
+        resolve_reference_repos, salvage_recovery_note, take_resume_candidate_for_task,
+        task_id_from_prompt_filename, tmux_status_line_has_live_worker,
+        try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
+        validate_lane_assignment_metadata, verification_plan, write_lane_assignment_metadata,
+        write_operator_actions_for_ready_tasks, ActiveLaneAssignment, CherryPickFailurePolicy,
+        LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LinearAutoSyncState,
+        LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind, ParallelEventLogger,
+        ParallelPreflightNeeds, ParallelStartupPrep, ParallelUnblockCandidate,
         ParallelUnblockCandidateKind, PartialFollowUpDisposition,
     };
 
@@ -7680,6 +7737,59 @@ mod tests {
         .expect("expected an unblock candidate");
         assert_eq!(candidate.task.id, "TASK-S");
         assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+    }
+
+    #[test]
+    fn shelved_unblock_note_is_goal_driven_and_commit_bound() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `TASK-A` blocked by shelved
+  Dependencies: `TASK-S`
+- [ ] `TASK-S` ready shelved blocker
+  Dependencies: none
+"#,
+        );
+        let task = plan.task("TASK-S").expect("TASK-S should exist").clone();
+        let candidate = ParallelUnblockCandidate {
+            task,
+            kind: ParallelUnblockCandidateKind::ShelvedResume,
+            downstream: vec!["TASK-A".to_string()],
+        };
+
+        let note = render_parallel_unblock_note(&candidate);
+        assert!(note.contains("`/goal` dependency-unblock"));
+        assert!(note.contains("local task/evidence commit"));
+        assert!(note.contains("AUTO_ENV_BLOCKER"));
+    }
+
+    #[test]
+    fn clean_no_commit_recovery_note_demands_goal_closeout_commit() {
+        let task = parse_loop_plan("- [ ] `TASK-S` Close stale shelf\n  Dependencies: none\n")
+            .task("TASK-S")
+            .expect("TASK-S should exist")
+            .clone();
+        let assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task,
+            resumed: false,
+            lane_root: PathBuf::from("/tmp/lane-1"),
+            lane_repo_root: PathBuf::from("/tmp/lane-1/repo"),
+            base_commit: "abc123".to_string(),
+            stdout_log_path: PathBuf::from("/tmp/lane-1/stdout.log"),
+            stderr_log_path: PathBuf::from("/tmp/lane-1/stderr.log"),
+            worker_pid_path: PathBuf::from("/tmp/lane-1/worker.pid"),
+            clean_commit_since: Some(Instant::now()),
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let note = clean_no_commit_goal_recovery_note(&assignment, Some("receipt stale"));
+        assert!(note.contains("/goal"));
+        assert!(note.contains("TASK-S"));
+        assert!(note.contains("empty evidence commit"));
+        assert!(note.contains("AUTO_ENV_BLOCKER"));
+        assert!(note.contains("receipt stale"));
     }
 
     #[test]

@@ -44,6 +44,7 @@ impl GoalContract {
                 "Satisfy the assigned prompt, active plan/spec contract, and repo-local instructions.".to_string(),
                 "Prefer runtime/source-of-truth changes before presentation changes when both are in scope.".to_string(),
                 "Produce the required files, commits, reports, receipts, or queue updates named by the phase.".to_string(),
+                "For recovery or parallel lanes, do not exit successfully from a load-bearing task without a local task/evidence commit unless the phase is explicitly report-only.".to_string(),
                 "Run the narrowest truthful validation available, and report exact blockers instead of claiming unverified success.".to_string(),
             ],
             non_goals: vec![
@@ -51,7 +52,7 @@ impl GoalContract {
                 "Do not replace durable autodev state such as manifests, implementation plans, review handoffs, receipts, or git history with conversational memory.".to_string(),
                 "Do not leave human-only review as the stopping condition when an executable proof or autonomous best answer is possible.".to_string(),
             ],
-            stop_condition: "Stop only when the phase is complete with durable evidence, or when a precise external blocker is recorded with the next executable recovery step.".to_string(),
+            stop_condition: "Stop only when the phase is complete with durable evidence and required commit/queue state, or when a precise external blocker is recorded with the next executable recovery step.".to_string(),
             evidence: vec![
                 "Changed files or generated artifacts are present at their required paths.".to_string(),
                 "Validation commands, receipt files, review reports, or run logs support the completion claim.".to_string(),
