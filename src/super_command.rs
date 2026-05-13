@@ -7,10 +7,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::backend_policy::PipelineStage;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::design_command;
 use crate::generation;
 use crate::parallel_command;
+use crate::prompt_builder::{EthosPosture, PromptSpec};
 use crate::state::load_state;
 use crate::task_parser::{parse_tasks, validate_execution_row, PLAN_TASK_PROCESS_FIELDS};
 use crate::util::{
@@ -21,17 +23,77 @@ use crate::{
     ParallelCargoTarget, SuperArgs,
 };
 
-const SUPER_REPORT_FILES: [&str; 7] = [
-    "CEO-14-DAY-PLAN.md",
-    "FUNCTIONAL-REVIEWS.md",
-    "PRODUCTION-READINESS.md",
-    "RISK-REGISTER.md",
-    "QUALITY-GATES.md",
-    "SYSTEM-MAP.md",
-    "SUPER-REPORT.md",
-];
+/// Canonical machine-readable findings emitted by the corpus-review phase.
+/// Replaces the historical seven-file markdown bundle
+/// (`CEO-14-DAY-PLAN.md`, `FUNCTIONAL-REVIEWS.md`, `PRODUCTION-READINESS.md`,
+/// `RISK-REGISTER.md`, `QUALITY-GATES.md`, `SYSTEM-MAP.md`, `SUPER-REPORT.md`),
+/// the `CROSS-REPO-MANIFEST.json` stub, and the `CODEBASE-BOOK/` dump --
+/// all of which had no downstream consumers and only existence-checked.
+const SUPER_FINDINGS_FILE: &str = "super-findings.json";
+/// Human-readable narrative rendered from the JSON. Operator-facing.
+const SUPER_REPORT_FILE: &str = "SUPER-REPORT.md";
 const EXECUTION_GATE_FILE: &str = "EXECUTION-GATE.md";
 const IMPLEMENTATION_PLAN: &str = "IMPLEMENTATION_PLAN.md";
+
+/// Canonical structure of `super-findings.json`. Single source of truth for the
+/// CEO functional review pass; `SUPER-REPORT.md` is its rendered narrative view.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperFindings {
+    pub(crate) run_id: String,
+    pub(crate) generated_at: String,
+    pub(crate) readiness: String,
+    #[serde(default)]
+    pub(crate) blockers: Vec<SuperBlocker>,
+    #[serde(default)]
+    pub(crate) risks: Vec<SuperRisk>,
+    #[serde(default)]
+    pub(crate) gates: Vec<SuperGate>,
+    pub(crate) campaign_plan: SuperCampaignPlan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperBlocker {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) owner_surface: String,
+    pub(crate) severity: String,
+    pub(crate) evidence: String,
+    pub(crate) remediation_hint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperRisk {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) likelihood: String,
+    pub(crate) impact: String,
+    pub(crate) mitigation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperGate {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) evidence_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperCampaignPlan {
+    pub(crate) horizon_days: u32,
+    #[serde(default)]
+    pub(crate) milestones: Vec<SuperMilestone>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SuperMilestone {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) day: u32,
+    #[serde(default)]
+    pub(crate) depends_on: Vec<String>,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 struct SuperManifest {
@@ -72,15 +134,6 @@ struct SuperStage {
     name: String,
     status: String,
     artifact: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SuperRepoRecord {
-    role: String,
-    path: String,
-    branch: String,
-    head: String,
-    status: String,
 }
 
 pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
@@ -133,7 +186,6 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     fs::create_dir_all(&super_root)
         .with_context(|| format!("failed to create {}", super_root.display()))?;
     write_manifest(&super_root, &manifest)?;
-    write_super_cross_repo_manifest(&super_root, &repo_root, &planning_root, &args)?;
 
     if super_stage_terminal(&manifest, "corpus") {
         println!("stage:       corpus (resume skip)");
@@ -534,51 +586,6 @@ fn read_deterministic_gate(super_root: &Path) -> Result<DeterministicGateSummary
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn write_super_cross_repo_manifest(
-    super_root: &Path,
-    repo_root: &Path,
-    planning_root: &Path,
-    args: &SuperArgs,
-) -> Result<()> {
-    #[derive(Serialize)]
-    struct CrossRepoManifest {
-        primary: SuperRepoRecord,
-        references: Vec<SuperRepoRecord>,
-        autodev_binary: String,
-        planning_root: String,
-        worker_model: String,
-        worker_reasoning_effort: String,
-    }
-
-    let manifest = CrossRepoManifest {
-        primary: repo_record("primary", repo_root),
-        references: args
-            .reference_repos
-            .iter()
-            .map(|path| repo_record("reference", path))
-            .collect(),
-        autodev_binary: binary_provenance_line(),
-        planning_root: planning_root.display().to_string(),
-        worker_model: args.worker_model.clone(),
-        worker_reasoning_effort: args.worker_reasoning_effort.clone(),
-    };
-    let path = super_root.join("CROSS-REPO-MANIFEST.json");
-    atomic_write(&path, &serde_json::to_vec_pretty(&manifest)?)
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn repo_record(role: &str, path: &Path) -> SuperRepoRecord {
-    SuperRepoRecord {
-        role: role.to_string(),
-        path: path.display().to_string(),
-        branch: git_text(path, ["branch", "--show-current"])
-            .unwrap_or_else(|| "unknown".to_string()),
-        head: git_text(path, ["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string()),
-        status: git_text(path, ["status", "--short", "--branch"])
-            .unwrap_or_else(|| "not a readable git repo".to_string()),
-    }
-}
-
 fn write_super_branch_reconciliation_plan(
     super_root: &Path,
     repo_root: &Path,
@@ -697,9 +704,13 @@ async fn run_super_corpus_review(
         &args.codex_bin,
     )
     .await?;
-    for file in SUPER_REPORT_FILES {
-        require_nonempty_file(&super_root.join(file))?;
-    }
+    let findings_path = super_root.join(SUPER_FINDINGS_FILE);
+    require_nonempty_file(&findings_path)?;
+    let findings_text = fs::read_to_string(&findings_path)
+        .with_context(|| format!("failed to read {}", findings_path.display()))?;
+    let _: SuperFindings = serde_json::from_str(&findings_text)
+        .with_context(|| format!("{} is not valid SuperFindings JSON", findings_path.display()))?;
+    require_nonempty_file(&super_root.join(SUPER_REPORT_FILE))?;
     Ok(())
 }
 
@@ -1318,59 +1329,94 @@ fn build_super_corpus_review_prompt(
     planning_root: &Path,
     super_root: &Path,
 ) -> String {
-    format!(
-        r#"You are the new CEO of this codebase running the `auto super` functional review war room.
+    // Route this synthesis through the centrally-declared super tier so model
+    // routing can be retuned in one place. The default tier is referenced for
+    // documentation: the surrounding host owns model selection per CLI args.
+    let _tier = PipelineStage::SuperSynthesis.default_tier();
 
-The normal `auto corpus` authoring and review passes have already produced `{planning_root}` for the repository at `{repo_root}`. The design perfection gate may also have written design/runtime artifacts under `{super_root}/design`. Treat those design artifacts as the first production-readiness input, not as a subordinate style appendix.
-
-Mission:
-- You inherited this codebase today.
-- You have 14 days to race it to production.
-- Compute and implementation capacity are not constraints; prioritization is about production leverage, risk, and dependency order.
-- Design/runtime integrity was perfected first. Now apply the same severity and precision across every functional lane.
-
-Edit boundary:
-- You may read the repository at `{repo_root}` and the planning corpus at `{planning_root}`.
-- You may read `{super_root}/design` and should preserve its runtime-first design/UI findings when they exist.
-- You may edit markdown files under `{planning_root}`.
-- You must write these non-empty files under `{super_root}`:
-  - `CEO-14-DAY-PLAN.md`
-  - `FUNCTIONAL-REVIEWS.md`
-  - `PRODUCTION-READINESS.md`
-  - `RISK-REGISTER.md`
-  - `QUALITY-GATES.md`
-  - `SYSTEM-MAP.md`
-  - `SUPER-REPORT.md`
-- Do not edit source code, root specs, root implementation plans, generated `gen-*` dirs, or skill definition directories.
-
-Run these functional reviews and synthesize their disagreements:
-- CEO/Product: production definition, 10-star user outcome, non-goals, opportunity cost, scope discipline.
-- Design/Frontend: design-system clarity, modern UI quality, accessibility, AI-slop risk, and runtime/UI drift; respect `{super_root}/design` as the opening gate.
-- Principal Engineer/Architecture: architecture seams, data flow, state, dependency order, maintainability.
-- Runtime/Engine: source-of-truth ownership, generated contracts, API/schema drift, state transitions, invariants.
-- Security/Trust: credentials, shell/YAML injection, secrets, dangerous flags, logs, authz, trust boundaries.
-- Reliability/Ops: idempotence, resume, partial failure, recovery, observability, receipts, operator handoff.
-- QA/Test Architect: missing regression tests, integration proof, false-positive verification, browser/runtime evidence.
-- Data/Contracts: migrations, compatibility, durable artifacts, schema ownership, backfill or rollback hazards.
-- Performance/Scale: hot paths, large repos, concurrency, resource cleanup, timeout behavior.
-- DX/Agent Workflow: first-run success, CLI help, errors, honest examples, setup friction, model/provider routing.
-- Release Manager: CI, install proof, versioning, rollback, release blockers, ship/no-ship criteria.
-
-Required output semantics:
-- `CEO-14-DAY-PLAN.md` must define the 14-day production race, top outcomes, dependency waves, and prioritized deliverables without capacity trimming.
-- `FUNCTIONAL-REVIEWS.md` must contain the lane-by-lane review board findings, severity, owner, needed artifact, and proof for each discipline above.
-- `PRODUCTION-READINESS.md` must contain a matrix by major subsystem with grade, evidence, production blocker, required fix, and proof artifact/command.
-- `RISK-REGISTER.md` must rank risks by severity, likelihood, blast radius, mitigation, and release-blocking status.
-- `QUALITY-GATES.md` must define hard gates before parallel execution, before release candidate, and before ship.
-- `SYSTEM-MAP.md` must map command surface, state files, external CLIs, credential flows, write paths, and generated artifacts.
-- `SUPER-REPORT.md` must summarize top blockers, top non-blocking improvements, not-doing list, how design was handled first, functional-lane risks, and any amendments made to `{planning_root}`.
-
-If the corpus under `{planning_root}` is missing production-readiness framing, amend it in place so the next `auto gen` pass produces release-oriented specs and executable plan tasks. Deliverables should be dependency-ordered for max-compute parallelism, not limited by a small team capacity assumption. Keep `genesis/` as corpus input, not a competing active control plane unless repository instructions explicitly say otherwise.
-"#,
+    let role = format!(
+        "You are the new CEO of this codebase running the `auto super` functional review war room.\n\
+\n\
+The normal `auto corpus` authoring and review passes have already produced `{planning_root}` for the repository at `{repo_root}`. The design perfection gate may also have written design/runtime artifacts under `{super_root}/design`. Treat those design artifacts as the first production-readiness input, not as a subordinate style appendix.\n\
+\n\
+Mission:\n\
+- You inherited this codebase today.\n\
+- You have 14 days to race it to production.\n\
+- Compute and implementation capacity are not constraints; prioritization is about production leverage, risk, and dependency order.\n\
+- Design/runtime integrity was perfected first. Now apply the same severity and precision across every functional lane.",
         repo_root = repo_root.display(),
         planning_root = planning_root.display(),
         super_root = super_root.display(),
-    )
+    );
+
+    let edit_boundary = format!(
+        "- You may read the repository at `{repo_root}` and the planning corpus at `{planning_root}`.\n\
+- You may read `{super_root}/design` and should preserve its runtime-first design/UI findings when they exist.\n\
+- You may edit markdown files under `{planning_root}`.\n\
+- You must write two artifacts under `{super_root}`: `{findings}` (canonical JSON, schema below) and `{report}` (human-readable narrative rendered from the same data).\n\
+- Do not edit source code, root specs, root implementation plans, generated `gen-*` dirs, or skill definition directories.\n\
+- Do not produce CEO-14-DAY-PLAN.md, FUNCTIONAL-REVIEWS.md, PRODUCTION-READINESS.md, RISK-REGISTER.md, QUALITY-GATES.md, SYSTEM-MAP.md, CROSS-REPO-MANIFEST.json, or a CODEBASE-BOOK/ tree under super; those legacy outputs are retired.",
+        repo_root = repo_root.display(),
+        planning_root = planning_root.display(),
+        super_root = super_root.display(),
+        findings = SUPER_FINDINGS_FILE,
+        report = SUPER_REPORT_FILE,
+    );
+
+    let review_lanes = "Run these functional reviews and fold their disagreements into the JSON below:\n\
+- CEO/Product: production definition, 10-star user outcome, non-goals, opportunity cost, scope discipline.\n\
+- Design/Frontend: design-system clarity, modern UI quality, accessibility, AI-slop risk, runtime/UI drift.\n\
+- Principal Engineer/Architecture: architecture seams, data flow, state, dependency order, maintainability.\n\
+- Runtime/Engine: source-of-truth ownership, generated contracts, API/schema drift, state transitions, invariants.\n\
+- Security/Trust: credentials, shell/YAML injection, secrets, dangerous flags, logs, authz, trust boundaries.\n\
+- Reliability/Ops: idempotence, resume, partial failure, recovery, observability, receipts, operator handoff.\n\
+- QA/Test Architect: missing regression tests, integration proof, false-positive verification, browser/runtime evidence.\n\
+- Data/Contracts: migrations, compatibility, durable artifacts, schema ownership, backfill or rollback hazards.\n\
+- Performance/Scale: hot paths, large repos, concurrency, resource cleanup, timeout behavior.\n\
+- DX/Agent Workflow: first-run success, CLI help, errors, honest examples, setup friction, model/provider routing.\n\
+- Release Manager: CI, install proof, versioning, rollback, release blockers, ship/no-ship criteria.";
+
+    let findings_contract = format!(
+        "`{findings}` is the single source of truth and MUST deserialize against this Rust schema (exact field names, snake_case):\n\
+\n\
+```json\n\
+{{\n  \"run_id\": \"<string>\",\n  \"generated_at\": \"<RFC3339 timestamp>\",\n  \"readiness\": \"go\" | \"conditional_go\" | \"no_go\",\n  \"blockers\": [\n    {{\"id\": \"BLK-001\", \"title\": \"...\", \"owner_surface\": \"src/...\", \"severity\": \"high|med|low\", \"evidence\": \"path or command\", \"remediation_hint\": \"...\"}}\n  ],\n  \"risks\": [\n    {{\"id\": \"RSK-001\", \"title\": \"...\", \"likelihood\": \"high|med|low\", \"impact\": \"high|med|low\", \"mitigation\": \"...\"}}\n  ],\n  \"gates\": [\n    {{\"id\": \"GATE-001\", \"name\": \"pre-parallel\", \"status\": \"pass|fail|n/a\", \"evidence_paths\": [\"...\"]}}\n  ],\n  \"campaign_plan\": {{\n    \"horizon_days\": 14,\n    \"milestones\": [{{\"id\": \"M-1\", \"title\": \"...\", \"day\": 3, \"depends_on\": []}}]\n  }}\n}}\n```\n\
+\n\
+Rules:\n\
+- The JSON is canonical. Every blocker, risk, gate, and milestone exists exactly once. Do not duplicate the same blocker as a risk + readiness paragraph + matrix row.\n\
+- IDs must be stable, prefixed (`BLK-`, `RSK-`, `GATE-`, `M-`), and unique within their array.\n\
+- `evidence` and `evidence_paths` must be concrete file paths, commands, or audit run IDs the next stage can re-run.\n\
+- Severity / likelihood / impact values use the lowercase tokens shown above.\n\
+\n\
+`{report}` is the human-readable narrative rendered from that same JSON. It MUST cite each blocker / risk / gate by its JSON `id` so the two stay consistent. It also names the top non-blocking improvements, the not-doing list, how design was handled first, functional-lane risks, and any amendments made to `{planning_root}`.",
+        findings = SUPER_FINDINGS_FILE,
+        report = SUPER_REPORT_FILE,
+        planning_root = planning_root.display(),
+    );
+
+    let amendment_clause = format!(
+        "If the corpus under `{planning_root}` is missing production-readiness framing, amend it in place so the next `auto gen` pass produces release-oriented specs and executable plan tasks. Keep `genesis/` as corpus input, not a competing active control plane unless repository instructions explicitly say otherwise.",
+        planning_root = planning_root.display(),
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Review lanes", review_lanes)
+        .output("Canonical findings + narrative", findings_contract)
+        .evidence_item(format!(
+            "`{}` deserializes against the SuperFindings schema; the host re-validates after this phase.",
+            SUPER_FINDINGS_FILE,
+        ))
+        .evidence_item(format!(
+            "`{}` references every blocker / risk / gate by its JSON `id`.",
+            SUPER_REPORT_FILE,
+        ))
+        .evidence_item(
+            "No legacy seven-file bundle is recreated; only the two canonical artifacts are written.",
+        )
+        .freeform_tail(amendment_clause)
+        .render()
 }
 
 fn build_super_execution_gate_prompt(
@@ -1382,46 +1428,67 @@ fn build_super_execution_gate_prompt(
     let output_clause = output_dir
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "the latest gen output recorded in .auto/state.json".to_string());
-    format!(
-        r#"You are the final `auto super` execution gate before `auto parallel` launches.
+    let findings_path = super_root.join(SUPER_FINDINGS_FILE);
 
-The repository is `{repo_root}`. The planning corpus is `{planning_root}`. The generated output is `{output_clause}`. The super artifacts are under `{super_root}`.
-
-Edit boundary:
-- You may read the repository, `{planning_root}`, generated output, root `specs/`, and root `IMPLEMENTATION_PLAN.md`.
-- You may read `{super_root}/design`; design/runtime UI contract risks are execution-gate inputs, not decoration.
-- You must read `{super_root}/CEO-14-DAY-PLAN.md`, `{super_root}/FUNCTIONAL-REVIEWS.md`, `{super_root}/PRODUCTION-READINESS.md`, `{super_root}/RISK-REGISTER.md`, `{super_root}/QUALITY-GATES.md`, and `{super_root}/SYSTEM-MAP.md` when present.
-- You may edit only root `IMPLEMENTATION_PLAN.md`, root `specs/*.md`, and `{super_root}/EXECUTION-GATE.md`.
-- Do not edit source code, `genesis/`, `gen-*`, skill definition directories, or worker artifacts.
-
-Review the root execution queue as if max-compute tmux-backed implementation workers will start immediately.
-
-Gate criteria:
-- The queue must implement the CEO 14-day production race, not a generic cleanup backlog or capacity-trimmed wishlist.
-- UI/design tasks must be tied to runtime/API source of truth, generated bindings, existing frontend helpers, and cross-surface readback proof. Reject fake mockups, manual frontend bindings, and fixture-data fallbacks as acceptance evidence.
-- Security, reliability, QA, data/contracts, operations, release, DX, and performance lanes must receive the same severity and proof standard as design.
-- Priority tasks must be dependency-ordered and small enough for one focused worker session.
-- Every unfinished task must have concrete ownership, acceptance criteria, verification, required tests, completion artifacts, dependencies, estimated scope, and completion signal.
-- Verification must be narrow and meaningful. Reject broad package-wide test commands, malformed shell snippets, zero-test filters, and directory greps as sole proof.
-- Security, credentials, generated executable workflow text, destructive operations, and external-service tasks must carry explicit scope boundaries and proof expectations.
-- Research or decision tasks must produce concrete artifacts and must not silently authorize implementation before the decision is made.
-- If the plan is not ready for parallel execution, amend it until it is ready or write a NO-GO verdict explaining the blocker.
-
-Write `{super_root}/EXECUTION-GATE.md` with:
-- `# SUPER EXECUTION GATE`
-- A line exactly `Verdict: GO` or `Verdict: NO-GO`
-- Queue summary
-- Changes made
-- Remaining risks
-- Parallel launch notes
-
-Only write `Verdict: GO` if it is safe and useful for `auto parallel` to begin immediately after this gate.
-"#,
+    let role = format!(
+        "You are the final `auto super` execution gate before `auto parallel` launches.\n\
+\n\
+The repository is `{repo_root}`. The planning corpus is `{planning_root}`. The generated output is `{output_clause}`. The super artifacts are under `{super_root}`.",
         repo_root = repo_root.display(),
         planning_root = planning_root.display(),
-        output_clause = output_clause,
         super_root = super_root.display(),
-    )
+    );
+
+    let edit_boundary = format!(
+        "- You may read the repository, `{planning_root}`, generated output, root `specs/`, and root `IMPLEMENTATION_PLAN.md`.\n\
+- You may read `{super_root}/design`; design/runtime UI contract risks are execution-gate inputs, not decoration.\n\
+- You MUST read `{findings_path}` and treat it as the canonical CEO functional-review output. The retired seven-file markdown bundle is not present and must not be re-read.\n\
+- You may edit only root `IMPLEMENTATION_PLAN.md`, root `specs/*.md`, and `{super_root}/{gate}`.\n\
+- Do not edit source code, `genesis/`, `gen-*`, skill definition directories, or worker artifacts.",
+        planning_root = planning_root.display(),
+        super_root = super_root.display(),
+        findings_path = findings_path.display(),
+        gate = EXECUTION_GATE_FILE,
+    );
+
+    let inputs = format!(
+        "Canonical CEO functional review JSON: `{findings_path}`. Schema: top-level `readiness`, `blockers[]`, `risks[]`, `gates[]`, and `campaign_plan` (with `horizon_days` and `milestones[]`). Cross-reference blockers, gates, and milestones by `id` when amending the queue.",
+        findings_path = findings_path.display(),
+    );
+
+    let gate_criteria = "- The queue must implement the campaign plan in `super-findings.json` (`campaign_plan.milestones`), not a generic cleanup backlog or capacity-trimmed wishlist.\n\
+- Every blocker with severity `high` in `super-findings.json` must be either resolved in-tree or have a priority task in `IMPLEMENTATION_PLAN.md` that cites its `BLK-` id.\n\
+- UI/design tasks must be tied to runtime/API source of truth, generated bindings, existing frontend helpers, and cross-surface readback proof. Reject fake mockups, manual frontend bindings, and fixture-data fallbacks as acceptance evidence.\n\
+- Security, reliability, QA, data/contracts, operations, release, DX, and performance lanes must receive the same severity and proof standard as design.\n\
+- Priority tasks must be dependency-ordered and small enough for one focused worker session.\n\
+- Every unfinished task must have concrete ownership, acceptance criteria, verification, required tests, completion artifacts, dependencies, estimated scope, and completion signal.\n\
+- Verification must be narrow and meaningful. Reject broad package-wide test commands, malformed shell snippets, zero-test filters, and directory greps as sole proof.\n\
+- Security, credentials, generated executable workflow text, destructive operations, and external-service tasks must carry explicit scope boundaries and proof expectations.\n\
+- Research or decision tasks must produce concrete artifacts and must not silently authorize implementation before the decision is made.\n\
+- If the plan is not ready for parallel execution, amend it until it is ready or write a NO-GO verdict explaining the blocker.";
+
+    let output_spec = format!(
+        "Write `{super_root}/{gate}` with:\n\
+- `# SUPER EXECUTION GATE`\n\
+- A line exactly `Verdict: GO` or `Verdict: NO-GO`\n\
+- Queue summary (cite blocker / gate ids from `super-findings.json`)\n\
+- Changes made\n\
+- Remaining risks (cite `RSK-` ids)\n\
+- Parallel launch notes\n\
+\n\
+Only write `Verdict: GO` if it is safe and useful for `auto parallel` to begin immediately after this gate.",
+        super_root = super_root.display(),
+        gate = EXECUTION_GATE_FILE,
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Canonical findings", inputs)
+        .input("Gate criteria", gate_criteria)
+        .output("Execution gate verdict", output_spec)
+        .verdicts(["Verdict: GO", "Verdict: NO-GO"])
+        .render()
 }
 
 #[derive(Deserialize, Serialize, Debug, Eq, PartialEq)]
@@ -1777,6 +1844,138 @@ fn write_manifest(super_root: &Path, manifest: &SuperManifest) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn super_findings_round_trips_through_serde() {
+        let original = SuperFindings {
+            run_id: "20260513-193400".to_string(),
+            generated_at: "2026-05-13T19:34:00Z".to_string(),
+            readiness: "conditional_go".to_string(),
+            blockers: vec![SuperBlocker {
+                id: "BLK-001".to_string(),
+                title: "audit findings concatenation".to_string(),
+                owner_surface: "src/audit_everything.rs".to_string(),
+                severity: "high".to_string(),
+                evidence: ".auto/audit-everything/20260513/FINAL-REVIEW.md".to_string(),
+                remediation_hint: "emit AUDIT-FINDINGS-SUMMARY.json instead".to_string(),
+            }],
+            risks: vec![SuperRisk {
+                id: "RSK-001".to_string(),
+                title: "supervisor self-respawn".to_string(),
+                likelihood: "med".to_string(),
+                impact: "high".to_string(),
+                mitigation: "checkpoint launcher state in-tree".to_string(),
+            }],
+            gates: vec![SuperGate {
+                id: "GATE-001".to_string(),
+                name: "pre-parallel".to_string(),
+                status: "pass".to_string(),
+                evidence_paths: vec![".auto/super/run-1/DETERMINISTIC-GATE.json".to_string()],
+            }],
+            campaign_plan: SuperCampaignPlan {
+                horizon_days: 14,
+                milestones: vec![
+                    SuperMilestone {
+                        id: "M-1".to_string(),
+                        title: "land synthesis JSON".to_string(),
+                        day: 2,
+                        depends_on: vec![],
+                    },
+                    SuperMilestone {
+                        id: "M-2".to_string(),
+                        title: "wire JSON into execution gate".to_string(),
+                        day: 4,
+                        depends_on: vec!["M-1".to_string()],
+                    },
+                ],
+            },
+        };
+
+        let serialized =
+            serde_json::to_string_pretty(&original).expect("SuperFindings must serialize");
+        let deserialized: SuperFindings =
+            serde_json::from_str(&serialized).expect("SuperFindings must deserialize");
+        assert_eq!(deserialized, original);
+    }
+
+    #[test]
+    fn super_findings_accepts_missing_optional_collections() {
+        let minimal = r#"{
+            "run_id": "run-1",
+            "generated_at": "2026-05-13T19:34:00Z",
+            "readiness": "go",
+            "campaign_plan": {"horizon_days": 14}
+        }"#;
+        let findings: SuperFindings =
+            serde_json::from_str(minimal).expect("minimal SuperFindings must deserialize");
+        assert!(findings.blockers.is_empty());
+        assert!(findings.risks.is_empty());
+        assert!(findings.gates.is_empty());
+        assert!(findings.campaign_plan.milestones.is_empty());
+        assert_eq!(findings.campaign_plan.horizon_days, 14);
+    }
+
+    #[test]
+    fn build_super_execution_gate_prompt_references_findings_json_not_legacy_bundle() {
+        let repo = PathBuf::from("/tmp/super-exec-gate-test/repo");
+        let planning = PathBuf::from("/tmp/super-exec-gate-test/repo/genesis");
+        let super_root = PathBuf::from("/tmp/super-exec-gate-test/repo/.auto/super/run-1");
+        let prompt = build_super_execution_gate_prompt(&repo, &planning, None, &super_root);
+
+        assert!(
+            prompt.contains("super-findings.json"),
+            "execution-gate prompt must reference canonical super-findings.json: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "/tmp/super-exec-gate-test/repo/.auto/super/run-1/super-findings.json"
+            ),
+            "execution-gate prompt must include the absolute findings path: {prompt}"
+        );
+        for legacy in [
+            "CEO-14-DAY-PLAN.md",
+            "FUNCTIONAL-REVIEWS.md",
+            "PRODUCTION-READINESS.md",
+            "RISK-REGISTER.md",
+            "QUALITY-GATES.md",
+            "SYSTEM-MAP.md",
+        ] {
+            assert!(
+                !prompt.contains(&format!("/{legacy}")),
+                "execution-gate prompt must not request retired artifact `{legacy}`: {prompt}"
+            );
+        }
+        assert!(prompt.contains("Verdict: GO"));
+        assert!(prompt.contains("Verdict: NO-GO"));
+    }
+
+    #[test]
+    fn build_super_corpus_review_prompt_emits_findings_and_report_only() {
+        let repo = PathBuf::from("/tmp/super-corpus-review-test/repo");
+        let planning = PathBuf::from("/tmp/super-corpus-review-test/repo/genesis");
+        let super_root = PathBuf::from("/tmp/super-corpus-review-test/repo/.auto/super/run-1");
+        let prompt = build_super_corpus_review_prompt(&repo, &planning, &super_root);
+
+        assert!(prompt.contains("super-findings.json"));
+        assert!(prompt.contains("SUPER-REPORT.md"));
+        // Retired bundle must NOT appear as required output (it should only
+        // appear inside the negation clause that tells the model to skip it).
+        for legacy in [
+            "CEO-14-DAY-PLAN.md",
+            "FUNCTIONAL-REVIEWS.md",
+            "PRODUCTION-READINESS.md",
+            "RISK-REGISTER.md",
+            "QUALITY-GATES.md",
+            "SYSTEM-MAP.md",
+        ] {
+            // Only allowed mention: the explicit "do not produce" negation list.
+            let count = prompt.matches(legacy).count();
+            assert!(
+                count <= 1,
+                "legacy artifact `{legacy}` referenced {count} times in corpus-review prompt; expected at most one (the negation clause)"
+            );
+        }
+    }
 
     #[test]
     fn build_super_focus_combines_production_directive_and_prompt() {
