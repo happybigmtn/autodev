@@ -37,12 +37,44 @@ pub(crate) enum LaneKind {
 
 impl LaneKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "code" => Some(Self::Code),
-            "operator" | "operator-action" | "operator action" => Some(Self::Operator),
-            "evidence" | "evidence-only" | "proof" | "proof-only" => Some(Self::Evidence),
-            _ => None,
+        let lowered = value.trim().to_ascii_lowercase();
+        if let Some(kind) = parse_lane_kind_token(&lowered) {
+            return Some(kind);
         }
+        // Compound forms like `product-runtime/live-ops` or `ops/evidence`
+        // signal that the task spans multiple lane categories. Try each
+        // `/`-separated segment in declared order; the LLM tends to list the
+        // dominant lane first.
+        if lowered.contains('/') {
+            for segment in lowered.split('/').map(str::trim) {
+                if let Some(kind) = parse_lane_kind_token(segment) {
+                    return Some(kind);
+                }
+            }
+        }
+        // Substring fallback for descriptive phrasing that doesn't match a
+        // canonical token. Order matters: Evidence is the most specific
+        // signal (proof artifacts, readback transcripts), Operator next
+        // (ops/deployment work), Code is the broad default.
+        if ["evidence", "proof", "readback", "transcript"]
+            .iter()
+            .any(|needle| lowered.contains(needle))
+        {
+            return Some(Self::Evidence);
+        }
+        if ["operator", "ops", "live-ops", "deploy", "operate"]
+            .iter()
+            .any(|needle| lowered.contains(needle))
+        {
+            return Some(Self::Operator);
+        }
+        if ["code", "runtime", "implementation", "test", "product"]
+            .iter()
+            .any(|needle| lowered.contains(needle))
+        {
+            return Some(Self::Code);
+        }
+        None
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -51,6 +83,17 @@ impl LaneKind {
             Self::Operator => "operator",
             Self::Evidence => "evidence",
         }
+    }
+}
+
+fn parse_lane_kind_token(value: &str) -> Option<LaneKind> {
+    match value {
+        "code" | "product-runtime" | "runtime" | "implementation" => Some(LaneKind::Code),
+        "operator" | "operator-action" | "operator action" | "ops" | "live-ops" => {
+            Some(LaneKind::Operator)
+        }
+        "evidence" | "evidence-only" | "proof" | "proof-only" => Some(LaneKind::Evidence),
+        _ => None,
     }
 }
 
@@ -892,9 +935,55 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_task_id_like, parse_task_header, parse_tasks, validate_execution_row, TaskStatus,
-        PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
+        is_task_id_like, parse_task_header, parse_tasks, validate_execution_row, LaneKind,
+        TaskStatus, PLAN_TASK_PROCESS_FIELDS, PLAN_TASK_REQUIRED_FIELDS, TASK_FIELD_BOUNDARIES,
     };
+
+    #[test]
+    fn lane_kind_parses_canonical_tokens() {
+        assert_eq!(LaneKind::parse("code"), Some(LaneKind::Code));
+        assert_eq!(LaneKind::parse("operator"), Some(LaneKind::Operator));
+        assert_eq!(LaneKind::parse("evidence"), Some(LaneKind::Evidence));
+        assert_eq!(LaneKind::parse("Operator-Action"), Some(LaneKind::Operator));
+        assert_eq!(LaneKind::parse("proof-only"), Some(LaneKind::Evidence));
+    }
+
+    #[test]
+    fn lane_kind_accepts_compound_slash_forms() {
+        // The autonomy smoke run had DESIGN-120526-02 with
+        // `Lane kind: product-runtime/live-ops` — a code-and-ops compound.
+        // First-segment-wins picks the dominant lane the LLM listed first.
+        assert_eq!(
+            LaneKind::parse("product-runtime/live-ops"),
+            Some(LaneKind::Code)
+        );
+        assert_eq!(LaneKind::parse("ops/evidence"), Some(LaneKind::Operator));
+        assert_eq!(LaneKind::parse("evidence/code"), Some(LaneKind::Evidence));
+    }
+
+    #[test]
+    fn lane_kind_falls_back_to_substring_signals() {
+        // Descriptive phrases that don't match any canonical token still
+        // need to land in a bucket. Order: Evidence > Operator > Code.
+        assert_eq!(
+            LaneKind::parse("readback-only verification"),
+            Some(LaneKind::Evidence)
+        );
+        assert_eq!(
+            LaneKind::parse("live-ops deploy"),
+            Some(LaneKind::Operator)
+        );
+        assert_eq!(
+            LaneKind::parse("runtime implementation"),
+            Some(LaneKind::Code)
+        );
+    }
+
+    #[test]
+    fn lane_kind_rejects_unrecognized_values() {
+        assert_eq!(LaneKind::parse(""), None);
+        assert_eq!(LaneKind::parse("xyz nonsense"), None);
+    }
 
     #[test]
     fn plan_task_field_catalog_covers_rich_contract_boundaries() {
