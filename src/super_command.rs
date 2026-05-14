@@ -677,17 +677,40 @@ async fn run_super_codex_phase(
     println!("context:     max");
     println!("prompt log:  {}", prompt_path.display());
     println!("stderr log:  {}", stderr_path.display());
-    let status = run_codex_exec_max_context(
-        repo_root,
-        prompt,
-        model,
-        reasoning_effort,
-        codex_bin,
-        &stderr_path,
-        None,
-        phase_slug,
-    )
-    .await?;
+    let claude_route = crate::claude_exec::looks_like_claude_model(model);
+    println!(
+        "backend:     {}",
+        if claude_route { "claude" } else { "codex" }
+    );
+    let status = if claude_route {
+        // Honor Claude model aliases (opus/sonnet/haiku/claude-*) for the
+        // super orchestrator phases historically pinned to Codex. The Claude
+        // backend's stream futility detector kicks in on hung tool-result
+        // loops; effort maps through resolve_claude_effort.
+        crate::claude_exec::run_claude_exec(
+            repo_root,
+            prompt,
+            model,
+            reasoning_effort,
+            None,
+            &stderr_path,
+            None,
+            phase_slug,
+        )
+        .await?
+    } else {
+        run_codex_exec_max_context(
+            repo_root,
+            prompt,
+            model,
+            reasoning_effort,
+            codex_bin,
+            &stderr_path,
+            None,
+            phase_slug,
+        )
+        .await?
+    };
     if !status.success() {
         bail!(
             "super phase `{phase_slug}` failed with status {status}; see {}",

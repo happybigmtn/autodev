@@ -294,7 +294,7 @@ pub(crate) fn describe_claude_harness(model: &str, effort: &str) -> String {
     )
 }
 
-fn looks_like_claude_model(model: &str) -> bool {
+pub(crate) fn looks_like_claude_model(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized.starts_with("claude") || matches!(normalized.as_str(), "opus" | "sonnet" | "haiku")
 }
