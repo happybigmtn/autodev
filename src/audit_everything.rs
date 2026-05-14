@@ -719,6 +719,23 @@ async fn run_context_phase(
         .with_context(|| format!("failed to create {}", paths.report_root.display()))?;
     write_skill_policy_reference(paths)?;
 
+    // Mechanical pre-pass: rewrite known archive/audit/super run-id pointers
+    // in AGENTS.md / ARCHITECTURE.md / CONTEXT.md / README.md before handing
+    // off to the LLM. Cuts the init-context phase down from minutes of
+    // tokens-for-sed to actual reasoning work. Failures here are advisory:
+    // the LLM stage still runs and can recover.
+    match crate::init_context::mechanical_refresh(&paths.worktree_root, None, &manifest.run_id) {
+        Ok(refresh) if !refresh.is_empty() => {
+            println!(
+                "init-context: mechanical refresh updated {} file(s), {} substitution(s)",
+                refresh.files_touched.len(),
+                refresh.substitutions.len()
+            );
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("init-context: mechanical refresh skipped: {err}"),
+    }
+
     let prompt = build_context_prompt(&paths.worktree_root, &paths.report_root);
     let config = PhaseConfig {
         model: args.synthesis_model.clone(),
