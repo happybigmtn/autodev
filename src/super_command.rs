@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::audit_everything::{AuditFinding, AuditFindingsSummary};
 use crate::backend_policy::PipelineStage;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::design_command;
@@ -21,6 +22,16 @@ use crate::util::{
 use crate::{
     AuditHarvestArgs, CorpusArgs, GenerationArgs, ParallelAction, ParallelArgs,
     ParallelCargoTarget, SuperArgs,
+};
+
+// `harvest_cluster` is a sibling source file but kept as a submodule of
+// `super_command` so the canonical `src/harvest_cluster.rs` layout works
+// without an extra `mod` declaration at the crate root.
+#[path = "harvest_cluster.rs"]
+mod harvest_cluster;
+
+use harvest_cluster::{
+    classify_complexity, cluster_findings, ClusterGroup, ComplexityClass,
 };
 
 /// Canonical machine-readable findings emitted by the corpus-review phase.
@@ -49,6 +60,69 @@ pub(crate) struct SuperFindings {
     #[serde(default)]
     pub(crate) gates: Vec<SuperGate>,
     pub(crate) campaign_plan: SuperCampaignPlan,
+    /// Decisions parked for an operator. `policy = deterministic` entries with
+    /// a `resolver_kind` are auto-resolved by `auto_resolve_deterministic_entries`
+    /// before the execution gate; the rest stay here for human review.
+    #[serde(default)]
+    pub(crate) operator_queue: Vec<OperatorQueueEntry>,
+    /// Audit trail of every entry resolved deterministically in-tree. Appended
+    /// in resolution order; never replaces existing rows.
+    #[serde(default)]
+    pub(crate) auto_resolved: Vec<ResolvedEntry>,
+}
+
+/// Routing policy for an operator-queue entry.
+///
+/// - `Deterministic`: the entry's `resolver_kind` names an in-tree resolver
+///   that can apply the change without a human or model call. Resolved
+///   immediately at the end of corpus review.
+/// - `External`: requires evidence from outside the repo (live runtime,
+///   external service, third-party action). Parks for a human.
+/// - `Manual`: technically deterministic but the operator has opted out of
+///   auto-application (e.g. high-blast-radius config change).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperatorPolicy {
+    Deterministic,
+    External,
+    Manual,
+}
+
+/// Tagged enum of in-tree resolvers. The variant data carries everything the
+/// resolver needs; payloads stay in `OperatorQueueEntry.payload` only for the
+/// human-readable rendering, not as input to the resolver itself.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ResolverKind {
+    /// Walk a baseline counter `current` toward `floor` by one step per call.
+    BaselineWalk { current: u32, floor: u32 },
+    /// Read a default value from `spec_path` (the first line that starts
+    /// with `<var>=`); store the right-hand-side as the resolved value.
+    EnvDefault { var: String, spec_path: PathBuf },
+    /// Read a composition table from `RSOCIETY-GDD.md` under `section` and
+    /// store the section body as the resolved value.
+    GddComposition { section: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct OperatorQueueEntry {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) policy: OperatorPolicy,
+    #[serde(default)]
+    pub(crate) resolver_kind: Option<ResolverKind>,
+    #[serde(default)]
+    pub(crate) payload: String,
+    #[serde(default)]
+    pub(crate) evidence: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ResolvedEntry {
+    pub(crate) entry_id: String,
+    pub(crate) resolver: String,
+    pub(crate) new_value: String,
+    pub(crate) resolved_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -139,6 +213,11 @@ struct SuperStage {
 pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     let started_at = Instant::now();
     let repo_root = git_repo_root()?;
+    let repo_slug = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    crate::session_survival::reexec_if_reapable(&format!("super-{repo_slug}"))?;
     ensure_repo_layout(&repo_root)?;
     let mut args = args;
     let resume_requested = args.resume.is_some();
@@ -242,6 +321,17 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     } else {
         println!("stage:       CEO functional review");
         run_super_corpus_review(&args, &repo_root, &planning_root, &super_root).await?;
+        // Auto-resolve deterministic operator-queue entries (baseline-walk,
+        // env-default, gdd-composition) before the execution gate reads
+        // super-findings.json. Entries with `policy = external` or `manual`
+        // stay parked for human review.
+        let auto_resolve_count = auto_resolve_super_findings_in_place(&repo_root, &super_root)?;
+        if auto_resolve_count > 0 {
+            println!(
+                "auto-resolved: {auto_resolve_count} deterministic operator-queue entr{}",
+                if auto_resolve_count == 1 { "y" } else { "ies" },
+            );
+        }
         push_stage(
             &super_root,
             &mut manifest,
@@ -714,6 +804,191 @@ async fn run_super_corpus_review(
     Ok(())
 }
 
+/// Read `super-findings.json`, auto-resolve every deterministic operator-queue
+/// entry in-place, and persist. Returns the number of entries resolved this
+/// pass (0 when the queue is empty or only contains non-deterministic items).
+fn auto_resolve_super_findings_in_place(repo_root: &Path, super_root: &Path) -> Result<usize> {
+    let findings_path = super_root.join(SUPER_FINDINGS_FILE);
+    if !findings_path.exists() {
+        return Ok(0);
+    }
+    let text = fs::read_to_string(&findings_path)
+        .with_context(|| format!("failed to read {}", findings_path.display()))?;
+    let mut findings: SuperFindings = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", findings_path.display()))?;
+    if findings.operator_queue.is_empty() {
+        return Ok(0);
+    }
+    let resolved = auto_resolve_deterministic_entries(&mut findings, repo_root)?;
+    let count = resolved.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    atomic_write(&findings_path, &serde_json::to_vec_pretty(&findings)?)
+        .with_context(|| format!("failed to write {}", findings_path.display()))?;
+    Ok(count)
+}
+
+/// Apply each deterministic operator-queue entry's resolver. Drains resolved
+/// entries from `findings.operator_queue` and appends a `ResolvedEntry` row
+/// to `findings.auto_resolved`. Entries with `policy = external` or `manual`
+/// are left in place, even if they carry a `resolver_kind`.
+pub(crate) fn auto_resolve_deterministic_entries(
+    findings: &mut SuperFindings,
+    repo_root: &Path,
+) -> Result<Vec<ResolvedEntry>> {
+    let now = timestamp_slug();
+    let mut resolved: Vec<ResolvedEntry> = Vec::new();
+    let mut remaining: Vec<OperatorQueueEntry> = Vec::with_capacity(findings.operator_queue.len());
+
+    let drained: Vec<OperatorQueueEntry> = std::mem::take(&mut findings.operator_queue);
+    for entry in drained {
+        if entry.policy != OperatorPolicy::Deterministic {
+            remaining.push(entry);
+            continue;
+        }
+        let Some(kind) = entry.resolver_kind.clone() else {
+            remaining.push(entry);
+            continue;
+        };
+        match apply_resolver(&kind, repo_root) {
+            Ok(new_value) => {
+                resolved.push(ResolvedEntry {
+                    entry_id: entry.id.clone(),
+                    resolver: resolver_label(&kind).to_string(),
+                    new_value,
+                    resolved_at: now.clone(),
+                });
+            }
+            Err(err) => {
+                // Resolver failed -- park the entry with a note in evidence
+                // so the next operator pass sees why it could not resolve.
+                let mut requeued = entry;
+                let note = format!(
+                    "\n[auto-resolve failed at {}: {}]",
+                    now,
+                    err.to_string().lines().next().unwrap_or("unknown")
+                );
+                requeued.evidence.push_str(&note);
+                remaining.push(requeued);
+            }
+        }
+    }
+
+    findings.operator_queue = remaining;
+    findings.auto_resolved.extend(resolved.iter().cloned());
+    Ok(resolved)
+}
+
+fn resolver_label(kind: &ResolverKind) -> &'static str {
+    match kind {
+        ResolverKind::BaselineWalk { .. } => "baseline_walk",
+        ResolverKind::EnvDefault { .. } => "env_default",
+        ResolverKind::GddComposition { .. } => "gdd_composition",
+    }
+}
+
+fn apply_resolver(kind: &ResolverKind, repo_root: &Path) -> Result<String> {
+    match kind {
+        ResolverKind::BaselineWalk { current, floor } => Ok(resolve_baseline_walk(*current, *floor)),
+        ResolverKind::EnvDefault { var, spec_path } => {
+            resolve_env_default(var, &absolutize_spec_path(repo_root, spec_path))
+        }
+        ResolverKind::GddComposition { section } => {
+            let gdd = repo_root.join("RSOCIETY-GDD.md");
+            resolve_gdd_composition(section, &gdd)
+        }
+    }
+}
+
+fn absolutize_spec_path(repo_root: &Path, spec_path: &Path) -> PathBuf {
+    if spec_path.is_absolute() {
+        spec_path.to_path_buf()
+    } else {
+        repo_root.join(spec_path)
+    }
+}
+
+fn resolve_baseline_walk(current: u32, floor: u32) -> String {
+    if current <= floor {
+        return current.to_string();
+    }
+    let step = current.saturating_sub(floor).min(1);
+    let next = current.saturating_sub(step);
+    next.to_string()
+}
+
+fn resolve_env_default(var: &str, spec_path: &Path) -> Result<String> {
+    let text = fs::read_to_string(spec_path)
+        .with_context(|| format!("failed to read {}", spec_path.display()))?;
+    let needle = format!("{var}=");
+    for raw_line in text.lines() {
+        let line = raw_line.trim_start_matches(|ch: char| ch == '-' || ch.is_whitespace());
+        if let Some(rest) = line.strip_prefix(&needle) {
+            let value = rest
+                .trim_start()
+                .trim_end_matches('`')
+                .trim_start_matches('`')
+                .trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    bail!(
+        "no default for `{}` found in {}",
+        var,
+        spec_path.display()
+    );
+}
+
+fn resolve_gdd_composition(section: &str, gdd_path: &Path) -> Result<String> {
+    let text = fs::read_to_string(gdd_path)
+        .with_context(|| format!("failed to read {}", gdd_path.display()))?;
+    let mut capturing = false;
+    let mut body: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            if capturing {
+                break;
+            }
+            if line_matches_section_header(trimmed, section) {
+                capturing = true;
+                continue;
+            }
+        } else if capturing {
+            body.push(line);
+        }
+    }
+    if !capturing {
+        bail!(
+            "section `{}` not found in {}",
+            section,
+            gdd_path.display()
+        );
+    }
+    let joined = body
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = joined.trim().to_string();
+    if trimmed.is_empty() {
+        bail!(
+            "section `{}` in {} is empty",
+            section,
+            gdd_path.display()
+        );
+    }
+    Ok(trimmed)
+}
+
+fn line_matches_section_header(header_line: &str, section: &str) -> bool {
+    let stripped = header_line.trim_start_matches('#').trim();
+    stripped == section || stripped.eq_ignore_ascii_case(section)
+}
+
 async fn run_super_execution_gate(
     args: &SuperArgs,
     repo_root: &Path,
@@ -1084,6 +1359,36 @@ async fn harvest_audit_findings(
         return Ok(summary_path);
     }
 
+    // Pre-cluster the canonical typed findings (if AUDIT-FINDINGS-SUMMARY.json
+    // from the new audit-everything reform is present). Non-SingleRow clusters
+    // are routed to NEEDS-PLAN-QUEUE.json / OPERATOR-QUEUE.json so the LLM
+    // does not author 50 rows for one conceptual refactor. The legacy compact
+    // findings whose path matches a non-SingleRow cluster are dropped from
+    // the LLM input.
+    let dispatch = run_harvest_cluster_dispatch(
+        repo_root,
+        output_root,
+        audit_run_id,
+        &already_covered_paths,
+    )?;
+    let actionable_compact: Vec<serde_json::Value> = if dispatch.deferred_paths.is_empty() {
+        actionable_compact
+    } else {
+        actionable_compact
+            .into_iter()
+            .filter(|value| {
+                let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                !dispatch.deferred_paths.contains(path)
+            })
+            .collect()
+    };
+    if actionable_compact.is_empty() {
+        println!(
+            "audit harvest: every score-range finding was routed to a complexity queue; IMPLEMENTATION_PLAN.md unchanged",
+        );
+        return Ok(summary_path);
+    }
+
     println!(
         "audit harvest: harvesting {} finding(s) from score range [{}..{}]",
         actionable_compact.len(),
@@ -1130,6 +1435,193 @@ async fn harvest_audit_findings(
     }
     println!("audit harvest: appended task rows to {}", plan_path.display());
     Ok(summary_path)
+}
+
+/// Outcome of a single cluster dispatch pass.
+#[derive(Debug, Default)]
+struct ClusterDispatchOutcome {
+    /// Paths whose finding was routed to a non-SingleRow queue. The LLM step
+    /// must skip these so a 50-file refactor does not become 50 plan rows.
+    deferred_paths: std::collections::HashSet<String>,
+    /// Number of clusters routed per class, for the operator log line.
+    counts_by_class: std::collections::BTreeMap<&'static str, usize>,
+    /// File paths that were written.
+    artifacts: Vec<PathBuf>,
+}
+
+/// Load `AUDIT-FINDINGS-SUMMARY.json` (canonical typed schema written by
+/// `audit_everything::collect_audit_findings`), cluster, classify, and route
+/// non-SingleRow clusters to dedicated queues under `output_root`.
+fn run_harvest_cluster_dispatch(
+    repo_root: &Path,
+    output_root: &Path,
+    audit_run_id: &str,
+    already_covered_paths: &std::collections::HashSet<String>,
+) -> Result<ClusterDispatchOutcome> {
+    let Some(summary) = load_audit_findings_summary(repo_root, audit_run_id)? else {
+        // The canonical typed summary is only emitted by the post-reform
+        // audit-everything pipeline; older or pre-aborted runs fall through
+        // to the legacy LLM-only flow.
+        return Ok(ClusterDispatchOutcome::default());
+    };
+
+    let filtered: Vec<AuditFinding> = summary
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            finding
+                .paths
+                .iter()
+                .all(|path| !already_covered_paths.contains(path))
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Ok(ClusterDispatchOutcome::default());
+    }
+
+    let clusters = cluster_findings(&filtered);
+    let outcome = dispatch_classified_harvest(&clusters, output_root, audit_run_id)?;
+    if outcome.counts_by_class.is_empty() {
+        println!(
+            "audit harvest: clustered {} typed finding(s) into {} group(s); all routed to single-row plan flow",
+            filtered.len(),
+            clusters.len(),
+        );
+    } else {
+        let parts: Vec<String> = outcome
+            .counts_by_class
+            .iter()
+            .map(|(class, count)| format!("{count} {class}"))
+            .collect();
+        println!(
+            "audit harvest: clustered {} typed finding(s) into {} group(s); routed {} (single-row clusters continue to LLM)",
+            filtered.len(),
+            clusters.len(),
+            parts.join(", "),
+        );
+    }
+    Ok(outcome)
+}
+
+fn load_audit_findings_summary(
+    repo_root: &Path,
+    audit_run_id: &str,
+) -> Result<Option<AuditFindingsSummary>> {
+    let summary_path = repo_root
+        .join(".auto")
+        .join("audit-everything")
+        .join(audit_run_id)
+        .join("worktree")
+        .join("audit")
+        .join("everything")
+        .join(audit_run_id)
+        .join("harvest")
+        .join("AUDIT-FINDINGS-SUMMARY.json");
+    if !summary_path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&summary_path)
+        .with_context(|| format!("failed to read {}", summary_path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let summary: AuditFindingsSummary = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", summary_path.display()))?;
+    Ok(Some(summary))
+}
+
+/// Route every cluster to the right downstream artifact and return the
+/// outcome. SingleRow clusters fall through to the existing LLM flow; the
+/// other three classes are written to dedicated JSON queues so an operator
+/// can pick them up without an extra prompt round-trip.
+pub(crate) fn dispatch_classified_harvest(
+    clusters: &[ClusterGroup],
+    output_root: &Path,
+    audit_run_id: &str,
+) -> Result<ClusterDispatchOutcome> {
+    fs::create_dir_all(output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+
+    let mut outcome = ClusterDispatchOutcome::default();
+    let mut needs_plan: Vec<serde_json::Value> = Vec::new();
+    let mut operator_entries: Vec<serde_json::Value> = Vec::new();
+
+    for cluster in clusters {
+        let class = classify_complexity(cluster);
+        match class {
+            ComplexityClass::SingleRow => continue,
+            ComplexityClass::CrossCuttingRefactor | ComplexityClass::GeneratorLevel => {
+                let kind = if matches!(class, ComplexityClass::GeneratorLevel) {
+                    "generator-level"
+                } else {
+                    "cross-cutting-refactor"
+                };
+                let entry = serde_json::json!({
+                    "audit_run_id": audit_run_id,
+                    "kind": kind,
+                    "complexity_class": class.as_str(),
+                    "cluster_title": cluster.cluster_title,
+                    "cluster_path": cluster.cluster_path,
+                    "seed_dr_id": cluster.seed.dr_id,
+                    "seed_class": cluster.seed.class.as_str(),
+                    "member_count": cluster.member_count,
+                    "member_paths": cluster.member_paths,
+                    "dedup_keys": cluster.dedup_keys,
+                    "rationale": "complexity-too-high for a single plan row; produce a design-doc proposal first.",
+                });
+                needs_plan.push(entry);
+                for path in &cluster.member_paths {
+                    outcome.deferred_paths.insert(path.clone());
+                }
+                *outcome.counts_by_class.entry(class.as_str()).or_insert(0) += 1;
+            }
+            ComplexityClass::ExternalState => {
+                let entry = serde_json::json!({
+                    "audit_run_id": audit_run_id,
+                    "complexity_class": class.as_str(),
+                    "policy": "external",
+                    "cluster_title": cluster.cluster_title,
+                    "cluster_path": cluster.cluster_path,
+                    "seed_dr_id": cluster.seed.dr_id,
+                    "seed_class": cluster.seed.class.as_str(),
+                    "member_count": cluster.member_count,
+                    "member_paths": cluster.member_paths,
+                    "dedup_keys": cluster.dedup_keys,
+                    "proof_missing": cluster.seed.proof_missing,
+                    "rationale": "requires external-state evidence (live runtime, pool acceptance, wall-clock data) before any code change is meaningful.",
+                });
+                operator_entries.push(entry);
+                for path in &cluster.member_paths {
+                    outcome.deferred_paths.insert(path.clone());
+                }
+                *outcome.counts_by_class.entry(class.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if !needs_plan.is_empty() {
+        let path = output_root.join("NEEDS-PLAN-QUEUE.json");
+        let body = serde_json::json!({
+            "audit_run_id": audit_run_id,
+            "generated_at": timestamp_slug(),
+            "entries": needs_plan,
+        });
+        atomic_write(&path, &serde_json::to_vec_pretty(&body)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        outcome.artifacts.push(path);
+    }
+    if !operator_entries.is_empty() {
+        let path = output_root.join("OPERATOR-QUEUE.json");
+        let body = serde_json::json!({
+            "audit_run_id": audit_run_id,
+            "generated_at": timestamp_slug(),
+            "entries": operator_entries,
+        });
+        atomic_write(&path, &serde_json::to_vec_pretty(&body)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        outcome.artifacts.push(path);
+    }
+    Ok(outcome)
 }
 
 /// Codex's API gateway hard-caps prompt input at ~1 MB of UTF-8 characters.
@@ -1302,6 +1794,7 @@ fn build_audit_harvest_prompt(
 
 CONSTRAINTS:
 - Append rows ONLY to the existing IMPLEMENTATION_PLAN.md. Do not edit other files. Do not create new files.
+- The findings below have already been pre-clustered. Cross-cutting refactors (paths > 5 or > 2 directories), generator-level edits (`generated/`, `codegen/`, `*.gen.*`, `build.rs`), and external-state work (live-runtime / wall-clock / pool acceptance evidence) have been written to `NEEDS-PLAN-QUEUE.json` and `OPERATOR-QUEUE.json` next to this prompt -- DO NOT re-emit task rows for those clusters. You are authoring rows for the single-row cluster residue only.
 - Match the existing row schema exactly: every appended task block must use the `- [ ] `<ID>` <Title>` header followed by the indented field set seen in the existing rows (Spec / Why now / Codebase evidence / Source of truth / Runtime owner / UI consumers / Generated artifacts / Fixture boundary / Retired surfaces / Owns / Integration touchpoints / Scope boundary / Acceptance criteria / Verification / Required tests / Contract generation / Cross-surface tests / Review/closeout / Completion artifacts / Dependencies / Estimated scope / Completion signal).
 - IDs must be unique across IMPLEMENTATION_PLAN.md. Use prefix `AUDIT-{audit_run_id}-NN`; scan the existing file first and start from the next free integer.
 - {consolidation_hint}
@@ -1889,6 +2382,8 @@ mod tests {
                     },
                 ],
             },
+            operator_queue: vec![],
+            auto_resolved: vec![],
         };
 
         let serialized =
@@ -2157,5 +2652,245 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn findings_with_entries(entries: Vec<OperatorQueueEntry>) -> SuperFindings {
+        SuperFindings {
+            run_id: "run-1".to_string(),
+            generated_at: "2026-05-13T19:34:00Z".to_string(),
+            readiness: "conditional_go".to_string(),
+            blockers: vec![],
+            risks: vec![],
+            gates: vec![],
+            campaign_plan: SuperCampaignPlan {
+                horizon_days: 14,
+                milestones: vec![],
+            },
+            operator_queue: entries,
+            auto_resolved: vec![],
+        }
+    }
+
+    #[test]
+    fn auto_resolve_baseline_walk_steps_current_toward_floor() {
+        let mut findings = findings_with_entries(vec![OperatorQueueEntry {
+            id: "OP-1".to_string(),
+            title: "walk active_channels baseline".to_string(),
+            policy: OperatorPolicy::Deterministic,
+            resolver_kind: Some(ResolverKind::BaselineWalk {
+                current: 469,
+                floor: 256,
+            }),
+            payload: "active_channels".to_string(),
+            evidence: "ops/baselines.json".to_string(),
+        }]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, Path::new("/tmp"))
+            .expect("resolver must succeed");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].new_value, "468");
+        assert_eq!(resolved[0].resolver, "baseline_walk");
+        assert!(findings.operator_queue.is_empty());
+        assert_eq!(findings.auto_resolved.len(), 1);
+    }
+
+    #[test]
+    fn auto_resolve_baseline_walk_stops_at_floor() {
+        let mut findings = findings_with_entries(vec![OperatorQueueEntry {
+            id: "OP-1".to_string(),
+            title: "walk at floor".to_string(),
+            policy: OperatorPolicy::Deterministic,
+            resolver_kind: Some(ResolverKind::BaselineWalk {
+                current: 100,
+                floor: 100,
+            }),
+            payload: String::new(),
+            evidence: String::new(),
+        }]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, Path::new("/tmp"))
+            .expect("floor walk must succeed");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].new_value, "100");
+    }
+
+    #[test]
+    fn auto_resolve_env_default_reads_spec_file() {
+        let root = temp_dir("super-resolver-env");
+        let spec = root.join("spec.md");
+        fs::write(
+            &spec,
+            "# defaults\n- RAT_WIRE_ASCII=1\n- RAT_WIRE_MOTION=on\n",
+        )
+        .unwrap();
+        let mut findings = findings_with_entries(vec![OperatorQueueEntry {
+            id: "OP-1".to_string(),
+            title: "env default".to_string(),
+            policy: OperatorPolicy::Deterministic,
+            resolver_kind: Some(ResolverKind::EnvDefault {
+                var: "RAT_WIRE_ASCII".to_string(),
+                spec_path: spec.clone(),
+            }),
+            payload: String::new(),
+            evidence: String::new(),
+        }]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, &root)
+            .expect("env-default resolver must succeed");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].new_value, "1");
+    }
+
+    #[test]
+    fn auto_resolve_gdd_composition_reads_section_body() {
+        let root = temp_dir("super-resolver-gdd");
+        let gdd = root.join("RSOCIETY-GDD.md");
+        fs::write(
+            &gdd,
+            "# Top\n\
+## First Earned Cycle\n\
+Composition: 60% relationship, 40% scaffold.\n\
+Source: live runtime.\n\n\
+## Next Section\n\
+Other body.\n",
+        )
+        .unwrap();
+        let mut findings = findings_with_entries(vec![OperatorQueueEntry {
+            id: "OP-1".to_string(),
+            title: "gdd section".to_string(),
+            policy: OperatorPolicy::Deterministic,
+            resolver_kind: Some(ResolverKind::GddComposition {
+                section: "First Earned Cycle".to_string(),
+            }),
+            payload: String::new(),
+            evidence: String::new(),
+        }]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, &root)
+            .expect("gdd composition resolver must succeed");
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].new_value.contains("Composition: 60% relationship"));
+        assert!(!resolved[0].new_value.contains("Other body"));
+    }
+
+    #[test]
+    fn auto_resolve_skips_external_and_manual_policies() {
+        let mut findings = findings_with_entries(vec![
+            OperatorQueueEntry {
+                id: "OP-EXT".to_string(),
+                title: "external evidence".to_string(),
+                policy: OperatorPolicy::External,
+                resolver_kind: Some(ResolverKind::BaselineWalk {
+                    current: 5,
+                    floor: 0,
+                }),
+                payload: String::new(),
+                evidence: String::new(),
+            },
+            OperatorQueueEntry {
+                id: "OP-MAN".to_string(),
+                title: "manual opt-out".to_string(),
+                policy: OperatorPolicy::Manual,
+                resolver_kind: Some(ResolverKind::BaselineWalk {
+                    current: 5,
+                    floor: 0,
+                }),
+                payload: String::new(),
+                evidence: String::new(),
+            },
+        ]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, Path::new("/tmp"))
+            .expect("skip should still return Ok");
+        assert!(resolved.is_empty());
+        assert_eq!(findings.operator_queue.len(), 2);
+        assert!(findings.auto_resolved.is_empty());
+    }
+
+    #[test]
+    fn auto_resolve_records_failure_back_to_queue() {
+        let root = temp_dir("super-resolver-fail");
+        let mut findings = findings_with_entries(vec![OperatorQueueEntry {
+            id: "OP-1".to_string(),
+            title: "missing var".to_string(),
+            policy: OperatorPolicy::Deterministic,
+            resolver_kind: Some(ResolverKind::EnvDefault {
+                var: "NOT_PRESENT".to_string(),
+                spec_path: root.join("missing.md"),
+            }),
+            payload: String::new(),
+            evidence: String::new(),
+        }]);
+        let resolved = auto_resolve_deterministic_entries(&mut findings, &root)
+            .expect("resolver failure is non-fatal");
+        assert!(resolved.is_empty());
+        assert_eq!(findings.operator_queue.len(), 1);
+        assert!(findings.operator_queue[0]
+            .evidence
+            .contains("auto-resolve failed"));
+    }
+
+    #[test]
+    fn dispatch_classified_harvest_emits_queue_artifacts() {
+        let root = temp_dir("super-dispatch");
+        let cluster_gen = ClusterGroup {
+            key: harvest_cluster::ClusterKey {
+                path_ancestor: PathBuf::from("crates/foo/src/generated"),
+                finding_class: "deepen".to_string(),
+                signature_hash: "abc".to_string(),
+            },
+            seed: AuditFinding {
+                dr_id: "DR-001".to_string(),
+                title: "Schema drift".to_string(),
+                cluster: "gen".to_string(),
+                paths: vec!["crates/foo/src/generated/schema.rs".to_string()],
+                class: crate::audit_everything::FindingClass::Deepen,
+                complexity_hint: "single-row".to_string(),
+                proof_found: String::new(),
+                proof_missing: String::new(),
+                risk: "med".to_string(),
+                dedup_key: "key1".to_string(),
+            },
+            cluster_title: "Schema drift".to_string(),
+            cluster_path: "crates/foo/src/generated/schema.rs".to_string(),
+            dedup_keys: vec!["key1".to_string()],
+            member_paths: vec!["crates/foo/src/generated/schema.rs".to_string()],
+            member_count: 1,
+        };
+        let cluster_external = ClusterGroup {
+            key: harvest_cluster::ClusterKey {
+                path_ancestor: PathBuf::from("crates/pool/src"),
+                finding_class: "deepen".to_string(),
+                signature_hash: "def".to_string(),
+            },
+            seed: AuditFinding {
+                dr_id: "DR-002".to_string(),
+                title: "Pool acceptance lag".to_string(),
+                cluster: "pool".to_string(),
+                paths: vec!["crates/pool/src/accept.rs".to_string()],
+                class: crate::audit_everything::FindingClass::Deepen,
+                complexity_hint: "external-state".to_string(),
+                proof_found: String::new(),
+                proof_missing: "needs wall-clock pool acceptance".to_string(),
+                risk: "med".to_string(),
+                dedup_key: "key2".to_string(),
+            },
+            cluster_title: "Pool acceptance lag".to_string(),
+            cluster_path: "crates/pool/src/accept.rs".to_string(),
+            dedup_keys: vec!["key2".to_string()],
+            member_paths: vec!["crates/pool/src/accept.rs".to_string()],
+            member_count: 1,
+        };
+        let clusters = vec![cluster_gen, cluster_external];
+        let outcome = dispatch_classified_harvest(&clusters, &root, "run-1").unwrap();
+        assert!(outcome
+            .artifacts
+            .iter()
+            .any(|p| p.ends_with("NEEDS-PLAN-QUEUE.json")));
+        assert!(outcome
+            .artifacts
+            .iter()
+            .any(|p| p.ends_with("OPERATOR-QUEUE.json")));
+        assert!(outcome
+            .deferred_paths
+            .contains("crates/foo/src/generated/schema.rs"));
+        assert!(outcome
+            .deferred_paths
+            .contains("crates/pool/src/accept.rs"));
     }
 }
