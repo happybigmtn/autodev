@@ -372,7 +372,7 @@ pub(crate) fn task_field_body_until_any(
     let mut body = Vec::new();
     for line in markdown.lines() {
         let unbulleted = strip_list_bullet(line);
-        if let Some(rest) = unbulleted.strip_prefix(field) {
+        if let Some(rest) = strip_field_prefix(unbulleted, field) {
             collecting = true;
             if !rest.trim().is_empty() {
                 body.push(rest.trim().to_string());
@@ -383,7 +383,7 @@ pub(crate) fn task_field_body_until_any(
             && next_fields
                 .iter()
                 .filter(|next_field| **next_field != field)
-                .any(|next_field| unbulleted.starts_with(next_field))
+                .any(|next_field| line_starts_with_field(unbulleted, next_field))
         {
             break;
         }
@@ -392,6 +392,31 @@ pub(crate) fn task_field_body_until_any(
         }
     }
     collecting.then(|| body.join("\n"))
+}
+
+/// Strips a plan task field prefix, returning the value after the colon.
+///
+/// Recognizes three forms so LLM-emitted plans don't have to match a single
+/// style exactly:
+///   - bare:        `Spec: …`
+///   - bold field:  `**Spec:** …`
+///   - bold name:   `**Spec**: …`
+pub(crate) fn strip_field_prefix<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    if let Some(rest) = line.strip_prefix(field) {
+        return Some(rest);
+    }
+    let field_name = field.trim_end_matches(':');
+    let bold_field = format!("**{field_name}:**");
+    if let Some(rest) = line.strip_prefix(&bold_field) {
+        return Some(rest);
+    }
+    let bold_name = format!("**{field_name}**:");
+    line.strip_prefix(&bold_name)
+}
+
+/// Returns true when `line` begins with the named field in any accepted form.
+pub(crate) fn line_starts_with_field(line: &str, field: &str) -> bool {
+    strip_field_prefix(line, field).is_some()
 }
 
 pub(crate) fn validate_execution_row(task: &PlanTask, all_task_ids: &BTreeSet<&str>) -> Result<()> {

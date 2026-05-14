@@ -5434,7 +5434,7 @@ No external dependencies.
         let error =
             verify_generated_implementation_plan(&root).expect_err("expected scope failure");
 
-        assert!(error.to_string().contains("Estimated scope: XS"));
+        assert!(format!("{error:#}").contains("Estimated scope: XS"));
     }
 
     #[test]
@@ -5631,37 +5631,14 @@ No external dependencies.
         assert!(error.to_string().contains("package-wide cargo test"));
     }
 
-    #[test]
-    fn generated_plan_rejects_multiple_cargo_test_filters() {
-        let root = temp_dir("multi-filter-cargo-test-verification");
-        write_real_spec(&root);
-        let task = valid_generated_plan_task().replace(
-            "    cargo test -p docs exact_docs_test",
-            "    cargo test generation::tests::one completion_artifacts::tests::two",
-        );
-        write_generated_plan(&root, &task);
-
-        let error = verify_generated_implementation_plan(&root)
-            .expect_err("expected multi-filter cargo test failure");
-
-        assert!(error.to_string().contains("multi-filter cargo test"));
-    }
-
-    #[test]
-    fn generated_plan_rejects_bin_only_cargo_lib_verification() {
-        let root = temp_dir("bin-only-cargo-lib-verification");
-        write_real_spec(&root);
-        let task = valid_generated_plan_task().replace(
-            "    cargo test -p docs exact_docs_test",
-            "    cargo test --lib generation::tests::one",
-        );
-        write_generated_plan(&root, &task);
-
-        let error = verify_generated_implementation_plan(&root)
-            .expect_err("expected cargo --lib verification failure");
-
-        assert!(error.to_string().contains("cargo test --lib"));
-    }
+    // `generated_plan_rejects_multiple_cargo_test_filters` and
+    // `generated_plan_rejects_bin_only_cargo_lib_verification` were retired in
+    // commit 6958baa ("autodev: relax cargo test --lib and multi-filter bans
+    // in verification"). `cargo test -p crate filter1 filter2` is a valid
+    // invocation that runs both filters, and `cargo test --lib <filter>` is
+    // fine for crates that have a lib target. The corresponding rejections
+    // in src/verification_lint.rs were intentionally loosened; the tests
+    // that locked those rejections in are obsolete.
 
     #[test]
     fn generated_plan_rejects_malformed_directory_grep_verification() {
@@ -5676,7 +5653,7 @@ No external dependencies.
         let error = verify_generated_implementation_plan(&root)
             .expect_err("expected malformed grep verification failure");
 
-        assert!(error.to_string().contains("malformed grep verification"));
+        assert!(format!("{error:#}").contains("malformed grep verification"));
     }
 
     #[test]
@@ -5692,21 +5669,13 @@ No external dependencies.
         assert!(error.to_string().contains("vague `Owns:`"));
     }
 
-    #[test]
-    fn generated_plan_rejects_tag_only_owns_prose_with_helpful_message() {
-        let root = temp_dir("tag-prose-ownership");
-        write_real_spec(&root);
-        let task = valid_generated_plan_task()
-            .replace("Owns: docs", "Owns: git tags only (no files change).");
-        write_generated_plan(&root, &task);
-
-        let error =
-            verify_generated_implementation_plan(&root).expect_err("expected ownership failure");
-
-        let msg = error.to_string();
-        assert!(msg.contains("must give concrete path-like ownership"));
-        assert!(msg.contains("refs/tags/<tag>"));
-    }
+    // `generated_plan_rejects_tag_only_owns_prose_with_helpful_message` was
+    // retired in commit dbeebf6 ("autodev: relax plan validators that fight
+    // LLM-natural prose"). `verify_generated_plan_task_has_concrete_ownership`
+    // now accepts prose-style ownership descriptions; the TBD/missing/
+    // unspecified guard still catches vacuous content. The
+    // `generated_plan_rejects_vague_ownership` test above still covers the
+    // remaining reject path.
 
     #[test]
     fn generated_plan_accepts_git_ref_path_owns() {
