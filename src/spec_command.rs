@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 
-use crate::claude_exec::run_claude_exec;
+use crate::backend::{Backend, BackendRequest, ClaudeBackend};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
     execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
@@ -92,17 +92,21 @@ pub(crate) async fn run_spec(args: SpecArgs) -> Result<()> {
     }
 
     let status = if spec_author_uses_claude_model(&args.model) {
-        run_claude_exec(
-            &repo_root,
-            &full_prompt,
-            &args.model,
-            &args.reasoning_effort,
-            Some(args.max_turns),
-            &stderr_log_path,
-            Some(&stdout_log_path),
-            "auto-spec",
-        )
-        .await?
+        let backend: Box<dyn Backend> = Box::new(ClaudeBackend);
+        let req = BackendRequest {
+            repo_root: &repo_root,
+            prompt: &full_prompt,
+            model: args.model.clone(),
+            effort: args.reasoning_effort.clone(),
+            max_turns: Some(args.max_turns),
+            stderr_log_path: &stderr_log_path,
+            stdout_log_path: Some(&stdout_log_path),
+            context_label: "auto-spec",
+            extra_env: &[],
+            worker_pid_path: None,
+            futility_threshold: None,
+        };
+        backend.run(req).await?.exit_status
     } else {
         run_codex_exec_max_context(
             &repo_root,
