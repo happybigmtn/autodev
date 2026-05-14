@@ -1185,13 +1185,14 @@ async fn run_final_review_and_file_quality_phase(
     if !final_review_is_go(paths) {
         manifest.file_quality.status = StageStatus::Failed;
         manifest.file_quality.note = Some(
-            "final review is not GO; audit cannot complete until final-review blockers are resolved and every file rerates at least 9/10"
+            "final review is not GO; audit cannot complete until the blockers it listed are resolved (the file-quality rerate phase only runs after final review is GO)"
                 .to_string(),
         );
         write_manifest(paths, manifest)?;
         finalize_change_summary_phase(paths, manifest, true)?;
         bail!(
-            "final review is not GO; auto audit will not exit successfully until final-review blockers are resolved and every file rerates at least {FILE_QUALITY_ACCEPT_SCORE:.0}/10"
+            "final review is not GO; resolve the blockers FINAL-REVIEW.md lists, then resume. (Once final review reaches GO, the file-quality rerate phase runs to {accept:.0}/10 per file.)",
+            accept = FILE_QUALITY_ACCEPT_SCORE,
         );
     }
     let changed = run_file_quality_gate_phase(args, paths, manifest).await?;
@@ -3764,7 +3765,32 @@ Output directory: `{artifact_dir}`
 
 Regrade the first-pass rating for exactly this file against the current repository state. Read the file itself, the first-pass artifacts, the group report, and the final review. Do not edit source code in this rerating step.
 
-Apply strict professional standards. The target is {target:.0}/10. A score below {accept:.0}/10 means this file still needs another deliverable pass before merge. Regrade independently; do not rubber-stamp the original first-pass score.
+# First-pass input shape
+
+The first-pass JSON at `{first_pass}` uses the typed-findings schema:
+```json
+{{
+  "path": "<repo-relative>",
+  "summary": "<one paragraph: what + ownership>",
+  "findings": [
+    {{ "class": "dead_code | consolidate | deepen | simplify | leave_with_reason | none", "body": "...", "paths_implicated": [] }}
+  ]
+}}
+```
+First-pass does **not** emit a `score_out_of_10` -- that ritual was retired. For backward compatibility with archived runs you may also encounter an older first-pass shape that does carry `score_out_of_10`, `best_version_assessment`, etc.; treat that as legacy input.
+
+# Deriving previous_score_out_of_10 from typed findings
+
+When the first-pass JSON uses the typed-findings shape, derive `previous_score_out_of_10` deterministically from the findings:
+- 10 if every finding's `class` is `none` or `leave_with_reason`
+- 8 if any finding is `simplify` but none are `dead_code` / `consolidate` / `deepen`
+- 7 if any finding is `consolidate` but none are `dead_code` / `deepen`
+- 5 if any finding is `dead_code` or `deepen`
+Pick the lowest applicable bucket. If the first-pass JSON already carries a literal `score_out_of_10`, use that instead.
+
+# Your judgment
+
+Apply strict professional standards. The target is {target:.0}/10. A score below {accept:.0}/10 means this file still needs another deliverable pass before merge. Regrade independently; do not rubber-stamp the derived previous score.
 
 Penalize the file if it still contains unnecessary code, orphaned/deprecated surfaces, duplicated responsibility, AI-slop, shallow ownership, vague comments, fake extensibility, or missed consolidation opportunities. A file should not reach {accept:.0}/10 if it obviously needs deletion, retirement, or architectural relocation and the audit failed to handle or document that.
 
@@ -3774,13 +3800,15 @@ Write:
 
 `rating.md` must include:
 - Current score out of 10.
-- Whether the first-pass score was too high, too low, or accurate.
+- Whether the first-pass score (or derived previous score, if typed-findings input) was too high, too low, or accurate.
 - Concrete deliverables needed to make the file a {target:.0}/10 work product.
 - Any remaining deletion, consolidation, simplification, AI-slop, or architecture-deepening deliverables.
 - What would be acceptable evidence that the file is at least {accept:.0}/10.
 
 `rating.json` must be valid JSON with:
 `path`, `pass_index`, `score_out_of_10`, `previous_score_out_of_10`, `first_pass_grade_was`, `debt_or_architecture_findings`, `deliverables_to_reach_10`, `minimum_evidence_for_9`, `confidence`.
+
+If the first-pass used the typed-findings shape, also include `previous_score_source: "derived_from_findings"`. If the first-pass had a literal score, include `previous_score_source: "first_pass_literal"`.
 "#,
         repo = paths.worktree_root.display(),
         report_root = paths.report_root.display(),
@@ -5666,6 +5694,105 @@ mod tests {
         let reparsed: AnalysisJson = serde_json::from_str(&serialized).expect("reparse");
         assert_eq!(reparsed.findings[0].class, FindingClass::Consolidate);
         assert_eq!(reparsed.findings[0].paths_implicated, vec!["src/util.rs"]);
+    }
+
+    #[test]
+    fn rerate_prompt_teaches_typed_findings_to_score_mapping() {
+        // Regression guard for the audit-everything rebuild gap: when
+        // Change #2 dropped score_out_of_10 from the first-pass JSON, the
+        // rerate prompt was left referencing a `previous_score_out_of_10`
+        // field it could no longer find. The fix is to teach the rerate
+        // prompt how to derive that score from typed findings deterministically,
+        // and to keep a backward-compat path for archived runs whose first-pass
+        // does still carry a literal score.
+        let base = std::env::temp_dir().join(format!(
+            "autodev-rerate-prompt-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).expect("temp dir");
+        let paths = RunPaths {
+            host_root: base.clone(),
+            manifest_path: base.join("MANIFEST.json"),
+            latest_path: base.join("latest"),
+            worktree_root: base.clone(),
+            report_root: base.join("reports"),
+            pause_path: base.join("PAUSE"),
+            in_place: false,
+        };
+        let mut manifest = EverythingManifest {
+            run_id: "20260513-000000".to_string(),
+            repo_root: base.display().to_string(),
+            worktree_root: base.display().to_string(),
+            report_root: paths.report_root.display().to_string(),
+            in_place: false,
+            branch: "trunk".to_string(),
+            audit_branch: "audit/x".to_string(),
+            base_commit: "deadbeef".to_string(),
+            created_at: "2026-05-13T00:00:00Z".to_string(),
+            context: ContextState::default(),
+            files: vec![],
+            groups: vec![GroupState {
+                name: "lib".to_string(),
+                slug: "lib".to_string(),
+                files: vec![],
+                report_path: "audit/everything/x/reports/lib.md".to_string(),
+                synthesis_status: StageStatus::Pending,
+                remediation_status: StageStatus::Pending,
+            }],
+            remediation_plan: StageState::default(),
+            remediation_tasks: vec![],
+            final_review_repairs: vec![],
+            file_quality: StageState::default(),
+            file_quality_passes: vec![],
+            change_summary: StageState::default(),
+            final_review: StageState::default(),
+            merge: StageState::default(),
+            final_status: StageState::default(),
+        };
+        manifest.created_at.clear();
+        manifest.created_at.push_str("2026-05-13T00:00:00Z");
+        let file = FileState {
+            path: "src/lib.rs".to_string(),
+            group: "lib".to_string(),
+            content_hash: "deadbeef".to_string(),
+            artifact_dir: "audit/everything/x/files/abc".to_string(),
+            status: StageStatus::Pending,
+        };
+        let prompt = build_file_quality_rerate_prompt(&paths, &manifest, &file, 1);
+
+        // The prompt must acknowledge the typed-findings shape and teach the
+        // derivation mapping, otherwise the model is left guessing.
+        assert!(
+            prompt.contains("typed-findings"),
+            "prompt must reference typed-findings input shape"
+        );
+        for class in [
+            "dead_code",
+            "consolidate",
+            "deepen",
+            "simplify",
+            "leave_with_reason",
+            "none",
+        ] {
+            assert!(
+                prompt.contains(class),
+                "prompt must teach the mapping for class `{class}`"
+            );
+        }
+        // The backward-compat path for archived runs must remain mentioned so
+        // the model can read either shape.
+        assert!(
+            prompt.contains("backward compatibility")
+                || prompt.contains("legacy input"),
+            "prompt must explain the legacy first-pass shape"
+        );
+        // The previous_score_source disambiguator must be requested so the
+        // host can tell whether the score was derived or read literally.
+        assert!(
+            prompt.contains("previous_score_source"),
+            "prompt must request `previous_score_source` so the host can disambiguate"
+        );
     }
 
     #[test]
