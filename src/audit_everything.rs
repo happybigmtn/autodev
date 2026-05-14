@@ -2260,17 +2260,33 @@ async fn run_one_remediation_lane(
     let stdout_path = lane_root.join(format!("{}-stdout.log", task.id));
     atomic_write(&prompt_path, prompt.as_bytes())
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
-    let status = run_codex_exec_max_context(
-        &lane_repo_root,
-        &prompt,
-        &config.model,
-        &config.effort,
-        &config.codex_bin,
-        &stderr_path,
-        Some(&stdout_path),
-        &format!("auto audit remediation {}", task.id),
-    )
-    .await?;
+    let claude_route = crate::claude_exec::looks_like_claude_model(&config.model);
+    let context_label = format!("auto audit remediation {}", task.id);
+    let status = if claude_route {
+        crate::claude_exec::run_claude_exec(
+            &lane_repo_root,
+            &prompt,
+            &config.model,
+            &config.effort,
+            None,
+            &stderr_path,
+            Some(&stdout_path),
+            &context_label,
+        )
+        .await?
+    } else {
+        run_codex_exec_max_context(
+            &lane_repo_root,
+            &prompt,
+            &config.model,
+            &config.effort,
+            &config.codex_bin,
+            &stderr_path,
+            Some(&stdout_path),
+            &context_label,
+        )
+        .await?
+    };
     if !status.success() {
         bail!(
             "remediation lane {} failed with status {status}; see {}",
@@ -2658,23 +2674,39 @@ async fn run_codex_phase_for_artifact(
     let stdout_path = artifact_dir.join(format!("{phase_slug}-stdout.log"));
     atomic_write(&prompt_path, prompt.as_bytes())
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+    let claude_route = crate::claude_exec::looks_like_claude_model(&config.model);
     println!(
-        "phase:       {phase_slug} | model: {} | effort: {} | prompt: {}",
+        "phase:       {phase_slug} | backend: {} | model: {} | effort: {} | prompt: {}",
+        if claude_route { "claude" } else { "codex" },
         config.model,
         config.effort,
         prompt_path.display()
     );
-    let status = run_codex_exec_max_context(
-        &paths.worktree_root,
-        prompt,
-        &config.model,
-        &config.effort,
-        &config.codex_bin,
-        &stderr_path,
-        Some(&stdout_path),
-        phase_slug,
-    )
-    .await?;
+    let status = if claude_route {
+        crate::claude_exec::run_claude_exec(
+            &paths.worktree_root,
+            prompt,
+            &config.model,
+            &config.effort,
+            None,
+            &stderr_path,
+            Some(&stdout_path),
+            phase_slug,
+        )
+        .await?
+    } else {
+        run_codex_exec_max_context(
+            &paths.worktree_root,
+            prompt,
+            &config.model,
+            &config.effort,
+            &config.codex_bin,
+            &stderr_path,
+            Some(&stdout_path),
+            phase_slug,
+        )
+        .await?
+    };
     if !status.success() {
         bail!(
             "professional audit phase `{phase_slug}` failed with status {status}; see {}",
