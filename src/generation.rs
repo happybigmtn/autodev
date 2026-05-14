@@ -1643,14 +1643,8 @@ fn verify_corpus_semantics(
         .with_context(|| format!("failed to read {}", report_path.display()))?;
     let primary_plan_path = active_plan_surface.primary_plan_path().unwrap_or("plans/");
 
-    if !corpus_text_references_primary_plan(&plans_index, primary_plan_path)
-        && !corpus_text_references_primary_plan(&report, primary_plan_path)
-    {
-        bail!(
-            "corpus must explicitly reference the active root planning surface at `{}` when the repo already has active plans",
-            primary_plan_path
-        );
-    }
+    let names_primary_plan = corpus_text_references_primary_plan(&plans_index, primary_plan_path)
+        || corpus_text_references_primary_plan(&report, primary_plan_path);
 
     let combined = format!("{plans_index}\n{report}").to_ascii_lowercase();
     let acknowledges_subordination = [
@@ -1659,10 +1653,25 @@ fn verify_corpus_semantics(
         "reconciled",
         "active planning surface",
         "active master plan",
+        "active root plan",
         "not a parallel control plane",
     ]
     .iter()
     .any(|needle| combined.contains(needle));
+    // A generic reference to the `plans/` directory satisfies the
+    // active-surface acknowledgment intent when paired with explicit
+    // subordination language. The validator's job is to ensure the corpus
+    // is aware of the active master plan, not to insist that every plan
+    // gets named individually.
+    let names_plans_directory =
+        combined.contains("plans/*.md") || combined.contains("`plans/`");
+
+    if !names_primary_plan && !(names_plans_directory && acknowledges_subordination) {
+        bail!(
+            "corpus must explicitly reference the active root planning surface at `{}` (or `plans/` with subordination language) when the repo already has active plans",
+            primary_plan_path
+        );
+    }
 
     if !acknowledges_subordination {
         bail!(
@@ -4878,6 +4887,60 @@ Depends on `genesis/PLANS.md` and the numbered subordinate plan files.
             "the 010326-other-feature-* family",
             primary
         ));
+    }
+
+    #[test]
+    fn corpus_semantics_accepts_generic_plans_ref_with_subordination() {
+        // Real autonomy smoke regression: the LLM authored PLANS.md with a
+        // generic `plans/*.md` reference plus explicit "subordinate to the
+        // active root plans" language, but no individually-named master
+        // plan. The validator's intent (active-surface acknowledgment) is
+        // still met.
+        let root = temp_dir("corpus-generic-plans-ref");
+        let planning_root = root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let plans_index_path = planning_root.join("PLANS.md");
+        fs::write(
+            &plans_index_path,
+            "# Index\n\nThis corpus is **subordinate** to the active root plans (`plans/*.md`) and to the active queue rows.\n",
+        )
+        .unwrap();
+        let report_path = planning_root.join("GENESIS-REPORT.md");
+        fs::write(&report_path, "# Report\n\nNo specific plan reference here.\n").unwrap();
+
+        let surface = ActivePlanSurface {
+            root_plan_standard_path: Some("PLANS.md".to_string()),
+            active_plan_paths: vec!["plans/020526-rat-wire-actual-design-plates.md".to_string()],
+        };
+        super::verify_corpus_semantics(&root, &planning_root, &plans_index_path, &report_path, &surface)
+            .expect("generic plans/ ref + subordination should be accepted");
+    }
+
+    #[test]
+    fn corpus_semantics_rejects_generic_plans_ref_without_subordination() {
+        // Generic plans/ reference alone is not enough — the corpus has to
+        // actually acknowledge the active surface as authoritative.
+        let root = temp_dir("corpus-generic-plans-no-sub");
+        let planning_root = root.join("genesis");
+        let plans_dir = planning_root.join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let plans_index_path = planning_root.join("PLANS.md");
+        fs::write(
+            &plans_index_path,
+            "# Index\n\nSee `plans/*.md` for the active surface.\n",
+        )
+        .unwrap();
+        let report_path = planning_root.join("GENESIS-REPORT.md");
+        fs::write(&report_path, "# Report\n\nNo subordination claim here either.\n").unwrap();
+
+        let surface = ActivePlanSurface {
+            root_plan_standard_path: Some("PLANS.md".to_string()),
+            active_plan_paths: vec!["plans/020526-rat-wire-actual-design-plates.md".to_string()],
+        };
+        let error = super::verify_corpus_semantics(&root, &planning_root, &plans_index_path, &report_path, &surface)
+            .expect_err("missing subordination should still fail");
+        assert!(format!("{error:#}").contains("explicitly reference"));
     }
 
     #[test]
