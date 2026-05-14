@@ -333,6 +333,11 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
                 if auto_resolve_count == 1 { "y" } else { "ies" },
             );
         }
+        // Deterministic gate pass over super-findings.json. Informational for
+        // v1 -- the execution-gate LLM run is still the final say. Emits a
+        // severity-count verdict and (when a prior super run exists) a
+        // blocker-bitrot delta so the operator can spot stuck IDs.
+        emit_super_gate_signals(&repo_root, &super_root);
         push_stage(
             &super_root,
             &mut manifest,
@@ -413,6 +418,13 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
                 "complete",
                 Some(&harvest_artifact),
             )?;
+            // Build a coverage row from the audit run's skipped.json so the
+            // operator can spot allowlist drift without re-running the audit.
+            emit_super_coverage_report(
+                &repo_root,
+                &super_root,
+                manifest.audit_run_id.as_deref(),
+            );
         }
     } else {
         push_skipped_stage_if_needed(&super_root, &mut manifest, "audit")?;
@@ -805,6 +817,99 @@ async fn run_super_corpus_review(
         .with_context(|| format!("{} is not valid SuperFindings JSON", findings_path.display()))?;
     require_nonempty_file(&super_root.join(SUPER_REPORT_FILE))?;
     Ok(())
+}
+
+/// Run the deterministic gate over the freshly-resolved `super-findings.json`
+/// and surface its verdict + blocker-bitrot delta to the operator log. This is
+/// informational for v1 -- the execution-gate LLM run still decides Go/No-Go.
+/// All errors are swallowed (logged via `eprintln!`) so a gate read failure
+/// never blocks the super pipeline.
+fn emit_super_gate_signals(repo_root: &Path, super_root: &Path) {
+    let findings = match crate::super_gate::read_super_findings(super_root) {
+        Ok(findings) => findings,
+        Err(err) => {
+            eprintln!("super_gate: could not read super-findings.json -- {err}");
+            return;
+        }
+    };
+    let outcome = crate::super_gate::severity_count_gate(&findings);
+    match outcome.status {
+        crate::super_gate::GateStatus::Go => {
+            println!("super_gate: GO -- 0 high-severity blockers");
+        }
+        crate::super_gate::GateStatus::ConditionalGo => {
+            println!(
+                "super_gate: CONDITIONAL GO -- {} operator-queue entr{} still parked",
+                outcome.deferred.len(),
+                if outcome.deferred.len() == 1 { "y" } else { "ies" },
+            );
+        }
+        crate::super_gate::GateStatus::NoGo => {
+            eprintln!(
+                "super_gate: NO-GO -- {} blocker(s) at severity:high",
+                outcome.reasons.len(),
+            );
+            for reason in &outcome.reasons {
+                eprintln!("  - {reason}");
+            }
+        }
+    }
+
+    if let Some(prev_run) = crate::super_gate::find_prior_super_run(repo_root, super_root) {
+        match crate::super_gate::read_super_findings(&prev_run) {
+            Ok(prev_findings) => {
+                let bitrot = crate::super_gate::compute_blocker_bitrot(&prev_findings, &findings);
+                if !bitrot.is_empty() {
+                    eprintln!(
+                        "super_gate: blocker bitrot detected ({} unchanged ID{} vs {})",
+                        bitrot.len(),
+                        if bitrot.len() == 1 { "" } else { "s" },
+                        prev_run.display(),
+                    );
+                    for id in &bitrot {
+                        eprintln!("  - {id}");
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "super_gate: prior run {} unreadable -- {err}",
+                    prev_run.display(),
+                );
+            }
+        }
+    }
+}
+
+/// Write `<super_root>/coverage.json` from the audit run's `skipped.json` so
+/// operators can see what the audit pass declined to inspect. Errors are
+/// logged but never block the super pipeline.
+fn emit_super_coverage_report(repo_root: &Path, super_root: &Path, audit_run_id: Option<&str>) {
+    let Some(run_id) = audit_run_id else {
+        return;
+    };
+    let audit_run_root = repo_root
+        .join(".auto")
+        .join("audit-everything")
+        .join(run_id);
+    match crate::super_gate::build_coverage_report(&audit_run_root) {
+        Ok(report) => match crate::super_gate::write_coverage_report(super_root, &report) {
+            Ok(path) => {
+                println!(
+                    "super_gate: coverage report -> {} ({} skipped / {} seen)",
+                    path.display(),
+                    report.skipped_count,
+                    report.total_files_seen,
+                );
+            }
+            Err(err) => {
+                eprintln!("super_gate: failed to write coverage.json -- {err}");
+            }
+        },
+        Err(err) => {
+            eprintln!("super_gate: failed to build coverage report -- {err}");
+        }
+    }
 }
 
 /// Read `super-findings.json`, auto-resolve every deterministic operator-queue

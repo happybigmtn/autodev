@@ -40,6 +40,7 @@ mod spec_command;
 mod state;
 mod steward_command;
 mod super_command;
+mod super_gate;
 mod symphony_command;
 mod task_parser;
 mod util;
