@@ -19,7 +19,9 @@ use crate::kimi_backend::{
     extract_final_text as kimi_extract_final_text, kimi_exec_args, parse_kimi_error,
     preflight_kimi_cli, resolve_kimi_bin, resolve_kimi_cli_model,
 };
+use crate::backend_policy::{PipelineStage, PromptTier};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::prompt_builder::{EthosPosture, PromptSpec};
 use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, copy_tree, ensure_repo_layout, git_repo_root,
@@ -2037,25 +2039,39 @@ fn build_finder_prompt(chunk: &RepoChunk, findings_json: &Path, findings_md: &Pa
             .collect::<Vec<_>>()
             .join("\n")
     };
-    format!(
-        r#"You are the finder pass in a multi-pass bug pipeline.
 
-Audit repo chunk `{chunk_id}` with primary scope `{scope}`.
+    let role = format!(
+        "You are the finder pass in a multi-pass bug pipeline. \
+         Tier: cheap (`{model}`). Pipeline stage: {stage:?}. \
+         Audit repo chunk `{chunk_id}` with primary scope `{scope}`.",
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::AuditPerFile,
+        chunk_id = chunk.id,
+        scope = chunk.scope_label,
+    );
 
-Primary files in this chunk:
-{files}
-
-Static risk hints from the cheap pre-index:
-{risk_hints}
-
-Rules:
-- Treat the live codebase as truth.
+    let edit_boundary = format!(
+        "- Treat the live codebase as truth.
 - You may inspect adjacent files outside this chunk only when they are required to validate an integration path.
 - Do not modify code.
 - Only write these files:
   - `{findings_json}`
-  - `{findings_md}`
-- `{findings_json}` must be a JSON array. If nothing survives your audit, write `[]`.
+  - `{findings_md}`",
+        findings_json = findings_json.display(),
+        findings_md = findings_md.display(),
+    );
+
+    let chunk_input = format!(
+        "Primary files in this chunk:
+{files}
+
+Static risk hints from the cheap pre-index:
+{risk_hints}",
+        files = render_prompt_files(&chunk.files),
+    );
+
+    let findings_json_output = format!(
+        "`{findings_json}` must be a JSON array. If nothing survives your audit, write `[]`.
 
 Scoring:
 - Low impact bug: 1 point
@@ -2064,36 +2080,42 @@ Scoring:
 
 Each JSON item must use exactly this schema:
 {{
-  "bug_id": "BUG-{ordinal:03}-01",
-  "title": "Short bug title",
-  "location": "path:line or subsystem identifier",
-  "impact": "low|medium|critical",
-  "points": 1,
-  "description": "Concrete failure mode",
-  "why_plausible": "Why this is plausibly real in this repo",
-  "falsification_checks": ["Specific repro or validation step"],
-  "evidence": ["Code reference or observed invariant"]
+  \"bug_id\": \"BUG-{ordinal:03}-01\",
+  \"title\": \"Short bug title\",
+  \"location\": \"path:line or subsystem identifier\",
+  \"impact\": \"low|medium|critical\",
+  \"points\": 1,
+  \"description\": \"Concrete failure mode\",
+  \"why_plausible\": \"Why this is plausibly real in this repo\",
+  \"falsification_checks\": [\"Specific repro or validation step\"],
+  \"evidence\": [\"Code reference or observed invariant\"]
 }}
 
 Requirements:
-- Maximize recall, but every finding must name a concrete failure mode and at least one falsification check.
-- Every finding must include direct code evidence and either a reproduction path, violated invariant, or exact validation command.
-- Prefer findings with a believable reproduction path, violated invariant, and plausible root-cause region over vague smell reports.
-- Cover correctness, state consistency, security, performance, and runtime behavior when the code supports them.
 - Use bug IDs with prefix `BUG-{ordinal:03}-`.
 - Match `points` to `impact` exactly.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
-- `{findings_md}` should summarize the same findings, grouped by impact, and end with a total score.
-"#,
-        chunk_id = chunk.id,
-        scope = chunk.scope_label,
-        files = render_prompt_files(&chunk.files),
-        risk_hints = risk_hints,
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).",
         findings_json = findings_json.display(),
-        findings_md = findings_md.display(),
         ordinal = chunk.ordinal,
-    )
+    );
+
+    let findings_md_output = format!(
+        "`{findings_md}` should summarize the same findings, grouped by impact, and end with a total score.",
+        findings_md = findings_md.display(),
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Chunk scope", chunk_input)
+        .output("Findings JSON", findings_json_output)
+        .output("Findings markdown", findings_md_output)
+        .evidence_item("Maximize recall, but every finding must name a concrete failure mode and at least one falsification check.")
+        .evidence_item("Every finding must include direct code evidence and either a reproduction path, violated invariant, or exact validation command.")
+        .evidence_item("Prefer findings with a believable reproduction path, violated invariant, and plausible root-cause region over vague smell reports.")
+        .evidence_item("Cover correctness, state consistency, security, performance, and runtime behavior when the code supports them.")
+        .render()
 }
 
 fn build_skeptic_prompt(
@@ -2102,49 +2124,69 @@ fn build_skeptic_prompt(
     verdicts_json: &Path,
     verdicts_md: &Path,
 ) -> String {
-    format!(
-        r#"You are the skeptic pass in a multi-pass bug pipeline.
+    let role = format!(
+        "You are the skeptic pass in a multi-pass bug pipeline. \
+         Tier: cheap (`{model}`). Pipeline stage: {stage:?}. \
+         Review chunk `{chunk_id}` with primary scope `{scope}`.",
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::AuditPerFile,
+        chunk_id = chunk.id,
+        scope = chunk.scope_label,
+    );
 
-Review chunk `{chunk_id}` with primary scope `{scope}`.
-
-Input findings file:
-- `{findings_json}`
-
-Rules:
-- Treat the codebase as truth.
+    let edit_boundary = format!(
+        "- Treat the codebase as truth.
 - Challenge every reported bug.
 - Do not modify code.
 - Only write these files:
   - `{verdicts_json}`
-  - `{verdicts_md}`
-- `{verdicts_json}` must be a JSON array with one verdict per input bug. If the input file is empty, write `[]`.
+  - `{verdicts_md}`",
+        verdicts_json = verdicts_json.display(),
+        verdicts_md = verdicts_md.display(),
+    );
+
+    let findings_input = format!(
+        "Input findings file:
+- `{findings_json}`",
+        findings_json = findings_json.display(),
+    );
+
+    let verdicts_json_output = format!(
+        "`{verdicts_json}` must be a JSON array with one verdict per input bug. If the input file is empty, write `[]`.
 
 Each JSON item must use exactly this schema:
 {{
-  "bug_id": "BUG-{ordinal:03}-01",
-  "decision": "accepted|disproved",
-  "confidence_percent": 0,
-  "counter_argument": "Why it is not a bug, or why the claim still survives challenge",
-  "risk_calculation": "Reasoning about the downside of dismissing it incorrectly",
-  "follow_up_checks": ["Extra validation that would tighten confidence"]
+  \"bug_id\": \"BUG-{ordinal:03}-01\",
+  \"decision\": \"accepted|disproved\",
+  \"confidence_percent\": 0,
+  \"counter_argument\": \"Why it is not a bug, or why the claim still survives challenge\",
+  \"risk_calculation\": \"Reasoning about the downside of dismissing it incorrectly\",
+  \"follow_up_checks\": [\"Extra validation that would tighten confidence\"]
 }}
 
 Requirements:
-- Be aggressive about disproving weak claims.
-- Challenge whether the claim identifies a real root-cause bug instead of a symptom, style issue, or speculative concern.
-- Prefer discarding findings that cannot be grounded in a runnable falsification path or direct code evidence.
 - Only `accepted` findings should survive to verification.
 - JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
-- `{verdicts_md}` should summarize disproved vs accepted findings and call out the hardest borderline decisions.
-"#,
-        chunk_id = chunk.id,
-        scope = chunk.scope_label,
-        findings_json = findings_json.display(),
+- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).",
         verdicts_json = verdicts_json.display(),
-        verdicts_md = verdicts_md.display(),
         ordinal = chunk.ordinal,
-    )
+    );
+
+    let verdicts_md_output = format!(
+        "`{verdicts_md}` should summarize disproved vs accepted findings and call out the hardest borderline decisions.",
+        verdicts_md = verdicts_md.display(),
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Finder output", findings_input)
+        .output("Verdicts JSON", verdicts_json_output)
+        .output("Verdicts markdown", verdicts_md_output)
+        .evidence_item("Be aggressive about disproving weak claims.")
+        .evidence_item("Challenge whether the claim identifies a real root-cause bug instead of a symptom, style issue, or speculative concern.")
+        .evidence_item("Prefer discarding findings that cannot be grounded in a runnable falsification path or direct code evidence.")
+        .render()
 }
 
 fn build_fix_prompt(
@@ -2153,53 +2195,74 @@ fn build_fix_prompt(
     results_md: &Path,
     branch: &str,
 ) -> String {
-    format!(
-        r#"You are the implementation pass in a multi-pass bug pipeline.
+    let role = format!(
+        "You are the implementation pass in a multi-pass bug pipeline. \
+         Tier: author (`{model}`). Pipeline stage: {stage:?}. \
+         Implement every verified bug in the repository-wide findings set.",
+        model = PromptTier::Author.claude_model(),
+        stage = PipelineStage::BugAuthor,
+    );
 
-Implement every verified bug in the repository-wide findings set.
-
-Input verified findings file:
-- `{verified_json}`
-
-Rules:
-- Modify code only as needed to address the verified findings plus the minimum adjacent integration surfaces.
-- Reproduce each bug with a failing test, failing command, or other executable proof first when practical. If that is truly not practical, document the best direct evidence you used instead of pretending.
+    let edit_boundary = format!(
+        "- Modify code only as needed to address the verified findings plus the minimum adjacent integration surfaces.
 - Fix root causes, not cosmetic symptoms.
-- Add or update regression coverage for every `fixed` result when the repo has a real test surface for that behavior.
-- Run validation commands that honestly support your changes.
 - Stay on the currently checked-out branch `{branch}`.
 - Commit only truthful fix increments with a message like `repo-name: bug fixes`.
 - Push to `origin/{branch}` after each successful commit.
 - Do not create or switch branches.
 - Do not stage or commit unrelated pre-existing changes already present in the worktree.
 - Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`.
-- Only write these files:
+- Only write these workflow files:
   - `{results_json}`
-  - `{results_md}`
-- `{results_json}` must be a JSON array with one entry per verified bug. If there are no verified bugs, write `[]`.
+  - `{results_md}`",
+        results_json = results_json.display(),
+        results_md = results_md.display(),
+    );
+
+    let verified_input = format!(
+        "Input verified findings file:
+- `{verified_json}`",
+        verified_json = verified_json.display(),
+    );
+
+    let working_rules = "- Reproduce each bug with a failing test, failing command, or other executable proof first when practical. If that is truly not practical, document the best direct evidence you used instead of pretending.
+- Add or update regression coverage for every `fixed` result when the repo has a real test surface for that behavior.
+- Run validation commands that honestly support your changes.
+- Treat verified findings as the contract; do not widen scope into unrelated cleanup.
+- For browser-facing or runtime-sensitive bugs, use runtime/browser verification when available.".to_string();
+
+    let results_json_output = format!(
+        "`{results_json}` must be a JSON array with one entry per verified bug. If there are no verified bugs, write `[]`.
 
 Each JSON item must use exactly this schema:
 {{
-  "bug_id": "BUG-001-01",
-  "status": "fixed|deferred|not_reproduced",
-  "summary": "What changed and why",
-  "validation_commands": ["Command actually run"],
-  "touched_files": ["path/to/file"],
-  "residual_risks": ["Anything still not fully closed"]
+  \"bug_id\": \"BUG-001-01\",
+  \"status\": \"fixed|deferred|not_reproduced\",
+  \"summary\": \"What changed and why\",
+  \"validation_commands\": [\"Command actually run\"],
+  \"touched_files\": [\"path/to/file\"],
+  \"residual_risks\": [\"Anything still not fully closed\"]
 }}
 
-Requirements:
-- Treat verified findings as the contract; do not widen scope into unrelated cleanup.
-- For browser-facing or runtime-sensitive bugs, use runtime/browser verification when available.
-- `{results_md}` should summarize proof-before-fix, root cause, fix, validation, and any deferred items.
-- JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
-"#,
-        verified_json = verified_json.display(),
+JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks. Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).",
         results_json = results_json.display(),
+    );
+
+    let results_md_output = format!(
+        "`{results_md}` should summarize proof-before-fix, root cause, fix, validation, and any deferred items.",
         results_md = results_md.display(),
-        branch = branch,
-    )
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::Full)
+        .edit_boundary(edit_boundary)
+        .input("Verified findings", verified_input)
+        .input("Working rules", working_rules)
+        .output("Implementation results JSON", results_json_output)
+        .output("Implementation results markdown", results_md_output)
+        .evidence_item("Every `fixed` entry cites the validation command(s) that demonstrate the fix holds.")
+        .evidence_item("Deferred or not_reproduced entries explain why with concrete evidence, not aspiration.")
+        .render()
 }
 
 fn build_final_review_prompt(
@@ -2209,18 +2272,16 @@ fn build_final_review_prompt(
     results_md: &Path,
     branch: &str,
 ) -> String {
-    format!(
-        r#"You are the final Codex review pass in a multi-pass bug pipeline.
+    let role = format!(
+        "You are the final Codex review pass in a multi-pass bug pipeline. \
+         Tier: final (`{model}`). Pipeline stage: {stage:?}. \
+         Review the repository-wide verified findings and the implementation pass results.",
+        model = PromptTier::Final.claude_model(),
+        stage = PipelineStage::AuditFinalReview,
+    );
 
-Review the repository-wide verified findings and the implementation pass results.
-
-Input files:
-- `{verified_json}`
-- `{implementation_json}`
-
-Rules:
-- Treat the live repo state as truth.
-- Re-check every verified bug against the implementation results before you trust them.
+    let edit_boundary = format!(
+        "- Treat the live repo state as truth.
 - Make any final code, test, or validation changes needed to close real remaining gaps.
 - Keep scope tight: finish or truthfully defer verified bugs; do not widen into unrelated cleanup.
 - Stay on the currently checked-out branch `{branch}`.
@@ -2229,35 +2290,59 @@ Rules:
 - Do not create or switch branches.
 - Do not stage or commit unrelated pre-existing changes already present in the worktree.
 - Do not stage or commit generated workflow artifacts under `bug/`, `.auto/`, `nemesis/`, or `gen-*`.
-- Only write these files:
+- Only write these workflow files:
   - `{results_json}`
-  - `{results_md}`
-- `{results_json}` must be a JSON array with one entry per verified bug. If there are no verified bugs, write `[]`.
+  - `{results_md}`",
+        results_json = results_json.display(),
+        results_md = results_md.display(),
+    );
+
+    let inputs_block = format!(
+        "Input files:
+- `{verified_json}`
+- `{implementation_json}`
+
+Re-check every verified bug against the implementation results before you trust them.",
+        verified_json = verified_json.display(),
+        implementation_json = implementation_json.display(),
+    );
+
+    let results_json_output = format!(
+        "`{results_json}` must be a JSON array with one entry per verified bug. If there are no verified bugs, write `[]`.
 
 Each JSON item must use exactly this schema:
 {{
-  "bug_id": "BUG-001-01",
-  "status": "confirmed|amended|deferred",
-  "summary": "What the final review concluded and what changed",
-  "validation_commands": ["Command actually run"],
-  "touched_files": ["path/to/file"],
-  "residual_risks": ["Anything still not fully closed"]
+  \"bug_id\": \"BUG-001-01\",
+  \"status\": \"confirmed|amended|deferred\",
+  \"summary\": \"What the final review concluded and what changed\",
+  \"validation_commands\": [\"Command actually run\"],
+  \"touched_files\": [\"path/to/file\"],
+  \"residual_risks\": [\"Anything still not fully closed\"]
 }}
 
-Requirements:
+Status meanings:
 - `confirmed` means the implementation pass already fixed the bug and your review required no further code changes.
 - `amended` means you made additional code, test, or validation changes to finish the fix.
 - `deferred` means the bug remains real but you could not close it safely in this run.
-- `{results_md}` should summarize what the implementation pass got right, what you had to tighten, and any truthful remaining gaps.
-- JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
-"#,
-        verified_json = verified_json.display(),
-        implementation_json = implementation_json.display(),
+
+JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks. Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).",
         results_json = results_json.display(),
+    );
+
+    let results_md_output = format!(
+        "`{results_md}` should summarize what the implementation pass got right, what you had to tighten, and any truthful remaining gaps.",
         results_md = results_md.display(),
-        branch = branch,
-    )
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::Full)
+        .edit_boundary(edit_boundary)
+        .input("Findings and implementation results", inputs_block)
+        .output("Final review results JSON", results_json_output)
+        .output("Final review results markdown", results_md_output)
+        .evidence_item("Every `amended` entry names the additional change that was required and the validation that confirms it.")
+        .evidence_item("Every `deferred` entry states why the gap could not be closed safely in this run.")
+        .render()
 }
 
 fn build_review_prompt(
@@ -2266,48 +2351,68 @@ fn build_review_prompt(
     results_json: &Path,
     results_md: &Path,
 ) -> String {
-    format!(
-        r#"You are the verification review pass in a multi-pass bug pipeline.
+    let role = format!(
+        "You are the verification review pass in a multi-pass bug pipeline. \
+         Tier: cheap (`{model}`). Pipeline stage: {stage:?}. \
+         Review the skeptic-approved bugs for chunk `{chunk_id}` with primary scope `{scope}`.",
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::AuditPerFile,
+        chunk_id = chunk.id,
+        scope = chunk.scope_label,
+    );
 
-Review the skeptic-approved bugs for chunk `{chunk_id}` with primary scope `{scope}`.
-
-Input accepted findings file:
-- `{accepted_json}`
-
-Rules:
-- Treat the codebase as truth.
+    let edit_boundary = format!(
+        "- Treat the codebase as truth.
 - Verify that each accepted bug is strong enough to survive to the final implementation pass.
 - Do not modify code.
 - Only write these files:
   - `{results_json}`
-  - `{results_md}`
-- `{results_json}` must be a JSON array with one entry per accepted bug. If there are no accepted bugs, write `[]`.
+  - `{results_md}`",
+        results_json = results_json.display(),
+        results_md = results_md.display(),
+    );
+
+    let accepted_input = format!(
+        "Input accepted findings file:
+- `{accepted_json}`",
+        accepted_json = accepted_json.display(),
+    );
+
+    let results_json_output = format!(
+        "`{results_json}` must be a JSON array with one entry per accepted bug. If there are no accepted bugs, write `[]`.
 
 Each JSON item must use exactly this schema:
 {{
-  "bug_id": "BUG-{ordinal:03}-01",
-  "verdict": "verified|discarded",
-  "confidence": "high|medium|low",
-  "notes": "Why this finding should or should not survive to implementation",
-  "follow_up": ["Concrete follow-up validation or scoping note"]
+  \"bug_id\": \"BUG-{ordinal:03}-01\",
+  \"verdict\": \"verified|discarded\",
+  \"confidence\": \"high|medium|low\",
+  \"notes\": \"Why this finding should or should not survive to implementation\",
+  \"follow_up\": [\"Concrete follow-up validation or scoping note\"]
 }}
 
-Requirements:
+Status meanings:
 - `verified` means the finding should survive into the repository-wide implementation pass.
 - `discarded` means the finding is too weak, duplicated, or insufficiently supported to implement.
-- Prefer `verified` only when the bug is concrete enough to justify a reproduce-first/root-cause fix workflow.
-- Call out missing regression coverage, missing runtime proof, or suspiciously broad scope in `follow_up`.
-- JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks.
-- Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).
-- `{results_md}` should summarize what survived to implementation and what was discarded.
-"#,
-        chunk_id = chunk.id,
-        scope = chunk.scope_label,
-        accepted_json = accepted_json.display(),
+
+JSON string values must stay valid JSON. Escape inner double quotes or rewrite them with single quotes/backticks. Double-escape literal backslashes in regexes, paths, and code snippets (for example `\\d`, `C:\\tmp`, or `foo\\bar`).",
         results_json = results_json.display(),
-        results_md = results_md.display(),
         ordinal = chunk.ordinal,
-    )
+    );
+
+    let results_md_output = format!(
+        "`{results_md}` should summarize what survived to implementation and what was discarded.",
+        results_md = results_md.display(),
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Accepted findings", accepted_input)
+        .output("Verification results JSON", results_json_output)
+        .output("Verification results markdown", results_md_output)
+        .evidence_item("Prefer `verified` only when the bug is concrete enough to justify a reproduce-first/root-cause fix workflow.")
+        .evidence_item("Call out missing regression coverage, missing runtime proof, or suspiciously broad scope in `follow_up`.")
+        .render()
 }
 
 fn render_prompt_files(files: &[String]) -> String {
@@ -3196,33 +3301,49 @@ fn build_bug_json_repair_prompt(
     artifact_label: &str,
     schema_hint: &str,
 ) -> String {
-    format!(
-        r#"You are repairing a malformed JSON workflow artifact for auto bug.
+    let role = format!(
+        "You are repairing a malformed JSON workflow artifact for auto bug. \
+         Tier: cheap (`{model}`). Pipeline stage: {stage:?}. \
+         Artifact type: `{artifact_label}`.",
+        model = PromptTier::Cheap.claude_model(),
+        stage = PipelineStage::MechanicalRewrite,
+    );
 
-Artifact type:
-- `{artifact_label}`
+    let edit_boundary = format!(
+        "- Do not modify code.
+- Do not edit any workflow artifact other than `{target_path}`.",
+        target_path = target_path.display(),
+    );
 
-Target artifact:
+    let inputs_block = format!(
+        "Target artifact:
 - `{target_path}`
 
 Raw backend response log:
 - `{raw_response_path}`
 
-Rules:
-- Do not modify code.
-- Do not edit any workflow artifact other than `{target_path}`.
-- Read the target artifact if it exists and the raw backend response log to recover the intended content.
-- Rewrite `{target_path}` so it contains valid JSON only. No markdown fences. No commentary.
-- Preserve every recoverable entry and field value. If wording is ambiguous, prefer the most literal faithful reconstruction instead of inventing new findings.
-- Keep the artifact as a JSON array using exactly this schema:
-{schema_hint}
-- JSON strings must stay valid JSON. Escape embedded quotes when needed.
-- Double-escape literal backslashes in regexes, paths, and code snippets.
-"#,
-        artifact_label = artifact_label,
+Read the target artifact if it exists and the raw backend response log to recover the intended content.",
         target_path = target_path.display(),
         raw_response_path = raw_response_path.display(),
-    )
+    );
+
+    let output_block = format!(
+        "Rewrite `{target_path}` so it contains valid JSON only. No markdown fences. No commentary.
+
+Keep the artifact as a JSON array using exactly this schema:
+{schema_hint}
+
+JSON strings must stay valid JSON. Escape embedded quotes when needed. Double-escape literal backslashes in regexes, paths, and code snippets.",
+        target_path = target_path.display(),
+    );
+
+    PromptSpec::new(role)
+        .ethos(EthosPosture::EthosOnly)
+        .edit_boundary(edit_boundary)
+        .input("Artifact context", inputs_block)
+        .output("Repaired artifact", output_block)
+        .evidence_item("Preserve every recoverable entry and field value. If wording is ambiguous, prefer the most literal faithful reconstruction instead of inventing new findings.")
+        .render()
 }
 
 async fn attempt_llm_json_file_repair(
@@ -3508,11 +3629,12 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_final_review_prompt, build_fix_prompt, collect_repo_chunks, derive_accepted_findings,
-        escape_unescaped_quotes_in_json_strings, load_json_file, normalize_finder_findings,
-        repair_llm_json, run_backend_prompt, run_backend_prompt_with_fallback, should_audit_path,
-        slugify, validate_accepted_findings, validate_findings, AcceptedFinding, BugFinding,
-        LlmBackend, RepoChunk, SkepticVerdict,
+        build_bug_json_repair_prompt, build_final_review_prompt, build_finder_prompt,
+        build_fix_prompt, build_review_prompt, build_skeptic_prompt, collect_repo_chunks,
+        derive_accepted_findings, escape_unescaped_quotes_in_json_strings, load_json_file,
+        normalize_finder_findings, repair_llm_json, run_backend_prompt,
+        run_backend_prompt_with_fallback, should_audit_path, slugify, validate_accepted_findings,
+        validate_findings, AcceptedFinding, BugFinding, LlmBackend, RepoChunk, SkepticVerdict,
     };
     use crate::pi_backend::PiProvider;
 
@@ -3947,5 +4069,140 @@ mod tests {
 
         assert_eq!(stdout, "[]\n");
         assert!(matches!(used_backend, LlmBackend::Codex { .. }));
+    }
+
+    #[test]
+    fn finder_prompt_carries_chunk_scope_and_edit_boundary() {
+        let chunk = test_chunk(7);
+        let prompt = build_finder_prompt(
+            &chunk,
+            Path::new("bug/chunks/chunk-007/finder-findings.json"),
+            Path::new("bug/chunks/chunk-007/finder-findings.md"),
+        );
+
+        assert!(prompt.contains("# Role"));
+        assert!(prompt.contains("# Edit boundary"));
+        assert!(prompt.contains("finder pass in a multi-pass bug pipeline"));
+        assert!(prompt.contains(&chunk.id));
+        assert!(prompt.contains("bug/chunks/chunk-007/finder-findings.json"));
+        assert!(prompt.contains("bug/chunks/chunk-007/finder-findings.md"));
+        assert!(prompt.contains("BUG-007-01"));
+        assert!(prompt.contains("Match `points` to `impact` exactly."));
+        // EthosOnly: ethos present, doctrine absent.
+        assert!(prompt.contains("Autodev Builder Ethos"));
+        assert!(!prompt.contains("Source-of-truth discipline:"));
+    }
+
+    #[test]
+    fn skeptic_prompt_lists_inputs_and_outputs_through_promptspec() {
+        let chunk = test_chunk(4);
+        let prompt = build_skeptic_prompt(
+            &chunk,
+            Path::new("bug/chunks/chunk-004/finder-findings.json"),
+            Path::new("bug/chunks/chunk-004/skeptic-verdicts.json"),
+            Path::new("bug/chunks/chunk-004/skeptic-verdicts.md"),
+        );
+
+        assert!(prompt.contains("# Inputs"));
+        assert!(prompt.contains("# Outputs"));
+        assert!(prompt.contains("skeptic pass in a multi-pass bug pipeline"));
+        assert!(prompt.contains("bug/chunks/chunk-004/finder-findings.json"));
+        assert!(prompt.contains("bug/chunks/chunk-004/skeptic-verdicts.json"));
+        assert!(prompt.contains("\"decision\": \"accepted|disproved\""));
+        assert!(prompt.contains("BUG-004-01"));
+        assert!(prompt.contains("Be aggressive about disproving weak claims."));
+    }
+
+    #[test]
+    fn review_prompt_documents_verified_and_discarded_status() {
+        let chunk = test_chunk(9);
+        let prompt = build_review_prompt(
+            &chunk,
+            Path::new("bug/chunks/chunk-009/accepted.json"),
+            Path::new("bug/chunks/chunk-009/review-results.json"),
+            Path::new("bug/chunks/chunk-009/review-results.md"),
+        );
+
+        assert!(prompt.contains("# Role"));
+        assert!(prompt.contains("verification review pass"));
+        assert!(prompt.contains("bug/chunks/chunk-009/accepted.json"));
+        assert!(prompt.contains("bug/chunks/chunk-009/review-results.json"));
+        assert!(prompt.contains("\"verdict\": \"verified|discarded\""));
+        assert!(prompt.contains("BUG-009-01"));
+        assert!(prompt.contains("reproduce-first/root-cause fix workflow"));
+    }
+
+    #[test]
+    fn fix_prompt_uses_promptspec_structure_and_keeps_branch_clauses() {
+        let prompt = build_fix_prompt(
+            Path::new("bug/verified-findings.json"),
+            Path::new("bug/implementation-results.json"),
+            Path::new("bug/implementation-results.md"),
+            "feat/effectiveness-pass-01",
+        );
+
+        // PromptSpec structural markers.
+        assert!(prompt.contains("# Role"));
+        assert!(prompt.contains("# Edit boundary"));
+        assert!(prompt.contains("# Inputs"));
+        assert!(prompt.contains("# Outputs"));
+        assert!(prompt.contains("# Evidence checklist"));
+
+        // Critical behavior preserved verbatim.
+        assert!(prompt.contains("implementation pass in a multi-pass bug pipeline"));
+        assert!(prompt.contains("Commit only truthful fix increments"));
+        assert!(prompt.contains(
+            "Push to `origin/feat/effectiveness-pass-01` after each successful commit."
+        ));
+        assert!(prompt.contains("bug/verified-findings.json"));
+        assert!(prompt.contains("bug/implementation-results.json"));
+        assert!(prompt.contains("\"status\": \"fixed|deferred|not_reproduced\""));
+
+        // Full ethos posture: doctrine present.
+        assert!(prompt.contains("Autodev Builder Ethos"));
+        assert!(prompt.contains("Source-of-truth discipline:"));
+    }
+
+    #[test]
+    fn final_review_prompt_uses_promptspec_and_preserves_status_meanings() {
+        let prompt = build_final_review_prompt(
+            Path::new("bug/verified-findings.json"),
+            Path::new("bug/implementation-results.json"),
+            Path::new("bug/final-review-results.json"),
+            Path::new("bug/final-review-results.md"),
+            "main",
+        );
+
+        assert!(prompt.contains("# Role"));
+        assert!(prompt.contains("# Edit boundary"));
+        assert!(prompt.contains(
+            "Review the repository-wide verified findings and the implementation pass results."
+        ));
+        assert!(prompt.contains("`confirmed` means the implementation pass already fixed the bug"));
+        assert!(prompt.contains("`amended` means you made additional code"));
+        assert!(prompt.contains("Push to `origin/main` after each successful commit."));
+        assert!(prompt.contains("\"status\": \"confirmed|amended|deferred\""));
+        // Full ethos posture: doctrine present.
+        assert!(prompt.contains("Source-of-truth discipline:"));
+    }
+
+    #[test]
+    fn bug_json_repair_prompt_targets_only_the_named_artifact() {
+        let prompt = build_bug_json_repair_prompt(
+            Path::new("bug/chunks/chunk-001/finder-findings.json"),
+            Path::new(".auto/logs/bug-finder-001-response.log"),
+            "finder-findings",
+            "[\n  { \"bug_id\": \"BUG-001-01\" }\n]",
+        );
+
+        assert!(prompt.contains("# Role"));
+        assert!(prompt.contains("# Edit boundary"));
+        assert!(prompt.contains("repairing a malformed JSON workflow artifact"));
+        assert!(prompt.contains("finder-findings"));
+        assert!(prompt.contains("bug/chunks/chunk-001/finder-findings.json"));
+        assert!(prompt.contains(".auto/logs/bug-finder-001-response.log"));
+        assert!(prompt.contains("valid JSON only. No markdown fences. No commentary."));
+        // EthosOnly posture: no lane doctrine.
+        assert!(!prompt.contains("Source-of-truth discipline:"));
     }
 }
