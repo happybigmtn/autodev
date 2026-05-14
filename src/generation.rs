@@ -3121,13 +3121,51 @@ fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result
         );
     }
     if explicit_test_count == 0 {
+        // Accept LLM-natural prose descriptions of the testing approach (for
+        // example, `inline shell self-test in the guard script`) when the
+        // body names a concrete testing mechanism. The bar: at least one
+        // testing-related keyword plus a few additional content words. This
+        // catches empty placeholders and bare `tests` while admitting prose
+        // forms common for guard scripts, shellcheck self-tests, and similar
+        // tasks where the testing approach is not a named function.
+        if required_tests_body_is_substantive_prose(normalized) {
+            return Ok(());
+        }
         bail!(
-            "generated implementation plan task `{}` must list concrete required test names or `Required tests: none`",
+            "generated implementation plan task `{}` must list concrete required test names, a prose description naming the testing mechanism, or `Required tests: none`",
             block.task_id
         );
     }
 
     Ok(())
+}
+
+fn required_tests_body_is_substantive_prose(body: &str) -> bool {
+    let lowercase = body.to_ascii_lowercase();
+    let testing_keyword = [
+        "test",
+        "self-test",
+        "selftest",
+        "check",
+        "spec",
+        "probe",
+        "validate",
+        "validation",
+        "verify",
+        "verification",
+        "assertion",
+        "regression",
+        "harness",
+        "suite",
+        "smoke",
+    ]
+    .iter()
+    .any(|needle| lowercase.contains(needle));
+    if !testing_keyword {
+        return false;
+    }
+    let word_count = body.split_whitespace().count();
+    word_count >= 4
 }
 
 fn required_tests_body_is_none(body: &str) -> bool {
@@ -5717,6 +5755,40 @@ No external dependencies.
 
         verify_generated_implementation_plan(&root)
             .expect("inline concrete required tests should be accepted");
+    }
+
+    #[test]
+    fn generated_plan_accepts_substantive_prose_required_tests() {
+        // CI-005 from the autonomy smoke run: a shell guard whose testing
+        // mechanism is an inline self-test. Naming the mechanism in prose is
+        // valid; the validator should not require a backtick or bullet.
+        let root = temp_dir("prose-required-tests");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
+            "Required tests: inline shell self-test in the guard script",
+        );
+        write_generated_plan(&root, &task);
+
+        verify_generated_implementation_plan(&root)
+            .expect("prose required-tests description should be accepted");
+    }
+
+    #[test]
+    fn generated_plan_rejects_vague_one_word_required_tests() {
+        // A bare `tests` (or other single-word filler) is not substantive —
+        // the prose path must still demand actual content.
+        let root = temp_dir("vague-prose-required-tests");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "Required tests:\n    - `cargo test -p docs exact_docs_test`",
+            "Required tests: tests",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected one-word required-tests to be rejected");
+        assert!(format!("{error:#}").contains("must list concrete required test names"));
     }
 
     #[test]
