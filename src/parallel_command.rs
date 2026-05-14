@@ -34,7 +34,15 @@ use crate::util::{
 };
 use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
+#[path = "receipts.rs"]
+pub(crate) mod receipts;
+
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
+
+/// Default consecutive cherry-pick failures before we fall back to a
+/// rebase + squash merge (Runner-up #90). Override via
+/// `AUTODEV_CHERRY_PICK_FALLBACK_THRESHOLD`.
+pub(crate) const DEFAULT_CHERRY_PICK_FALLBACK_THRESHOLD: u32 = 3;
 const SHARED_QUEUE_FILES: [&str; 6] = [
     "IMPLEMENTATION_PLAN.md",
     "COMPLETED.md",
@@ -4028,8 +4036,32 @@ fn checkpoint_parallel_host_queue_changes(
     let mut add_args = vec!["add", "--all", "--"];
     add_args.extend(queue_files.iter().copied());
     run_git(repo_root, add_args)?;
+    // Plan-integrity guard (Change #9): refuse the queue-sync commit if
+    // its IMPLEMENTATION_PLAN.md diff demotes a completed task row. The
+    // orchestrator catches the structured error and routes to a conflict
+    // broker instead of silently losing receipts.
+    if let Err(err) = assert_no_plan_demotion(repo_root, "HEAD") {
+        let _ = run_git(repo_root, ["reset", "HEAD", "--", "IMPLEMENTATION_PLAN.md"]);
+        let _ = run_git(repo_root, ["checkout", "--", "IMPLEMENTATION_PLAN.md"]);
+        parallel_logger.warn(format!("{err:#}"));
+        return Err(err);
+    }
     let message = format!("{}: parallel host queue sync", repo_name(repo_root));
     run_git(repo_root, ["commit", "-m", &message])?;
+    // Receipts rehash (Change #9): compute a fresh anchor over the
+    // queue-state paths and amend the commit footer so the receipt is
+    // commit-atomic. Older footers remain readable.
+    if let Err(err) = receipts_rehash_amend(
+        repo_root,
+        &queue_files
+            .iter()
+            .map(|s| PathBuf::from(*s))
+            .collect::<Vec<_>>(),
+    ) {
+        parallel_logger.warn(format!(
+            "receipts-rehash amend skipped after host queue sync: {err:#}"
+        ));
+    }
     let commit = git_stdout(repo_root, ["rev-parse", "--short", "HEAD"])?;
     let commit = commit.trim().to_string();
     if push_branch_with_remote_sync(repo_root, target_branch)? {
@@ -7011,14 +7043,413 @@ fn cherry_pick_lane_range(
         return Ok(());
     }
 
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let conflicted = cherry_pick_conflicted_paths(repo_root);
     if failure_policy == CherryPickFailurePolicy::Abort {
         let _ = run_git(repo_root, ["cherry-pick", "--abort"]);
     }
+    if conflicted.is_empty() {
+        bail!(
+            "git cherry-pick failed in {}: {stderr}",
+            repo_root.display(),
+        );
+    }
     bail!(
-        "git cherry-pick failed in {}: {}",
+        "git cherry-pick failed in {}: {stderr}; conflicts: {}",
         repo_root.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
+        conflicted.join(", ")
     );
+}
+
+/// Returns the list of paths currently in conflict (unmerged stage entries).
+///
+/// Empty when there is no active cherry-pick or merge.
+pub(crate) fn cherry_pick_conflicted_paths(repo_root: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Maximum number of consecutive cherry-pick failures (per-lane) before
+/// `cherry_pick_lane_range_with_fallback` falls back to rebase + squash
+/// merge. Reads `AUTODEV_CHERRY_PICK_FALLBACK_THRESHOLD` if set.
+pub(crate) fn cherry_pick_fallback_threshold() -> u32 {
+    env::var("AUTODEV_CHERRY_PICK_FALLBACK_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CHERRY_PICK_FALLBACK_THRESHOLD)
+}
+
+/// Outcome of [`cherry_pick_lane_range_with_fallback`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CherryPickFallbackOutcome {
+    /// The cherry-pick succeeded directly.
+    CherryPicked,
+    /// The fallback ran successfully — `parent` was restored, lane was
+    /// rebased onto `base`, and the lane diff landed as a single squash
+    /// commit.
+    Squashed { conflicts_seen: u32 },
+}
+
+/// Tries cherry-pick first and falls back to rebase + squash merge after
+/// `threshold` consecutive merge-conflict failures (Runner-up #90).
+///
+/// `lane_branch` is the symbolic ref to merge from; `base` is the
+/// canonical branch to rebase onto; `parent` is the commit to hard-reset
+/// to before the fallback. The fallback path produces a single commit
+/// summarising the entire lane diff so we stop walking 61-conflict
+/// pre-image cherry-pick stacks.
+pub(crate) fn cherry_pick_lane_range_with_fallback(
+    repo_root: &Path,
+    base: &str,
+    parent: &str,
+    lane_branch: &str,
+    threshold: u32,
+) -> Result<CherryPickFallbackOutcome> {
+    let mut consecutive_conflicts = 0u32;
+    let mut last_conflicts: Vec<String> = Vec::new();
+    while consecutive_conflicts < threshold {
+        match cherry_pick_lane_range(
+            repo_root,
+            parent,
+            lane_branch,
+            CherryPickFailurePolicy::Abort,
+        ) {
+            Ok(()) => return Ok(CherryPickFallbackOutcome::CherryPicked),
+            Err(err) => {
+                let message = format!("{err:#}");
+                let conflicts = extract_conflict_list(&message);
+                if conflicts.is_empty() {
+                    return Err(err);
+                }
+                consecutive_conflicts += 1;
+                last_conflicts = conflicts;
+            }
+        }
+    }
+    // Threshold reached — fall back to a deterministic squash.
+    //
+    // We materialise the lane's end-state tree onto `base` as a single
+    // commit. This loses interim history (intentional: the operator can
+    // still inspect the lane branch ref) but it sidesteps the 61-pre-image
+    // conflict loop and produces one auditable commit.
+    let lane_sha = git_stdout(repo_root, ["rev-parse", lane_branch])?
+        .trim()
+        .to_string();
+    run_git(repo_root, ["reset", "--hard", base])?;
+    // read-tree -u --reset writes lane's tree into the index AND worktree.
+    let read_tree = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["read-tree", "-u", "--reset", &lane_sha])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+    if !read_tree.status.success() {
+        bail!(
+            "cherry-pick fallback: git read-tree {lane_sha} failed in {}: {}; prior conflicts: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&read_tree.stderr).trim(),
+            last_conflicts.join(", ")
+        );
+    }
+    let _ = run_git(repo_root, ["add", "-A"]);
+    let commit_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!(
+                "cherry-pick fallback: squash {lane_branch} (resolved {} conflicts)",
+                consecutive_conflicts
+            ),
+        ])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+    if !commit_output.status.success() {
+        bail!(
+            "cherry-pick fallback: squash commit failed in {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&commit_output.stderr).trim()
+        );
+    }
+    Ok(CherryPickFallbackOutcome::Squashed {
+        conflicts_seen: consecutive_conflicts,
+    })
+}
+
+fn extract_conflict_list(message: &str) -> Vec<String> {
+    let Some(idx) = message.find("conflicts: ") else {
+        return Vec::new();
+    };
+    let tail = &message[idx + "conflicts: ".len()..];
+    tail.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Outcome of [`apply_patch_with_structural_fallback`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuralPatchOutcome {
+    /// Patch applied as-is at the expected line range.
+    AppliedExact,
+    /// Patch applied after shifting to a structural-match offset.
+    AppliedStructural { matched_offset: usize },
+    /// Neither anchor matched.
+    NoMatch,
+}
+
+/// Applies a `expected_lines` -> `replacement_lines` patch with a
+/// fallback to a 3-line surrounding-context structural match when the
+/// exact expected window isn't present (Runner-up #90 apply-patch
+/// fallback). Returns the new text without writing it; callers decide
+/// whether to atomically write.
+pub(crate) fn apply_patch_with_structural_fallback(
+    source: &str,
+    expected_lines: &[&str],
+    replacement_lines: &[&str],
+    context_before: &[&str],
+    context_after: &[&str],
+) -> (String, StructuralPatchOutcome) {
+    let lines: Vec<&str> = source.lines().collect();
+    let exact = find_exact_window(&lines, expected_lines);
+    if let Some(idx) = exact {
+        let updated = splice_window(&lines, idx, expected_lines.len(), replacement_lines);
+        return (updated, StructuralPatchOutcome::AppliedExact);
+    }
+    // Structural fallback: match the context-before window, then the
+    // context-after window, and overwrite whatever sits between them.
+    let strip = |s: &str| -> String {
+        let trimmed = s.trim_start();
+        // strip leading "<lineno>:" or "<lineno>\t" if present
+        let rest = trimmed.find(|c: char| !c.is_ascii_digit()).map_or(trimmed, |i| {
+            let (digits, rest) = trimmed.split_at(i);
+            if digits.is_empty() {
+                trimmed
+            } else {
+                rest.trim_start_matches([':', '\t', ' '])
+            }
+        });
+        rest.trim_end().to_string()
+    };
+    let stripped_before: Vec<String> = context_before.iter().map(|s| strip(s)).collect();
+    let stripped_after: Vec<String> = context_after.iter().map(|s| strip(s)).collect();
+    let normalised: Vec<String> = lines.iter().map(|s| strip(s)).collect();
+    let before_idx = find_exact_window(&normalised, &stripped_before);
+    let after_idx = find_exact_window(&normalised, &stripped_after);
+    match (before_idx, after_idx) {
+        (Some(b), Some(a)) if a >= b + stripped_before.len() => {
+            let splice_start = b + stripped_before.len();
+            let splice_len = a - splice_start;
+            let updated = splice_window(&lines, splice_start, splice_len, replacement_lines);
+            (
+                updated,
+                StructuralPatchOutcome::AppliedStructural {
+                    matched_offset: splice_start,
+                },
+            )
+        }
+        _ => (source.to_string(), StructuralPatchOutcome::NoMatch),
+    }
+}
+
+fn find_exact_window<S: AsRef<str>>(haystack: &[S], needle: &[impl AsRef<str>]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    'outer: for start in 0..=haystack.len() - needle.len() {
+        for (i, item) in needle.iter().enumerate() {
+            if haystack[start + i].as_ref() != item.as_ref() {
+                continue 'outer;
+            }
+        }
+        return Some(start);
+    }
+    None
+}
+
+fn splice_window(lines: &[&str], start: usize, len: usize, replacement: &[&str]) -> String {
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len() - len + replacement.len());
+    out.extend_from_slice(&lines[..start]);
+    out.extend_from_slice(replacement);
+    out.extend_from_slice(&lines[start + len..]);
+    out.join("\n")
+}
+
+/// Set of task IDs that would be demoted by a candidate plan rewrite.
+///
+/// Returned by [`detect_plan_demotions`] so the orchestrator can route
+/// the conflict to a broker instead of silently losing receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanDemotionReport {
+    pub(crate) demoted_task_ids: Vec<String>,
+}
+
+impl PlanDemotionReport {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.demoted_task_ids.is_empty()
+    }
+}
+
+/// Detects `[x] -> [ ]` or `[x] -> [~]` rewrites between two plan
+/// snapshots. Each demoted task ID is returned so callers can refuse the
+/// commit and surface the conflict.
+pub(crate) fn detect_plan_demotions(previous: &str, next: &str) -> PlanDemotionReport {
+    let prev_done = collect_done_task_ids(previous);
+    let next_done = collect_done_task_ids(next);
+    let mut demoted: Vec<String> = prev_done
+        .into_iter()
+        .filter(|id| !next_done.contains(id))
+        .collect();
+    demoted.sort();
+    demoted.dedup();
+    PlanDemotionReport {
+        demoted_task_ids: demoted,
+    }
+}
+
+fn collect_done_task_ids(plan: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in plan.lines() {
+        let trimmed = line.trim_start();
+        let rest = if let Some(rest) = trimmed.strip_prefix("- [x] ") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("- [X] ") {
+            rest
+        } else {
+            continue;
+        };
+        if let Some(id) = extract_task_id(rest) {
+            out.insert(id);
+        }
+    }
+    out
+}
+
+fn extract_task_id(rest: &str) -> Option<String> {
+    let trimmed = rest.trim_start();
+    if let Some(after_tick) = trimmed.strip_prefix('`') {
+        if let Some(end) = after_tick.find('`') {
+            let id = after_tick[..end].trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    let token: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Refuses an in-flight commit whose IMPLEMENTATION_PLAN.md diff demotes
+/// any `[x]` row to `[ ]`/`[~]`. Returns Ok when no demotion is staged.
+///
+/// `parent` is the parent commit to diff `IMPLEMENTATION_PLAN.md` against.
+pub(crate) fn assert_no_plan_demotion(repo: &Path, parent: &str) -> Result<()> {
+    let plan_relative = Path::new("IMPLEMENTATION_PLAN.md");
+    let current_full = repo.join(plan_relative);
+    if !current_full.exists() {
+        return Ok(());
+    }
+    let current = fs::read_to_string(&current_full)
+        .with_context(|| format!("failed to read {}", current_full.display()))?;
+    let previous = git_show_path(repo, parent, "IMPLEMENTATION_PLAN.md").unwrap_or_default();
+    let report = detect_plan_demotions(&previous, &current);
+    if report.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "plan-integrity guard refused commit in {}: IMPLEMENTATION_PLAN.md demotes completed task(s): {}",
+        repo.display(),
+        report.demoted_task_ids.join(", ")
+    );
+}
+
+fn git_show_path(repo: &Path, commit: &str, path: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &format!("{commit}:{path}")])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo.display()))?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Computes a receipts anchor for the lane-owned paths and amends the
+/// current HEAD commit with the anchor footer. Intended to run in the
+/// SAME commit-cycle as the lane's auto-commit so queue-sync can verify
+/// against a fresh anchor instead of chasing drift.
+pub(crate) fn receipts_rehash_amend(repo: &Path, owned_paths: &[PathBuf]) -> Result<()> {
+    if owned_paths.is_empty() {
+        return Ok(());
+    }
+    let anchor = receipts::compute_anchor(repo, owned_paths)?;
+    let footer = receipts::render_footer(&anchor);
+    let head_message_output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo.display()))?;
+    if !head_message_output.status.success() {
+        bail!(
+            "receipts rehash: cannot read HEAD message in {}",
+            repo.display()
+        );
+    }
+    let head_message = String::from_utf8_lossy(&head_message_output.stdout)
+        .trim_end()
+        .to_string();
+    if head_message.contains(receipts::RECEIPT_ANCHOR_COMMIT_KEY)
+        && head_message.contains(receipts::RECEIPT_ANCHOR_CONTENT_KEY)
+        && head_message.contains(&anchor.content_sha256)
+    {
+        return Ok(());
+    }
+    let trailer = if head_message.ends_with('\n') {
+        format!("{head_message}\n{footer}")
+    } else {
+        format!("{head_message}\n\n{footer}")
+    };
+    let amend = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--amend", "--no-edit", "-m", &trailer])
+        .output()
+        .with_context(|| format!("failed to launch git in {}", repo.display()))?;
+    if !amend.status.success() {
+        bail!(
+            "receipts rehash: git commit --amend failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&amend.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn scrub_parallel_receipt_staging(repo_root: &Path) -> Result<()> {
@@ -10088,5 +10519,209 @@ mod tests {
             .status()
             .expect("failed to run touch");
         assert!(status.success(), "touch should update test file mtime");
+    }
+
+    // ---- Change #9: receipts + plan-integrity ------------------------
+
+    #[test]
+    fn detect_plan_demotions_flags_done_to_pending() {
+        let before = "- [x] `TASK-1` first\n- [x] `TASK-2` second\n";
+        let after = "- [ ] `TASK-1` first\n- [x] `TASK-2` second\n";
+        let report = super::detect_plan_demotions(before, after);
+        assert_eq!(report.demoted_task_ids, vec!["TASK-1".to_string()]);
+    }
+
+    #[test]
+    fn detect_plan_demotions_flags_done_to_partial() {
+        let before = "- [x] `AUDIT-7` resolved\n";
+        let after = "- [~] `AUDIT-7` resolved\n";
+        let report = super::detect_plan_demotions(before, after);
+        assert_eq!(report.demoted_task_ids, vec!["AUDIT-7".to_string()]);
+    }
+
+    #[test]
+    fn detect_plan_demotions_ignores_promotions_and_new_rows() {
+        let before = "- [ ] `TASK-1`\n";
+        let after = "- [x] `TASK-1`\n- [ ] `TASK-2`\n";
+        let report = super::detect_plan_demotions(before, after);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn assert_no_plan_demotion_rejects_demotion_against_head() {
+        let repo = unique_temp_dir("plan-demotion-guard");
+        fs::create_dir_all(&repo).expect("mkdir");
+        run_git_in(&repo, ["init", "--quiet", "-b", "main"]);
+        run_git_in(&repo, ["config", "user.email", "t@example.com"]);
+        run_git_in(&repo, ["config", "user.name", "Autodev Test"]);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-1` done\n",
+        )
+        .expect("write plan");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] `TASK-1` done\n",
+        )
+        .expect("rewrite plan");
+        let err = super::assert_no_plan_demotion(&repo, "HEAD")
+            .expect_err("demotion should be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("TASK-1"), "error should name TASK-1: {msg}");
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[test]
+    fn assert_no_plan_demotion_allows_clean_changes() {
+        let repo = unique_temp_dir("plan-demotion-clean");
+        fs::create_dir_all(&repo).expect("mkdir");
+        run_git_in(&repo, ["init", "--quiet", "-b", "main"]);
+        run_git_in(&repo, ["config", "user.email", "t@example.com"]);
+        run_git_in(&repo, ["config", "user.name", "Autodev Test"]);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] `TASK-1` open\n",
+        )
+        .expect("write plan");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-1` open\n",
+        )
+        .expect("rewrite plan");
+        super::assert_no_plan_demotion(&repo, "HEAD")
+            .expect("promotion should be allowed");
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[test]
+    fn receipts_rehash_amend_embeds_anchor_footer() {
+        let repo = unique_temp_dir("rehash-amend");
+        fs::create_dir_all(&repo).expect("mkdir");
+        run_git_in(&repo, ["init", "--quiet", "-b", "main"]);
+        run_git_in(&repo, ["config", "user.email", "t@example.com"]);
+        run_git_in(&repo, ["config", "user.name", "Autodev Test"]);
+        fs::write(repo.join("plan.md"), "body\n").expect("write");
+        run_git_in(&repo, ["add", "plan.md"]);
+        run_git_in(&repo, ["commit", "-m", "lane: land plan"]);
+
+        super::receipts_rehash_amend(&repo, &[PathBuf::from("plan.md")])
+            .expect("rehash amend");
+
+        let body = run_git_in(&repo, ["log", "-1", "--format=%B"]);
+        assert!(
+            body.contains(super::receipts::RECEIPT_ANCHOR_COMMIT_KEY),
+            "footer missing commit key: {body}"
+        );
+        assert!(
+            body.contains(super::receipts::RECEIPT_ANCHOR_CONTENT_KEY),
+            "footer missing content key: {body}"
+        );
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    // ---- Runner-up #90: cherry-pick + apply-patch fallback ------------
+
+    #[test]
+    fn cherry_pick_fallback_squashes_after_threshold() {
+        let root = unique_temp_dir("parallel-fallback-squash");
+        let lane_dir = root.join("lane-fallback");
+        fs::create_dir_all(&lane_dir).expect("mkdir");
+        run_git_in(&lane_dir, ["init", "--quiet", "-b", "main"]);
+        run_git_in(&lane_dir, ["config", "user.email", "t@example.com"]);
+        run_git_in(&lane_dir, ["config", "user.name", "Autodev"]);
+        fs::write(lane_dir.join("shared.txt"), "base\n").expect("write");
+        run_git_in(&lane_dir, ["add", "shared.txt"]);
+        run_git_in(&lane_dir, ["commit", "-m", "base"]);
+        let base = run_git_in(&lane_dir, ["rev-parse", "HEAD"]).trim().to_string();
+
+        run_git_in(&lane_dir, ["checkout", "-b", "lane"]);
+        fs::write(lane_dir.join("shared.txt"), "lane edit\n").expect("write");
+        run_git_in(&lane_dir, ["commit", "-am", "lane change"]);
+        let _lane_head = run_git_in(&lane_dir, ["rev-parse", "HEAD"]).trim().to_string();
+
+        run_git_in(&lane_dir, ["checkout", "main"]);
+        fs::write(lane_dir.join("shared.txt"), "main edit\n").expect("write");
+        run_git_in(&lane_dir, ["commit", "-am", "main change"]);
+        let parent = run_git_in(&lane_dir, ["rev-parse", "HEAD"]).trim().to_string();
+
+        let outcome = super::cherry_pick_lane_range_with_fallback(
+            &lane_dir, &base, &parent, "lane", 1,
+        )
+        .expect("fallback should land");
+        match outcome {
+            super::CherryPickFallbackOutcome::Squashed { conflicts_seen } => {
+                assert!(conflicts_seen >= 1);
+            }
+            super::CherryPickFallbackOutcome::CherryPicked => {
+                panic!("expected fallback to engage");
+            }
+        }
+        let body = run_git_in(&lane_dir, ["log", "-1", "--format=%s"]);
+        assert!(
+            body.contains("cherry-pick fallback"),
+            "squash commit message should mark the fallback: {body}"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn apply_patch_fallback_exact_match() {
+        let source = "alpha\nbeta\ngamma\n";
+        let (out, outcome) = super::apply_patch_with_structural_fallback(
+            source,
+            &["beta"],
+            &["delta"],
+            &["alpha"],
+            &["gamma"],
+        );
+        assert_eq!(outcome, super::StructuralPatchOutcome::AppliedExact);
+        assert!(out.contains("alpha"));
+        assert!(out.contains("delta"));
+        assert!(!out.contains("beta"));
+    }
+
+    #[test]
+    fn apply_patch_fallback_structural_match_when_expected_drifts() {
+        // expected lines carry line-number prefixes so the exact match
+        // fails; the surrounding context still anchors a structural splice.
+        let source = "alpha\nbeta\nbeta2\ngamma\n";
+        let (out, outcome) = super::apply_patch_with_structural_fallback(
+            source,
+            &["12: beta", "13: beta2"],
+            &["delta"],
+            &["alpha"],
+            &["gamma"],
+        );
+        assert!(
+            matches!(
+                outcome,
+                super::StructuralPatchOutcome::AppliedStructural { .. }
+            ),
+            "expected structural fallback, got {outcome:?}"
+        );
+        assert!(out.contains("alpha"));
+        assert!(out.contains("delta"));
+        assert!(out.contains("gamma"));
+        assert!(!out.contains("beta\n"));
+        assert!(!out.contains("beta2"));
+    }
+
+    #[test]
+    fn apply_patch_fallback_no_match_returns_source_unchanged() {
+        let source = "alpha\nbeta\ngamma\n";
+        let (out, outcome) = super::apply_patch_with_structural_fallback(
+            source,
+            &["nope"],
+            &["whatever"],
+            &["does-not-exist"],
+            &["also-missing"],
+        );
+        assert_eq!(outcome, super::StructuralPatchOutcome::NoMatch);
+        assert_eq!(out, source);
     }
 }
