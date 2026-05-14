@@ -1705,11 +1705,35 @@ fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
             plan_path.display()
         );
     }
-    let has_standard_unit_shape = ["goal", "files", "test"].into_iter().all(|fragment| {
-        markdown_section_contains(&markdown, "## Implementation Units", |line| {
-            line.to_ascii_lowercase().contains(fragment)
-        })
+    let has_files_line = markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        line.to_ascii_lowercase().contains("files")
     });
+    let has_test_line = markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        line.to_ascii_lowercase().contains("test")
+    });
+    let has_intent_line = markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        let lowered = line.to_ascii_lowercase();
+        if ["goal", "approach", "purpose"]
+            .into_iter()
+            .any(|fragment| lowered.contains(fragment))
+        {
+            return true;
+        }
+        let trimmed = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+        if let Some(rest) = trimmed.strip_prefix(|c: char| c == 'U' || c == 'u') {
+            let digit_run: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digit_run.is_empty()
+                && rest[digit_run.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next == '.' || next == ':')
+            {
+                return true;
+            }
+        }
+        false
+    });
+    let has_standard_unit_shape = has_files_line && has_test_line && has_intent_line;
     let has_artifact_only_unit_shape =
         markdown_section_contains(&markdown, "## Implementation Units", |line| {
             line.to_ascii_lowercase()
@@ -4718,6 +4742,112 @@ Depends on `genesis/PLANS.md` and the numbered subordinate plan files.
         )
         .unwrap();
 
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_execplan_validator_accepts_approach_style_units() {
+        let root = temp_dir("corpus-execplan-approach");
+        let plan_path = root.join("003-final-dossier-writer.md");
+        fs::write(
+            &plan_path,
+            r#"# Implement fail-closed final go/no-go dossier writer
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This plan must be maintained in accordance with `PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Produce the dossier writer script.
+
+## Requirements Trace
+
+R2 — Produce a dossier.
+
+## Scope Boundaries
+
+This plan does not change the contract decided in Plan 002.
+
+## Progress
+
+- [ ] (2026-05-14 13:02Z) Plan authored.
+
+## Surprises & Discoveries
+
+None yet.
+
+## Decision Log
+
+- Decision: Implement the writer in Python 3.
+  Rationale: Consistency.
+  Date/Author: 2026-05-14 / corpus author
+
+## Outcomes & Retrospective
+
+None yet.
+
+## Context and Orientation
+
+The writer script lives at `scripts/ops/write-rsociety-final-go-no-go-dossier.py`.
+
+## Plan of Work
+
+1. Read the style reference.
+2. Author the writer script.
+
+## Implementation Units
+
+U1. Scaffold the writer script with arg parser, dataclasses, and main entry point.
+   Requirements advanced: R2.
+   Dependencies: Plan 002 (contract).
+   Files to create: `scripts/ops/write-rsociety-final-go-no-go-dossier.py`.
+   Files to modify: none.
+   Tests to add: a self-test inside the script (`--self-test`).
+   Approach: Copy the structure of the existing writer; replace the body.
+
+U2. Implement the decision precedence rules.
+   Requirements advanced: R2b, R2c.
+   Dependencies: U1.
+   Files to modify: the writer script.
+   Tests to add: self-test cases for each rule.
+   Approach: Encode each rule as a function.
+
+## Concrete Steps
+
+    python3 scripts/ops/write-rsociety-final-go-no-go-dossier.py --self-test
+
+## Validation and Acceptance
+
+Self-test exits 0 with all cases passing.
+
+## Idempotence and Recovery
+
+Re-running overwrites the dossier.
+
+## Artifacts and Notes
+
+Capture the dossier head after the writer runs.
+
+## Interfaces and Dependencies
+
+Python 3.13 stdlib only.
+"#,
+        )
+        .unwrap();
+
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_execplan_validator_accepts_real_autonomy_dossier_writer_plan() {
+        let root = temp_dir("corpus-execplan-real-003");
+        let plan_path = root.join("003-final-dossier-writer.md");
+        fs::write(
+            &plan_path,
+            include_str!("testdata/corpus-plan-003-final-dossier-writer.md"),
+        )
+        .unwrap();
         verify_corpus_execplan(&plan_path).unwrap();
     }
 
