@@ -735,6 +735,14 @@ async fn run_super_audit_phase(args: &SuperArgs, repo_root: &Path) -> Result<Str
     cmd.current_dir(repo_root)
         .arg("audit")
         .arg("--everything")
+        // In super context the audit's role is to feed the harvest queue;
+        // it is informational, not gating. `--report-only` keeps the
+        // analysis pass + final review running but short-circuits the
+        // NO-GO bail in run_final_review_and_file_quality_phase. Audit
+        // findings still land in analysis.json; the harvest stage reads
+        // those files directly. The deterministic super_gate and the
+        // execution-gate LLM remain the final say for the super run.
+        .arg("--report-only")
         .arg("--everything-threads")
         .arg(args.audit_threads.max(1).to_string())
         .arg("--remediation-threads")
