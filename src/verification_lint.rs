@@ -145,7 +145,7 @@ fn cargo_test_filter_tokens(argv: &[String]) -> Vec<String> {
     let mut index = 2usize;
     while index < argv.len() {
         let token = argv[index].as_str();
-        if token == "--" || token == "&&" || token == ";" || token == "||" {
+        if token == "--" || is_shell_control_token(token) {
             break;
         }
         if cargo_option_takes_value(token) {
@@ -213,6 +213,13 @@ fn grep_file_operands(argv: &[String]) -> Vec<&str> {
     let mut saw_pattern = false;
     while index < argv.len() {
         let token = argv[index].as_str();
+        if is_shell_control_token(token) {
+            // A pipe, redirect, or compound-command separator terminates the
+            // grep call's argument list. Anything after it belongs to the
+            // next command, not to grep, so it must not be treated as a grep
+            // operand.
+            break;
+        }
         if token == "--" {
             index += 1;
             continue;
@@ -233,6 +240,13 @@ fn grep_file_operands(argv: &[String]) -> Vec<&str> {
         index += 1;
     }
     operands
+}
+
+fn is_shell_control_token(token: &str) -> bool {
+    matches!(
+        token,
+        "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | "<<" | "2>" | "2>>" | "&"
+    )
 }
 
 fn operand_looks_like_directory(operand: &str) -> bool {
@@ -278,4 +292,54 @@ fn strip_plan_bullet(line: &str) -> &str {
         }
     }
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_terminates_grep_argument_list() {
+        // The original failure on autonomy: `grep -E "..." path/file.md | head -20`
+        // was being rejected because the validator treated `|` as a file
+        // operand and the directory heuristic fired on it. The fix stops
+        // scanning operands at the first shell control token.
+        let body = "    grep -E \"ops/evidence/\" ops/scorecard.md | head -20";
+        verify_commands_are_runnable("TRUTH-005", "Verification:", body)
+            .expect("piped grep should be accepted");
+    }
+
+    #[test]
+    fn redirect_terminates_grep_argument_list() {
+        let body = "    grep -n verification src/main.rs > /tmp/output.log";
+        verify_commands_are_runnable("X", "Verification:", body)
+            .expect("redirected grep should be accepted");
+    }
+
+    #[test]
+    fn pipe_does_not_disable_pre_pipe_directory_check() {
+        // The validator must still catch a directory operand that appears
+        // BEFORE the shell pipe — relaxing the post-pipe parsing should not
+        // weaken the actual directory check.
+        let body = "    grep -n foo src | head -1";
+        let error = verify_commands_are_runnable("X", "Verification:", body)
+            .expect_err("pre-pipe directory operand should still be rejected");
+        assert!(format!("{error:#}").contains("malformed grep verification"));
+    }
+
+    #[test]
+    fn compound_command_separators_terminate_argument_list() {
+        let body = "    grep -n foo file.rs && echo done";
+        verify_commands_are_runnable("X", "Verification:", body)
+            .expect("&&-chained grep should be accepted");
+    }
+
+    #[test]
+    fn cargo_test_pipe_terminator_does_not_treat_pipe_as_filter() {
+        // Same class of bug for `cargo test ... | tee log.txt` — the pipe
+        // must terminate filter scanning, not leak in as a filter token.
+        let body = "    cargo test -p autodev validator | tee /tmp/log.txt";
+        verify_commands_are_runnable("X", "Verification:", body)
+            .expect("piped cargo test should be accepted");
+    }
 }
