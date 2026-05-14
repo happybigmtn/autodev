@@ -8,6 +8,12 @@ async fn run_super_parallel_stage(
     super_root: &Path,
     gate: &DeterministicGateSummary,
 ) -> Result<()> {
+    // When the operator chose a Claude-alias worker model (opus, sonnet,
+    // claude-opus-4-7, ...) the lane workers must spawn through claude_exec,
+    // not codex_exec — Codex with a ChatGPT account rejects Claude models
+    // outright. The lane-worker route already supports both backends; we
+    // just need to set the claude flag based on the model.
+    let claude_route = crate::claude_exec::looks_like_claude_model(&args.worker_model);
     parallel_command::run_parallel(ParallelArgs {
         action: None::<ParallelAction>,
         max_iterations: args.max_iterations,
@@ -22,7 +28,7 @@ async fn run_super_parallel_stage(
         include_siblings: false,
         run_root: Some(super_root.join("parallel")),
         codex_bin: args.codex_bin.clone(),
-        claude: false,
+        claude: claude_route,
         max_turns: None,
         max_retries: 2,
     })
