@@ -1643,7 +1643,9 @@ fn verify_corpus_semantics(
         .with_context(|| format!("failed to read {}", report_path.display()))?;
     let primary_plan_path = active_plan_surface.primary_plan_path().unwrap_or("plans/");
 
-    if !plans_index.contains(primary_plan_path) && !report.contains(primary_plan_path) {
+    if !corpus_text_references_primary_plan(&plans_index, primary_plan_path)
+        && !corpus_text_references_primary_plan(&report, primary_plan_path)
+    {
         bail!(
             "corpus must explicitly reference the active root planning surface at `{}` when the repo already has active plans",
             primary_plan_path
@@ -1669,6 +1671,45 @@ fn verify_corpus_semantics(
     }
 
     Ok(())
+}
+
+/// Returns true if `text` references the primary plan in any form that
+/// unambiguously names this plan family. Accepts:
+///   1. The full path: `plans/020526-rat-wire-actual-design-plates.md`
+///   2. The basename: `020526-rat-wire-actual-design-plates.md`
+///   3. The stem: `020526-rat-wire-actual-design-plates`
+///   4. A glob form: `020526-rat-wire-*` where the prefix is at least two
+///      dash-separated tokens of the stem (so it can't collide with an
+///      unrelated single-token date prefix).
+fn corpus_text_references_primary_plan(text: &str, primary_plan_path: &str) -> bool {
+    if text.contains(primary_plan_path) {
+        return true;
+    }
+    let basename = primary_plan_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(primary_plan_path);
+    if !basename.is_empty() && text.contains(basename) {
+        return true;
+    }
+    let stem = basename.strip_suffix(".md").unwrap_or(basename);
+    if !stem.is_empty() && text.contains(stem) {
+        return true;
+    }
+    let tokens: Vec<&str> = stem.split('-').collect();
+    if tokens.len() < 2 {
+        return false;
+    }
+    for take in (2..tokens.len()).rev() {
+        let prefix = tokens[..take].join("-");
+        for tail in ["-*", "*", "-…", "-..."] {
+            let needle = format!("{prefix}{tail}");
+            if text.contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
@@ -4743,6 +4784,71 @@ Depends on `genesis/PLANS.md` and the numbered subordinate plan files.
         .unwrap();
 
         verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_accepts_full_path() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(super::corpus_text_references_primary_plan(
+            "see plans/020526-rat-wire-actual-design-plates.md for details",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_accepts_basename() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(super::corpus_text_references_primary_plan(
+            "see `020526-rat-wire-actual-design-plates.md`",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_accepts_stem() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(super::corpus_text_references_primary_plan(
+            "the 020526-rat-wire-actual-design-plates plan covers this",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_accepts_glob_prefix() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(super::corpus_text_references_primary_plan(
+            "the family of 020526-rat-wire-* plans drives this work",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_requires_at_least_two_tokens_for_glob() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        // A bare date prefix is too ambiguous — many unrelated plans share
+        // a date, so the glob form needs at least two dash-separated tokens.
+        assert!(!super::corpus_text_references_primary_plan(
+            "the 020526-* family",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_rejects_unrelated_glob() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(!super::corpus_text_references_primary_plan(
+            "the 010326-other-feature-* family",
+            primary
+        ));
+    }
+
+    #[test]
+    fn corpus_primary_plan_reference_rejects_when_text_lacks_any_form() {
+        let primary = "plans/020526-rat-wire-actual-design-plates.md";
+        assert!(!super::corpus_text_references_primary_plan(
+            "this corpus inspected several other plans only",
+            primary
+        ));
     }
 
     #[test]
