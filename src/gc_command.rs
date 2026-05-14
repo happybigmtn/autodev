@@ -60,6 +60,49 @@ pub(crate) struct GcArgs {
     /// Without `--force`, the command refuses while a super run is active.
     #[arg(long)]
     pub force: bool,
+
+    /// Install a systemd-user timer that runs `auto gc --all --archive --prune`
+    /// on a recurring schedule (default weekly at 04:00 local). After install,
+    /// no manual gc is needed -- the timer keeps `.auto/` from blowing up.
+    #[arg(long, conflicts_with_all = ["repo", "all", "archive", "prune"])]
+    pub install_timer: bool,
+
+    /// Remove the recurring gc timer installed by --install-timer.
+    #[arg(long, conflicts_with_all = ["repo", "all", "archive", "prune", "install_timer"])]
+    pub uninstall_timer: bool,
+
+    /// Schedule for --install-timer. Default `weekly`. Accepts any systemd
+    /// `OnCalendar=` value (e.g. `daily`, `Mon *-*-* 04:00:00`, `*-*-1,15 04:00:00`).
+    #[arg(long, default_value = "weekly")]
+    pub timer_schedule: String,
+}
+
+/// Soft-warn the operator when a repo's .auto/ has exceeded a reclaim threshold.
+/// Called from super_command::run_super at launch so a stale .auto/ from a long
+/// uninterrupted streak gets surfaced before the new run piles more on top.
+pub(crate) fn warn_if_auto_dir_oversized(repo: &Path) {
+    let auto_dir = repo.join(".auto");
+    if !auto_dir.is_dir() {
+        return;
+    }
+    let threshold_gib: u64 = std::env::var("AUTODEV_GC_WARN_GIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    let bytes = match dir_bytes(&auto_dir) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let threshold_bytes = threshold_gib.saturating_mul(1024 * 1024 * 1024);
+    if bytes < threshold_bytes {
+        return;
+    }
+    eprintln!(
+        "auto gc: WARNING -- {} is {} (threshold {} GiB). Run `auto gc --archive --prune` to reclaim before this run piles on top.",
+        auto_dir.display(),
+        human_bytes(Some(bytes)),
+        threshold_gib,
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +126,13 @@ pub(crate) struct GcReport {
 }
 
 pub(crate) fn run_gc(args: GcArgs) -> Result<()> {
+    if args.install_timer {
+        return install_systemd_user_timer(&args.timer_schedule);
+    }
+    if args.uninstall_timer {
+        return uninstall_systemd_user_timer();
+    }
+
     let mut keep_running = args.keep_running;
     if args.no_keep_running {
         keep_running = false;
@@ -582,11 +632,162 @@ fn print_report(report: &GcReport) {
 /// `super_command::run_super` after the run finishes. Best-effort: failures log
 /// but don't propagate.
 pub(crate) fn archive_after_super_run(repo: &Path) {
-    if let Err(err) = archive_audit_runs(repo, false) {
-        eprintln!(
+    match archive_audit_runs(repo, false) {
+        Ok(runs) => {
+            let fresh: Vec<&ArchivedRun> = runs.iter().filter(|r| !r.already_archived).collect();
+            if !fresh.is_empty() {
+                eprintln!(
+                    "auto gc: archived {} new audit run(s) into {}",
+                    fresh.len(),
+                    archive_root_for(repo)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no canonical evidence dir)".to_string()),
+                );
+            }
+        }
+        Err(err) => eprintln!(
             "auto gc: archive after super run failed (best-effort): {err:#}"
-        );
+        ),
     }
+}
+
+const TIMER_UNIT_NAME: &str = "auto-gc.timer";
+const SERVICE_UNIT_NAME: &str = "auto-gc.service";
+
+/// Install the systemd-user timer that runs `auto gc --all --archive --prune`
+/// on a recurring schedule. After install, this command is the durable answer
+/// to "how do we keep pruning so .auto/ doesn't blow up" -- the timer fires
+/// regardless of whether anyone is running autodev interactively.
+fn install_systemd_user_timer(schedule: &str) -> Result<()> {
+    let user_dir = systemd_user_dir()?;
+    fs::create_dir_all(&user_dir)
+        .with_context(|| format!("create {}", user_dir.display()))?;
+
+    let auto_binary = std::env::current_exe()
+        .context("resolve current `auto` binary path for systemd unit")?;
+
+    // Service unit: invokes auto gc against every repo under /home/r/Coding.
+    // ConditionPathIsDirectory means the unit silently no-ops when there's
+    // nothing to scan -- avoids alarming failure logs on a fresh machine.
+    let service_body = format!(
+        "[Unit]\n\
+         Description=autodev: archive durable evidence + prune .auto/ regenerable scratch\n\
+         Documentation=https://github.com/anthropics/autodev\n\
+         ConditionPathIsDirectory=%h/Coding\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={bin} gc --all --archive --prune\n\
+         Nice=10\n\
+         IOSchedulingClass=idle\n\
+         # Best-effort: never fail the timer if gc returns nonzero (e.g. one\n\
+         # repo refused because a super run is active).\n\
+         SuccessExitStatus=0 1\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n",
+        bin = auto_binary.display(),
+    );
+
+    let timer_body = format!(
+        "[Unit]\n\
+         Description=autodev: weekly .auto/ archive + prune\n\
+         Documentation=https://github.com/anthropics/autodev\n\
+         \n\
+         [Timer]\n\
+         OnCalendar={schedule}\n\
+         # If the machine was off when the timer should have fired, run it on\n\
+         # next boot instead of waiting another week.\n\
+         Persistent=true\n\
+         # Spread fleet load when multiple machines run the same timer.\n\
+         RandomizedDelaySec=15m\n\
+         Unit={SERVICE_UNIT_NAME}\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n",
+    );
+
+    let service_path = user_dir.join(SERVICE_UNIT_NAME);
+    let timer_path = user_dir.join(TIMER_UNIT_NAME);
+    fs::write(&service_path, service_body)
+        .with_context(|| format!("write {}", service_path.display()))?;
+    fs::write(&timer_path, timer_body)
+        .with_context(|| format!("write {}", timer_path.display()))?;
+
+    systemctl_user(&["daemon-reload"])?;
+    systemctl_user(&["enable", "--now", TIMER_UNIT_NAME])?;
+
+    let mut stderr = std::io::stderr().lock();
+    writeln!(
+        stderr,
+        "auto gc: installed {} (schedule: {})",
+        TIMER_UNIT_NAME, schedule,
+    )
+    .ok();
+    writeln!(
+        stderr,
+        "         service: {}\n         timer:   {}",
+        service_path.display(),
+        timer_path.display(),
+    )
+    .ok();
+    writeln!(
+        stderr,
+        "         status:  systemctl --user status {TIMER_UNIT_NAME}",
+    )
+    .ok();
+    writeln!(
+        stderr,
+        "         next:    systemctl --user list-timers {TIMER_UNIT_NAME}",
+    )
+    .ok();
+    Ok(())
+}
+
+fn uninstall_systemd_user_timer() -> Result<()> {
+    let _ = systemctl_user(&["disable", "--now", TIMER_UNIT_NAME]);
+    let user_dir = systemd_user_dir()?;
+    let service_path = user_dir.join(SERVICE_UNIT_NAME);
+    let timer_path = user_dir.join(TIMER_UNIT_NAME);
+    let mut removed = Vec::new();
+    if timer_path.is_file() {
+        fs::remove_file(&timer_path).ok();
+        removed.push(timer_path);
+    }
+    if service_path.is_file() {
+        fs::remove_file(&service_path).ok();
+        removed.push(service_path);
+    }
+    let _ = systemctl_user(&["daemon-reload"]);
+    if removed.is_empty() {
+        eprintln!("auto gc: no auto-gc timer was installed");
+    } else {
+        eprintln!("auto gc: removed {} unit file(s)", removed.len());
+        for path in removed {
+            eprintln!("         - {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn systemd_user_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow!("HOME not set; cannot locate systemd user config dir"))?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+fn systemctl_user(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .with_context(|| format!("invoke systemctl --user {}", args.join(" ")))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "systemctl --user {} exited with status {status}",
+            args.join(" ")
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

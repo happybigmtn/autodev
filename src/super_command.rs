@@ -218,6 +218,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
     crate::session_survival::reexec_if_reapable(&format!("super-{repo_slug}"))?;
+    crate::gc_command::warn_if_auto_dir_oversized(&repo_root);
     ensure_repo_layout(&repo_root)?;
     let mut args = args;
     let resume_requested = args.resume.is_some();
@@ -468,6 +469,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         println!("parallel:    skipped (--no-execute)");
         println!("super root:  {}", super_root.display());
         println!("elapsed:     {:?}", started_at.elapsed());
+        crate::gc_command::archive_after_super_run(&repo_root);
         return Ok(());
     }
 
@@ -508,6 +510,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     println!("auto super complete");
     println!("super root:  {}", super_root.display());
     println!("elapsed:     {:?}", started_at.elapsed());
+    crate::gc_command::archive_after_super_run(&repo_root);
     Ok(())
 }
 
