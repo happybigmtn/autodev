@@ -114,6 +114,36 @@ struct DeterministicGateSummary {
     follow_on_tasks: usize,
 }
 
+/// Extract task identifiers from archive-style markdown like `REVIEW.md` and
+/// `COMPLETED.md`. Archives use `## \`TASK-ID\`` section headers rather than
+/// checkbox bullets, so `parse_tasks` (which scans for `- [ ]` headers) does
+/// not pick them up. This helper recognizes the archive form so completed
+/// dependencies satisfy the dependency check.
+fn extract_archive_task_ids(markdown: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("## ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('`') else {
+            continue;
+        };
+        let Some(end) = rest.find('`') else {
+            continue;
+        };
+        let candidate = &rest[..end];
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            ids.push(candidate.to_string());
+        }
+    }
+    ids
+}
+
 fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSummary> {
     let markdown = fs::read_to_string(plan_path)
         .with_context(|| format!("failed to read {}", plan_path.display()))?;
@@ -142,9 +172,30 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
         bail!("{} has no unchecked executable tasks", plan_path.display());
     }
     let shared_tasks = parse_tasks(&markdown);
-    let all_task_ids = shared_tasks
+    let mut known_task_ids: std::collections::BTreeSet<String> = shared_tasks
         .iter()
-        .map(|task| task.id.as_str())
+        .map(|task| task.id.clone())
+        .collect();
+    // Dependencies often point at tasks that have already been completed
+    // and moved out of IMPLEMENTATION_PLAN.md into REVIEW.md or COMPLETED.md.
+    // The deterministic gate should treat those as automatically satisfied
+    // rather than rejecting the dependent task as referencing an unknown id.
+    if let Some(plan_dir) = plan_path.parent() {
+        for archive_name in ["REVIEW.md", "COMPLETED.md"] {
+            let archive_path = plan_dir.join(archive_name);
+            if let Ok(archive_markdown) = fs::read_to_string(&archive_path) {
+                known_task_ids.extend(
+                    parse_tasks(&archive_markdown)
+                        .into_iter()
+                        .map(|task| task.id),
+                );
+                known_task_ids.extend(extract_archive_task_ids(&archive_markdown));
+            }
+        }
+    }
+    let all_task_ids = known_task_ids
+        .iter()
+        .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
     for task in &unchecked {
         verify_super_task(task, &all_task_ids)?;
