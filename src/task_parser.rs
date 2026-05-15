@@ -708,7 +708,7 @@ fn validate_execution_row_completion_artifacts(task: &PlanTask) -> Result<()> {
 /// underscores are treated as part of a word, so a compound technical term
 /// like `unknown-literal` or `todo-list-widget` is NOT flagged — only a bare
 /// placeholder such as `Fixture boundary: unknown` or `Source of truth: TBD`.
-fn first_vague_placeholder_word(value: &str) -> Option<&'static str> {
+pub(crate) fn first_vague_placeholder_word(value: &str) -> Option<&'static str> {
     const FORBIDDEN: [&str; 4] = ["tbd", "todo", "unspecified", "unknown"];
     for token in value.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
         let lowered = token.to_ascii_lowercase();

@@ -3006,14 +3006,11 @@ fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
         let value = plan_task_field_line_value(block, field)
             .with_context(|| format!("task `{}` missing `{field}`", block.task_id))?;
-        let lowercase = value.to_ascii_lowercase();
-        for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
-            if lowercase.contains(forbidden) {
-                bail!(
-                    "generated implementation plan task `{}` has vague `{field}` content `{forbidden}`",
-                    block.task_id
-                );
-            }
+        if let Some(forbidden) = crate::task_parser::first_vague_placeholder_word(&value) {
+            bail!(
+                "generated implementation plan task `{}` has vague `{field}` content `{forbidden}`",
+                block.task_id
+            );
         }
     }
 
