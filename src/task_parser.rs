@@ -703,17 +703,30 @@ fn validate_execution_row_completion_artifacts(task: &PlanTask) -> Result<()> {
     Ok(())
 }
 
+/// Returns the first vague placeholder word (`tbd`, `todo`, `unspecified`,
+/// `unknown`) that appears as a standalone token in `value`. Hyphens and
+/// underscores are treated as part of a word, so a compound technical term
+/// like `unknown-literal` or `todo-list-widget` is NOT flagged — only a bare
+/// placeholder such as `Fixture boundary: unknown` or `Source of truth: TBD`.
+fn first_vague_placeholder_word(value: &str) -> Option<&'static str> {
+    const FORBIDDEN: [&str; 4] = ["tbd", "todo", "unspecified", "unknown"];
+    for token in value.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+        let lowered = token.to_ascii_lowercase();
+        if let Some(hit) = FORBIDDEN.iter().find(|forbidden| **forbidden == lowered) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
         let value = execution_row_first_field_line(task, field)?;
-        let lowercase = value.to_ascii_lowercase();
-        for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
-            if lowercase.contains(forbidden) {
-                bail!(
-                    "task `{}` has vague `{field}` content `{forbidden}`",
-                    task.id
-                );
-            }
+        if let Some(forbidden) = first_vague_placeholder_word(&value) {
+            bail!(
+                "task `{}` has vague `{field}` content `{forbidden}`",
+                task.id
+            );
         }
     }
 
@@ -983,6 +996,41 @@ mod tests {
     fn lane_kind_rejects_unrecognized_values() {
         assert_eq!(LaneKind::parse(""), None);
         assert_eq!(LaneKind::parse("xyz nonsense"), None);
+    }
+
+    #[test]
+    fn vague_placeholder_flags_bare_placeholder_words() {
+        assert_eq!(super::first_vague_placeholder_word("unknown"), Some("unknown"));
+        assert_eq!(super::first_vague_placeholder_word("TBD"), Some("tbd"));
+        assert_eq!(
+            super::first_vague_placeholder_word("TODO: figure this out"),
+            Some("todo")
+        );
+        assert_eq!(
+            super::first_vague_placeholder_word("Runtime owner is unspecified"),
+            Some("unspecified")
+        );
+    }
+
+    #[test]
+    fn vague_placeholder_ignores_compound_technical_terms() {
+        // FEC-PARITY regression: `unknown-literal` is a TypeScript term, not
+        // a placeholder. Hyphenated/underscored compounds must not trip the
+        // bare-placeholder check.
+        assert_eq!(
+            super::first_vague_placeholder_word(
+                "negative-path fixtures (missing-state, unknown-literal, non-record inputs)"
+            ),
+            None
+        );
+        assert_eq!(
+            super::first_vague_placeholder_word("a todo-list-widget component"),
+            None
+        );
+        assert_eq!(
+            super::first_vague_placeholder_word("the unknown_value field"),
+            None
+        );
     }
 
     #[test]
