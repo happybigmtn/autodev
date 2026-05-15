@@ -1072,19 +1072,37 @@ async fn run_design_codex_phase(
     context_label: &str,
 ) -> Result<()> {
     let stderr_path = output_dir.join(format!("{context_label}-stderr.log"));
-    println!("phase:       {context_label}");
+    let claude_route = crate::claude_exec::looks_like_claude_model(model);
+    println!(
+        "phase:       {context_label} | backend: {}",
+        if claude_route { "claude" } else { "codex" }
+    );
     println!("stderr log:  {}", stderr_path.display());
-    let status = run_codex_exec_max_context(
-        repo_root,
-        prompt,
-        model,
-        reasoning_effort,
-        codex_bin,
-        &stderr_path,
-        None,
-        context_label,
-    )
-    .await?;
+    let status = if claude_route {
+        crate::claude_exec::run_claude_exec(
+            repo_root,
+            prompt,
+            model,
+            reasoning_effort,
+            None,
+            &stderr_path,
+            None,
+            context_label,
+        )
+        .await?
+    } else {
+        run_codex_exec_max_context(
+            repo_root,
+            prompt,
+            model,
+            reasoning_effort,
+            codex_bin,
+            &stderr_path,
+            None,
+            context_label,
+        )
+        .await?
+    };
     if !status.success() {
         bail!(
             "{context_label} failed with status {status}; see {}",
