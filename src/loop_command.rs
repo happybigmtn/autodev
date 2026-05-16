@@ -1118,6 +1118,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos();
-        std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+        let dir = std::env::temp_dir().join(format!("autodev-{label}-{nanos}"));
+        fs::create_dir_all(&dir).expect("failed to create unique temp dir");
+        dir
     }
 }
