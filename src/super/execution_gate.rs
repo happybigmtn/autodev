@@ -237,12 +237,9 @@ fn verify_super_task(
         );
     }
 
-    for forbidden in [
-        "TBD",
-        "TODO",
-        "decomposition required",
-        "split before implementation",
-    ] {
+    // Phrase-level signals are always bad wherever they appear -- a task
+    // markdown that literally says "decomposition required" is not ready.
+    for forbidden in ["decomposition required", "split before implementation"] {
         if task.markdown.contains(forbidden) {
             bail!(
                 "task `{}` contains forbidden placeholder `{forbidden}`",
@@ -250,7 +247,48 @@ fn verify_super_task(
             );
         }
     }
+    // `TBD`/`TODO` are placeholders only when *used* as a field value, not
+    // when *referenced* -- e.g. a Review/closeout criterion may legitimately
+    // say `no question is left as "TBD"`. validate_execution_row above
+    // already rejects a field whose value is a bare placeholder; here we
+    // only catch a bare, unquoted standalone `TBD`/`TODO` token elsewhere.
+    for forbidden in ["TBD", "TODO"] {
+        if markdown_has_bare_placeholder(&task.markdown, forbidden) {
+            bail!(
+                "task `{}` contains forbidden placeholder `{forbidden}`",
+                task.task_id
+            );
+        }
+    }
     Ok(())
+}
+
+/// True when `placeholder` appears in `markdown` as a standalone token that
+/// is NOT wrapped in quotes or backticks. A quoted/backticked occurrence
+/// (`"TBD"`, `` `TODO` ``) is a reference -- prose naming the placeholder --
+/// not a placeholder being used, so it is not flagged.
+fn markdown_has_bare_placeholder(markdown: &str, placeholder: &str) -> bool {
+    let bytes = markdown.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = markdown[search_from..].find(placeholder) {
+        let start = search_from + rel;
+        let end = start + placeholder.len();
+        let before = bytes.get(start.wrapping_sub(1)).copied();
+        let after = bytes.get(end).copied();
+        let is_wrapped = |b: Option<u8>| matches!(b, Some(b'"') | Some(b'`') | Some(b'\''));
+        let prev_is_word = before
+            .map(|b| b.is_ascii_alphanumeric() || b == b'_')
+            .unwrap_or(false);
+        let next_is_word = after
+            .map(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .unwrap_or(false);
+        // Standalone (not part of a longer word) and not quote/backtick-wrapped.
+        if !prev_is_word && !next_is_word && !(is_wrapped(before) && is_wrapped(after)) {
+            return true;
+        }
+        search_from = end;
+    }
+    false
 }
 
 #[allow(dead_code)]

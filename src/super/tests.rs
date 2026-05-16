@@ -158,6 +158,41 @@ mod tests {
     }
 
     #[test]
+    fn bare_placeholder_flags_unquoted_standalone_token() {
+        assert!(crate::super_command::markdown_has_bare_placeholder(
+            "  Owns: TBD\n",
+            "TBD"
+        ));
+        assert!(crate::super_command::markdown_has_bare_placeholder(
+            "Verification: TODO write the test",
+            "TODO"
+        ));
+    }
+
+    #[test]
+    fn bare_placeholder_ignores_quoted_reference() {
+        // TRUTH-DECISIONS regression: the Review/closeout criterion
+        // `no question is left as "TBD"` quotes the placeholder as
+        // acceptance criteria -- it is a reference, not a use.
+        assert!(!crate::super_command::markdown_has_bare_placeholder(
+            "  Review/closeout: no question is left as \"TBD\".\n",
+            "TBD"
+        ));
+        assert!(!crate::super_command::markdown_has_bare_placeholder(
+            "the `TODO` marker must be absent",
+            "TODO"
+        ));
+    }
+
+    #[test]
+    fn bare_placeholder_ignores_substring_in_longer_word() {
+        assert!(!crate::super_command::markdown_has_bare_placeholder(
+            "the TBDX-001 task and a TODOLIST file",
+            "TBD"
+        ));
+    }
+
+    #[test]
     fn deterministic_gate_rejects_package_wide_cargo_test() {
         let root = temp_dir("super-gate-broad");
         let plan = root.join(IMPLEMENTATION_PLAN);
