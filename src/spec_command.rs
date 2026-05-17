@@ -1,17 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 
+use crate::SpecArgs;
 use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
-    execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
-    TaskStatus,
+    TaskStatus, execution_row_first_field_line, parse_task_header, parse_tasks,
+    validate_execution_row,
 };
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
-use crate::SpecArgs;
 
 const SPEC_REQUIRED_SECTIONS: [&str; 13] = [
     "## Objective",
@@ -322,7 +322,28 @@ fn verify_product_experience_contract(markdown: &str, spec_path: &Path) -> Resul
     let required: [(&str, &[&str]); 3] = [
         (
             "surface plate",
-            &["surface plate", "mockup", "wireframe", "viewport"],
+            &[
+                "surface plate",
+                "surface plates",
+                "mockup",
+                "mockups",
+                "wireframe",
+                "wireframes",
+                "viewport",
+                "plate --",
+                "plate -",
+                "plate \u{2014}",
+                "surface 1",
+                "surface 2",
+                "exact command",
+                "exact output",
+                "json-rpc",
+                "\"jsonrpc\"",
+                "http/1.1",
+                "80x24",
+                "120x32",
+                "160x48",
+            ],
         ),
         (
             "visual hierarchy",
@@ -637,9 +658,11 @@ mod tests {
         fs::write(&plan_path, plan).expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("header rejected");
-        assert!(error
-            .to_string()
-            .contains("must use canonical unchecked header"));
+        assert!(
+            error
+                .to_string()
+                .contains("must use canonical unchecked header")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -754,6 +777,147 @@ none
 
         let error = verify_spec_output(&spec_path).expect_err("weak design rejected");
         assert!(error.to_string().contains("lacks surface plate detail"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_accepts_developer_facing_text_plates() {
+        let root = temp_root("text-plate-product-contract");
+        let spec_path = root.join("specs/300426-mcp.md");
+        fs::write(
+            &spec_path,
+            r#"# Specification: MCP catalog
+
+## Objective
+Make the catalog easier to maintain without changing public tools.
+
+## Product Experience Contract
+There is no browser or TUI. The product surface is the JSON-RPC payload and generated reference markdown.
+
+### Surface 1 - `tools/list` JSON-RPC response
+The agent's first read is the `tools` array. The second read is each tool name and schema. The third read is the per-property schema detail.
+
+Plate - Admin profile:
+```
+{ "jsonrpc": "2.0", "result": { "tools": [ { "name": "player_session_start" } ] } }
+```
+
+Visual hierarchy: the tool name dominates, then the description, then the schema block.
+
+State storyboard:
+- empty: no tools are advertised.
+- degraded: refused calls return a profile-specific error.
+- live: listed tools dispatch to handlers.
+- success: reference markdown regenerates byte-identical.
+
+## Source Of Truth
+`src/mcp.rs`
+
+## Evidence Status
+verified: current catalog exists.
+
+## Runtime Contract
+`src/mcp.rs` owns dispatch.
+
+## UI Contract
+JSON-RPC clients consume runtime-owned tool definitions.
+
+## Generated Artifacts
+reference markdown
+
+## Fixture Policy
+production code cannot import fixture/demo/sample data.
+
+## Retired / Superseded Surfaces
+none
+
+## Acceptance Criteria
+- Tools remain byte-identical.
+
+## Verification
+`cargo test mcp_catalog`
+
+## Review And Closeout
+reviewer compares the generated reference.
+
+## Open Questions
+none
+"#,
+        )
+        .expect("write spec");
+
+        verify_spec_output(&spec_path).expect("text plates validate");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_spec_accepts_exact_command_status_output_surfaces() {
+        let root = temp_root("command-surface-product-contract");
+        let spec_path = root.join("specs/300426-cli.md");
+        fs::write(
+            &spec_path,
+            r#"# Specification: CLI status
+
+## Objective
+Make status output easier to trust.
+
+## Product Experience Contract
+The user-facing surface is terminal output.
+
+Exact command/status/output surface:
+```
+$ auto status
+status: degraded
+next: run auto doctor
+```
+
+First read: `status: degraded`. Second read: the `next:` action. Third read: detailed blocker rows below the summary.
+
+Visual hierarchy: one status line first, one next action second, detailed rows last.
+
+State storyboard:
+- empty: no queue rows are present.
+- degraded: blockers are listed with next actions.
+- live: active lanes show pid and task id.
+- success: status is green and next action is explicit.
+
+## Source Of Truth
+`src/status.rs`
+
+## Evidence Status
+verified: command exists.
+
+## Runtime Contract
+`src/status.rs` owns queue facts.
+
+## UI Contract
+terminal output renders queue facts without inventing status.
+
+## Generated Artifacts
+none
+
+## Fixture Policy
+production code cannot import fixture/demo/sample data.
+
+## Retired / Superseded Surfaces
+none
+
+## Acceptance Criteria
+- Status output includes one explicit next action.
+
+## Verification
+`cargo test status_output`
+
+## Review And Closeout
+reviewer compares fixture stdout.
+
+## Open Questions
+none
+"#,
+        )
+        .expect("write spec");
+
+        verify_spec_output(&spec_path).expect("command surfaces validate");
         let _ = fs::remove_dir_all(root);
     }
 
