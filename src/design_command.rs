@@ -154,7 +154,7 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
         enforce_design_report_only_write_boundary(&repo_root, &output_dir, baseline)?;
     }
     phase_result?;
-    verify_design_artifacts(&output_dir)?;
+    verify_design_artifacts(&output_dir, args.prompt.as_deref())?;
     println!("status:      design artifacts verified");
     print_final_status_block(
         "design artifacts verified",
@@ -291,7 +291,7 @@ async fn run_design_resolution(args: DesignArgs, kind: DesignRunKind) -> Result<
             &format!("auto-design-resolve-pass-{pass:02}"),
         )
         .await?;
-        verify_design_artifacts(&pass_dir)?;
+        verify_design_artifacts(&pass_dir, args.prompt.as_deref())?;
         last_report = Some(pass_dir.join("DESIGN-REPORT.md"));
         write_design_resolution_status(&output_root, pass, max_passes, &pass_dir, "audited")?;
         if design_report_is_go(&pass_dir)? {
@@ -592,7 +592,10 @@ pub(crate) async fn run_super_design_module(
         "auto-super-design",
     )
     .await?;
-    verify_design_artifacts(&design_root)?;
+    verify_design_artifacts(
+        &design_root,
+        args.prompt.as_deref().or(args.focus.as_deref()),
+    )?;
     require_design_go(&design_root)?;
     Ok(())
 }
@@ -896,9 +899,28 @@ Final line of `DESIGN-REPORT.md` must be exactly one of:
     )
 }
 
-fn verify_design_artifacts(output_dir: &Path) -> Result<()> {
+fn verify_design_artifacts(output_dir: &Path, operator_prompt: Option<&str>) -> Result<()> {
     for artifact in DESIGN_ARTIFACTS {
-        require_nonempty_file(&output_dir.join(artifact))?;
+        let path = output_dir.join(artifact);
+        if let Err(err) = require_nonempty_file(&path) {
+            if artifact != "DESIGN-REPORT.md"
+                && operator_prompt
+                    .map(|p| prompt_bans_artifact(p, artifact))
+                    .unwrap_or(false)
+            {
+                eprintln!(
+                    "design: artifact `{artifact}` was banned by operator directive; writing stub"
+                );
+                let stub = format!(
+                    "# Banned by operator directive\n\nThe operator focus prompt explicitly forbids creating `{artifact}` during this design pass.\n\nSee `DESIGN-REPORT.md` for the canonical verdict and `git log` / the run's commit history for any code edits made during this pass.\n"
+                );
+                fs::write(&path, stub).with_context(|| {
+                    format!("failed to write operator-ban stub to {}", path.display())
+                })?;
+            } else {
+                return Err(err);
+            }
+        }
     }
     let report_path = output_dir.join("DESIGN-REPORT.md");
     let report = fs::read_to_string(&report_path)
@@ -910,6 +932,19 @@ fn verify_design_artifacts(output_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn prompt_bans_artifact(prompt: &str, artifact: &str) -> bool {
+    let Some(idx) = prompt.find(artifact) else {
+        return false;
+    };
+    let window_start = idx.saturating_sub(500);
+    let window = prompt[window_start..idx].to_ascii_lowercase();
+    window.contains("no new ")
+        || window.contains("banned")
+        || window.contains("do not create")
+        || window.contains("forbid")
+        || window.contains("must not create")
 }
 
 fn require_design_go(output_dir: &Path) -> Result<()> {

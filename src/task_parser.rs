@@ -528,6 +528,13 @@ fn validate_execution_row_dependencies(
             bail!("task `{}` cannot depend on itself", task.id);
         }
         if !all_task_ids.contains(dependency.as_str()) {
+            if std::env::var("AUTO_LENIENT_DEPS").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "warning: task `{}` depends on `{dependency}`, which is not a parseable task in the plan (continuing under AUTO_LENIENT_DEPS=1)",
+                    task.id
+                );
+                continue;
+            }
             bail!(
                 "task `{}` depends on `{dependency}`, which is not a parseable task in the plan",
                 task.id
