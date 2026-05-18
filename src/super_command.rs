@@ -1463,8 +1463,18 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
         .iter()
         .map(|task| task.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let lenient = std::env::var("AUTO_LENIENT_GATE").ok().as_deref() == Some("1")
+        || std::env::var("AUTO_LENIENT_DEPS").ok().as_deref() == Some("1");
     for task in &unchecked {
-        verify_super_task(task, &all_task_ids)?;
+        if let Err(err) = verify_super_task(task, &all_task_ids) {
+            if lenient {
+                eprintln!(
+                    "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
+                );
+                continue;
+            }
+            return Err(err);
+        }
     }
 
     Ok(DeterministicGateSummary {
