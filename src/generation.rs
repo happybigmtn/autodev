@@ -2846,22 +2846,45 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         }
     }
     let blocks = extract_plan_task_blocks(&normalized)?;
-    validate_execution_rows(&normalized)
-        .context("generated implementation plan failed shared execution-row validation")?;
+    let lenient = std::env::var("AUTO_LENIENT_GATE").ok().as_deref() == Some("1")
+        || std::env::var("AUTO_LENIENT_DEPS").ok().as_deref() == Some("1");
+    if let Err(err) = validate_execution_rows(&normalized)
+        .context("generated implementation plan failed shared execution-row validation")
+    {
+        if lenient {
+            eprintln!(
+                "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
+            );
+        } else {
+            return Err(err);
+        }
+    }
     for block in &blocks {
         if block.checked {
             continue;
         }
-        for &field in PLAN_TASK_REQUIRED_FIELDS {
-            if !block.markdown.contains(field) {
-                bail!(
-                    "generated implementation plan task `{}` is missing `{}`",
-                    block.task_id,
-                    field
-                );
+        let block_validation = (|| -> Result<()> {
+            for &field in PLAN_TASK_REQUIRED_FIELDS {
+                if !block.markdown.contains(field) {
+                    bail!(
+                        "generated implementation plan task `{}` is missing `{}`",
+                        block.task_id,
+                        field
+                    );
+                }
             }
+            verify_generated_plan_task_is_scoped(block)?;
+            Ok(())
+        })();
+        if let Err(err) = block_validation {
+            if lenient {
+                eprintln!(
+                    "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
+                );
+                continue;
+            }
+            return Err(err);
         }
-        verify_generated_plan_task_is_scoped(block)?;
     }
     let available_specs = collect_available_spec_refs(&output_dir.join("specs"))?;
     validate_plan_spec_refs(
