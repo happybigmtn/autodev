@@ -220,6 +220,10 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             sync_only: false,
         })
         .await?;
+        audit_generated_plan_against_operator_bans(
+            &repo_root,
+            args.prompt.as_deref().or(args.focus.as_deref()),
+        );
         let state = load_state(&repo_root)?;
         let output_dir = state
             .latest_output_dir
@@ -1782,6 +1786,65 @@ fn push_stage(
     });
     append_status_log(super_root, name, status);
     write_manifest(super_root, manifest)
+}
+
+fn audit_generated_plan_against_operator_bans(repo_root: &Path, operator_prompt: Option<&str>) {
+    // Best-effort observability: when the operator's prompt enumerates banned
+    // path prefixes (typical pattern: "No new docs/ops/...", "No new
+    // genesis/checkpoints/0XX-*.md"), count how often the generated plan
+    // mentions those prefixes. If many tasks reference banned paths, the
+    // operator is likely about to burn cycles producing doc-spam that the
+    // AUTO_REJECT_DOCS_ONLY_COMMITS=1 filter will reject downstream. Surface
+    // this loudly so the operator can intervene before parallel starts.
+    let Some(prompt) = operator_prompt else {
+        return;
+    };
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let Ok(plan) = std::fs::read_to_string(&plan_path) else {
+        return;
+    };
+    let banned_substrings: Vec<&str> = prompt
+        .lines()
+        .filter(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("no new ") || l.contains("banned") || l.contains("do not create")
+        })
+        .flat_map(|line| {
+            // Extract path-shaped tokens (contain '/' or end with .md).
+            line.split(|c: char| c.is_whitespace() || c == ',' || c == '`')
+                .filter(|tok| {
+                    let t = tok.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '/');
+                    !t.is_empty()
+                        && (t.contains('/') || t.ends_with(".md"))
+                        && !t.starts_with('-')
+                })
+        })
+        .collect();
+    if banned_substrings.is_empty() {
+        return;
+    }
+    let mut hits: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for needle in &banned_substrings {
+        let count = plan.matches(*needle).count();
+        if count > 0 {
+            *hits.entry(*needle).or_insert(0) += count;
+        }
+    }
+    let total: usize = hits.values().sum();
+    if total == 0 {
+        return;
+    }
+    eprintln!(
+        "warning: generated plan contains {total} mention(s) of operator-banned path prefix(es); \
+         AUTO_REJECT_DOCS_ONLY_COMMITS=1 will likely reject commits that touch only these paths. \
+         Consider editing IMPLEMENTATION_PLAN.md to remove the banned-pattern tasks before \
+         the parallel stage starts."
+    );
+    let mut entries: Vec<(&&str, &usize)> = hits.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1));
+    for (needle, count) in entries.iter().take(8) {
+        eprintln!("warning:   {count} hits  {needle}");
+    }
 }
 
 fn append_status_log(super_root: &Path, name: &str, status: &str) {
