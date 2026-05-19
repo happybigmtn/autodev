@@ -935,16 +935,32 @@ fn verify_design_artifacts(output_dir: &Path, operator_prompt: Option<&str>) -> 
 }
 
 fn prompt_bans_artifact(prompt: &str, artifact: &str) -> bool {
-    let Some(idx) = prompt.find(artifact) else {
-        return false;
-    };
-    let window_start = idx.saturating_sub(500);
-    let window = prompt[window_start..idx].to_ascii_lowercase();
-    window.contains("no new ")
-        || window.contains("banned")
-        || window.contains("do not create")
-        || window.contains("forbid")
-        || window.contains("must not create")
+    // Look at EVERY occurrence of the filename, not just the first. Operator
+    // prompts commonly mention banned filenames twice: once in a prelude
+    // explaining what NOT to repeat (e.g., "the prior design gate wrote ...
+    // DESIGN-AUDIT.md ..."), then later in a "BANNED OUTPUTS" section. The
+    // first occurrence has no ban keyword nearby, so checking only the first
+    // produced a false negative.
+    let mut search_from = 0usize;
+    while let Some(rel) = prompt[search_from..].find(artifact) {
+        let idx = search_from + rel;
+        // Walk back to a UTF-8 char boundary to avoid panicking on the slice.
+        let mut window_start = idx.saturating_sub(500);
+        while window_start > 0 && !prompt.is_char_boundary(window_start) {
+            window_start -= 1;
+        }
+        let window = prompt[window_start..idx].to_ascii_lowercase();
+        if window.contains("no new ")
+            || window.contains("banned")
+            || window.contains("do not create")
+            || window.contains("forbid")
+            || window.contains("must not create")
+        {
+            return true;
+        }
+        search_from = idx + artifact.len();
+    }
+    false
 }
 
 fn require_design_go(output_dir: &Path) -> Result<()> {
