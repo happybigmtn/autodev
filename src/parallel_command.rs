@@ -6512,12 +6512,61 @@ fn inspect_lane_repo_progress(repo_root: &Path, base_commit: &str) -> Result<Lan
     let head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
     let has_new_commits = head.trim() != base_commit;
     let status = status.trim();
+    if has_new_commits
+        && std::env::var("AUTO_REJECT_DOCS_ONLY_COMMITS").ok().as_deref() == Some("1")
+        && lane_commit_range_is_docs_only(repo_root, base_commit, head.trim())?
+    {
+        eprintln!(
+            "warning: lane produced only docs-only commits ({}..{}); treating as no progress under AUTO_REJECT_DOCS_ONLY_COMMITS=1",
+            base_commit, head.trim()
+        );
+        return if status.is_empty() {
+            Ok(LaneRepoProgress::None)
+        } else {
+            Ok(LaneRepoProgress::Dirty(status.to_string()))
+        };
+    }
     match (has_new_commits, status.is_empty()) {
         (false, true) => Ok(LaneRepoProgress::None),
         (false, false) => Ok(LaneRepoProgress::Dirty(status.to_string())),
         (true, true) => Ok(LaneRepoProgress::NewCommits),
         (true, false) => Ok(LaneRepoProgress::NewCommitsWithDirty(status.to_string())),
     }
+}
+
+fn lane_commit_range_is_docs_only(
+    repo_root: &Path,
+    base_commit: &str,
+    head_commit: &str,
+) -> Result<bool> {
+    let range = format!("{base_commit}..{head_commit}");
+    let files = git_stdout(repo_root, ["diff", "--name-only", &range])?;
+    let lines: Vec<&str> = files
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Ok(false);
+    }
+    Ok(lines.iter().all(|file| is_docs_only_path(file)))
+}
+
+fn is_docs_only_path(path: &str) -> bool {
+    // Files that never contain executable/test logic. A commit whose entire
+    // changed-file set matches these patterns is considered "docs/evidence
+    // only" and (when AUTO_REJECT_DOCS_ONLY_COMMITS=1) treated as no progress.
+    path.ends_with(".md")
+        || path.starts_with("docs/")
+        || path.starts_with("genesis/checkpoints/")
+        || path.starts_with("genesis/ASSESSMENT.")
+        || path.starts_with("genesis/DESIGN.")
+        || path.starts_with("genesis/FOCUS.")
+        || path.starts_with("genesis/GENESIS-REPORT.")
+        || path.starts_with("genesis/PLANS.")
+        || path.starts_with("genesis/SPEC.")
+        || path.contains("/operator-evidence/")
+        || path.contains("RECEIPTS-DRIFT")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
