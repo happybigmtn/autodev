@@ -2192,7 +2192,7 @@ async fn run_parallel_loop(
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
     let mut shelved_tasks = BTreeMap::<String, String>::new();
-    let mut attempted_partial_followups = BTreeSet::<String>::new();
+    let mut attempted_partial_followups = BTreeMap::<String, usize>::new();
     let mut deferred_partial_tasks = BTreeSet::<String>::new();
     let mut unblock_attempt_counts = BTreeMap::<String, usize>::new();
     let max_autonomous_unblock_attempts = autonomous_unblock_attempt_limit(args.max_retries);
@@ -2258,7 +2258,7 @@ async fn run_parallel_loop(
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.markdown == *markdown)
         });
-        attempted_partial_followups.retain(|task_id| {
+        attempted_partial_followups.retain(|task_id, _count| {
             plan.tasks
                 .iter()
                 .find(|task| task.id == *task_id)
@@ -5126,12 +5126,24 @@ enum PartialFollowUpDisposition {
     ParkForRestOfRun,
 }
 
+fn partial_followup_attempt_limit() -> usize {
+    std::env::var("AUTO_PARTIAL_FOLLOWUP_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+}
+
 fn record_partial_follow_up(
     task_id: &str,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    attempted_partial_followups: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
 ) -> PartialFollowUpDisposition {
-    if attempted_partial_followups.insert(task_id.to_string()) {
+    let limit = partial_followup_attempt_limit();
+    let count = attempted_partial_followups
+        .entry(task_id.to_string())
+        .or_insert(0);
+    *count += 1;
+    if *count <= limit {
         deferred_partial_tasks.remove(task_id);
         PartialFollowUpDisposition::RetryLaterThisRun
     } else {
@@ -5142,7 +5154,7 @@ fn record_partial_follow_up(
 
 fn clear_partial_follow_up_tracking(
     task_id: &str,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    attempted_partial_followups: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
 ) {
     attempted_partial_followups.remove(task_id);
@@ -5152,7 +5164,7 @@ fn clear_partial_follow_up_tracking(
 fn attach_partial_follow_up_note(
     repo_root: &Path,
     assignment: &mut ActiveLaneAssignment,
-    attempted_partial_followups: &BTreeSet<String>,
+    attempted_partial_followups: &BTreeMap<String, usize>,
 ) {
     if assignment.task.status != LoopTaskStatus::Partial || assignment.host_recovery_note.is_some()
     {
@@ -5162,7 +5174,7 @@ fn attach_partial_follow_up_note(
     let evidence =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     let assessment = assess_task_completion_gap(&assignment.task.markdown, &evidence);
-    let pass_label = if attempted_partial_followups.contains(&assignment.task.id) {
+    let pass_label = if attempted_partial_followups.contains_key(&assignment.task.id) {
         "This is the automatic evidence-repair pass for a task that already landed code earlier in this run."
     } else {
         "This task is already marked `- [~]`; treat this lane as follow-up work to close the remaining evidence gap rather than redoing landed implementation."
@@ -5211,7 +5223,7 @@ fn attach_partial_follow_up_note(
 fn completion_status_suffix(
     task_id: &str,
     completion_status: LoopTaskStatus,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    attempted_partial_followups: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
 ) -> &'static str {
     match completion_status {
@@ -5678,7 +5690,7 @@ async fn harvest_resumable_lane_results(
     repo_root: &Path,
     target_branch: &str,
     resumable_lanes: &mut BTreeMap<usize, LaneResumeCandidate>,
-    attempted_partial_followups: &mut BTreeSet<String>,
+    attempted_partial_followups: &mut BTreeMap<String, usize>,
     deferred_partial_tasks: &mut BTreeSet<String>,
     linear_tracker: &mut Option<LinearTracker>,
     parallel_logger: &ParallelEventLogger,
@@ -9655,25 +9667,28 @@ mod tests {
 
     #[test]
     fn record_partial_follow_up_gives_one_retry_then_parks() {
-        let mut attempted = BTreeSet::new();
+        // Default AUTO_PARTIAL_FOLLOWUP_MAX is 2, so 2 retries then park on 3rd.
+        // Set env var explicitly so this test is independent of caller env.
+        std::env::set_var("AUTO_PARTIAL_FOLLOWUP_MAX", "1");
+        let mut attempted = BTreeMap::new();
         let mut deferred = BTreeSet::new();
 
         assert_eq!(
             record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
             PartialFollowUpDisposition::RetryLaterThisRun
         );
-        assert!(attempted.contains("TASK-001"));
+        assert!(attempted.contains_key("TASK-001"));
         assert!(!deferred.contains("TASK-001"));
 
         assert_eq!(
             record_partial_follow_up("TASK-001", &mut attempted, &mut deferred),
             PartialFollowUpDisposition::ParkForRestOfRun
         );
-        assert!(attempted.contains("TASK-001"));
+        assert!(attempted.contains_key("TASK-001"));
         assert!(deferred.contains("TASK-001"));
 
         clear_partial_follow_up_tracking("TASK-001", &mut attempted, &mut deferred);
-        assert!(!attempted.contains("TASK-001"));
+        assert!(!attempted.contains_key("TASK-001"));
         assert!(!deferred.contains("TASK-001"));
     }
 
