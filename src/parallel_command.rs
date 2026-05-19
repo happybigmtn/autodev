@@ -6554,6 +6554,20 @@ fn lane_commit_range_is_docs_only(
 }
 
 fn is_docs_only_path(path: &str) -> bool {
+    // Meaningful-progress files: plan-status updates, release notes,
+    // orientation docs, agent instructions. A commit that touches any of
+    // these counts as real progress even if everything else is doc-shaped.
+    let meaningful_progress_files = [
+        "IMPLEMENTATION_PLAN.md",
+        "CHANGELOG.md",
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "VERSION",
+    ];
+    if meaningful_progress_files.iter().any(|m| path == *m) {
+        return false;
+    }
     // Files that never contain executable/test logic. A commit whose entire
     // changed-file set matches these patterns is considered "docs/evidence
     // only" and (when AUTO_REJECT_DOCS_ONLY_COMMITS=1) treated as no progress.
