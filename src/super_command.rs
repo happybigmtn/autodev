@@ -1780,7 +1780,29 @@ fn push_stage(
         status: status.to_string(),
         artifact: artifact.map(|path| path.display().to_string()),
     });
+    append_status_log(super_root, name, status);
     write_manifest(super_root, manifest)
+}
+
+fn append_status_log(super_root: &Path, name: &str, status: &str) {
+    // Tail-friendly stage-only log so operators can `tail -f status.log`
+    // without wading through codex narrative. Best-effort: never fails the
+    // surrounding push_stage even if the write errors.
+    let path = super_root.join("status.log");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let line = format!("{now} pid={pid} stage={name} status={status}\n");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn write_manifest(super_root: &Path, manifest: &SuperManifest) -> Result<()> {
