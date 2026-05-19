@@ -491,12 +491,18 @@ fn hydrate_super_args_from_manifest(args: &mut SuperArgs, manifest: &SuperManife
 }
 
 fn super_stage_terminal(manifest: &SuperManifest, name: &str) -> bool {
+    // "launched" was previously treated as terminal so the parallel stage would
+    // be skipped on resume even when it exited with everything shelved. That
+    // turned resume into a footgun: a ctrl-c or shelved-everything exit left
+    // the run looking "done" and forced operators to bypass super entirely.
+    // Only true completion ("complete") or explicit skip ("skipped") now count
+    // as terminal. Resume re-enters any stage that didn't write "complete".
     manifest
         .stages
         .iter()
         .rev()
         .find(|stage| stage.name == name)
-        .is_some_and(|stage| matches!(stage.status.as_str(), "complete" | "skipped" | "launched"))
+        .is_some_and(|stage| matches!(stage.status.as_str(), "complete" | "skipped"))
 }
 
 fn super_stage_terminal_any(manifest: &SuperManifest, names: &[&str]) -> bool {
@@ -1914,7 +1920,9 @@ mod tests {
         let loaded = load_super_manifest(&root).unwrap();
 
         assert!(super_stage_terminal(&loaded, "gen"));
-        assert!(super_stage_terminal(&loaded, "parallel"));
+        // "launched" is intentionally NOT terminal so resume re-enters parallel
+        // when an earlier run exited cleanly with everything shelved.
+        assert!(!super_stage_terminal(&loaded, "parallel"));
         assert_eq!(super_stage_artifact(&loaded, "gen"), Some(artifact));
         assert_eq!(read_deterministic_gate(&root).unwrap(), gate);
     }
