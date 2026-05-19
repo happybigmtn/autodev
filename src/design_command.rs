@@ -903,17 +903,31 @@ fn verify_design_artifacts(output_dir: &Path, operator_prompt: Option<&str>) -> 
     for artifact in DESIGN_ARTIFACTS {
         let path = output_dir.join(artifact);
         if let Err(err) = require_nonempty_file(&path) {
-            if artifact != "DESIGN-REPORT.md"
-                && operator_prompt
-                    .map(|p| prompt_bans_artifact(p, artifact))
-                    .unwrap_or(false)
+            if operator_prompt
+                .map(|p| prompt_bans_artifact(p, artifact))
+                .unwrap_or(false)
             {
                 eprintln!(
                     "design: artifact `{artifact}` was banned by operator directive; writing stub"
                 );
-                let stub = format!(
-                    "# Banned by operator directive\n\nThe operator focus prompt explicitly forbids creating `{artifact}` during this design pass.\n\nSee `DESIGN-REPORT.md` for the canonical verdict and `git log` / the run's commit history for any code edits made during this pass.\n"
-                );
+                let stub = if artifact == "DESIGN-REPORT.md" {
+                    // DESIGN-REPORT.md must contain a verdict header so downstream
+                    // require_design_go can decide whether to proceed. When the
+                    // operator forbids the file we conservatively stamp NO-GO so
+                    // super pauses and the operator can review code commits made
+                    // during the pass instead of waving through a missing verdict.
+                    "# Banned by operator directive\n\n\
+                     The operator focus prompt explicitly forbids creating `DESIGN-REPORT.md` during this design pass.\n\n\
+                     Verdict: NO-GO\n\n\
+                     Auto super stamped this NO-GO verdict because the operator forbade the canonical verdict file. \
+                     Review the commits this pass produced and update `DESIGN-REPORT.md` manually with `Verdict: GO` \
+                     (or invoke `auto super` with `--skip-design`) if you want downstream stages to proceed.\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "# Banned by operator directive\n\nThe operator focus prompt explicitly forbids creating `{artifact}` during this design pass.\n\nSee `DESIGN-REPORT.md` for the canonical verdict and `git log` / the run's commit history for any code edits made during this pass.\n"
+                    )
+                };
                 fs::write(&path, stub).with_context(|| {
                     format!("failed to write operator-ban stub to {}", path.display())
                 })?;
