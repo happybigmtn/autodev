@@ -24,7 +24,8 @@ The local CLI command is `auto`.
 - `auto qa-only` runs a report-only runtime QA pass on the current branch.
 - `auto health` runs a repo-wide quality and verification health report.
 - `auto book` rewrites the audit book into a deeper navigable codebase guide.
-- `auto doctor` runs a no-model first-run preflight for local layout, binary metadata, and help surfaces.
+- `auto doctor` runs a no-model first-run preflight that separates baseline checkout/binary
+  readiness from execution readiness and optional model-tool capabilities.
 - `auto review` reviews completed work on the current branch.
 - `auto steward` runs a stewardship pass for a mid-flight repo.
 - `auto audit` runs a file-by-file audit against an operator-authored doctrine.
@@ -66,8 +67,10 @@ need to pass directories in the normal case.
 - `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and
   the `standard` tier
 - `auto health` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
-- `auto doctor` is read-only and no-model; missing `codex`, `claude`, `pi`, and `gh` are reported
-  as capability warnings rather than baseline first-run failures
+- `auto doctor` is read-only and no-model. Baseline readiness covers checkout layout, binary
+  provenance, and help surfaces. Execution readiness reports planning root, queue, and generated
+  snapshot state. Missing `codex`, `claude`, `pi`, and `gh` are model-tool capability warnings
+  rather than baseline first-run failures.
 - `auto review` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
 - `auto ship` runs on the currently checked-out branch by default with `gpt-5.5` and `high`,
   targeting the repo's resolved base branch
@@ -131,9 +134,10 @@ auto doctor
 git status --short
 ```
 
-The checkout should have a clear branch, readable agent instructions, a sane
-binary surface, and no unexplained dirty files. Dirty state is allowed only when
-the next step explicitly owns it.
+The checkout should have baseline readiness, a clear branch, readable agent instructions, and no
+unexplained dirty files. Execution readiness and model-tool warnings tell you which planning or
+model-backed workflows need setup next; they do not block no-model first-run commands by
+themselves. Dirty state is allowed only when the next step explicitly owns it.
 
 #### 1. Create Or Refresh The Spec
 

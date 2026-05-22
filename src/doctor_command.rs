@@ -59,13 +59,14 @@ pub(crate) async fn run_doctor(_args: DoctorArgs) -> Result<()> {
 
 #[derive(Debug)]
 struct DoctorReport {
-    required: Vec<RequiredCheck>,
+    baseline: Vec<RequiredCheck>,
+    execution: Vec<RequiredCheck>,
     capabilities: Vec<CapabilityCheck>,
 }
 
 impl DoctorReport {
     fn required_failed(&self) -> bool {
-        self.required.iter().any(|check| !check.passed)
+        self.baseline.iter().any(|check| !check.passed)
     }
 }
 
@@ -100,22 +101,23 @@ struct CommandProbe {
 
 fn build_doctor_report(current_exe: &Path) -> DoctorReport {
     let mut report = DoctorReport {
-        required: Vec::new(),
+        baseline: Vec::new(),
+        execution: Vec::new(),
         capabilities: build_optional_tool_checks(find_on_path),
     };
 
     match git_repo_root() {
         Ok(repo_root) => {
-            report.required.push(RequiredCheck {
+            report.baseline.push(RequiredCheck {
                 name: "repo root".to_string(),
                 passed: true,
                 detail: format!("found {}", repo_root.display()),
                 action: None,
             });
-            report.required.extend(check_repo_checkout(&repo_root));
-            report.required.extend(check_planning_health(&repo_root));
+            report.baseline.extend(check_repo_checkout(&repo_root));
+            report.execution.extend(check_planning_health(&repo_root));
         }
-        Err(err) => report.required.push(RequiredCheck {
+        Err(err) => report.baseline.push(RequiredCheck {
             name: "repo root".to_string(),
             passed: false,
             detail: err.to_string(),
@@ -123,11 +125,11 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
         }),
     }
 
-    report.required.push(check_version_probe(&run_auto_probe(
+    report.baseline.push(check_version_probe(&run_auto_probe(
         current_exe,
         &["--version"],
     )));
-    report.required.extend(check_help_surfaces_with(|args| {
+    report.baseline.extend(check_help_surfaces_with(|args| {
         run_auto_probe(current_exe, args)
     }));
 
@@ -486,17 +488,22 @@ fn print_doctor_report(report: &DoctorReport) {
 fn render_doctor_report(report: &DoctorReport) -> String {
     let mut output = String::new();
 
-    output.push_str("required:\n");
-    for check in &report.required {
-        let status = if check.passed { "ok" } else { "fail" };
-        output.push_str(&format!("- [{status}] {}: {}\n", check.name, check.detail));
-        if let Some(action) = &check.action {
-            output.push_str(&format!("  next: {action}\n"));
-        }
+    output.push_str("baseline readiness:\n");
+    for check in &report.baseline {
+        output.push_str(&render_required_check(check));
     }
 
     output.push('\n');
-    output.push_str("capabilities:\n");
+    output.push_str("execution readiness:\n");
+    if report.execution.is_empty() {
+        output.push_str("- [warn] planning and queue state were not checked because the repo root was unavailable\n");
+    }
+    for check in &report.execution {
+        output.push_str(&render_required_check(check));
+    }
+
+    output.push('\n');
+    output.push_str("model/tool capabilities:\n");
     for check in &report.capabilities {
         match &check.found {
             Some(path) => output.push_str(&format!(
@@ -519,9 +526,20 @@ fn render_doctor_report(report: &DoctorReport) -> String {
     output.push('\n');
     output.push_str("next steps:\n");
     if report.required_failed() {
-        output.push_str("- fix the failed required checks above, then rerun auto doctor\n");
+        output
+            .push_str("- fix the failed baseline readiness checks above, then rerun auto doctor\n");
         output.push_str("doctor failed\n");
+    } else if report.execution.iter().any(|check| !check.passed) {
+        output.push_str("- baseline is ready for no-model commands\n");
+        output.push_str(
+            "- fix failed execution readiness checks before running planning or model-backed workflows\n",
+        );
+        output.push_str(
+            "- install or authenticate model tools only for workflows that need those capabilities\n",
+        );
+        output.push_str("doctor ok\n");
     } else {
+        output.push_str("- baseline is ready for no-model commands\n");
         output.push_str("- run cargo test for local regression proof\n");
         output.push_str(
             "- run model-backed commands such as auto health only after credentials are configured\n",
@@ -529,6 +547,16 @@ fn render_doctor_report(report: &DoctorReport) -> String {
         output.push_str("doctor ok\n");
     }
 
+    output
+}
+
+fn render_required_check(check: &RequiredCheck) -> String {
+    let mut output = String::new();
+    let status = if check.passed { "ok" } else { "fail" };
+    output.push_str(&format!("- [{status}] {}: {}\n", check.name, check.detail));
+    if let Some(action) = &check.action {
+        output.push_str(&format!("  next: {action}\n"));
+    }
     output
 }
 
@@ -675,7 +703,7 @@ mod tests {
             launch_error: None,
         });
         let report = DoctorReport {
-            required: vec![
+            baseline: vec![
                 RequiredCheck {
                     name: "repo layout".to_string(),
                     passed: true,
@@ -684,6 +712,12 @@ mod tests {
                 },
                 version,
             ],
+            execution: vec![RequiredCheck {
+                name: "queue health".to_string(),
+                passed: true,
+                detail: "1 task(s): 1 pending, 0 partial, 0 blocked, 0 done".to_string(),
+                action: None,
+            }],
             capabilities: vec![CapabilityCheck {
                 tool: "codex",
                 found: None,
@@ -698,6 +732,65 @@ mod tests {
         assert!(rendered.contains("- [warn] codex: not found on PATH"));
         assert!(rendered.contains("no model providers, network APIs, Linear, GitHub"));
         assert!(rendered.contains("Docker, browser automation, or tmux sessions were invoked"));
+        assert!(rendered.contains("doctor ok"));
+    }
+
+    #[test]
+    fn doctor_distinguishes_baseline_from_execution_readiness() {
+        let report = DoctorReport {
+            baseline: vec![RequiredCheck {
+                name: "repo layout".to_string(),
+                passed: true,
+                detail: "found Cargo.toml, src/main.rs, README.md, AGENTS.md".to_string(),
+                action: None,
+            }],
+            execution: vec![RequiredCheck {
+                name: "queue health".to_string(),
+                passed: true,
+                detail: "4 task(s): 1 pending, 1 partial, 1 blocked, 1 done".to_string(),
+                action: None,
+            }],
+            capabilities: vec![CapabilityCheck {
+                tool: "codex",
+                found: None,
+                workflows: "model-backed flows",
+            }],
+        };
+
+        let rendered = render_doctor_report(&report);
+
+        assert!(rendered.contains("baseline readiness:\n- [ok] repo layout:"));
+        assert!(rendered.contains("execution readiness:\n- [ok] queue health:"));
+        assert!(rendered.contains("model/tool capabilities:\n- [warn] codex: not found on PATH"));
+        assert!(!rendered.contains("required:\n"));
+        assert!(!rendered.lines().any(|line| line == "capabilities:"));
+
+        let execution_blocked = DoctorReport {
+            baseline: vec![RequiredCheck {
+                name: "repo layout".to_string(),
+                passed: true,
+                detail: "found Cargo.toml, src/main.rs, README.md, AGENTS.md".to_string(),
+                action: None,
+            }],
+            execution: vec![RequiredCheck {
+                name: "planning root".to_string(),
+                passed: false,
+                detail: "missing genesis".to_string(),
+                action: Some(
+                    "run auto corpus or pass --planning-root to model-backed commands".to_string(),
+                ),
+            }],
+            capabilities: vec![CapabilityCheck {
+                tool: "claude",
+                found: None,
+                workflows: "Claude-backed corpus and generation flows",
+            }],
+        };
+        let rendered = render_doctor_report(&execution_blocked);
+
+        assert!(!execution_blocked.required_failed());
+        assert!(rendered.contains("- [fail] planning root: missing genesis"));
+        assert!(rendered.contains("baseline is ready for no-model commands"));
         assert!(rendered.contains("doctor ok"));
     }
 

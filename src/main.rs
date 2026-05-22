@@ -89,7 +89,7 @@ enum Command {
     Health(HealthArgs),
     /// Rewrite the last audit's CODEBASE-BOOK as a detailed narrative walkthrough
     Book(BookArgs),
-    /// Run a no-model first-run preflight for local layout, binary metadata, and help surfaces
+    /// Run a no-model first-run preflight for baseline and execution readiness
     Doctor(doctor_command::DoctorArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
