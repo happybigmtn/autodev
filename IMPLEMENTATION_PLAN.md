@@ -2,7 +2,7 @@
 
 ## Priority Work
 
-- [~] `P0-001` Restore the validation baseline and public command surface
+- [x] `P0-001` Restore the validation baseline and public command surface
 
     Spec: `specs/220526-validation-command-surface-baseline.md`
     Why now: This is the first P0 because workers cannot interpret later red tests if formatting and the live Clap command list are already failing; it also gives operators a truthful first-run command surface before deeper validator or release work.
