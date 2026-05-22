@@ -372,7 +372,7 @@ pub(crate) fn task_field_body_until_any(
     let mut body = Vec::new();
     for line in markdown.lines() {
         let unbulleted = strip_list_bullet(line);
-        if let Some(rest) = unbulleted.strip_prefix(field) {
+        if let Some(rest) = task_field_line_remainder(unbulleted, field) {
             collecting = true;
             if !rest.trim().is_empty() {
                 body.push(rest.trim().to_string());
@@ -383,7 +383,7 @@ pub(crate) fn task_field_body_until_any(
             && next_fields
                 .iter()
                 .filter(|next_field| **next_field != field)
-                .any(|next_field| unbulleted.starts_with(next_field))
+                .any(|next_field| task_field_line_remainder(unbulleted, next_field).is_some())
         {
             break;
         }
@@ -392,6 +392,27 @@ pub(crate) fn task_field_body_until_any(
         }
     }
     collecting.then(|| body.join("\n"))
+}
+
+fn task_field_line_remainder<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(field) {
+        return Some(rest);
+    }
+
+    let label = field.trim_end_matches(':');
+    for marker in [
+        format!("**{label}:**"),
+        format!("**{label}**:"),
+        format!("__{label}:__"),
+        format!("__{label}__:"),
+    ] {
+        if trimmed.starts_with(&marker) {
+            return trimmed.get(marker.len()..);
+        }
+    }
+
+    None
 }
 
 pub(crate) fn validate_execution_row(task: &PlanTask, all_task_ids: &BTreeSet<&str>) -> Result<()> {
@@ -466,16 +487,19 @@ fn validate_execution_row_dependencies(
     all_task_ids: &BTreeSet<&str>,
 ) -> Result<()> {
     let body = execution_row_field_body(task, "Dependencies:")?;
-    let meaningful_lines: Vec<String> = body
+    let raw_meaningful_lines: Vec<String> = body
         .lines()
         .map(strip_list_bullet)
         .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let meaningful_lines: Vec<String> = raw_meaningful_lines
+        .iter()
         // Strip parenthesized annotations and trailing sentence punctuation
-        // (`.`, `;`, `:`) before treating the line as a token list. Opus and
-        // humans naturally write `\`DEP-1\` (note here)` or `none.`; the
-        // annotation/punctuation is decorative, not part of the dependency
-        // identity. The keyword check inside reject_dependency_prose still
-        // catches genuine prose like "after wave 2".
+        // (`.`, `;`, `:`) before treating the line as a token list. The raw
+        // text is still checked below so runnable execution rows cannot hide
+        // prose dependency hints in those annotations.
         .map(|line| strip_dependency_annotations(line).trim().to_string())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
@@ -484,8 +508,10 @@ fn validate_execution_row_dependencies(
         bail!("task `{}` has empty `Dependencies:`", task.id);
     }
 
+    let raw_joined = raw_meaningful_lines.join(" ");
     let joined = meaningful_lines.join(" ");
     if joined.eq_ignore_ascii_case("none") {
+        reject_dependency_prose(task, &raw_joined)?;
         if !task.dependencies.is_empty() {
             bail!(
                 "task `{}` says `Dependencies: none` but parser found {:?}",
@@ -495,7 +521,7 @@ fn validate_execution_row_dependencies(
         }
         return Ok(());
     }
-    reject_dependency_prose(task, &joined)?;
+    reject_dependency_prose(task, &raw_joined)?;
 
     let mut explicit = Vec::new();
     for line in meaningful_lines {
@@ -543,19 +569,16 @@ fn validate_execution_row_dependencies(
 }
 
 fn reject_dependency_prose(task: &PlanTask, text: &str) -> Result<()> {
-    // Strip parenthesized clarifications and trailing punctuation before
-    // checking for prose phrases. LLM authors (and humans) naturally write
-    // dependencies like `\`DEP-1\` (waits on the pooled posture)` or
-    // `\`DEP-1\`, \`DEP-2\`.` -- these are clarifying annotations, not
-    // ambiguous prose, and should not block validation. The keyword checks
-    // below still reject actual prose like "after wave 2" that would create
-    // dependency-resolution ambiguity.
+    // Preserve parser tolerance for historical dependency notes, but keep
+    // execution-row validation strict: runnable queues need scheduler input,
+    // not parenthetical prose that can smuggle extra task IDs or wave hints.
+    let original_lower = text.to_ascii_lowercase();
     let stripped = strip_dependency_annotations(text);
     let lower = stripped.to_ascii_lowercase();
     for phrase in [
         "parallel", "wave", "after ", "once ", "blocked", "gated", "depends", "external",
     ] {
-        if lower.contains(phrase) {
+        if original_lower.contains(phrase) || lower.contains(phrase) {
             bail!(
                 "task `{}` `Dependencies:` must be machine-readable IDs only; remove prose phrase `{phrase}`",
                 task.id
@@ -713,15 +736,20 @@ fn validate_execution_row_commands(task: &PlanTask) -> Result<()> {
 
 fn validate_execution_row_concrete_ownership(task: &PlanTask) -> Result<()> {
     let owns = execution_row_field_body(task, "Owns:")?;
-    // Loosened: accept prose-style ownership descriptions like
-    // `nine drill evidence files; no script logic changes` when the LLM
-    // describes a class of artifacts rather than enumerating each path.
-    // The TBD/TODO/unspecified/unknown check below still blocks vacuous
-    // ownership. Path-token detection is now an advisory hint, not a hard
-    // gate; tasks that legitimately own a category (drill evidence,
-    // ops-evidence dir, etc.) can pass without per-file enumeration.
     if owns.trim().is_empty() {
         bail!("task `{}` has non-concrete `Owns:` field", task.id);
+    }
+    let lower = owns.to_ascii_lowercase();
+    for forbidden in ["tbd", "todo", "unspecified", "unknown", "missing"] {
+        if lower.contains(forbidden) {
+            bail!("task `{}` has vague `Owns:` content `{forbidden}`", task.id);
+        }
+    }
+    if !contains_path_like_token(&owns) {
+        bail!(
+            "task `{}` `Owns:` must give concrete path-like ownership such as `src/`, `docs`, `README.md`, or `refs/tags/<tag>`",
+            task.id
+        );
     }
     Ok(())
 }
@@ -760,7 +788,7 @@ fn validate_execution_row_field_boundaries(task: &PlanTask, field: &str) -> Resu
             .lines()
             .map(strip_list_bullet)
             .map(str::trim)
-            .any(|line| line.starts_with(boundary))
+            .any(|line| task_field_line_remainder(line, boundary).is_some())
         {
             bail!(
                 "task `{}` `{field}` body swallowed metadata boundary `{boundary}`",

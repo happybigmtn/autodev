@@ -1624,7 +1624,35 @@ mod tests {
         fs::create_dir_all(&temp).expect("create temp dir");
         fs::write(
             temp.join("IMPLEMENTATION_PLAN.md"),
-            "# Plan\n\n- [x] `TASK-1` Done\n  - Verification: `cargo test one`\n\n- [ ] `TASK-2` Todo\n",
+            r#"# Plan
+
+- [x] `TASK-1` Done
+  - Verification: `cargo test one`
+
+- [ ] `TASK-2` Todo
+  Spec: `specs/task-2.md`
+  Why now: keeps a valid pending review fixture.
+  Codebase evidence: `REVIEW.md`
+  Source of truth: `REVIEW.md`
+  Runtime owner: none
+  UI consumers: none
+  Generated artifacts: none
+  Fixture boundary: test fixture only.
+  Retired surfaces: none
+  Owns: `REVIEW.md`
+  Integration touchpoints: `COMPLETED.md`
+  Scope boundary: review queue fixture only.
+  Acceptance criteria: pending task remains after harvest.
+  Verification: `cargo test review_command::tests::harvest_completed_plan_items_flows_through_completed_queue`
+  Required tests: `cargo test review_command::tests::harvest_completed_plan_items_flows_through_completed_queue`
+  Contract generation: none -- no generated contract
+  Cross-surface tests: none -- no UI/runtime boundary
+  Review/closeout: reviewer checks completed handoff only.
+  Completion artifacts: none
+  Dependencies: none
+  Estimated scope: XS
+  Completion signal: fixture remains valid.
+"#,
         )
         .expect("write plan");
         fs::write(temp.join("REVIEW.md"), format!("{REVIEW_HEADER}\n\n")).expect("write review");

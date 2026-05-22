@@ -95,6 +95,8 @@ impl ShipGateReport {
 #[derive(Debug, Deserialize)]
 struct VerificationReceipt {
     #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
 }
 
@@ -273,7 +275,8 @@ fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptComman
             &[],
         )
         .ok()
-        .flatten();
+        .flatten()
+        .or_else(|| ship_json_receipt_commit_problem(repo_root, &receipt));
         receipt
             .commands
             .into_iter()
@@ -284,6 +287,21 @@ fn load_verification_receipts(repo_root: &Path) -> Vec<VerificationReceiptComman
             .collect::<Vec<_>>()
     }));
     receipts
+}
+
+fn ship_json_receipt_commit_problem(
+    repo_root: &Path,
+    receipt: &VerificationReceipt,
+) -> Option<String> {
+    let current = git_stdout(repo_root, ["rev-parse", "HEAD"]).ok()?;
+    let current = current.trim();
+    let recorded = receipt.commit.as_deref()?;
+    if recorded == current {
+        return None;
+    }
+    Some(format!(
+        "commit mismatch, recorded `{recorded}` is not current HEAD `{current}`"
+    ))
 }
 
 fn normalized_command(command: &str) -> String {

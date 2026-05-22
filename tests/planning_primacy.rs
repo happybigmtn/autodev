@@ -6,12 +6,12 @@ fn root_queue_mentions_generated_snapshots_only_as_evidence_or_promotion_inputs(
     let plan = read_repo_file("IMPLEMENTATION_PLAN.md");
 
     assert!(
-        plan.contains("`SAT-006` The planning corpus remains subordinate to root queue truth"),
-        "SAT-006 closeout row should remain visible in the root plan"
+        plan.contains("`P0-004` Make default `auto super` snapshot-first and promotion-gated"),
+        "P0-004 snapshot-first row should remain visible in the root plan"
     );
     assert!(
-        plan.contains("references `gen-*` only as provenance or promotion evidence"),
-        "SAT-006 should state the generated snapshot relationship"
+        plan.contains("Generated artifacts: `gen-*/corpus/**`"),
+        "P0-004 should state the generated snapshot relationship"
     );
 
     let generated_reference_lines: Vec<_> = plan

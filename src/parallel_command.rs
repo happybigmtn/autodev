@@ -8262,7 +8262,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_parallel_canonical_checkpoints_verification_receipts() {
+    fn repair_parallel_canonical_ignores_verification_receipt_staging() {
         let (root, _remote, _upstream, worker) =
             init_remote_and_clones("parallel-repair-receipts", "trunk");
         let run_root = root.join("run");
@@ -8274,13 +8274,12 @@ mod tests {
             .expect("failed to write receipt");
 
         repair_parallel_canonical_before_dispatch(&worker, "trunk", &logger)
-            .expect("dirty receipt should be checkpointed");
+            .expect("receipt staging should not block dispatch");
 
-        assert_eq!(run_git_in(&worker, ["status", "--short"]), "");
+        let status = run_git_in(&worker, ["status", "--short", "--untracked-files=all"]);
+        assert!(status.contains(".auto/symphony/verification-receipts/TASK-1.json"));
         let log = run_git_in(&worker, ["log", "--format=%s", "-1"]);
-        assert_eq!(log.trim(), "worker: auto parallel checkpoint");
-        let committed = run_git_in(&worker, ["show", "--name-only", "--format=", "HEAD"]);
-        assert!(committed.contains(".auto/symphony/verification-receipts/TASK-1.json"));
+        assert_ne!(log.trim(), "worker: auto parallel checkpoint");
         fs::remove_dir_all(&root).expect("failed to remove temp root");
     }
 
@@ -9474,9 +9473,11 @@ mod tests {
             &[],
             &[],
         );
-        assert!(verdict.contains("code lanes ready: CODE-001"));
+        assert!(verdict.contains("code lanes ready:"));
+        assert!(verdict.contains("CODE-001"));
         assert!(verdict.contains("evidence queue: EVID-001"));
-        assert!(verdict.contains("operator queue: OPS-001"));
+        assert!(verdict.contains("OPS-001"));
+        assert!(!verdict.contains("operator queue: OPS-001"));
     }
 
     #[test]
@@ -9507,7 +9508,8 @@ mod tests {
             &[],
         );
         assert!(verdict.contains("code lanes ready: LIVE-001"));
-        assert!(verdict.contains("operator queue: OPS-001"));
+        assert!(verdict.contains("OPS-001"));
+        assert!(!verdict.contains("operator queue: OPS-001"));
     }
 
     #[test]
