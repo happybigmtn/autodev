@@ -52,7 +52,7 @@
     Estimated scope: S
     Completion signal: Shared proof-command lint is strict again across `auto spec`, generated plans, and receipt extraction safety tests.
 
-- [ ] `P0-003` Checkpoint the local validator baseline
+- [x] `P0-003` Checkpoint the local validator baseline
 
     Spec: `specs/220526-generated-plan-proof-validators.md`
     Why now: This checkpoint follows two high-risk baseline fixes so the next workers do not widen scope on top of an ambiguous formatter, command-surface, or proof-lint state; it outranks new feature work until the execution queue can prove itself.
