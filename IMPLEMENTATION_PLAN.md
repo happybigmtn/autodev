@@ -77,7 +77,7 @@
     Estimated scope: XS
     Completion signal: Baseline validator cluster is green enough for snapshot and receipt workers to proceed.
 
-- [~] `P0-004` Make default `auto super` snapshot-first and promotion-gated
+- [x] `P0-004` Make default `auto super` snapshot-first and promotion-gated
 
     Spec: `specs/220526-super-snapshot-first-runtime.md`
     Why now: This is the next P0 because default `auto super` currently mutates root queue truth before operator review; it outranks release polish because operator sovereignty and root ledger safety are prerequisites for any model-backed macro run.
