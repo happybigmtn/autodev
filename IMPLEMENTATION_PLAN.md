@@ -302,7 +302,7 @@
     Estimated scope: S
     Completion signal: Claude profile refresh no longer uses raw copy and fails closed on symlinked credential paths.
 
-- [~] `P1-013` Checkpoint quota credential hardening
+- [x] `P1-013` Checkpoint quota credential hardening
 
     Spec: `specs/220526-quota-persistence-and-credential-hardening.md`
     Why now: This checkpoint follows three credential/state safety changes so later quota routing or provider-transport work does not hide a security regression in persistence or secret movement.
