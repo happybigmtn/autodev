@@ -745,6 +745,8 @@ struct VerificationReceipt {
 struct VerificationDirtyState {
     #[serde(default)]
     fingerprint: Option<String>,
+    #[serde(default)]
+    entries: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -1235,16 +1237,18 @@ fn verification_receipt_freshness_problem_for_source(
 
     if source == VerificationReceiptSource::JsonFile && json_receipt_commit_is_current {
         if let Some(current) = current_dirty_fingerprint {
-            match receipt
-                .dirty_state
-                .as_ref()
-                .and_then(|state| state.fingerprint.as_deref())
-            {
+            let Some(dirty_state) = receipt.dirty_state.as_ref() else {
+                return Some("missing dirty-state fingerprint".to_string());
+            };
+            match dirty_state.fingerprint.as_deref() {
                 Some(recorded) if recorded == current => {}
                 Some(recorded) => {
                     return Some(format!(
                         "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
                     ))
+                }
+                None if dirty_state.entries.is_empty() && current_dirty_state_is_clean(repo_root) =>
+                {
                 }
                 None => return Some("missing dirty-state fingerprint".to_string()),
             }
@@ -1331,6 +1335,15 @@ fn current_dirty_state_fingerprint(repo_root: &Path) -> Option<String> {
         .output()
         .ok()?;
     output.status.success().then(|| sha256_hex(&output.stdout))
+}
+
+fn current_dirty_state_is_clean(repo_root: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "-z"])
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
 }
 
 fn current_plan_hash(repo_root: &Path) -> Option<String> {
@@ -2237,6 +2250,7 @@ Dependencies: none
             commit: Some(commit.clone()),
             dirty_state: Some(VerificationDirtyState {
                 fingerprint: Some(dirty_fingerprint.clone()),
+                ..VerificationDirtyState::default()
             }),
             plan_hash: Some(plan_hash.clone()),
             declared_artifacts: vec![VerificationReceiptArtifact {
@@ -2285,6 +2299,17 @@ Dependencies: none
             (
                 {
                     let mut receipt = base_receipt.clone();
+                    receipt.dirty_state = Some(VerificationDirtyState {
+                        fingerprint: None,
+                        entries: vec![serde_json::Value::String(" M src/main.rs".to_string())],
+                    });
+                    receipt
+                },
+                "missing dirty-state fingerprint",
+            ),
+            (
+                {
+                    let mut receipt = base_receipt.clone();
                     receipt.plan_hash = None;
                     receipt
                 },
@@ -2325,6 +2350,57 @@ Dependencies: none
     }
 
     #[test]
+    fn verification_receipt_freshness_accepts_legacy_clean_dirty_entries() {
+        let root = temp_dir("legacy-clean-dirty-entries");
+        init_git_repo(&root);
+        let receipt_path = root.join(".auto/symphony/verification-receipts/SAT-LEGACY.json");
+        let expected_command = "npm run typecheck".to_string();
+        let receipt = VerificationReceipt {
+            task_id: Some("TASK-LEGACY".to_string()),
+            commit: super::current_git_commit(&root),
+            dirty_state: Some(VerificationDirtyState {
+                fingerprint: None,
+                entries: Vec::new(),
+            }),
+            plan_hash: super::current_plan_hash(&root),
+            declared_artifacts: Vec::new(),
+            commands: vec![VerificationReceiptCommand {
+                command: expected_command.clone(),
+                expected_argv: Some(vec![
+                    "npm".to_string(),
+                    "run".to_string(),
+                    "typecheck".to_string(),
+                ]),
+                exit_code: Some(0),
+                status: Some("passed".to_string()),
+                ..VerificationReceiptCommand::default()
+            }],
+        };
+
+        assert_eq!(
+            verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &receipt,
+                std::slice::from_ref(&expected_command),
+                &[],
+            ),
+            None
+        );
+
+        fs::write(root.join("dirty.txt"), "dirty\n").expect("failed to dirty repo");
+        let problem = verification_receipt_freshness_problem(
+            &root,
+            &receipt_path,
+            &receipt,
+            std::slice::from_ref(&expected_command),
+            &[],
+        )
+        .expect("dirty repo should reject legacy clean state");
+        assert!(problem.contains("missing dirty-state fingerprint"));
+    }
+
+    #[test]
     fn verification_receipt_freshness_ignores_mutable_handoff_artifact_hashes() {
         let root = temp_dir("mutable-handoff-artifact-hash");
         init_git_repo(&root);
@@ -2344,6 +2420,7 @@ Dependencies: none
             commit: super::current_git_commit(&root),
             dirty_state: Some(VerificationDirtyState {
                 fingerprint: super::current_dirty_state_fingerprint(&root),
+                ..VerificationDirtyState::default()
             }),
             plan_hash: super::current_plan_hash(&root),
             declared_artifacts: vec![VerificationReceiptArtifact {
@@ -2360,6 +2437,7 @@ Dependencies: none
         };
         receipt.dirty_state = Some(VerificationDirtyState {
             fingerprint: super::current_dirty_state_fingerprint(&root),
+            ..VerificationDirtyState::default()
         });
 
         assert_eq!(
