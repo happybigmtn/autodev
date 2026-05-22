@@ -45,7 +45,8 @@ const HOST_QUEUE_STATE_FILES: [&str; 7] = [
     "RECEIPTS-DRIFT.md",
 ];
 const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(15);
+const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(30);
+const CLEAN_COMMIT_QUIET_GRACE: Duration = Duration::from_secs(120);
 const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
 const STALE_GIT_INDEX_LOCK_GRACE: Duration = Duration::from_secs(30);
 const MIN_AUTONOMOUS_UNBLOCK_ATTEMPTS: usize = 4;
@@ -6148,7 +6149,16 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
                     continue;
                 }
 
-                if commit_since.elapsed() >= CLEAN_COMMIT_GRACE {
+                if !clean_commit_harvest_ready(
+                    commit_since.elapsed(),
+                    path_modified_elapsed(&assignment.stdout_log_path)
+                        .ok()
+                        .flatten(),
+                ) {
+                    continue;
+                }
+
+                {
                     if let Err(err) = signal_worker(pid, "TERM") {
                         eprintln!(
                             "warning: failed sending SIGTERM to lingering worker pid {} for lane-{} `{}`: {err:#}",
@@ -6180,6 +6190,29 @@ fn nudge_lingering_committed_lanes(active_lanes: &mut BTreeMap<usize, ActiveLane
             }
         }
     }
+}
+
+fn clean_commit_harvest_ready(
+    clean_commit_elapsed: Duration,
+    last_output_elapsed: Option<Duration>,
+) -> bool {
+    clean_commit_elapsed >= CLEAN_COMMIT_GRACE
+        && last_output_elapsed.is_none_or(|elapsed| elapsed >= CLEAN_COMMIT_QUIET_GRACE)
+}
+
+fn path_modified_elapsed(path: &Path) -> Result<Option<Duration>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let modified = fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("failed to read mtime for {}", path.display()))?;
+    Ok(Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_else(|_| Duration::from_secs(0)),
+    ))
 }
 
 fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
@@ -7801,7 +7834,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::anyhow;
 
@@ -7811,8 +7844,9 @@ mod tests {
     use super::{
         audit_parallel_completion_drift, build_iteration_prompt, build_parallel_lane_prompt,
         checkpoint_parallel_host_queue_changes, cherry_pick_lane_range,
-        classify_parallel_preflight_needs, clear_partial_follow_up_tracking,
-        default_cargo_build_jobs_for, dirty_worktree_recovery_note, discover_sibling_git_repos,
+        classify_parallel_preflight_needs, clean_commit_harvest_ready,
+        clear_partial_follow_up_tracking, default_cargo_build_jobs_for,
+        dirty_worktree_recovery_note, discover_sibling_git_repos,
         effective_parallel_claude_max_turns, environment_blocker_reason,
         host_queue_state_files_for_repo, inspect_lane_repo_progress, is_linear_usage_limit_error,
         is_verification_only_task, landing_error_suggests_dirty_canonical_worktree,
@@ -7838,7 +7872,8 @@ mod tests {
         LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LaneWorkerMetadata,
         LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind,
         ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
-        ParallelUnblockCandidateKind, PartialFollowUpDisposition, HOST_QUEUE_STATE_FILES,
+        ParallelUnblockCandidateKind, PartialFollowUpDisposition, CLEAN_COMMIT_GRACE,
+        CLEAN_COMMIT_QUIET_GRACE, HOST_QUEUE_STATE_FILES,
     };
 
     fn sample_worker_metadata() -> LaneWorkerMetadata {
@@ -10410,6 +10445,26 @@ mod tests {
         let live_log =
             fs::read_to_string(run_root.join("live.log")).expect("closeout should write host log");
         assert!(live_log.contains("receipt-closeout: closed 1 partial task(s)"));
+    }
+
+    #[test]
+    fn clean_commit_harvest_waits_for_post_commit_output_quiet_period() {
+        assert!(!clean_commit_harvest_ready(
+            CLEAN_COMMIT_GRACE + Duration::from_secs(1),
+            Some(Duration::from_secs(0)),
+        ));
+        assert!(!clean_commit_harvest_ready(
+            CLEAN_COMMIT_GRACE - Duration::from_secs(1),
+            Some(CLEAN_COMMIT_QUIET_GRACE + Duration::from_secs(1)),
+        ));
+        assert!(clean_commit_harvest_ready(
+            CLEAN_COMMIT_GRACE + Duration::from_secs(1),
+            Some(CLEAN_COMMIT_QUIET_GRACE + Duration::from_secs(1)),
+        ));
+        assert!(clean_commit_harvest_ready(
+            CLEAN_COMMIT_GRACE + Duration::from_secs(1),
+            None,
+        ));
     }
 
     #[test]
