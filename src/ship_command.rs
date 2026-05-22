@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -477,22 +477,17 @@ fn line_is_release_blocker(line: &str) -> bool {
         || normalized.contains("unresolved blocker")
 }
 
-fn record_ship_gate_blockers(
+fn record_ship_gate_blockers_with_verdict(
     repo_root: &Path,
     branch: &str,
     base_branch: &str,
+    verdict: &str,
     report: &ShipGateReport,
 ) -> Result<()> {
-    write_ship_gate_section(
-        repo_root,
-        branch,
-        base_branch,
-        "Blocked before model execution",
-        None,
-        report,
-    )
+    write_ship_gate_section(repo_root, branch, base_branch, verdict, None, report)
 }
 
+#[cfg(test)]
 fn record_ship_gate_bypass(
     repo_root: &Path,
     branch: &str,
@@ -501,11 +496,30 @@ fn record_ship_gate_bypass(
     report: &ShipGateReport,
 ) -> Result<()> {
     validate_ship_gate_bypass_reason(reason)?;
-    write_ship_gate_section(
+    record_ship_gate_bypass_with_verdict(
         repo_root,
         branch,
         base_branch,
         "Bypassed before model execution",
+        reason,
+        report,
+    )
+}
+
+fn record_ship_gate_bypass_with_verdict(
+    repo_root: &Path,
+    branch: &str,
+    base_branch: &str,
+    verdict: &str,
+    reason: &str,
+    report: &ShipGateReport,
+) -> Result<()> {
+    validate_ship_gate_bypass_reason(reason)?;
+    write_ship_gate_section(
+        repo_root,
+        branch,
+        base_branch,
+        verdict,
         Some(reason),
         report,
     )
@@ -554,8 +568,82 @@ fn write_ship_gate_section(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ShipGatePhase {
+    BeforeModel,
+    AfterModelIteration,
+}
+
+impl ShipGatePhase {
+    fn blocked_verdict(self) -> &'static str {
+        match self {
+            Self::BeforeModel => "Blocked before model execution",
+            Self::AfterModelIteration => "Blocked after model iteration before readiness",
+        }
+    }
+
+    fn bypassed_verdict(self) -> &'static str {
+        match self {
+            Self::BeforeModel => "Bypassed before model execution",
+            Self::AfterModelIteration => "Bypassed after model iteration before readiness",
+        }
+    }
+
+    fn failure_context(self) -> &'static str {
+        match self {
+            Self::BeforeModel => "before model execution",
+            Self::AfterModelIteration => "after model iteration before readiness",
+        }
+    }
+}
+
+fn enforce_ship_gate(
+    repo_root: &Path,
+    branch: &str,
+    base_branch: &str,
+    bypass_reason: Option<&str>,
+    phase: ShipGatePhase,
+) -> Result<()> {
+    let ship_gate = evaluate_ship_gate(repo_root, branch, base_branch);
+    if let Some(reason) = bypass_reason {
+        record_ship_gate_bypass_with_verdict(
+            repo_root,
+            branch,
+            base_branch,
+            phase.bypassed_verdict(),
+            reason,
+            &ship_gate,
+        )?;
+        println!("release gate: bypassed; reason recorded in SHIP.md");
+    } else if ship_gate.is_blocked() {
+        record_ship_gate_blockers_with_verdict(
+            repo_root,
+            branch,
+            base_branch,
+            phase.blocked_verdict(),
+            &ship_gate,
+        )?;
+        bail!(
+            "auto ship release gate failed {}:\n{}",
+            phase.failure_context(),
+            ship_gate
+                .blockers
+                .iter()
+                .map(|blocker| format!("- {blocker}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    } else {
+        println!("release gate: passed");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
-    let repo_root = git_repo_root()?;
+    run_ship_in_repo(git_repo_root()?, args).await
+}
+
+async fn run_ship_in_repo(repo_root: PathBuf, args: ShipArgs) -> Result<()> {
     ensure_repo_layout(&repo_root)?;
 
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?;
@@ -596,25 +684,9 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
     println!("reasoning:   {}", args.reasoning_effort);
     println!("run root:    {}", run_root.display());
 
-    let ship_gate = evaluate_ship_gate(&repo_root, &push_branch, &base_branch);
-    if let Some(reason) = args.bypass_release_gate.as_deref() {
-        let reason = reason.trim();
+    let bypass_reason = args.bypass_release_gate.as_deref().map(str::trim);
+    if let Some(reason) = bypass_reason {
         validate_ship_gate_bypass_reason(reason)?;
-        record_ship_gate_bypass(&repo_root, &push_branch, &base_branch, reason, &ship_gate)?;
-        println!("release gate: bypassed; reason recorded in SHIP.md");
-    } else if ship_gate.is_blocked() {
-        record_ship_gate_blockers(&repo_root, &push_branch, &base_branch, &ship_gate)?;
-        bail!(
-            "auto ship release gate failed before model execution:\n{}",
-            ship_gate
-                .blockers
-                .iter()
-                .map(|blocker| format!("- {blocker}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    } else {
-        println!("release gate: passed");
     }
 
     if let Some(commit) =
@@ -624,6 +696,14 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
     } else if sync_branch_with_remote(&repo_root, push_branch.as_str())? {
         println!("remote sync: rebased onto origin/{}", push_branch);
     }
+
+    enforce_ship_gate(
+        &repo_root,
+        &push_branch,
+        &base_branch,
+        bypass_reason,
+        ShipGatePhase::BeforeModel,
+    )?;
 
     let mut iteration = 0usize;
     while iteration < args.max_iterations {
@@ -671,6 +751,13 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
             {
                 iteration += 1;
                 println!("checkpoint:  committed iteration changes at {commit}");
+                enforce_ship_gate(
+                    &repo_root,
+                    &push_branch,
+                    &base_branch,
+                    bypass_reason,
+                    ShipGatePhase::AfterModelIteration,
+                )?;
                 println!();
                 println!("================ SHIP {} ================", iteration);
                 continue;
@@ -687,6 +774,13 @@ pub(crate) async fn run_ship(args: ShipArgs) -> Result<()> {
         {
             println!("checkpoint:  committed trailing changes at {commit}");
         }
+        enforce_ship_gate(
+            &repo_root,
+            &push_branch,
+            &base_branch,
+            bypass_reason,
+            ShipGatePhase::AfterModelIteration,
+        )?;
         iteration += 1;
         println!();
         println!("================ SHIP {} ================", iteration);
@@ -761,10 +855,12 @@ fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn test_dir(label: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -804,6 +900,38 @@ mod tests {
             .args(["commit", "--allow-empty", "-m", "initial"])
             .output()
             .expect("git commit failed");
+    }
+
+    fn init_main_git_repo(repo_root: &Path) {
+        init_git_repo(repo_root);
+        command_ok(repo_root, ["branch", "-M", "main"]);
+    }
+
+    fn command_ok<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a str>) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+            .expect("git command failed to launch");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_all(repo_root: &Path, message: &str) {
+        command_ok(repo_root, ["add", "."]);
+        command_ok(repo_root, ["commit", "-m", message]);
+    }
+
+    fn setup_origin(repo: &Path, label: &str) -> PathBuf {
+        let origin = test_dir(label);
+        command_ok(&origin, ["init", "--bare", "--initial-branch=main"]);
+        command_ok(repo, ["remote", "add", "origin", origin.to_str().unwrap()]);
+        command_ok(repo, ["push", "-u", "origin", "main"]);
+        origin
     }
 
     fn write_release_reports(repo_root: &std::path::Path, branch: &str, base_branch: &str) {
@@ -858,10 +986,179 @@ mod tests {
         );
     }
 
+    fn write_passing_release_receipts_for_head(repo_root: &Path) {
+        let head = git_stdout(repo_root, ["rev-parse", "HEAD"])
+            .expect("git rev-parse failed")
+            .trim()
+            .to_string();
+        write_receipt_json(repo_root, &passing_release_receipt_json(&head, "pending"));
+        let dirty_fingerprint = dirty_state_fingerprint(repo_root);
+        write_receipt_json(
+            repo_root,
+            &passing_release_receipt_json(&head, &dirty_fingerprint),
+        );
+    }
+
+    fn passing_release_receipt_json(head: &str, dirty_fingerprint: &str) -> String {
+        format!(
+            r#"{{"commit":"{head}","dirty_state":{{"fingerprint":"{dirty_fingerprint}"}},"commands":[
+{{"command":"cargo fmt --check","expected_argv":["cargo","fmt","--check"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo clippy --all-targets --all-features -- -D warnings","expected_argv":["cargo","clippy","--all-targets","--all-features","--","-D","warnings"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo test","expected_argv":["cargo","test"],"exit_code":0,"status":"passed"}},
+{{"command":"cargo install --path . --root /tmp/autodev-install-proof","expected_argv":["cargo","install","--path",".","--root","/tmp/autodev-install-proof"],"exit_code":0,"status":"passed"}},
+{{"command":"auto --version","expected_argv":["auto","--version"],"exit_code":0,"status":"passed"}}
+]}}"#
+        )
+    }
+
+    fn dirty_state_fingerprint(repo_root: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["status", "--porcelain=v1", "-z"])
+            .output()
+            .expect("git status failed");
+        assert!(
+            output.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        format!("{:x}", Sha256::digest(&output.stdout))
+    }
+
     fn write_receipt_json(repo_root: &std::path::Path, json: &str) {
         let receipt_dir = repo_root.join(".auto/symphony/verification-receipts");
         fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
         fs::write(receipt_dir.join("release.json"), json).expect("failed to write receipt");
+    }
+
+    fn write_fake_codex_script(path: &Path, body: &str) {
+        fs::write(path, body).expect("failed to write fake codex");
+        Command::new("chmod")
+            .arg("+x")
+            .arg(path)
+            .output()
+            .expect("chmod fake codex failed");
+    }
+
+    fn ship_args(repo: &Path, codex_bin: PathBuf) -> ShipArgs {
+        ShipArgs {
+            max_iterations: 1,
+            prompt_file: None,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: Some("main".to_string()),
+            base_branch: Some("main".to_string()),
+            run_root: Some(repo.join(".auto/ship-test")),
+            bypass_release_gate: None,
+            codex_bin,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ship_gate_runs_after_checkpoint_before_model() {
+        let repo = test_dir("checkpoint-before-gate");
+        init_main_git_repo(&repo);
+        fs::create_dir_all(repo.join("src")).expect("failed to create src");
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn release_value() -> u8 { 1 }\n",
+        )
+        .expect("failed to write source");
+        write_release_reports(&repo, "main", "main");
+        commit_all(&repo, "release baseline");
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn release_value() -> u8 { 2 }\n",
+        )
+        .expect("failed to dirty source");
+        setup_origin(&repo, "checkpoint-before-gate-origin");
+        let fake_codex = repo.join(".auto/fake-codex.sh");
+        fs::create_dir_all(repo.join(".auto")).expect("failed to create .auto");
+        write_fake_codex_script(
+            &fake_codex,
+            "#!/bin/sh\ncat >/dev/null\n: > codex-invoked\nexit 0\n",
+        );
+        write_passing_release_receipts_for_head(&repo);
+        let pre_checkpoint_report = evaluate_ship_gate(&repo, "main", "main");
+        assert!(
+            !pre_checkpoint_report.is_blocked(),
+            "pre-checkpoint gate should pass so this test proves ordering; blockers: {:?}",
+            pre_checkpoint_report.blockers
+        );
+
+        let err = run_ship_in_repo(repo.clone(), ship_args(&repo, fake_codex))
+            .await
+            .expect_err("stale post-checkpoint receipts should stop ship before model work");
+
+        assert!(
+            err.to_string().contains("release gate failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !repo.join("codex-invoked").exists(),
+            "model ship prep must not run after post-checkpoint gate failure"
+        );
+        let ship = fs::read_to_string(repo.join("SHIP.md")).expect("failed to read SHIP.md");
+        assert!(ship.contains("Blocked before model execution"));
+        assert!(ship.contains("stale validation receipt"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ship_gate_runs_after_remote_sync_before_model() {
+        let repo = test_dir("remote-sync-before-gate");
+        init_main_git_repo(&repo);
+        fs::create_dir_all(repo.join("src")).expect("failed to create src");
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn release_value() -> u8 { 1 }\n",
+        )
+        .expect("failed to write source");
+        write_release_reports(&repo, "main", "main");
+        commit_all(&repo, "release baseline");
+        let fake_codex = repo.join(".auto/fake-codex.sh");
+        fs::create_dir_all(repo.join(".auto")).expect("failed to create .auto");
+        write_fake_codex_script(
+            &fake_codex,
+            "#!/bin/sh\ncat >/dev/null\n: > codex-invoked\nexit 0\n",
+        );
+        let origin = setup_origin(&repo, "remote-sync-before-gate-origin");
+        write_passing_release_receipts_for_head(&repo);
+        let updater = test_dir("remote-sync-before-gate-updater");
+        let clone_output = Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), updater.to_str().unwrap()])
+            .output()
+            .expect("git clone failed");
+        assert!(
+            clone_output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        command_ok(&updater, ["config", "user.email", "test@example.com"]);
+        command_ok(&updater, ["config", "user.name", "Test User"]);
+        fs::write(
+            updater.join("src/lib.rs"),
+            "pub fn release_value() -> u8 { 2 }\n",
+        )
+        .expect("failed to write remote source");
+        commit_all(&updater, "remote release change");
+        command_ok(&updater, ["push", "origin", "main"]);
+
+        let err = run_ship_in_repo(repo.clone(), ship_args(&repo, fake_codex))
+            .await
+            .expect_err("stale post-sync receipts should stop ship before model work");
+
+        assert!(
+            err.to_string().contains("release gate failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !repo.join("codex-invoked").exists(),
+            "model ship prep must not run after post-sync gate failure"
+        );
+        let ship = fs::read_to_string(repo.join("SHIP.md")).expect("failed to read SHIP.md");
+        assert!(ship.contains("Blocked before model execution"));
+        assert!(ship.contains("stale validation receipt"));
     }
 
     #[test]
@@ -957,23 +1254,36 @@ mod tests {
             .any(|blocker| blocker == "red validation receipt: `cargo test`"));
     }
 
-    #[test]
-    fn ship_gate_runs_after_remote_sync_before_model() {
-        let repo = test_dir("post-sync-gate");
-        write_release_reports(&repo, "feature/ship", "main");
-        write_passing_release_receipts(&repo);
+    #[tokio::test(flavor = "current_thread")]
+    async fn ship_gate_reruns_after_model_iteration_changes() {
+        let repo = test_dir("rerun-after-model-changes");
+        init_main_git_repo(&repo);
+        write_release_reports(&repo, "main", "main");
+        commit_all(&repo, "release reports");
+        setup_origin(&repo, "rerun-after-model-changes-origin");
+        let fake_codex = repo.join(".auto/fake-codex.sh");
+        fs::create_dir_all(repo.join(".auto")).expect("failed to create .auto");
+        write_fake_codex_script(
+            &fake_codex,
+            "#!/bin/sh\ncat >/dev/null\ncat > SHIP.md <<'EOF'\n# SHIP\n\nRelease Blockers:\n- unresolved production blocker\nRollback: revert.\nMonitoring: inspect CI.\nPR: none.\nEOF\nexit 0\n",
+        );
+        write_passing_release_receipts_for_head(&repo);
 
-        let report = evaluate_ship_gate(&repo, "feature/ship", "main");
+        let err = run_ship_in_repo(repo.clone(), ship_args(&repo, fake_codex))
+            .await
+            .expect_err("post-model release blockers should be gated before readiness");
 
         assert!(
-            !report.is_blocked(),
-            "passing receipts and fresh reports should allow model execution: {:?}",
-            report.blockers
+            err.to_string().contains("release gate failed"),
+            "unexpected error: {err}"
         );
+        let ship = fs::read_to_string(repo.join("SHIP.md")).expect("failed to read SHIP.md");
+        assert!(ship.contains("Blocked after model iteration before readiness"));
+        assert!(ship.contains("unresolved production blocker"));
     }
 
     #[test]
-    fn ship_gate_reruns_after_model_iteration_changes() {
+    fn ship_gate_detects_unresolved_release_blockers() {
         let repo = test_dir("rerun-gate");
         write_release_reports(&repo, "feature/ship", "main");
         write_passing_release_receipts(&repo);
