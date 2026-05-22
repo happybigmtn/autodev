@@ -277,7 +277,7 @@
     Estimated scope: S
     Completion signal: Quota config/state persistence is atomic, owner-only, and symlink-refusing.
 
-- [ ] `P1-012` Harden Claude credential refresh copy
+- [x] `P1-012` Harden Claude credential refresh copy
 
     Spec: `specs/220526-quota-persistence-and-credential-hardening.md`
     Why now: This closes the remaining credential movement gap after canonical config/state hardening; it outranks quota UX polish because raw credential copy can follow unsafe paths and loosen secret-file permissions.
