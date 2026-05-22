@@ -329,7 +329,7 @@
 
 ## Follow-On Work
 
-- [~] `FOL-001` Split doctor baseline readiness from execution readiness
+- [x] `FOL-001` Split doctor baseline readiness from execution readiness
 
     Spec: `specs/220526-operator-status-and-first-run-truth.md`
     Why now: This is deferred until the validation baseline is green because doctor output should explain a trustworthy command surface; it remains important for zero-friction onboarding but does not outrank red formatter/proof/command tests.
