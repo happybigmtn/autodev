@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::quota_config::{validate_account_name, QuotaConfig};
-use crate::util::write_0o600_if_unix;
+use crate::util::atomic_write_0o600_if_unix;
 
 /// How long an exhausted account stays unavailable before auto-retrying.
 const EXHAUSTION_COOLDOWN_HOURS: i64 = 1;
@@ -52,7 +52,7 @@ impl QuotaState {
         let dir = QuotaConfig::config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = serde_json::to_string_pretty(self).context("failed to serialize quota state")?;
-        write_0o600_if_unix(&path, text.as_bytes())
+        atomic_write_0o600_if_unix(&path, text.as_bytes())
     }
 
     pub(crate) fn get(&self, name: &str) -> AccountState {
@@ -318,6 +318,67 @@ mod tests {
         state.release_lease("test").unwrap();
         state.release_lease("test").unwrap();
         assert_eq!(state.get("test").active_leases, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_atomic_owner_only_and_rejects_destination_symlink() {
+        let home = TempConfigHome::new("quota-state-save-atomic");
+        let now = Utc::now();
+        let mut state = QuotaState::default();
+        state.mark_exhausted("work-codex", now).unwrap();
+        let state_path = QuotaState::state_path();
+        let state_dir = state_path.parent().expect("state path should have parent");
+        fs::create_dir_all(state_dir).expect("failed to create quota state dir");
+        let outside = home.root.join("outside-state.json");
+        fs::write(&outside, r#"{"outside":true}"#).expect("failed to seed outside state");
+        std::os::unix::fs::symlink(&outside, &state_path)
+            .expect("failed to symlink state destination");
+
+        let error = state
+            .save()
+            .expect_err("symlinked state destination should be rejected")
+            .to_string();
+        assert!(error.contains("symlinked destination"));
+        assert_eq!(
+            fs::read_to_string(&outside).expect("failed to read outside state"),
+            r#"{"outside":true}"#
+        );
+        assert!(
+            fs::symlink_metadata(&state_path)
+                .expect("failed to stat symlinked state")
+                .file_type()
+                .is_symlink(),
+            "failed save should leave the symlink destination untouched"
+        );
+        fs::remove_file(&state_path).expect("failed to remove symlinked state");
+
+        state.save().expect("state save should succeed");
+
+        let saved = fs::read_to_string(&state_path).expect("failed to read saved state");
+        assert!(saved.contains("\"work-codex\""));
+        let mode = fs::metadata(&state_path)
+            .expect("failed to stat saved state")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let temp_files = fs::read_dir(state_dir)
+            .expect("failed to read quota state dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read quota state dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".state.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "unexpected state temp files: {temp_files:?}"
+        );
     }
 
     #[cfg(unix)]

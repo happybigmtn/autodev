@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::util::write_0o600_if_unix;
+use crate::util::{atomic_write_0o600_if_unix, write_0o600_if_unix};
 
 const CONFIG_DIR: &str = "quota-router";
 const CONFIG_FILE: &str = "config.toml";
@@ -117,7 +117,7 @@ impl QuotaConfig {
         let dir = Self::config_dir();
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let text = toml::to_string_pretty(self).context("failed to serialize quota config")?;
-        write_0o600_if_unix(&path, text.as_bytes())
+        atomic_write_0o600_if_unix(&path, text.as_bytes())
     }
 
     pub(crate) fn find_account(&self, name: &str) -> Option<&AccountEntry> {
@@ -897,6 +897,74 @@ provider = "codex"
         assert!(profile_dir.join(".credentials.json").exists());
         assert!(!profile_dir.join("credentials.json").exists());
         assert!(!profile_dir.join(".claude.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_atomic_owner_only_and_rejects_destination_symlink() {
+        let home = TempConfigHome::new("quota-config-save-atomic");
+        let config = QuotaConfig {
+            accounts: vec![AccountEntry {
+                name: "work-codex".into(),
+                provider: Provider::Codex,
+            }],
+            selected_codex_account: Some("work-codex".into()),
+            selected_claude_account: None,
+        };
+        let config_path = QuotaConfig::config_path();
+        let config_dir = config_path
+            .parent()
+            .expect("config path should have parent");
+        fs::create_dir_all(config_dir).expect("failed to create quota config dir");
+        let outside = home.root.join("outside-config.toml");
+        fs::write(&outside, "outside = true\n").expect("failed to seed outside config");
+        std::os::unix::fs::symlink(&outside, &config_path)
+            .expect("failed to symlink config destination");
+
+        let error = config
+            .save()
+            .expect_err("symlinked config destination should be rejected")
+            .to_string();
+        assert!(error.contains("symlinked destination"));
+        assert_eq!(
+            fs::read_to_string(&outside).expect("failed to read outside config"),
+            "outside = true\n"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .expect("failed to stat symlinked config")
+                .file_type()
+                .is_symlink(),
+            "failed save should leave the symlink destination untouched"
+        );
+        fs::remove_file(&config_path).expect("failed to remove symlinked config");
+
+        config.save().expect("config save should succeed");
+
+        let saved = fs::read_to_string(&config_path).expect("failed to read saved config");
+        assert!(saved.contains("name = \"work-codex\""));
+        let mode = fs::metadata(&config_path)
+            .expect("failed to stat saved config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let temp_files = fs::read_dir(config_dir)
+            .expect("failed to read quota config dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read quota config dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".config.toml.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "unexpected config temp files: {temp_files:?}"
+        );
     }
 
     #[cfg(unix)]

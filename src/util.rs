@@ -550,24 +550,81 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let temp = parent.join(format!(
+    let temp = atomic_write_temp_path(parent, path);
+    fs::write(&temp, bytes).map_err(|err| {
+        atomic_write_failure(err, &temp, format!("failed to write {}", temp.display()))
+    })?;
+    atomic_rename(&temp, path)
+}
+
+#[cfg(unix)]
+pub(crate) fn atomic_write_0o600_if_unix(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    reject_symlink_destination(path)?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let temp = atomic_write_temp_path(parent, path);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(err) = write_result {
+        return Err(atomic_write_failure(
+            err,
+            &temp,
+            format!("failed to write {}", temp.display()),
+        ));
+    }
+    atomic_rename(&temp, path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn atomic_write_0o600_if_unix(path: &Path, bytes: &[u8]) -> Result<()> {
+    reject_symlink_destination(path)?;
+    atomic_write(path, bytes)
+}
+
+fn atomic_write_temp_path(parent: &Path, path: &Path) -> std::path::PathBuf {
+    parent.join(format!(
         ".{}.tmp-{}-{}-{}",
         path.file_name().and_then(|v| v.to_str()).unwrap_or("write"),
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default(),
         ATOMIC_WRITE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&temp, bytes).map_err(|err| {
-        atomic_write_failure(err, &temp, format!("failed to write {}", temp.display()))
-    })?;
-    fs::rename(&temp, path).map_err(|err| {
+    ))
+}
+
+fn atomic_rename(temp: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp, path).map_err(|err| {
         atomic_write_failure(
             err,
-            &temp,
+            temp,
             format!("failed to atomically replace {}", path.display()),
         )
     })?;
     Ok(())
+}
+
+fn reject_symlink_destination(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!(
+                "refusing to replace symlinked destination {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
 }
 
 fn atomic_write_failure(error: std::io::Error, temp: &Path, context: String) -> anyhow::Error {
@@ -761,10 +818,11 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        atomic_write, auto_checkpoint_if_needed, checkpoint_status, chmod_0o600_if_unix,
-        clip_line_for_display, ensure_repo_layout_with, is_checkpoint_excluded_path,
-        prune_old_entries, push_branch_with_remote_sync, stage_checkpoint_changes,
-        sync_branch_with_remote, truncate_file_to_max_bytes, write_0o600_if_unix, CLI_LONG_VERSION,
+        atomic_write, atomic_write_0o600_if_unix, auto_checkpoint_if_needed, checkpoint_status,
+        chmod_0o600_if_unix, clip_line_for_display, ensure_repo_layout_with,
+        is_checkpoint_excluded_path, prune_old_entries, push_branch_with_remote_sync,
+        stage_checkpoint_changes, sync_branch_with_remote, truncate_file_to_max_bytes,
+        write_0o600_if_unix, CLI_LONG_VERSION,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1456,6 +1514,53 @@ fi
             .collect::<Vec<_>>();
         entries.sort();
         assert_eq!(entries, vec!["result.json".to_string()]);
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_0o600_if_unix_preserves_owner_only_mode() {
+        let dir = temp_repo_path("atomic-write-0600");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("state.json");
+        fs::write(&target, br#"{"old":true}"#).expect("failed to seed target");
+
+        let mut permissions = fs::metadata(&target)
+            .expect("failed to stat seeded target")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&target, permissions).expect("failed to loosen target permissions");
+
+        atomic_write_0o600_if_unix(&target, br#"{"new":true}"#)
+            .expect("atomic owner-only write should succeed");
+
+        assert_eq!(
+            fs::read(&target).expect("failed to read target"),
+            br#"{"new":true}"#
+        );
+        let mode = fs::metadata(&target)
+            .expect("failed to stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let temp_files = fs::read_dir(&dir)
+            .expect("failed to read temp dir")
+            .map(|entry| {
+                entry
+                    .expect("failed to read temp dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".state.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "unexpected temp files after owner-only write: {temp_files:?}"
+        );
 
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
