@@ -177,7 +177,7 @@
     Estimated scope: S
     Completion signal: The two currently failing ship-gate stale receipt tests are green and release blockers match shared receipt freshness semantics.
 
-- [ ] `P1-008` Resolve operator and evidence lane routing
+- [x] `P1-008` Resolve operator and evidence lane routing
 
     Spec: `specs/220526-receipt-and-lane-evidence-contract.md`
     Why now: This is the next operator-visible evidence slice because `Lane kind:` is parsed but routing is contradictory; it outranks lane assignment metadata because a user first needs status and dispatch to agree on whether work is autonomous, evidence-only, or operator-owned.
