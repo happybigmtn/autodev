@@ -1,4 +1,10 @@
 pub(crate) const AUTODEV_PROMPT_ETHOS_MARKER: &str = "## Autodev Builder Ethos";
+pub(crate) const PRODUCTION_ORCHESTRATION_DISCIPLINE: &str = r#"Production orchestration discipline:
+- Treat a partially completed repo with an active `IMPLEMENTATION_PLAN.md`, `WORKLIST.md`, `plans/`, or equivalent queue as a live production playground. Reconcile and sharpen that queue instead of creating a competing plan universe.
+- Rank work by direct production leverage: first unblock compile/runtime/source-of-truth contracts, then executable user/operator workflows, then reusable UI/runtime component contracts, then tests that guard those contracts, then docs/evidence only when they directly unblock those slices.
+- Evidence budget: do not create standalone audit, receipt, checkpoint, or evidence tasks unless later implementation depends on a named unresolved decision. Every evidence task must name the exact implementation it unlocks and the decision that cannot be made without it.
+- Never leave the next executor with only docs-only, report-only, artifact-only, or low-priority cleanup while high-count runtime, user-facing, or source-of-truth blockers remain.
+- For design work, prefer shared runtime-backed components, interaction contracts, and reusable visual systems over one-off screen polish. A design task is queue-ready only when it names the runtime/API owner, UI consumers, generated artifacts or `none`, fixture boundary, and executable proof."#;
 
 const AUTODEV_PROMPT_ETHOS: &str = r#"## Autodev Builder Ethos
 
@@ -30,6 +36,7 @@ mod tests {
         assert!(prompt.starts_with(AUTODEV_PROMPT_ETHOS_MARKER));
         assert!(prompt.contains("highest-leverage complete slice"));
         assert!(prompt.contains("Runtime truth before presentation"));
+        assert!(super::PRODUCTION_ORCHESTRATION_DISCIPLINE.contains("live production playground"));
 
         let second = with_autodev_prompt_ethos(&prompt);
         assert_eq!(second, prompt);

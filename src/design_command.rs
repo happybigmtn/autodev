@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::parallel_command;
+use crate::prompt_ethos::PRODUCTION_ORCHESTRATION_DISCIPLINE;
 use crate::qa_only_command::{
     allowed_report_only_dirty_paths, collect_dirty_state, print_final_status_block,
     report_only_dirty_state_report,
@@ -442,25 +443,56 @@ async fn run_design_parallel_pass(
     output_root: &Path,
     pass: usize,
 ) -> Result<()> {
+    let run_root = output_root.join("parallel").join(format!("pass-{pass:02}"));
+    fs::create_dir_all(&run_root)
+        .with_context(|| format!("failed to create {}", run_root.display()))?;
+    let prompt_path = run_root.join("design-resolve-parallel-prompt.md");
+    let prompt = build_design_parallel_prompt(output_root, pass);
+    atomic_write(&prompt_path, prompt.as_bytes())
+        .with_context(|| format!("failed to write {}", prompt_path.display()))?;
     parallel_command::run_parallel_inline(ParallelArgs {
         action: None::<ParallelAction>,
         max_iterations: args.max_iterations,
         max_concurrent_workers: args.max_concurrent_workers.max(1),
         cargo_build_jobs: None,
         cargo_target: ParallelCargoTarget::Auto,
-        prompt_file: None,
+        prompt_file: Some(prompt_path),
         model: args.worker_model.clone(),
         reasoning_effort: args.worker_reasoning_effort.clone(),
         branch: args.branch.clone(),
         reference_repos: args.reference_repos.clone(),
         include_siblings: false,
-        run_root: Some(output_root.join("parallel").join(format!("pass-{pass:02}"))),
+        run_root: Some(run_root),
         codex_bin: args.codex_bin.clone(),
         claude: false,
         max_turns: None,
         max_retries: 2,
     })
     .await
+}
+
+fn build_design_parallel_prompt(output_root: &Path, pass: usize) -> String {
+    format!(
+        r#"You are an `auto design --resolve` implementation worker.
+
+Read repo-local instructions first, then read `IMPLEMENTATION_PLAN.md` and the latest design artifacts for this pass:
+- Design output root: `{output_root}`
+- Current design pass: `pass-{pass:02}`
+- Required context: `{output_root}/pass-{pass:02}/DESIGN-REPORT.md`, `{output_root}/pass-{pass:02}/DESIGN-PLAN-ITEMS.md`, and `{output_root}/pass-{pass:02}/ENGINE-UI-CONTRACT.md` when present.
+
+{production_orchestration_discipline}
+
+Worker selection rules:
+- Prefer dependency-ready `DESIGN-*` tasks and design/runtime/UI tasks promoted by `auto design`.
+- If multiple tasks are available, pick the one that repairs a shared runtime-backed component, interaction contract, source-of-truth drift, or user-facing blocker before isolated polish.
+- Do not choose docs-only, report-only, screenshot-only, evidence-only, or artifact-only work unless the assigned task explicitly proves it unlocks source/runtime/UI implementation.
+- Implement exactly one bounded task with code, tests, and narrow verification. Do not edit `DESIGN-AUDIT.md`, `DESIGN-SYSTEM-PROPOSAL.md`, `ENGINE-UI-CONTRACT.md`, `FRONTEND-QA.md`, `DESIGN-PLAN-ITEMS.md`, or `DESIGN-REPORT.md` from the lane unless the assigned task explicitly owns that artifact update.
+- Design implementation should land reusable components/contracts and runtime-backed presentation behavior, not one-off presentations for a single screen or game.
+"#,
+        output_root = output_root.display(),
+        pass = pass,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
+    )
 }
 
 fn write_design_resolution_status(
@@ -819,6 +851,8 @@ Output directory: `{output_dir}`
 
 Your job is to synthesize expert design review, design-system consultation, web interface guidelines, frontend design craft, and QA into a repo-native design contract. This is not a fake mockup generator. This is a design/runtime integrity pass that must be perfected before broader functional lanes proceed.
 
+{production_orchestration_discipline}
+
 Use these lenses together:
 - Plan design review: rate and close gaps in information architecture, interaction states, journey, AI-slop risk, design-system alignment, responsive behavior, accessibility, and unresolved design decisions.
 - Design consultation: infer or improve a coherent product-specific system: aesthetic direction, safe category conventions, deliberate creative risks, typography, color, spacing, layout, motion, and component vocabulary.
@@ -843,6 +877,8 @@ Hard rules:
 - Production code must not import fixture/demo/sample data as fallback truth.
 - Retired or superseded screens/specs must be deleted, archived, tombstoned, or explicitly blocked from active implementation.
 - A design improvement is not complete unless it names the engine/API contract and the proof that would fail if UI drifts again.
+- Existing queues matter: if root `IMPLEMENTATION_PLAN.md` or another active queue already exists, reconcile design findings into that queue and promote the highest-leverage shared UI/runtime work. Do not create a parallel design backlog that leaves executable runtime or user-facing blockers untouched.
+- Design tasks must prefer reusable component systems, shared layout/state primitives, and runtime-backed interaction contracts over one-off presentations for a single screen, route, game, or fixture.
 
 {edit_clause}
 {qa_clause}
@@ -891,6 +927,7 @@ Final line of `DESIGN-REPORT.md` must be exactly one of:
             .unwrap_or_else(|| "no planning corpus".to_string()),
         edit_clause = edit_clause,
         qa_clause = qa_clause,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
         apply_status = if apply {
             "applying edits is enabled"
         } else {
@@ -1011,9 +1048,9 @@ fn require_nonempty_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_design_prompt, enforce_design_report_only_write_boundary,
-        preserve_final_no_go_design_plan_items, promote_design_plan_items_to_root_queue,
-        DesignRunKind,
+        build_design_parallel_prompt, build_design_prompt,
+        enforce_design_report_only_write_boundary, preserve_final_no_go_design_plan_items,
+        promote_design_plan_items_to_root_queue, DesignRunKind,
     };
     use crate::qa_only_command::{collect_dirty_state, format_final_status_block};
     use crate::task_parser::{parse_tasks, TaskStatus};
@@ -1036,8 +1073,23 @@ mod tests {
         assert!(prompt.contains("not a fake mockup generator"));
         assert!(prompt.contains("Do not create fake mockups as acceptance evidence"));
         assert!(prompt.contains("UI must consume runtime/API/generated truth"));
+        assert!(prompt.contains("live production playground"));
+        assert!(prompt.contains("reusable component systems"));
         assert!(prompt.contains("ENGINE-UI-CONTRACT.md"));
         assert!(prompt.contains("FRONTEND-QA.md"));
+    }
+
+    #[test]
+    fn design_parallel_prompt_steers_workers_to_shared_executable_design_repairs() {
+        let prompt = build_design_parallel_prompt(&PathBuf::from("/repo/.auto/design/run"), 2);
+
+        assert!(prompt.contains("auto design --resolve"));
+        assert!(prompt.contains("pass-02"));
+        assert!(prompt.contains("DESIGN-PLAN-ITEMS.md"));
+        assert!(prompt.contains("Prefer dependency-ready `DESIGN-*` tasks"));
+        assert!(prompt.contains("shared runtime-backed component"));
+        assert!(prompt.contains("not one-off presentations"));
+        assert!(prompt.contains("docs-only, report-only, screenshot-only, evidence-only"));
     }
 
     #[test]

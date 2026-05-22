@@ -8,6 +8,7 @@ use chrono::{Local, NaiveDate};
 
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::corpus::{emit_corpus_snapshot, load_planning_corpus, PlanningCorpus};
+use crate::prompt_ethos::PRODUCTION_ORCHESTRATION_DISCIPLINE;
 use crate::state::{load_state, save_state, AutoState};
 use crate::task_parser::{
     parse_task_header as parse_shared_task_header, validate_execution_rows, TaskStatus,
@@ -2009,6 +2010,8 @@ Additional operator-provided context:
 
 {priority_focus_lens}
 
+{production_orchestration_discipline}
+
 Mandatory output files:
 - `{planning_root}/ASSESSMENT.md`
 - `{planning_root}/SPEC.md`
@@ -2054,6 +2057,7 @@ Review the actual codebase first, not just docs:
   - Classify important planning decisions as `Mechanical`, `Taste`, or `User Challenge`. Treat model disagreements and close alternatives as taste decisions that need a short rationale. Treat any point that would change the operator's stated direction as a user challenge instead of silently auto-deciding it.
   - Use these decision principles: choose completeness, inspect broadly when the problem requires it, stay pragmatic, avoid redundant artifacts, prefer explicit contracts over clever prose, and bias toward action when evidence is sufficient.
 - Apply the priority focus lens when ranking outputs: a small implementation slice that proves the core loop, fixes a runtime/source-of-truth gap, or makes a user/operator path clear should outrank a large documentation, audit, or artifact-only exercise unless the artifact directly unblocks that slice.
+- Apply the production orchestration discipline when the repo already has an active queue: the corpus should steer, reconcile, and reorder the next executor cycle, not expand lower-priority evidence work ahead of executable blockers.
 
 {idea_context_clause}
 {focus_context_clause}
@@ -2128,6 +2132,7 @@ Never trust docs over code. If docs claim something the code does not support, s
         idea_context_clause = idea_context_clause,
         focus_context_clause = focus_context_clause,
         priority_focus_lens = PRIORITY_FOCUS_LENS,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
     )
 }
 
@@ -2201,10 +2206,13 @@ Edit boundary:
 
 {priority_focus_lens}
 
+{production_orchestration_discipline}
+
 Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
 - Enforce the priority focus lens: if the corpus ranks a documentation, audit, report, or generated-artifact exercise above executable product/code/test/UX progress, require code-grounded evidence that it directly unblocks the next slice. Otherwise move it behind higher-leverage implementation focus.
+- Enforce the production orchestration discipline: if an active root queue exists, amend the corpus so it reconciles to the highest-priority executable queue work instead of producing duplicate evidence, audit, or checkpoint lanes.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
 - Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in `GENESIS-REPORT.md`, `ASSESSMENT.md`, or `{report_path}`.
 - Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend the corpus only when the repository evidence supports the change.
@@ -2256,6 +2264,7 @@ Validation expectations:
         reference_repo_clause = reference_repo_clause,
         active_plan_clause = active_plan_clause,
         priority_focus_lens = PRIORITY_FOCUS_LENS,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
     )
 }
 
@@ -2291,10 +2300,13 @@ Edit boundary:
 
 {priority_focus_lens}
 
+{production_orchestration_discipline}
+
 Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
 - Enforce the priority focus lens: specs and tasks should identify the next highest-leverage implementation focus areas. Move docs-only, audit-only, report-only, and artifact-only work behind executable source/test/UX/runtime work unless it directly unblocks that work.
+- Enforce the production orchestration discipline: active production blockers, runtime/source-of-truth gaps, reusable UI/runtime contracts, and executable proofs must outrank evidence expansion unless the evidence names the exact implementation decision it unlocks.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
 - Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in the generated docs or `{report_path}`.
 - Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend generated docs only when repository evidence supports the change.
@@ -2352,6 +2364,7 @@ Validation expectations:
         output_dir = output_dir.display(),
         report_path = report_path.display(),
         priority_focus_lens = PRIORITY_FOCUS_LENS,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
     )
 }
 
@@ -2425,6 +2438,8 @@ Focus context:
 
 {priority_focus_lens}
 
+{production_orchestration_discipline}
+
 Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
 - Filenames must use `ddmmyy-topic-slug.md`
@@ -2466,6 +2481,7 @@ Required output contract:
 - Preserve proven current behavior in reverse mode
 - In gen mode, preserve intended future direction from the corpus, but keep future intent under recommendations or hypotheses until code or primary-source evidence proves otherwise
 - Generate specs for the highest-priority product/system focus areas first. Do not multiply specs for docs, audits, reports, or artifacts unless they directly unblock an executable implementation slice.
+- In live partially complete repos, generate specs that tighten the next executable implementation queue. Do not spend the spec pass inventing new evidence-only tracks while runtime, user/operator workflow, or reusable UI/runtime contract blockers remain.
 
 Cover the main product and system surfaces represented in the repo. Use the codebase and the planning corpus to decide the right spec set."#,
         repo_root = repo_root.display(),
@@ -2486,6 +2502,7 @@ Cover the main product and system surfaces represented in the repo. Use the code
             plan_listing
         },
         priority_focus_lens = PRIORITY_FOCUS_LENS,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
     )
 }
 
@@ -2529,6 +2546,8 @@ Generated specs for this run:
 
 {priority_focus_lens}
 
+{production_orchestration_discipline}
+
 Before writing the plan, do the real planning work:
 - operate in read-only planning mode first
 - map dependency order and existing code patterns
@@ -2544,6 +2563,7 @@ Before writing the plan, do the real planning work:
 - add explicit checkpoint tasks after each risky cluster or every 2-3 priority tasks so a future worker knows when to stop and re-evaluate before widening scope
 - In `## Priority Work`, prefer tasks that change source code, tests, runtime contracts, user/operator flows, or executable verification. Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work` unless they directly unblock implementation or correct stale guidance that would otherwise make workers implement the wrong thing.
 - Do not turn the priority queue into a documentation or audit campaign for a repo that is not production-ready yet. Make the next `auto parallel` run land the highest-leverage executable improvements.
+- For active repos, preserve useful existing queue intent but rewrite ordering and task contracts so the next `auto parallel` run can select production blockers first. Evidence, receipts, checkpoints, and report generation may appear only when they name the exact implementation decision they unlock.
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
@@ -2632,6 +2652,7 @@ The goal is a truthful, execution-ready implementation queue."#,
             spec_listing
         },
         priority_focus_lens = PRIORITY_FOCUS_LENS,
+        production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
     )
 }
 
@@ -4421,6 +4442,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("Do not use the short `## Objective`"));
         assert!(prompt.contains("current gstack `/autoplan` review discipline"));
         assert!(prompt.contains("Priority focus lens"));
+        assert!(prompt.contains("Production orchestration discipline"));
+        assert!(prompt.contains("live production playground"));
         assert!(prompt
             .contains("product leverage, user-visible clarity, and engineering feasibility/tests"));
         assert!(prompt.contains("Never emit the absolute repository-root path"));
@@ -4467,6 +4490,7 @@ Spec: `specs/050426-deterministic-transcripts.md`
             corpus_prompt.contains("You may edit only markdown files under `/tmp/repo/genesis`")
         );
         assert!(corpus_prompt.contains("Priority focus lens"));
+        assert!(corpus_prompt.contains("production orchestration discipline"));
         assert!(corpus_prompt.contains("`Mechanical`, `Taste`, or `User Challenge`"));
         assert!(corpus_prompt.contains(
             "Every numbered plan under `/tmp/repo/genesis/plans/` must use the compact priority-plan shape"
@@ -4489,6 +4513,7 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(generation_prompt
             .contains("The generator will sync reviewed outputs to the root after your pass"));
         assert!(generation_prompt.contains("Priority focus lens"));
+        assert!(generation_prompt.contains("active production blockers"));
         assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
@@ -5340,6 +5365,8 @@ No external dependencies.
         assert!(prompt.contains("must name concrete path-like owners"));
         assert!(prompt.contains("must also be encoded in the task's `Dependencies:` field"));
         assert!(prompt.contains("rank candidate tasks through the priority focus lens"));
+        assert!(prompt.contains("Production orchestration discipline"));
+        assert!(prompt.contains("Evidence, receipts, checkpoints, and report generation"));
         assert!(prompt.contains("Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work`"));
         assert!(prompt.contains("Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`; this is proof metadata"));
     }
