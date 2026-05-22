@@ -171,6 +171,29 @@ const CORPUS_PRIORITY_PLAN_REQUIRED_SECTIONS: [&str; 7] = [
     "## Verification",
     "## Deferred",
 ];
+const CORPUS_REPORT_REQUIRED_SECTIONS: [&str; 3] = [
+    "## Priority Focus",
+    "## Next Autodev Lever",
+    "## Delete Or Demote",
+];
+const CORPUS_NEXT_LEVER_MARKERS: [&str; 5] = [
+    "auto design",
+    "auto gen",
+    "auto parallel",
+    "active run",
+    "human decision",
+];
+const CORPUS_DELETE_DEMOTE_MARKERS: [&str; 9] = [
+    "delete",
+    "demote",
+    "not-doing",
+    "not doing",
+    "stale",
+    "evidence-only",
+    "docs-only",
+    "lower-priority",
+    "none",
+];
 const CORPUS_LEGACY_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
     "## Purpose / Big Picture",
     "## Requirements Trace",
@@ -1676,14 +1699,16 @@ fn verify_corpus_semantics(
         }
     }
 
+    let report = fs::read_to_string(report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+    verify_corpus_report_sections(report_path, &report)?;
+
     if !active_plan_surface.has_active_plans() {
         return Ok(());
     }
 
     let plans_index = fs::read_to_string(plans_index_path)
         .with_context(|| format!("failed to read {}", plans_index_path.display()))?;
-    let report = fs::read_to_string(report_path)
-        .with_context(|| format!("failed to read {}", report_path.display()))?;
     let primary_plan_path = active_plan_surface.primary_plan_path().unwrap_or("plans/");
 
     if !plans_index.contains(primary_plan_path) && !report.contains(primary_plan_path) {
@@ -1708,6 +1733,49 @@ fn verify_corpus_semantics(
     if !acknowledges_subordination {
         bail!(
             "corpus must explicitly state that generated plans reconcile to the active root planning surface instead of creating a parallel plan universe"
+        );
+    }
+
+    Ok(())
+}
+
+fn verify_corpus_report_sections(report_path: &Path, report: &str) -> Result<()> {
+    let missing = missing_corpus_sections(report, &CORPUS_REPORT_REQUIRED_SECTIONS);
+    if !missing.is_empty() {
+        bail!(
+            "GENESIS-REPORT.md must include non-empty production-steering sections: {}",
+            missing.join(", ")
+        );
+    }
+
+    let (_, next_lever_body) =
+        split_markdown_section(report, "## Next Autodev Lever").ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is missing `## Next Autodev Lever`",
+                report_path.display()
+            )
+        })?;
+    let next_lever_lower = next_lever_body.to_ascii_lowercase();
+    if !CORPUS_NEXT_LEVER_MARKERS
+        .iter()
+        .any(|marker| next_lever_lower.contains(marker))
+    {
+        bail!(
+            "GENESIS-REPORT.md `## Next Autodev Lever` must recommend one immediate path across auto design, auto gen, auto parallel, active-run supervision, or human decision"
+        );
+    }
+
+    let (_, delete_demote_body) = split_markdown_section(report, "## Delete Or Demote")
+        .ok_or_else(|| {
+            anyhow::anyhow!("{} is missing `## Delete Or Demote`", report_path.display())
+        })?;
+    let delete_demote_lower = delete_demote_body.to_ascii_lowercase();
+    if !CORPUS_DELETE_DEMOTE_MARKERS
+        .iter()
+        .any(|marker| delete_demote_lower.contains(marker))
+    {
+        bail!(
+            "GENESIS-REPORT.md `## Delete Or Demote` must explicitly name stale, evidence-only, docs-only, lower-priority, or no-current demotion tracks"
         );
     }
 
@@ -4053,11 +4121,28 @@ mod tests {
             ("ASSESSMENT.md", "# Assessment\n\nReady.\n"),
             ("SPEC.md", "# Spec\n\nRuntime contract.\n"),
             ("PLANS.md", "# Plans\n\n- plans/001-build.md\n"),
-            ("GENESIS-REPORT.md", "# Report\n\nCorpus report.\n"),
         ] {
             fs::write(root.join(relative), body).unwrap();
         }
+        fs::write(root.join("GENESIS-REPORT.md"), valid_corpus_report()).unwrap();
         fs::write(root.join("plans/001-build.md"), valid_corpus_execplan()).unwrap();
+    }
+
+    fn valid_corpus_report() -> String {
+        [
+            "# Report",
+            "",
+            "## Priority Focus",
+            "Runtime and user-facing production blockers outrank broad evidence generation.",
+            "",
+            "## Next Autodev Lever",
+            "Run `auto design` before `auto gen` because the UI/runtime contract is the immediate lever in this fixture.",
+            "",
+            "## Delete Or Demote",
+            "Demote stale evidence-only and lower-priority docs-only tracks unless they unblock a named implementation slice.",
+            "",
+        ]
+        .join("\n")
     }
 
     fn valid_corpus_execplan() -> String {
@@ -4987,7 +5072,7 @@ This is too high level to guide a novice implementation.
         .unwrap();
         fs::write(
             planning_root.join("GENESIS-REPORT.md"),
-            "# Report\n\nThe corpus is ready.\n",
+            valid_corpus_report(),
         )
         .unwrap();
         fs::write(
@@ -5087,6 +5172,57 @@ No external dependencies.
     }
 
     #[test]
+    fn corpus_output_validator_requires_lever_and_demote_sections() {
+        let repo_root = temp_dir("corpus-lever-sections");
+        let planning_root = repo_root.join("genesis");
+        write_valid_corpus(&planning_root);
+
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            "# Report\n\n## Priority Focus\n\nRuntime first.\n",
+        )
+        .unwrap();
+        let error = verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface::default(),
+        )
+        .expect_err("expected missing lever sections to fail");
+        assert!(error.to_string().contains("Next Autodev Lever"));
+        assert!(error.to_string().contains("Delete Or Demote"));
+
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            "# Report\n\n## Priority Focus\n\nRuntime first.\n\n## Next Autodev Lever\n\nKeep thinking about priorities.\n\n## Delete Or Demote\n\nMove stale evidence-only work aside.\n",
+        )
+        .unwrap();
+        let error = verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface::default(),
+        )
+        .expect_err("expected vague lever recommendation to fail");
+        assert!(error
+            .to_string()
+            .contains("must recommend one immediate path"));
+
+        fs::write(
+            planning_root.join("GENESIS-REPORT.md"),
+            valid_corpus_report(),
+        )
+        .unwrap();
+        verify_corpus_outputs(
+            &repo_root,
+            &planning_root,
+            false,
+            &ActivePlanSurface::default(),
+        )
+        .expect("valid lever and demotion sections should pass");
+    }
+
+    #[test]
     fn corpus_output_validator_rejects_parallel_plan_universe_and_absolute_paths() {
         let repo_root = temp_dir("corpus-semantic-guard");
         fs::write(repo_root.join("PLANS.md"), "# root plans\n").unwrap();
@@ -5110,7 +5246,7 @@ No external dependencies.
         .unwrap();
         fs::write(
             planning_root.join("GENESIS-REPORT.md"),
-            "# Report\n\nThe corpus is ready.\n",
+            valid_corpus_report(),
         )
         .unwrap();
         fs::write(
@@ -5214,8 +5350,9 @@ No external dependencies.
         fs::write(
             planning_root.join("GENESIS-REPORT.md"),
             format!(
-                "# Report\n\nThe corpus is reconciled against `plans/001-master-plan.md`.\n\nBad link: {}\n",
-                repo_root.display()
+                "{}\nThe corpus is reconciled against `plans/001-master-plan.md`.\n\nBad link: {}\n",
+                valid_corpus_report(),
+                repo_root.display(),
             ),
         )
         .unwrap();
@@ -5251,8 +5388,9 @@ No external dependencies.
         fs::write(
             planning_root.join("GENESIS-REPORT.md"),
             format!(
-                "# Report\n\nWork from `{}` starts here.\n",
-                repo_root.display()
+                "{}\nWork from `{}` starts here.\n",
+                valid_corpus_report(),
+                repo_root.display(),
             ),
         )
         .unwrap();
