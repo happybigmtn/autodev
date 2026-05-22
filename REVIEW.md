@@ -37,3 +37,11 @@
 - Validation: verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-001.json` has unsuperseded failed command(s): `cargo test`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-001.json` has unsuperseded failed command(s): `cargo test`
+
+## `FOL-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/audit_everything.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-004.json`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff

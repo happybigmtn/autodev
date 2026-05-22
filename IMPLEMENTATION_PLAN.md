@@ -404,7 +404,7 @@
     Estimated scope: M
     Completion signal: Lane assignment metadata and host-owned queue prompts describe the same protected runtime contract.
 
-- [ ] `FOL-004` Add a stable final status block to audit status
+- [x] `FOL-004` Add a stable final status block to audit status
 
     Spec: `specs/220526-operator-status-and-first-run-truth.md`
     Why now: This is deferred because it improves operator clarity but does not unblock the core queue, snapshot, receipt, or quota safety loops; it should reuse existing status formatting instead of creating a new audit report campaign.
