@@ -32,6 +32,9 @@ receipts as a compatibility/staging fallback.
 - `commands[].command`: exact command text from the task row.
 - `commands[].expected_argv`: shell-split argv for the expected command.
 - `commands[].exit_code` and `commands[].status`: command result.
+  Older repo-local wrappers that wrote `exit_status` are accepted as a
+  compatibility alias for `exit_code`, but new receipts should emit
+  `exit_code`.
 - `declared_artifacts[].path` and `declared_artifacts[].sha256`: hash evidence
   for declared completion artifacts when the task row requires them.
 

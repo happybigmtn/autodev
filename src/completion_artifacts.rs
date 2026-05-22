@@ -765,7 +765,7 @@ struct VerificationReceiptCommand {
     supersedes: Vec<String>,
     #[serde(default)]
     expected_argv: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "exit_status")]
     exit_code: Option<i32>,
     #[serde(default)]
     status: Option<String>,
@@ -2467,6 +2467,17 @@ Dependencies: none
         ] {
             assert!(schema.contains(field), "schema should mention `{field}`");
         }
+    }
+
+    #[test]
+    fn receipt_command_accepts_exit_status_alias() {
+        let command = serde_json::from_str::<VerificationReceiptCommand>(
+            r#"{"command":"npm run typecheck","exit_status":0,"status":"passed"}"#,
+        )
+        .expect("legacy exit_status command should parse");
+
+        assert_eq!(command.exit_code, Some(0));
+        assert!(super::verification_receipt_command_passed(&command));
     }
 
     #[test]
