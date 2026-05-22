@@ -12,7 +12,8 @@ if [[ ${2:-} == "--" ]]; then
 else
   shift
 fi
-command="$*"
+printf -v command "%q " "$@"
+command=${command% }
 repo_root=$(git rev-parse --show-toplevel)
 stdout_file=$(mktemp)
 stderr_file=$(mktemp)
@@ -24,7 +25,7 @@ trap cleanup EXIT
 cd "$repo_root"
 
 set +e
-bash -lc "$command" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+"$@" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
 status=$?
 set -e
 
