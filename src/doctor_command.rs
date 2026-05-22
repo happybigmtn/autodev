@@ -20,7 +20,9 @@ const HELP_SURFACES: &[&[&str]] = &[
     &["design", "--help"],
     &["super", "--help"],
     &["parallel", "--help"],
+    &["doctor", "--help"],
     &["quota", "--help"],
+    &["audit-harvest", "--help"],
     &["symphony", "--help"],
 ];
 const OPTIONAL_TOOLS: &[OptionalTool] = &[
@@ -621,7 +623,9 @@ mod tests {
                 "auto design --help",
                 "auto super --help",
                 "auto parallel --help",
+                "auto doctor --help",
                 "auto quota --help",
+                "auto audit-harvest --help",
                 "auto symphony --help",
             ]
         );

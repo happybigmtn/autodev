@@ -5392,7 +5392,6 @@ mod tests {
         assert_eq!(PAUSE_REQUEST_FILE, "PAUSE");
         assert_eq!(FILE_QUALITY_ACCEPT_SCORE, 9.0);
         assert_eq!(FILE_QUALITY_TARGET_SCORE, 10.0);
-        assert!(FILE_QUALITY_TARGET_SCORE > FILE_QUALITY_ACCEPT_SCORE);
 
         let dir = std::env::temp_dir().join(format!(
             "auto-audit-status-quality-contract-{}",

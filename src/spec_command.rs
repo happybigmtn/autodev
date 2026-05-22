@@ -1,17 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 
-use crate::SpecArgs;
 use crate::claude_exec::run_claude_exec;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
-    TaskStatus, execution_row_first_field_line, parse_task_header, parse_tasks,
-    validate_execution_row,
+    execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
+    TaskStatus,
 };
 use crate::util::{atomic_write, ensure_repo_layout, git_repo_root, timestamp_slug};
+use crate::SpecArgs;
 
 const SPEC_REQUIRED_SECTIONS: [&str; 13] = [
     "## Objective",
@@ -461,9 +461,7 @@ fn section_has_body(markdown: &str, header: &str) -> bool {
 }
 
 fn section_body<'a>(markdown: &'a str, header: &str) -> Option<&'a str> {
-    let Some(start) = markdown.find(header) else {
-        return None;
-    };
+    let start = markdown.find(header)?;
     let body_start = start + header.len();
     let after = &markdown[body_start..];
     let body_end = after
@@ -658,11 +656,9 @@ mod tests {
         fs::write(&plan_path, plan).expect("write plan");
 
         let error = verify_plan_output(&plan_path, &spec_path).expect_err("header rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("must use canonical unchecked header")
-        );
+        assert!(error
+            .to_string()
+            .contains("must use canonical unchecked header"));
         let _ = fs::remove_dir_all(root);
     }
 

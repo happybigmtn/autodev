@@ -1800,20 +1800,20 @@ fn verify_corpus_legacy_execplan(plan_path: &Path, markdown: &str) -> Result<()>
         );
     }
     let has_standard_unit_shape = ["goal", "files", "test"].into_iter().all(|fragment| {
-        markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        markdown_section_contains(markdown, "## Implementation Units", |line| {
             line.to_ascii_lowercase().contains(fragment)
         })
     });
     let has_artifact_only_unit_shape =
-        markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        markdown_section_contains(markdown, "## Implementation Units", |line| {
             line.to_ascii_lowercase()
                 .contains("test expectation: none --")
-        }) && markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        }) && markdown_section_contains(markdown, "## Implementation Units", |line| {
             let lowered = line.to_ascii_lowercase();
             ["artifact", "index", "checkpoint", "report", "note", "file"]
                 .into_iter()
                 .any(|fragment| lowered.contains(fragment))
-        }) && markdown_section_contains(&markdown, "## Implementation Units", |line| {
+        }) && markdown_section_contains(markdown, "## Implementation Units", |line| {
             let lowered = line.to_ascii_lowercase();
             [
                 "goal",

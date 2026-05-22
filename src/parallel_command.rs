@@ -6568,7 +6568,7 @@ fn is_docs_only_path(path: &str) -> bool {
         "CLAUDE.md",
         "VERSION",
     ];
-    if meaningful_progress_files.iter().any(|m| path == *m) {
+    if meaningful_progress_files.contains(&path) {
         return false;
     }
     // Files that never contain executable/test logic. A commit whose entire

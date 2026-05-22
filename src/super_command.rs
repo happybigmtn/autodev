@@ -252,7 +252,12 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
                 &mut manifest,
                 "audit",
                 "complete",
-                Some(&repo_root.join(".auto").join("audit-everything").join(&audit_run_id)),
+                Some(
+                    &repo_root
+                        .join(".auto")
+                        .join("audit-everything")
+                        .join(&audit_run_id),
+                ),
             )?;
         }
 
@@ -260,13 +265,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             println!("stage:       audit harvest (resume skip)");
         } else if let Some(audit_run_id) = manifest.audit_run_id.clone() {
             println!("stage:       audit harvest");
-            let harvest_artifact = run_super_audit_harvest(
-                &args,
-                &repo_root,
-                &super_root,
-                &audit_run_id,
-            )
-            .await?;
+            let harvest_artifact =
+                run_super_audit_harvest(&args, &repo_root, &super_root, &audit_run_id).await?;
             push_stage(
                 &super_root,
                 &mut manifest,
@@ -793,8 +793,8 @@ async fn run_super_audit_phase(args: &SuperArgs, repo_root: &Path) -> Result<Str
     fs::create_dir_all(&audit_root)
         .with_context(|| format!("failed to create {}", audit_root.display()))?;
 
-    let auto_bin = std::env::current_exe()
-        .context("failed to resolve current `auto` binary path")?;
+    let auto_bin =
+        std::env::current_exe().context("failed to resolve current `auto` binary path")?;
     let mut cmd = Command::new(&auto_bin);
     cmd.current_dir(repo_root)
         .arg("audit")
@@ -802,7 +802,13 @@ async fn run_super_audit_phase(args: &SuperArgs, repo_root: &Path) -> Result<Str
         .arg("--everything-threads")
         .arg(args.audit_threads.max(1).to_string())
         .arg("--remediation-threads")
-        .arg(args.audit_threads.max(1).saturating_div(2).max(1).to_string())
+        .arg(
+            args.audit_threads
+                .max(1)
+                .saturating_div(2)
+                .max(1)
+                .to_string(),
+        )
         .arg("--first-pass-retries")
         .arg(args.audit_first_pass_retries.to_string())
         .arg("--first-pass-model")
@@ -823,8 +829,11 @@ async fn run_super_audit_phase(args: &SuperArgs, repo_root: &Path) -> Result<Str
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    println!("audit:       {} threads, {} retry round(s)",
-        args.audit_threads.max(1), args.audit_first_pass_retries);
+    println!(
+        "audit:       {} threads, {} retry round(s)",
+        args.audit_threads.max(1),
+        args.audit_first_pass_retries
+    );
     let status = cmd
         .spawn()
         .with_context(|| format!("failed to spawn `{}` audit subprocess", auto_bin.display()))?
@@ -859,7 +868,10 @@ async fn run_super_audit_phase(args: &SuperArgs, repo_root: &Path) -> Result<Str
         if name == "latest-run" {
             continue;
         }
-        let mtime = entry.metadata()?.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let mtime = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::UNIX_EPOCH);
         match &latest {
             None => latest = Some((name, mtime)),
             Some((_, t)) if mtime > *t => latest = Some((name, mtime)),
@@ -956,7 +968,10 @@ fn resolve_latest_audit_run_id(audit_root: &Path) -> Result<String> {
         if name == "latest-run" {
             continue;
         }
-        let mtime = entry.metadata()?.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let mtime = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::UNIX_EPOCH);
         match &latest {
             None => latest = Some((name, mtime)),
             Some((_, t)) if mtime > *t => latest = Some((name, mtime)),
@@ -1033,10 +1048,7 @@ async fn harvest_audit_findings(
         if score < score_min || score > score_max {
             continue;
         }
-        let path = value
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
         if !path.is_empty() && already_covered_paths.contains(path) {
             filtered_dup += 1;
             continue;
@@ -1109,13 +1121,8 @@ async fn harvest_audit_findings(
             chunk_count,
             chunk.len(),
         );
-        let prompt = build_audit_harvest_prompt(
-            &plan_existing,
-            &chunk,
-            audit_run_id,
-            score_min,
-            score_max,
-        );
+        let prompt =
+            build_audit_harvest_prompt(&plan_existing, &chunk, audit_run_id, score_min, score_max);
         run_super_codex_phase(
             repo_root,
             output_root,
@@ -1127,7 +1134,10 @@ async fn harvest_audit_findings(
         )
         .await?;
     }
-    println!("audit harvest: appended task rows to {}", plan_path.display());
+    println!(
+        "audit harvest: appended task rows to {}",
+        plan_path.display()
+    );
     Ok(summary_path)
 }
 
@@ -1137,9 +1147,7 @@ async fn harvest_audit_findings(
 /// remaining budget. Each chunk runs as its own codex call; the harvest
 /// prompt's "scan existing IMPLEMENTATION_PLAN.md and skip duplicates"
 /// directive prevents duplicate rows across chunks.
-fn chunk_findings_for_codex(
-    compressed: &[serde_json::Value],
-) -> Vec<Vec<serde_json::Value>> {
+fn chunk_findings_for_codex(compressed: &[serde_json::Value]) -> Vec<Vec<serde_json::Value>> {
     const HARD_CAP_CHARS: usize = 1_000_000; // codex limit
     const PROMPT_OVERHEAD_CHARS: usize = 80_000; // boilerplate + plan excerpt
     const PER_CHUNK_BUDGET_CHARS: usize = HARD_CAP_CHARS - PROMPT_OVERHEAD_CHARS;
@@ -1285,7 +1293,11 @@ fn build_audit_harvest_prompt(
     score_max: i64,
 ) -> String {
     let findings_json = serde_json::to_string_pretty(findings).unwrap_or_default();
-    let plan_excerpt: String = plan_existing.lines().take(60).collect::<Vec<_>>().join("\n");
+    let plan_excerpt: String = plan_existing
+        .lines()
+        .take(60)
+        .collect::<Vec<_>>()
+        .join("\n");
     let cohort_label = if score_min == score_max {
         format!("score == {score_min}")
     } else {
@@ -1478,9 +1490,7 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
     for task in &unchecked {
         if let Err(err) = verify_super_task(task, &all_task_ids) {
             if lenient {
-                eprintln!(
-                    "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
-                );
+                eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
                 continue;
             }
             return Err(err);
@@ -1814,9 +1824,7 @@ fn audit_generated_plan_against_operator_bans(repo_root: &Path, operator_prompt:
             line.split(|c: char| c.is_whitespace() || c == ',' || c == '`')
                 .filter(|tok| {
                     let t = tok.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '/');
-                    !t.is_empty()
-                        && (t.contains('/') || t.ends_with(".md"))
-                        && !t.starts_with('-')
+                    !t.is_empty() && (t.contains('/') || t.ends_with(".md")) && !t.starts_with('-')
                 })
         })
         .collect();

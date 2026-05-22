@@ -8,7 +8,7 @@ The local CLI command is `auto`.
 
 ## What It Owns
 
-`auto` owns twenty-one commands:
+`auto` owns twenty-two commands:
 
 - `auto corpus` reviews the repo and authors a fresh planning corpus under `genesis/`.
 - `auto gen` generates specs and a new implementation plan from `genesis/`.
@@ -31,6 +31,7 @@ The local CLI command is `auto`.
 - `auto ship` prepares the current branch to ship, pushes it, and opens or refreshes a PR when appropriate.
 - `auto nemesis` runs a disposable Nemesis audit and appends its outputs into root specs and plan.
 - `auto quota` manages quota-aware account multiplexing for Claude and Codex.
+- `auto audit-harvest` harvests completed `auto audit --everything` findings into implementation-plan rows.
 - `auto symphony` syncs implementation-plan items into Linear and runs the local Symphony runtime.
 
 It does not own the old parallel `malina run` workflow.

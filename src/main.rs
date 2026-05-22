@@ -1722,9 +1722,28 @@ mod tests {
     #[test]
     fn top_level_command_surface_matches_live_enum() {
         let expected = [
-            "corpus", "gen", "spec", "design", "super", "reverse", "bug", "loop", "parallel", "qa",
-            "qa-only", "health", "book", "doctor", "review", "steward", "audit", "ship", "nemesis",
-            "quota", "symphony",
+            "corpus",
+            "gen",
+            "spec",
+            "design",
+            "super",
+            "reverse",
+            "bug",
+            "loop",
+            "parallel",
+            "qa",
+            "qa-only",
+            "health",
+            "book",
+            "doctor",
+            "review",
+            "steward",
+            "audit",
+            "ship",
+            "nemesis",
+            "quota",
+            "audit-harvest",
+            "symphony",
         ];
         let cli_command = Cli::command();
         let actual = cli_command

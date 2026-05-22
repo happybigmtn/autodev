@@ -48,5 +48,7 @@ jobs:
           auto design --help
           auto super --help
           auto parallel --help
+          auto doctor --help
           auto quota --help
+          auto audit-harvest --help
           auto symphony --help

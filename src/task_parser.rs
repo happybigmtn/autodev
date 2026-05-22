@@ -438,9 +438,7 @@ pub(crate) fn validate_execution_rows(plan: &str) -> Result<Vec<PlanTask>> {
     {
         if let Err(err) = validate_execution_row(task, &all_task_ids) {
             if lenient {
-                eprintln!(
-                    "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
-                );
+                eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
                 continue;
             }
             return Err(err);
@@ -454,10 +452,7 @@ pub(crate) fn execution_row_field_body(task: &PlanTask, field: &str) -> Result<S
         .with_context(|| format!("task `{}` missing `{field}`", task.id))
 }
 
-pub(crate) fn execution_row_first_field_line<'a>(
-    task: &'a PlanTask,
-    field: &str,
-) -> Result<String> {
+pub(crate) fn execution_row_first_field_line(task: &PlanTask, field: &str) -> Result<String> {
     let body = execution_row_field_body(task, field)?;
     body.lines()
         .map(str::trim)
@@ -625,7 +620,11 @@ fn validate_execution_row_completion_artifacts(task: &PlanTask) -> Result<()> {
         .find(|line| !line.is_empty())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if first == "none" || first.starts_with("none ") || first.starts_with("none--") || first.starts_with("none -") {
+    if first == "none"
+        || first.starts_with("none ")
+        || first.starts_with("none--")
+        || first.starts_with("none -")
+    {
         return Ok(());
     }
     // Accept any non-empty body. Authors (LLM and human) often write a

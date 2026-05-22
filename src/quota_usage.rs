@@ -193,9 +193,7 @@ fn jwt_expired(token: &str) -> bool {
 }
 
 fn jwt_payload(token: &str) -> Option<serde_json::Value> {
-    let Some(payload_b64) = token.split('.').nth(1) else {
-        return None;
-    };
+    let payload_b64 = token.split('.').nth(1)?;
     let Ok(payload_bytes) = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) else {
         return None;
     };
