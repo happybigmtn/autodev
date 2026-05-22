@@ -3,9 +3,10 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
+use crate::backend_process::{clear_worker_pid, log_stderr, read_stream, write_worker_pid};
 use crate::codex_stream;
 use crate::codex_stream::capture_pi_output;
 use crate::kimi_backend::{kimi_exec_args, parse_kimi_error, resolve_kimi_bin};
@@ -13,7 +14,7 @@ use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::quota_config::Provider;
 use crate::quota_exec;
-use crate::util::{atomic_write, opencode_agent_dir, timestamp_slug};
+use crate::util::{atomic_write, opencode_agent_dir};
 
 pub(crate) const MAX_CODEX_MODEL_CONTEXT_WINDOW: i64 = 1_000_000;
 
@@ -468,74 +469,11 @@ async fn spawn_codex(
     Ok((status, stderr_text))
 }
 
-fn write_worker_pid(worker_pid_path: Option<&Path>, pid: Option<u32>) -> Result<()> {
-    let Some(path) = worker_pid_path else {
-        return Ok(());
-    };
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    atomic_write(path, pid.to_string().as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn clear_worker_pid(worker_pid_path: Option<&Path>) -> Result<()> {
-    let Some(path) = worker_pid_path else {
-        return Ok(());
-    };
-    if !path.exists() {
-        return Ok(());
-    }
-    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
-}
-
-fn log_stderr(stderr_text: &str, stderr_log_path: &Path) -> Result<()> {
-    let rendered = if stderr_text.trim().is_empty() {
-        "[no stderr captured]"
-    } else {
-        stderr_text
-    };
-    let entry = format!("\n===== {} =====\n{rendered}\n", timestamp_slug());
-    let mut existing = if stderr_log_path.exists() {
-        fs::read(stderr_log_path)
-            .with_context(|| format!("failed to read {}", stderr_log_path.display()))?
-    } else {
-        Vec::new()
-    };
-    existing.extend_from_slice(entry.as_bytes());
-    atomic_write(stderr_log_path, &existing)?;
-    Ok(())
-}
-
-async fn read_stream<R>(stream: R) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(stream);
-    let mut text = String::new();
-    reader
-        .read_to_string(&mut text)
-        .await
-        .context("failed to read child stream")?;
-    Ok(text)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{log_stderr, select_shared_exec_backend, SharedExecBackend};
-    use crate::util::timestamp_slug;
-
-    #[test]
-    fn empty_stderr_still_writes_artifact() {
-        let path = std::env::temp_dir().join(format!("codex-stderr-{}.log", timestamp_slug()));
-        log_stderr("", &path).expect("write stderr log");
-        let written = fs::read_to_string(&path).expect("read stderr log");
-        assert!(written.contains("[no stderr captured]"));
-        let _ = fs::remove_file(path);
-    }
+    use super::{select_shared_exec_backend, SharedExecBackend};
 
     #[test]
     fn shared_exec_routes_minimax_alias_to_pi() {
