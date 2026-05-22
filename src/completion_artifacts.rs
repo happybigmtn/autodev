@@ -997,15 +997,17 @@ fn inspect_verification_receipt(
     let mut unsuperseded_failed = receipt
         .commands
         .iter()
-        .filter(|entry| !verification_receipt_command_passed(entry))
-        .filter(|entry| {
+        .enumerate()
+        .filter(|(_, entry)| !verification_receipt_command_passed(entry))
+        .filter(|(entry_index, entry)| {
             !verification_receipt_failed_entry_is_superseded(
+                *entry_index,
                 entry,
                 &receipt.commands,
                 expected_commands,
             )
         })
-        .map(|entry| entry.command.clone())
+        .map(|(_, entry)| entry.command.clone())
         .collect::<Vec<_>>();
     unsuperseded_failed.sort();
     unsuperseded_failed.dedup();
@@ -1116,15 +1118,17 @@ fn verification_receipt_content_problem(
     let mut unsuperseded_failed = receipt
         .commands
         .iter()
-        .filter(|entry| !verification_receipt_command_passed(entry))
-        .filter(|entry| {
+        .enumerate()
+        .filter(|(_, entry)| !verification_receipt_command_passed(entry))
+        .filter(|(entry_index, entry)| {
             !verification_receipt_failed_entry_is_superseded(
+                *entry_index,
                 entry,
                 &receipt.commands,
                 expected_commands,
             )
         })
-        .map(|entry| entry.command.clone())
+        .map(|(_, entry)| entry.command.clone())
         .collect::<Vec<_>>();
     unsuperseded_failed.sort();
     unsuperseded_failed.dedup();
@@ -1170,11 +1174,20 @@ fn verification_receipt_command_passed(entry: &VerificationReceiptCommand) -> bo
 }
 
 fn verification_receipt_failed_entry_is_superseded(
+    failed_index: usize,
     failed_entry: &VerificationReceiptCommand,
     all_entries: &[VerificationReceiptCommand],
     expected_commands: &[String],
 ) -> bool {
-    all_entries.iter().any(|entry| {
+    all_entries.iter().enumerate().any(|(entry_index, entry)| {
+        entry_index > failed_index
+            && verification_receipt_command_passed(entry)
+            && verification_receipt_commands_match_same_expected(
+                failed_entry,
+                entry,
+                expected_commands,
+            )
+    }) || all_entries.iter().any(|entry| {
         verification_receipt_command_passed(entry)
             && expected_commands
                 .iter()
@@ -1183,6 +1196,17 @@ fn verification_receipt_failed_entry_is_superseded(
                 .supersedes
                 .iter()
                 .any(|superseded| superseded == &failed_entry.command)
+    })
+}
+
+fn verification_receipt_commands_match_same_expected(
+    left: &VerificationReceiptCommand,
+    right: &VerificationReceiptCommand,
+    expected_commands: &[String],
+) -> bool {
+    expected_commands.iter().any(|expected| {
+        verification_receipt_command_matches(left, expected)
+            && verification_receipt_command_matches(right, expected)
     })
 }
 
@@ -1503,12 +1527,17 @@ fn verification_receipt_command_matches(
         return true;
     }
 
-    if entry.argv.is_empty() {
-        return false;
+    let expected_argv = match shell_split(expected_command) {
+        Some(argv) => argv,
+        None => return false,
+    };
+
+    if !entry.argv.is_empty() {
+        return expected_argv == entry.argv;
     }
 
-    shell_split(expected_command)
-        .map(|expected_argv| expected_argv == entry.argv)
+    shell_split(&entry.command)
+        .map(|entry_argv| expected_argv == entry_argv)
         .unwrap_or(false)
 }
 
@@ -2650,6 +2679,35 @@ Dependencies: none
             &root,
             "TASK-SUPERSEDED",
             "- [ ] `TASK-SUPERSEDED` Example\nVerification:\n  - `rg -n \"multi-filter\" WORKLIST.md src/generation.rs`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+        assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_accepts_later_pass_for_same_failed_command() {
+        let root = temp_dir("later-pass-same-command-receipt");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-LATER-PASS`\n",
+        )
+        .expect("failed to write review");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-LATER-PASS.json"),
+            r#"{"commands":[{"command":"rg -n HotRoller|crapsHotRollerTotalNumerator contracts/src contracts/tests","exit_code":127,"status":"failed"},{"command":"rg -n \"HotRoller|crapsHotRollerTotalNumerator\" contracts/src contracts/tests","exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-LATER-PASS",
+            "- [ ] `TASK-LATER-PASS` Example\nVerification:\n  - `rg -n \"HotRoller|crapsHotRollerTotalNumerator\" contracts/src contracts/tests`\nDependencies: none\n",
         );
 
         assert!(evidence.verification_receipt_present);
