@@ -61,3 +61,11 @@
 - Validation: host observed verification receipt at `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-003.json`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff
+
+## `P0-004`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`, `src/super_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-004.json` has unsuperseded failed command(s): `cargo run -- super --dry-run --no-execute snapshot proof`, `cargo test`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-004.json` has unsuperseded failed command(s): `cargo run -- super --dry-run --no-execute snapshot proof`, `cargo test`
