@@ -16,6 +16,7 @@ use crate::task_parser::{parse_tasks, validate_execution_row, PLAN_TASK_PROCESS_
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug,
 };
+use crate::verdict::exact_terminal_verdict;
 use crate::{
     AuditHarvestArgs, CorpusArgs, GenerationArgs, ParallelAction, ParallelArgs,
     ParallelCargoTarget, SuperArgs,
@@ -36,6 +37,7 @@ const SUPER_GENERATION_MODE_SNAPSHOT_ONLY: &str = "snapshot-only";
 const SUPER_PLAN_SOURCE_GENERATED_SNAPSHOT: &str = "generated snapshot";
 const SUPER_PLAN_SOURCE_ROOT_LEDGER: &str = "root ledger";
 const SUPER_ROOT_PLAN_STATUS_UNCHANGED: &str = "unchanged";
+const SUPER_EXECUTION_GATE_VERDICTS: [&str; 2] = ["Verdict: GO", "Verdict: NO-GO"];
 
 #[derive(Clone, Deserialize, Serialize)]
 struct SuperManifest {
@@ -820,16 +822,26 @@ async fn run_super_execution_gate(
     )
     .await?;
     let gate_path = super_root.join(EXECUTION_GATE_FILE);
-    require_nonempty_file(&gate_path)?;
-    let gate = fs::read_to_string(&gate_path)
+    validate_super_execution_gate_report(&gate_path)
+}
+
+fn validate_super_execution_gate_report(gate_path: &Path) -> Result<()> {
+    require_nonempty_file(gate_path)?;
+    let gate = fs::read_to_string(gate_path)
         .with_context(|| format!("failed to read {}", gate_path.display()))?;
-    if !gate.lines().any(|line| line.trim() == "Verdict: GO") {
-        bail!(
-            "super execution gate did not approve parallel execution; expected `Verdict: GO` in {}",
+    let verdict = exact_terminal_verdict(&gate, &SUPER_EXECUTION_GATE_VERDICTS)
+        .with_context(|| format!("invalid terminal verdict in {}", gate_path.display()))?;
+    match verdict.as_deref() {
+        Some("Verdict: GO") => Ok(()),
+        Some(found) => bail!(
+            "super execution gate did not approve parallel execution; found `{found}` in {}; expected exactly one `Verdict: GO` terminal verdict",
             gate_path.display()
-        );
+        ),
+        None => bail!(
+            "super execution gate did not approve parallel execution; missing terminal verdict in {}; expected exactly one `Verdict: GO` or `Verdict: NO-GO`",
+            gate_path.display()
+        ),
     }
-    Ok(())
 }
 
 async fn run_super_codex_phase(
@@ -2213,6 +2225,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn super_execution_gate_rejects_mixed_verdicts() {
+        let gate_path = execution_gate_file(
+            "mixed",
+            "# SUPER EXECUTION GATE\n\nVerdict: GO\n\nLater:\nVerdict: NO-GO\n",
+        );
+
+        let error = validate_super_execution_gate_report(&gate_path)
+            .expect_err("mixed verdicts must fail closed");
+
+        assert!(format!("{error:#}").contains("exactly one terminal verdict"));
+    }
+
+    #[test]
+    fn super_execution_gate_rejects_duplicate_verdicts() {
+        let gate_path = execution_gate_file(
+            "duplicate",
+            "# SUPER EXECUTION GATE\n\nVerdict: GO\n\nQueue summary\n\nVerdict: GO\n",
+        );
+
+        let error = validate_super_execution_gate_report(&gate_path)
+            .expect_err("duplicate verdicts must fail closed");
+
+        assert!(format!("{error:#}").contains("exactly one terminal verdict"));
+    }
+
+    #[test]
+    fn super_execution_gate_rejects_missing_verdict() {
+        let gate_path = execution_gate_file(
+            "missing",
+            "# SUPER EXECUTION GATE\n\nQueue summary\n- Not ready\n",
+        );
+
+        let error = validate_super_execution_gate_report(&gate_path)
+            .expect_err("missing verdicts must fail closed");
+
+        assert!(format!("{error:#}").contains("missing terminal verdict"));
+    }
+
+    #[test]
+    fn super_execution_gate_rejects_invalid_verdict() {
+        let gate_path = execution_gate_file(
+            "invalid",
+            "# SUPER EXECUTION GATE\n\nVerdict: PASS-ish\n\nQueue summary\n- Ambiguous\n",
+        );
+
+        let error = validate_super_execution_gate_report(&gate_path)
+            .expect_err("invalid verdicts must fail closed");
+
+        assert!(format!("{error:#}").contains("invalid terminal verdict line"));
+    }
+
+    #[test]
+    fn super_execution_gate_accepts_single_go_verdict() {
+        let gate_path = execution_gate_file(
+            "single-go",
+            "# SUPER EXECUTION GATE\n\nVerdict: GO\n\nQueue summary\n- Ready\n\nChanges made\n- None\n\nRemaining risks\n- None\n\nPromotion and later parallel launch notes\n- Promote snapshot before launch\n",
+        );
+
+        validate_super_execution_gate_report(&gate_path).unwrap();
+    }
+
     fn valid_plan(verification: &str) -> String {
         format!(
             r#"# IMPLEMENTATION_PLAN
@@ -2262,6 +2336,15 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn execution_gate_file(label: &str, content: &str) -> PathBuf {
+        let root = temp_dir(&format!("super-execution-gate-{label}"));
+        let super_root = root.join(".auto").join("super").join("run-1");
+        fs::create_dir_all(&super_root).unwrap();
+        let gate_path = super_root.join(EXECUTION_GATE_FILE);
+        fs::write(&gate_path, content).unwrap();
+        gate_path
     }
 
     fn super_args() -> SuperArgs {
