@@ -202,6 +202,30 @@ impl QuotaConfig {
     }
 }
 
+/// Resolve the CODEX_HOME for a quota profile, honoring the isolated
+/// `<profile_dir>/codex-home/` subdir layout when present.
+///
+/// Isolated layout is required to avoid OpenAI's cross-account session
+/// revocation: every codex login from the same `installation_id` revokes
+/// the prior account's refresh token. Each profile having its own
+/// CODEX_HOME (with its own `installation_id`) makes OpenAI treat the
+/// accounts as separate devices.
+pub(crate) fn codex_home_for_profile(profile_dir: &Path) -> PathBuf {
+    let subdir = profile_dir.join("codex-home");
+    if subdir.join("auth.json").exists() {
+        subdir
+    } else {
+        profile_dir.to_path_buf()
+    }
+}
+
+/// True iff this Codex profile uses the isolated `codex-home/` layout.
+/// Callers should skip the legacy `~/.codex/auth.json` file swap and
+/// instead spawn codex with `CODEX_HOME=<profile_dir>/codex-home`.
+pub(crate) fn codex_profile_uses_isolated_home(profile_dir: &Path) -> bool {
+    profile_dir.join("codex-home").join("auth.json").exists()
+}
+
 pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Result<()> {
     ensure_profile_path_contained(&QuotaConfig::profiles_dir(), profile_dir)?;
     let staged_profile_dir = staged_profile_dir(profile_dir)?;

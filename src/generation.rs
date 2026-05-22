@@ -161,7 +161,16 @@ const REQUIRED_PLAN_SECTIONS: [&str; 3] = [
     "## Follow-On Work",
     "## Completed / Already Satisfied",
 ];
-const CORPUS_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
+const CORPUS_PRIORITY_PLAN_REQUIRED_SECTIONS: [&str; 7] = [
+    "## Priority Decision",
+    "## User / Operator Outcome",
+    "## Evidence",
+    "## Scope Boundary",
+    "## Implementation Slice",
+    "## Verification",
+    "## Deferred",
+];
+const CORPUS_LEGACY_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
     "## Purpose / Big Picture",
     "## Requirements Trace",
     "## Scope Boundaries",
@@ -179,6 +188,24 @@ const CORPUS_EXECPLAN_REQUIRED_SECTIONS: [&str; 15] = [
     "## Interfaces and Dependencies",
 ];
 const CODEX_SKILL_BOUNDARY: &str = "IMPORTANT: Do NOT read or execute any SKILL.md files or files in skill definition directories (paths containing skills/gstack). These are AI assistant skill definitions meant for a different system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Stay focused on the repository code only.";
+const PRIORITY_FOCUS_LENS: &str = r#"Priority focus lens:
+- Prioritize by product leverage, user-visible clarity, and engineering feasibility/tests. The best output is not the largest audit; it is the smallest truthful slice that improves the product or operator experience and can be proven with narrow verification.
+- Treat the corpus as a priority map for the next implementation cycle, not as an audit book or documentation exercise.
+- Meld the CEO, design, and engineering perspectives into one ranking:
+  1. User/operator value: does this create or unblock the core product loop?
+  2. Design clarity: will a user or operator know what to do, what state they are in, and how to recover?
+  3. Engineering leverage: does this reduce the biggest implementation risk, source-of-truth drift, or verification gap?
+  4. Evidence: is there code, tests, logs, or direct repo evidence that this matters now?
+  5. Parallel executability: can one focused worker land the slice with concrete verification?
+- For repos that are not production codebases yet, do not front-load large documentation, audit, governance, release, or artifact-expansion work. Capture only the smallest docs needed to keep implementation truthful.
+- Documentation, audits, reports, generated snapshots, and process artifacts are support evidence, not the goal. They only outrank code, tests, or UX/runtime work when they directly unblock the next executable slice or correct stale instructions that would send workers into the wrong files.
+- Prefer vertical slices that make the system run, become testable, or become understandable to its intended user/operator over broad inventory, book-writing, or report-only tasks.
+- Priority classes:
+  - P0: blocks using, learning from, or validating the core product loop now.
+  - P1: unlocks multiple future slices, removes high-risk ambiguity, or makes tests catch real regressions.
+  - P2: cleanup, polish, docs, audits, reports, or artifact hygiene that does not unlock immediate learning.
+- Score candidates by user/operator pain, code leverage/reuse, risk retired, executable proof within one worker slice, and subtraction/scope reduction. Apply a penalty to docs/audit/artifact-only work unless it directly unblocks P0/P1 implementation.
+- Every top priority must state why it outranks plausible alternatives using the combined product/design/engineering lens above."#;
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     let run_started_at = Instant::now();
@@ -1055,7 +1082,14 @@ async fn run_logged_codex_review(
     // operator picks an opus/sonnet/claude alias for `--review-model`. The
     // codex path still applies for gpt-5.5 and explicit codex models.
     if author_phase_uses_claude_model(model) {
-        return run_logged_claude_review(repo_root, phase_slug, prompt, model, reasoning_effort, report_path);
+        return run_logged_claude_review(
+            repo_root,
+            phase_slug,
+            prompt,
+            model,
+            reasoning_effort,
+            report_path,
+        );
     }
     let prompt_path = repo_root
         .join(".auto")
@@ -1565,6 +1599,14 @@ fn normalize_corpus_execplan_heading_line(line: &str) -> Option<String> {
     let unnumbered = strip_ordered_list_marker(rest).unwrap_or(rest).trim();
     let canonical = match unnumbered.to_ascii_lowercase().as_str() {
         "purpose and big picture" | "purpose / big picture" => "## Purpose / Big Picture",
+        "priority decision" => "## Priority Decision",
+        "user / operator outcome" | "user/operator outcome" | "user and operator outcome" => {
+            "## User / Operator Outcome"
+        }
+        "evidence" => "## Evidence",
+        "scope boundary" => "## Scope Boundary",
+        "implementation slice" => "## Implementation Slice",
+        "deferred" => "## Deferred",
         "requirements trace" => "## Requirements Trace",
         "scope boundaries" => "## Scope Boundaries",
         "progress" => "## Progress",
@@ -1687,16 +1729,68 @@ fn verify_corpus_execplan(plan_path: &Path) -> Result<()> {
             plan_path.display()
         );
     }
-    for section in CORPUS_EXECPLAN_REQUIRED_SECTIONS {
-        if !markdown_section_has_nonempty_body(&markdown, section) {
-            bail!(
-                "corpus plan {} is missing non-empty ExecPlan section `{}`",
-                plan_path.display(),
-                section
-            );
-        }
+    if corpus_plan_has_sections(&markdown, &CORPUS_PRIORITY_PLAN_REQUIRED_SECTIONS) {
+        verify_corpus_priority_plan(plan_path, &markdown)?;
+        return Ok(());
     }
-    if !markdown_section_contains(&markdown, "## Progress", |line| {
+    if !corpus_plan_has_sections(&markdown, &CORPUS_LEGACY_EXECPLAN_REQUIRED_SECTIONS) {
+        let missing_priority =
+            missing_corpus_sections(&markdown, &CORPUS_PRIORITY_PLAN_REQUIRED_SECTIONS).join(", ");
+        let missing_legacy =
+            missing_corpus_sections(&markdown, &CORPUS_LEGACY_EXECPLAN_REQUIRED_SECTIONS)
+                .join(", ");
+        bail!(
+            "corpus plan {} must use either compact priority-plan sections (missing: {}) or legacy ExecPlan sections (missing: {})",
+            plan_path.display(),
+            missing_priority,
+            missing_legacy
+        );
+    }
+    verify_corpus_legacy_execplan(plan_path, &markdown)
+}
+
+fn corpus_plan_has_sections(markdown: &str, sections: &[&str]) -> bool {
+    sections
+        .iter()
+        .all(|section| markdown_section_has_nonempty_body(markdown, section))
+}
+
+fn missing_corpus_sections(markdown: &str, sections: &[&str]) -> Vec<String> {
+    sections
+        .iter()
+        .copied()
+        .filter(|section| !markdown_section_has_nonempty_body(markdown, section))
+        .map(str::to_string)
+        .collect()
+}
+
+fn verify_corpus_priority_plan(plan_path: &Path, markdown: &str) -> Result<()> {
+    let has_code_slice = ["goal", "files", "test"].into_iter().all(|fragment| {
+        markdown_section_contains(markdown, "## Implementation Slice", |line| {
+            line.to_ascii_lowercase().contains(fragment)
+        })
+    });
+    let has_decision_slice =
+        markdown_section_contains(markdown, "## Implementation Slice", |line| {
+            line.to_ascii_lowercase()
+                .contains("test expectation: none --")
+        }) && markdown_section_contains(markdown, "## Implementation Slice", |line| {
+            let lowered = line.to_ascii_lowercase();
+            ["decision", "checkpoint", "research", "validation", "gate"]
+                .into_iter()
+                .any(|fragment| lowered.contains(fragment))
+        });
+    if !has_code_slice && !has_decision_slice {
+        bail!(
+            "corpus plan {} must describe an implementation-slice goal/files/tests or an explicit decision/checkpoint slice in `## Implementation Slice`",
+            plan_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_corpus_legacy_execplan(plan_path: &Path, markdown: &str) -> Result<()> {
+    if !markdown_section_contains(markdown, "## Progress", |line| {
         let trimmed = line.trim_start();
         trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]")
     }) {
@@ -1913,6 +2007,8 @@ Additional operator-provided context:
 {reference_repo_clause}
 {active_plan_clause}
 
+{priority_focus_lens}
+
 Mandatory output files:
 - `{planning_root}/ASSESSMENT.md`
 - `{planning_root}/SPEC.md`
@@ -1957,6 +2053,7 @@ Review the actual codebase first, not just docs:
   - DX review must cover first-run developer/operator experience, learn-by-doing paths, error clarity, time-to-hello-world, honest examples, and uncertainty-reducing docs or tooling when applicable.
   - Classify important planning decisions as `Mechanical`, `Taste`, or `User Challenge`. Treat model disagreements and close alternatives as taste decisions that need a short rationale. Treat any point that would change the operator's stated direction as a user challenge instead of silently auto-deciding it.
   - Use these decision principles: choose completeness, inspect broadly when the problem requires it, stay pragmatic, avoid redundant artifacts, prefer explicit contracts over clever prose, and bias toward action when evidence is sufficient.
+- Apply the priority focus lens when ranking outputs: a small implementation slice that proves the core loop, fixes a runtime/source-of-truth gap, or makes a user/operator path clear should outrank a large documentation, audit, or artifact-only exercise unless the artifact directly unblocks that slice.
 
 {idea_context_clause}
 {focus_context_clause}
@@ -1974,62 +2071,50 @@ ASSESSMENT.md must include:
 - assumption ledger: what seems true, what is verified, and what still needs proof
 - focus-response section: what the operator focus emphasized, what the code says about it, and any non-focused risks that still outrank it
 - opportunity framing: strongest direction, rejected directions, and why they were rejected
+- priority focus map: the top 3-5 focus areas, each scored qualitatively against user/operator value, design clarity, engineering leverage, evidence, and parallel executability
 - for developer-facing repos: a short DX assessment covering first-run friction, copy-paste onboarding honesty, error clarity, and whether the fastest path produces a meaningful success moment
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
 
 `{planning_root}/PLANS.md` must index the generated plan set and explain sequencing, dependency order, and why the chosen slice order is preferable to obvious alternatives. This file is an index, not the ExecPlan authoring standard. If the target repo has a root `PLANS.md`, read the entire file before writing numbered plans, treat it as the governing ExecPlan standard, and make the generated index say that numbered plans follow the root `PLANS.md` standard. Determine the active planning surface from the repo's own instructions and control docs rather than assuming it from filename alone. If the target repo already has active root plans under `plans/` and no repo instruction overrides that, the generated index must say those root plans remain the active planning surface and that the generated corpus is subordinate to them. If repo instructions designate `{planning_root}` as the active planning corpus, the generated index must say that explicitly instead of inventing root-level primacy.
 
+GENESIS-REPORT.md must start with `## Priority Focus` before general findings. That section must list the top 3-5 focus areas in priority order and explain why each outranks plausible documentation, audit, artifact, or process work right now.
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
 If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
 GENESIS-REPORT.md must also include a concise decision audit trail with `Mechanical`, `Taste`, and `User Challenge` classifications for major scope and sequencing choices.
 
-Each numbered plan under `{planning_root}/plans/` must be a full ExecPlan, not a high-level task stub. The generated plan file itself is the ExecPlan, so omit surrounding triple-backtick fences and do not nest fenced code blocks inside it; use indented command blocks when examples are needed.
+Each numbered plan under `{planning_root}/plans/` must be a compact priority plan, not a high-level task stub and not a 15-section audit document. The generated plan file itself is the plan, so omit surrounding triple-backtick fences and do not nest fenced code blocks inside it; use indented command blocks when examples are needed.
 
-ExecPlan requirements for every numbered plan:
+Priority-plan requirements for every numbered plan:
 - start with a markdown H1 title
 - do not include YAML front matter or metadata blocks before the H1
-- include the living-document paragraph from the root `PLANS.md` skeleton: "This ExecPlan is a living document..." and say it must be maintained in accordance with root `PLANS.md` when that file exists
 - be fully self-contained for a novice who has only the current working tree and that single plan file
 - define every non-obvious term in plain language and tie it to concrete repo files or commands
 - describe one concrete vertical slice or research gate, not a vague epic
+- prefer code/test/UX/runtime-contract slices over docs-only or audit-only work; keep docs-only and report-only plans out of the first priority group unless they unblock implementation or prevent workers from following stale instructions
 - if a slice feels larger than one focused implementation session, split it into additional numbered plans
 - keep future-phase plans with unresolved feasibility research-shaped, with explicit decision gates before implementation promises
-- after every 2-3 numbered plans or at meaningful phase boundaries, include an explicit checkpoint or decision-gate plan file that says what must be true before later work proceeds
+- after every 2-3 numbered plans or at meaningful phase boundaries, include an explicit checkpoint or decision-gate plan only when later work truly depends on unresolved evidence
 
 Every numbered plan under `{planning_root}/plans/` must include these non-empty sections, using these exact headings:
-- `## Purpose / Big Picture`
-- `## Requirements Trace`
-- `## Scope Boundaries`
-- `## Progress`
-- `## Surprises & Discoveries`
-- `## Decision Log`
-- `## Outcomes & Retrospective`
-- `## Context and Orientation`
-- `## Plan of Work`
-- `## Implementation Units`
-- `## Concrete Steps`
-- `## Validation and Acceptance`
-- `## Idempotence and Recovery`
-- `## Artifacts and Notes`
-- `## Interfaces and Dependencies`
+- `## Priority Decision`
+- `## User / Operator Outcome`
+- `## Evidence`
+- `## Scope Boundary`
+- `## Implementation Slice`
+- `## Verification`
+- `## Deferred`
 
-Section requirements for numbered ExecPlans:
-- `## Purpose / Big Picture` explains what a user or operator gains and how they can see it working
-- `## Requirements Trace` uses requirement labels such as `R1`, `R2`, and states the contracts or success criteria the work must satisfy
-- `## Scope Boundaries` states what the plan intentionally does not change and what adjacent surfaces remain unchanged
-- `## Progress` uses checkbox bullets with timestamps; unchecked items are allowed for newly generated plans, but the section must reflect the current state truthfully
-- `## Surprises & Discoveries`, `## Decision Log`, and `## Outcomes & Retrospective` must exist even before implementation starts; use "None yet" only when that is true, and include the rationale for initial plan-shaping decisions in the decision log
-- `## Context and Orientation` names the relevant repository-relative files, functions, modules, commands, and current behavior so a novice can navigate without prior context
-- `## Plan of Work` describes the sequence of edits and additions in prose, with file paths and concrete locations where possible
-- `## Implementation Units` breaks work into independently verifiable units; each unit must name the goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only, checkpoint, or index/master plans, include the artifact to create, name the file it produces or updates, and write `Test expectation: none -- <reason>` only when no code behavior changes.
-- `## Concrete Steps` gives exact commands to run from the repository root and short expected observations where useful
-- `## Validation and Acceptance` phrases acceptance as observable behavior with specific inputs, commands, outputs, or artifacts; name tests that should fail before the work and pass after when applicable
-- `## Idempotence and Recovery` explains how to rerun steps safely and how to recover from partial completion
-- `## Artifacts and Notes` captures concise evidence snippets, logs, or diffs that prove success or will be filled in as work proceeds
-- `## Interfaces and Dependencies` names the concrete modules, APIs, traits, commands, services, or external dependencies the plan uses or changes
+Section requirements for numbered priority plans:
+- `## Priority Decision` states P0/P1/P2, the score/rationale, and why this outranks plausible alternatives.
+- `## User / Operator Outcome` explains what a user or operator gains and how they can see it working.
+- `## Evidence` names repository-relative code, tests, logs, commands, or docs that prove this priority is real.
+- `## Scope Boundary` states what the plan intentionally does not change, especially docs/audits/artifacts that are not needed now.
+- `## Implementation Slice` names the goal, dependencies, files to create or modify, tests to add or modify, and the approach. For research/checkpoint plans, name the decision artifact and write `Test expectation: none -- <reason>` only when no code behavior changes.
+- `## Verification` gives exact commands or checks from the repository root and the expected observation.
+- `## Deferred` lists follow-on work that is intentionally not part of this slice.
 
-Do not use the short `## Objective` / `## Description` / `## Acceptance Criteria` / `## Verification` / `## Dependencies` shape for numbered plans. That shape is too high-level for this corpus. Use the full ExecPlan envelope above.
+Do not use the short `## Objective` / `## Description` / `## Acceptance Criteria` / `## Verification` / `## Dependencies` shape for numbered plans. That shape is too high-level for this corpus. Do not use the old 15-section ExecPlan envelope unless a repo-local instruction explicitly requires it.
 
 Never trust docs over code. If docs claim something the code does not support, say so clearly."#,
         target_repo = repo_root.display(),
@@ -2042,6 +2127,7 @@ Never trust docs over code. If docs claim something the code does not support, s
         focus_output_clause = focus_output_clause,
         idea_context_clause = idea_context_clause,
         focus_context_clause = focus_context_clause,
+        priority_focus_lens = PRIORITY_FOCUS_LENS,
     )
 }
 
@@ -2113,9 +2199,12 @@ Edit boundary:
 
 {reference_repo_clause}{active_plan_clause}
 
+{priority_focus_lens}
+
 Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
+- Enforce the priority focus lens: if the corpus ranks a documentation, audit, report, or generated-artifact exercise above executable product/code/test/UX progress, require code-grounded evidence that it directly unblocks the next slice. Otherwise move it behind higher-leverage implementation focus.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
 - Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in `GENESIS-REPORT.md`, `ASSESSMENT.md`, or `{report_path}`.
 - Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend the corpus only when the repository evidence supports the change.
@@ -2140,17 +2229,19 @@ DX review pass, when applicable:
 
 Corpus-specific validation:
 - `ASSESSMENT.md` must say what was actually inspected, separate verified facts from assumptions, and call out stale doc claims.
+- `ASSESSMENT.md` must include a priority focus map with the top 3-5 focus areas ranked by user/operator value, design clarity, engineering leverage, evidence, and parallel executability.
 - `SPEC.md` must describe concrete current behavior and intended near-term direction without presenting guesses as settled facts.
 - `PLANS.md` under `{planning_root}` must be an index to the generated plan set, not a substitute for the repo root ExecPlan standard.
 - Determine the active planning surface from repo instructions and control docs, not from filenames alone.
 - If active root plans already exist under `plans/` and the repo's own instructions do not designate another active planning root, the generated corpus must explicitly reconcile to them and must not present itself as a second active planning surface.
 - If repo-root instructions explicitly designate `{planning_root}` as the active planning corpus, the generated corpus should say that plainly and should not invent root-level primacy.
-- Every numbered plan under `{planning_root}/plans/` must be a full ExecPlan rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape.
-- Numbered ExecPlans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
+- `GENESIS-REPORT.md` must start with `## Priority Focus` and explain why the chosen top focus areas outrank plausible documentation, audit, artifact, or process work right now.
+- Every numbered plan under `{planning_root}/plans/` must use the compact priority-plan shape rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape or the bulky 15-section audit-style ExecPlan shape.
+- Numbered priority plans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
 - Reject or rewrite any absolute repo-root path that appears in the corpus. Use repository-relative references, "the repository root" in prose, or `cd "$(git rev-parse --show-toplevel)"` in shell examples instead.
-- Every numbered ExecPlan must include non-empty sections for `Purpose / Big Picture`, `Requirements Trace`, `Scope Boundaries`, `Progress`, `Surprises & Discoveries`, `Decision Log`, `Outcomes & Retrospective`, `Context and Orientation`, `Plan of Work`, `Implementation Units`, `Concrete Steps`, `Validation and Acceptance`, `Idempotence and Recovery`, `Artifacts and Notes`, and `Interfaces and Dependencies`.
-- `Progress` must include checkbox bullets. `Implementation Units` must name goal, requirements advanced, dependencies, files to create or modify, tests to add or modify, approach, and specific test scenarios. For research-only, checkpoint, or index/master work, name the artifact or index file being produced and explain why no code test is expected.
-- Add checkpoint or decision-gate plans after each risky cluster or every 2-3 numbered plans when later work depends on unresolved evidence.
+- Every numbered priority plan must include non-empty sections for `Priority Decision`, `User / Operator Outcome`, `Evidence`, `Scope Boundary`, `Implementation Slice`, `Verification`, and `Deferred`.
+- `Priority Decision` must state P0/P1/P2 and why the slice outranks plausible docs/audit/artifact work. `Implementation Slice` must name goal, dependencies, files to create or modify, tests to add or modify, and approach. For research-only or checkpoint work, name the decision artifact and explain why no code test is expected.
+- Add checkpoint or decision-gate plans only when later work depends on unresolved evidence.
 
 Validation expectations:
 - Use lightweight local inspection commands as needed, such as `rg`, `ls`, and targeted file reads. Do not run long integration suites or production-affecting commands for this document review pass.
@@ -2164,6 +2255,7 @@ Validation expectations:
         report_path = report_path.display(),
         reference_repo_clause = reference_repo_clause,
         active_plan_clause = active_plan_clause,
+        priority_focus_lens = PRIORITY_FOCUS_LENS,
     )
 }
 
@@ -2197,9 +2289,12 @@ Edit boundary:
 - Do not edit root `specs/`, root `IMPLEMENTATION_PLAN.md`, source code, the planning corpus, or any skill definition directory. The generator will sync reviewed outputs to the root after your pass.
 - Do not ask the user questions. Make conservative, code-grounded decisions and record uncertainty.
 
+{priority_focus_lens}
+
 Review method adapted from the latest gstack `/autoplan` workflow:
 - Run review phases in order: CEO, Design when user-facing UI or UX is in scope, Eng, and DX when the repo is developer-facing or has a meaningful setup/API/operator experience.
 - Use these decision principles: choose completeness over shortcuts; be willing to inspect broadly when needed; be pragmatic; avoid duplicate/redundant artifacts; prefer explicit contracts over clever prose; bias toward action when evidence is sufficient.
+- Enforce the priority focus lens: specs and tasks should identify the next highest-leverage implementation focus areas. Move docs-only, audit-only, report-only, and artifact-only work behind executable source/test/UX/runtime work unless it directly unblocks that work.
 - Classify important review decisions in the report as `Mechanical`, `Taste`, or `User Challenge`.
 - Treat a `User Challenge` as any point where both the authoring pass and your independent review would recommend changing the user's stated direction. Do not silently auto-decide those; preserve the challenge explicitly in the generated docs or `{report_path}`.
 - Treat author-vs-review disagreements that are not mechanical as `Taste` decisions, explain why you chose one direction, and amend generated docs only when repository evidence supports the change.
@@ -2238,6 +2333,7 @@ Generated implementation plan validation:
 - Every unfinished task must include `Spec:`, `Why now:`, `Codebase evidence:`, `Owns:`, `Integration touchpoints:`, `Scope boundary:`, `Acceptance criteria:`, `Verification:`, `Required tests:`, `Completion artifacts:`, `Dependencies:`, `Estimated scope:`, and `Completion signal:`.
 - Every unfinished task must also include `Source of truth:`, `Runtime owner:`, `UI consumers:`, `Generated artifacts:`, `Fixture boundary:`, `Retired surfaces:`, `Contract generation:`, `Cross-surface tests:`, and `Review/closeout:`.
 - Runtime-impacting tasks should implement runtime/API truth before UI consumers, regenerate contracts before consumer adaptation, and include an independent closeout proof that catches the original drift.
+- Priority work should be code/test/UX/runtime-contract forward. Documentation, audit, report, or generated-artifact-only tasks need explicit `Why now:` evidence that they unblock implementation; otherwise demote them to follow-on work.
 - Every `Spec:` reference must point to a spec file that exists under `{output_dir}/specs/`.
 - Behavior-changing tasks should prefer a prove-it validation path: failing test or repro first, green proof, then broader regression check.
 - Research or design tasks must name the closing artifact or decision and must not promise implementation details before the prerequisite evidence exists.
@@ -2255,6 +2351,7 @@ Validation expectations:
         planning_root = planning_root.display(),
         output_dir = output_dir.display(),
         report_path = report_path.display(),
+        priority_focus_lens = PRIORITY_FOCUS_LENS,
     )
 }
 
@@ -2326,6 +2423,8 @@ Idea-seed context:
 Focus context:
 {focus_clause}
 
+{priority_focus_lens}
+
 Required output contract:
 - Write one markdown file per generated spec into `{output_dir}/specs/`
 - Filenames must use `ddmmyy-topic-slug.md`
@@ -2366,6 +2465,7 @@ Required output contract:
 - If the repo is developer-facing, capture onboarding, error handling, and first-success expectations truthfully enough that a future worker can improve the DX without guessing
 - Preserve proven current behavior in reverse mode
 - In gen mode, preserve intended future direction from the corpus, but keep future intent under recommendations or hypotheses until code or primary-source evidence proves otherwise
+- Generate specs for the highest-priority product/system focus areas first. Do not multiply specs for docs, audits, reports, or artifacts unless they directly unblock an executable implementation slice.
 
 Cover the main product and system surfaces represented in the repo. Use the codebase and the planning corpus to decide the right spec set."#,
         repo_root = repo_root.display(),
@@ -2385,6 +2485,7 @@ Cover the main product and system surfaces represented in the repo. Use the code
         } else {
             plan_listing
         },
+        priority_focus_lens = PRIORITY_FOCUS_LENS,
     )
 }
 
@@ -2426,10 +2527,13 @@ Use up to {parallelism} parallel subagents where helpful.
 Generated specs for this run:
 {spec_listing}
 
+{priority_focus_lens}
+
 Before writing the plan, do the real planning work:
 - operate in read-only planning mode first
 - map dependency order and existing code patterns
 - identify the highest-risk unknowns
+- rank candidate tasks through the priority focus lens before assigning them to `## Priority Work`
 - prefer vertical slices over horizontal layer dumps
 - keep tasks small enough for one focused worker session
 - do not hide ambiguity; encode real blockers and assumptions in the task contracts
@@ -2438,6 +2542,8 @@ Before writing the plan, do the real planning work:
 - do not create implementation tasks whose contract depends on unverified future-phase details; write a research, validation, or decision task first
 - verify every exact current-state fact in the plan from code, tests, or concrete commands before you write it down
 - add explicit checkpoint tasks after each risky cluster or every 2-3 priority tasks so a future worker knows when to stop and re-evaluate before widening scope
+- In `## Priority Work`, prefer tasks that change source code, tests, runtime contracts, user/operator flows, or executable verification. Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work` unless they directly unblock implementation or correct stale guidance that would otherwise make workers implement the wrong thing.
+- Do not turn the priority queue into a documentation or audit campaign for a repo that is not production-ready yet. Make the next `auto parallel` run land the highest-leverage executable improvements.
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
@@ -2486,13 +2592,14 @@ Output requirements:
 - `Source of truth:` must name the canonical runtime/API/spec/doc owner for facts changed by the task
 - `Runtime owner:` must name the engine/runtime path or `none`
 - `UI consumers:` must name concrete UI/presentation paths/routes or `none`
-- `Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`
+- `Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`; this is proof metadata, not a reason to create artifact-only work
 - `Fixture boundary:` must state production cannot import fixture/demo/sample data, or explain why not applicable
 - `Retired surfaces:` must name stale specs/files/contracts to delete/archive/tombstone, or `none`
 - `Owns:` must name concrete path-like owners such as `crates/foo/src/lib.rs`, `crates/foo/`, `docker-compose.yml`, `docs`, or a root crate/directory; do not put shell commands, broad prose, `missing`, `TBD`, or `unspecified` there. Tasks whose only output is a git ref (annotated tag, branch) MUST write the ref path directly, e.g. `Owns: refs/tags/v0.2.0` or `Owns: refs/heads/release/0.3` — prose like `git tags only` is rejected
 - `Integration touchpoints:` should name concrete adjacent modules, route prefixes, commands, or config files; if none exist, write `none`
 - Do not include lane prose, staffing prose, or meta commentary
 - Keep tasks dependency-ordered and bounded; if a task feels bigger than one focused implementation session, break it down again
+- `Why now:` must explain the task's blended product/design/engineering priority, not just that an artifact is missing
 - Any prerequisite, expansion gate, or "after P-..." constraint mentioned in prose must also be encoded in the task's `Dependencies:` field; never rely on prose-only gates
 - Front-load risk where practical, but never at the cost of violating dependency order
 - `Acceptance criteria:` must be specific, testable, and truthful
@@ -2506,7 +2613,7 @@ Output requirements:
 - `Contract generation:` must name the generation/check command for affected generated artifacts, or `none -- no generated contract`
 - `Cross-surface tests:` must name a runtime-output-to-UI/readback proof when UI is affected, or `none -- no UI/runtime boundary`
 - `Review/closeout:` must describe independent proof for the original requirement. It cannot be only `cargo check`; include test, grep/assertion, artifact, or reviewer checklist proof that would catch the original drift returning
-- `Completion artifacts:` must list concrete repo-relative evidence files or directories that must exist before the task can truthfully become done; write `none` only when the task has no durable artifact beyond code/tests/review handoff
+- `Completion artifacts:` must list concrete repo-relative evidence files or directories that must exist before the task can truthfully become done; write `none` only when the task has no durable artifact beyond code/tests/review handoff. This field records proof for the implementation slice, not permission to create reports as the slice.
 - `Verification:` must stay narrow: prefer exact test-name filters and affected-crate checks; do not use `cargo check --workspace`, `cargo test --workspace`, `cargo test --all`, or equivalent broad workspace sweeps as the primary item verification
 - Every `cargo test` verification command must include a concrete test-name/filter token after package or target flags; reject package-wide commands such as `cargo test -p crate`, `cargo test -p crate --lib`, or `cargo test -p crate --test integration_file`
 - Put only unfinished work in the unchecked queue sections
@@ -2524,6 +2631,7 @@ The goal is a truthful, execution-ready implementation queue."#,
         } else {
             spec_listing
         },
+        priority_focus_lens = PRIORITY_FOCUS_LENS,
     )
 }
 
@@ -2852,9 +2960,7 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         .context("generated implementation plan failed shared execution-row validation")
     {
         if lenient {
-            eprintln!(
-                "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
-            );
+            eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
         } else {
             return Err(err);
         }
@@ -2878,9 +2984,7 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
         })();
         if let Err(err) = block_validation {
             if lenient {
-                eprintln!(
-                    "warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)"
-                );
+                eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
                 continue;
             }
             return Err(err);
@@ -2988,11 +3092,6 @@ fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn field_value_is_none(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    normalized == "none" || normalized.starts_with("none --") || normalized.starts_with("none -")
 }
 
 fn strip_list_bullet(line: &str) -> &str {
@@ -4313,15 +4412,17 @@ Spec: `specs/050426-deterministic-transcripts.md`
 
         assert!(prompt.contains("key assumptions to validate next"));
         assert!(prompt.contains("alternatives considered"));
-        assert!(prompt.contains("explicit checkpoint or decision-gate plan file"));
+        assert!(prompt.contains("explicit checkpoint or decision-gate plan only when"));
         assert!(prompt.contains("prefer `AGENTS.md`"));
-        assert!(prompt.contains("must be a full ExecPlan"));
-        assert!(prompt.contains("## Purpose / Big Picture"));
-        assert!(prompt.contains("## Requirements Trace"));
-        assert!(prompt.contains("## Implementation Units"));
+        assert!(prompt.contains("must be a compact priority plan"));
+        assert!(prompt.contains("## Priority Decision"));
+        assert!(prompt.contains("## User / Operator Outcome"));
+        assert!(prompt.contains("## Implementation Slice"));
         assert!(prompt.contains("Do not use the short `## Objective`"));
         assert!(prompt.contains("current gstack `/autoplan` review discipline"));
-        assert!(prompt.contains("CEO -> Design"));
+        assert!(prompt.contains("Priority focus lens"));
+        assert!(prompt
+            .contains("product leverage, user-visible clarity, and engineering feasibility/tests"));
         assert!(prompt.contains("Never emit the absolute repository-root path"));
         assert!(prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(prompt.contains(
@@ -4365,10 +4466,10 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(
             corpus_prompt.contains("You may edit only markdown files under `/tmp/repo/genesis`")
         );
-        assert!(corpus_prompt.contains("Run review phases in order: CEO, Design"));
+        assert!(corpus_prompt.contains("Priority focus lens"));
         assert!(corpus_prompt.contains("`Mechanical`, `Taste`, or `User Challenge`"));
         assert!(corpus_prompt.contains(
-            "Every numbered plan under `/tmp/repo/genesis/plans/` must be a full ExecPlan"
+            "Every numbered plan under `/tmp/repo/genesis/plans/` must use the compact priority-plan shape"
         ));
         assert!(corpus_prompt.contains("Reject or rewrite any absolute repo-root path"));
         assert!(corpus_prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
@@ -4387,7 +4488,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
         assert!(generation_prompt
             .contains("The generator will sync reviewed outputs to the root after your pass"));
-        assert!(generation_prompt.contains("Run review phases in order: CEO, Design"));
+        assert!(generation_prompt.contains("Priority focus lens"));
+        assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
 
@@ -4550,6 +4652,52 @@ Add the final test transcript here after implementation.
 ## Interfaces and Dependencies
 
 Use the existing `example::proof` module; no new external service is required.
+"#,
+        )
+        .unwrap();
+
+        verify_corpus_execplan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn corpus_priority_plan_validator_accepts_compact_focus_shape() {
+        let root = temp_dir("corpus-priority-plan-ok");
+        let plan_path = root.join("001-core-loop.md");
+        fs::write(
+            &plan_path,
+            r#"# Core Loop Proof
+
+## Priority Decision
+
+P0: prove the core operator loop before expanding docs or audits. Score: user pain 3, code leverage 3, risk retired 2, proof 2, subtraction 2.
+
+## User / Operator Outcome
+
+An operator can run the command, see the expected state, and know whether the loop works.
+
+## Evidence
+
+`src/main.rs`, `src/generation.rs`, and the focused test command show this is the current bottleneck.
+
+## Scope Boundary
+
+This does not write broad audit reports, new governance docs, or release artifacts.
+
+## Implementation Slice
+
+Goal: make the core loop produce a verifiable result.
+Dependencies: none.
+Files to create or modify: `src/generation.rs`, `tests/planning_primacy.rs`.
+Tests to add or modify: add `core_loop_is_prioritized`.
+Approach: change the prompt and prove the generated contract names the priority.
+
+## Verification
+
+    cargo test generation::tests::corpus_priority_plan_validator_accepts_compact_focus_shape
+
+## Deferred
+
+Large documentation refreshes remain follow-on until the loop proof exists.
 "#,
         )
         .unwrap();
@@ -5191,6 +5339,9 @@ No external dependencies.
         assert!(prompt.contains("must include a concrete test-name/filter token"));
         assert!(prompt.contains("must name concrete path-like owners"));
         assert!(prompt.contains("must also be encoded in the task's `Dependencies:` field"));
+        assert!(prompt.contains("rank candidate tasks through the priority focus lens"));
+        assert!(prompt.contains("Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work`"));
+        assert!(prompt.contains("Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`; this is proof metadata"));
     }
 
     #[test]

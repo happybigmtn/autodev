@@ -6490,8 +6490,8 @@ fn build_parallel_lane_prompt(
         verification.narrative_guidance.join(" | ")
     };
     format!(
-        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit or commit `.auto/symphony/verification-receipts/*.json`. Receipt JSON is staging evidence; the host embeds durable proof in closeout commit footers.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.
-- Already-complete check: If you discover the task is genuinely already complete -- all acceptance criteria match the current main tree, all executable verification commands pass, declared completion artifacts exist, and you would not need to add or change any non-doc source file to satisfy the task -- your final commit should be a one-line plan-status-update editing IMPLEMENTATION_PLAN.md to change this task's checkbox from `[~]` to `[x]`, with a commit message of `<repo>: {task_id} mark complete (already shipped)`. Do NOT do this to bluff completion when work is missing; only when the work was provably done in a prior pass and no new code is needed.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
+        "{prompt_template}\n\nParallel assignment for this worker:\n- Assigned task for this lane: `{task_id}` {title}\n- This task is already dependency-ready for this run: {dependency_clause}\n- The host owns queue reconciliation and branch landing in parallel mode.\n- Do not push to `origin/{branch}` or any other remote. Create local commit(s) only; the host will land them onto `{branch}`.\n- Before finishing, run `git status --short`. Finish only with at least one local commit for this task and a clean worktree. If files are still dirty, either commit task-owned leftovers or revert unrelated/formatter spillover before exiting.\n- {protected_clause}\n- {cargo_target_clause}\n- If the repo contains `scripts/run-task-verification.sh`, run the host-parsed executable verification commands through that wrapper instead of invoking them bare. Do not treat narrative `Verification:` prose as literal shell input.\n- Host-parsed executable verification commands: {verification_commands_clause}\n- Narrative verification guidance preserved from the task: {verification_guidance_clause}\n- Source-of-truth discipline: runtime/engine/API owners define facts; UI/presentation code renders those facts. Do not duplicate runtime-owned catalogs, constants, settlement math, risk classifications, eligibility rules, balances, or status derivations in UI code.\n- Runtime-first order: when the task touches both runtime and UI, implement or confirm the runtime/API contract first, regenerate/check generated bindings or schemas second, then update UI consumers.\n- Fixture boundary: production code must not import fixture/demo/sample data as fallback truth. Fixture data belongs in tests, stories, demos, or explicit dev-only harnesses.\n- Contract generation: if the task names generated artifacts or changes runtime/API shapes, run the named generator/check or record `AUTO_ENV_BLOCKER`/`AUTO_VERIFICATION_BLOCKER` with the exact reason it could not run.\n- Cross-surface proof: if UI consumers are named, include at least one runtime-output-to-UI/readback proof or a clear blocker. Component-only tests are insufficient when the original risk is runtime/UI drift.\n- Retire-first cleanup: if the task names retired or superseded surfaces, delete/archive/tombstone them and clean callers/indexes in the same lane when in scope. Do not leave stale active doctrine as a TODO unless the task explicitly gates it.\n- Independent closeout: before your final answer, re-check the original task fields (`Source of truth`, `Runtime owner`, `UI consumers`, `Generated artifacts`, `Fixture boundary`, `Retired surfaces`, and `Review/closeout`) and state how each was satisfied or blocked.\n- If no executable verification commands were parsed, derive the narrowest truthful proof yourself and record blockers honestly instead of patching the wrapper to accept prose.\n- If a proof command exits successfully but reports `0 tests`, treat that proof as not run. Find the exact test/package target or report the verification blocker; do not count zero-test output as passing evidence.\n- Do not use direct target-dir test binaries as final proof unless you built that exact artifact from this lane's current source tree in the immediately preceding command. Prefer `cargo test` or the repo's verification wrapper.\n- If missing external infrastructure blocks verification or runtime smoke tests, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero. Do not present an environment blocker as a code proof failure.\n- Never hand-edit or delete `.auto/symphony/verification-receipts/*.json` and never `git add`/commit them. The wrapper writes them; leave them in the worktree exactly as written. The host will propagate them to canonical after harvest and then embed durable proof in its own closeout commit footer. If you remove them locally, the host cannot promote the task to `[x]`.\n- The host marks this task `- [x]` only when local review handoff, verification evidence, and declared completion artifacts are present. Otherwise it leaves the task `- [~]` for follow-up instead of bluffing completion.
+- Already-complete check: If you discover the task is genuinely already complete -- all acceptance criteria match the current main tree, all executable verification commands pass, declared completion artifacts exist, and you would not need to add or change any non-doc source file to satisfy the task -- do not edit IMPLEMENTATION_PLAN.md yourself. Print `AUTO_ALREADY_COMPLETE: {task_id} <proof command/artifact>` in your final answer and leave host reconciliation to the host. Do NOT use this to bluff completion when work is missing; only when the work was provably done in a prior pass and no new code is needed.\n{preflight_clause}{recovery_clause}\nCanonical queue snapshot when this lane started:\n- Unfinished task count: {pending_count}\n- Currently blocked tasks: {blocked_clause}\n\nAssigned task markdown:\n{markdown}\n",
         task_id = task.id,
         title = task.title,
         dependency_clause = dependency_clause,
@@ -6514,7 +6514,10 @@ fn inspect_lane_repo_progress(repo_root: &Path, base_commit: &str) -> Result<Lan
     let has_new_commits = head.trim() != base_commit;
     let status = status.trim();
     if has_new_commits
-        && std::env::var("AUTO_REJECT_DOCS_ONLY_COMMITS").ok().as_deref() == Some("1")
+        && std::env::var("AUTO_REJECT_DOCS_ONLY_COMMITS")
+            .ok()
+            .as_deref()
+            == Some("1")
         && lane_commit_range_is_docs_only(repo_root, base_commit, head.trim())?
     {
         eprintln!(
@@ -6716,6 +6719,21 @@ fn land_parallel_lane_result(
         &final_range_base,
         &final_lane_head,
     )?;
+    // Receipts the worker wrote to its lane worktree don't reach canonical via
+    // cherry-pick — the worker prompt forbids committing them (`.auto/symphony/
+    // verification-receipts/*.json` is "staging evidence"). Without those files
+    // in canonical, `reconcile_parallel_landed_task` -> `inspect_task_completion_
+    // evidence` cannot see `verification_receipt_present`, so every landing
+    // returns Partial and tasks stay [~] forever. Copy the lane's receipts here
+    // so the host can read them in the same harvest cycle.
+    if let Err(err) =
+        propagate_lane_receipts(&assignment.lane_repo_root, repo_root, &assignment.task.id)
+    {
+        eprintln!(
+            "warning: failed propagating lane-{} receipts for `{}`: {err:#}",
+            assignment.lane_index, assignment.task.id
+        );
+    }
     let completion_status = reconcile_parallel_landed_task(repo_root, assignment, &changed_files)?;
     if completion_status == LoopTaskStatus::Done {
         assignment.task.status = LoopTaskStatus::Done;
@@ -6751,6 +6769,125 @@ fn lane_changed_files(repo_root: &Path, base_commit: &str, head_ref: &str) -> Re
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// Copy a lane worker's `.auto/symphony/verification-receipts/<task>.json` and
+/// `.auto/task-receipts/<task>/` into canonical so the host's `inspect_task_
+/// completion_evidence` can see them when deciding `[~]` vs `[x]`. Workers are
+/// explicitly forbidden from committing these files (per the lane prompt at
+/// parallel_command.rs around line 6493), so without this propagation step the
+/// host's evidence inspector always reports `verification_receipt_present:
+/// false` and every landing returns Partial.
+///
+/// Only the named task's receipts are propagated; other lanes' receipts in the
+/// lane worktree are left alone. Missing files are not an error — the lane
+/// may legitimately have skipped the wrapper for non-verifiable tasks.
+fn propagate_lane_receipts(
+    lane_repo_root: &Path,
+    canonical_root: &Path,
+    task_id: &str,
+) -> Result<()> {
+    let receipt_rel = std::path::PathBuf::from(".auto/symphony/verification-receipts")
+        .join(format!("{task_id}.json"));
+    let src_receipt = lane_repo_root.join(&receipt_rel);
+    let dst_receipt = canonical_root.join(&receipt_rel);
+    if src_receipt.is_file() {
+        if let Some(parent) = dst_receipt.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create canonical receipts dir {}",
+                    parent.display()
+                )
+            })?;
+        }
+        // Read the lane's receipt, rewrite the `commit` and `dirty_state`
+        // fields to match canonical HEAD before writing to canonical. The
+        // lane worker recorded its own local commit SHA in the receipt,
+        // but cherry-pick creates new commit SHAs in canonical — so the
+        // recorded SHA is neither the current HEAD nor an ancestor of it,
+        // which the host's freshness check rejects as "commit mismatch".
+        // Rewriting to canonical's current state restores freshness.
+        let lane_text = std::fs::read_to_string(&src_receipt).with_context(|| {
+            format!(
+                "failed to read lane symphony receipt {}",
+                src_receipt.display()
+            )
+        })?;
+        let mut value: serde_json::Value = serde_json::from_str(&lane_text).with_context(|| {
+            format!(
+                "failed to parse lane symphony receipt {} as JSON",
+                src_receipt.display()
+            )
+        })?;
+        if let Ok(canonical_commit) = git_stdout(canonical_root, ["rev-parse", "HEAD"]) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "commit".to_string(),
+                    serde_json::Value::String(canonical_commit.trim().to_string()),
+                );
+            }
+        }
+        if let Ok(porcelain) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(canonical_root)
+            .args(["status", "--porcelain=v1", "-z"])
+            .output()
+        {
+            if porcelain.status.success() {
+                use sha2::{Digest, Sha256};
+                let fp = format!("{:x}", Sha256::digest(&porcelain.stdout));
+                if let Some(obj) = value.as_object_mut() {
+                    let mut dirty = serde_json::Map::new();
+                    dirty.insert("fingerprint".to_string(), serde_json::Value::String(fp));
+                    obj.insert("dirty_state".to_string(), serde_json::Value::Object(dirty));
+                }
+            }
+        }
+        let pretty = serde_json::to_string_pretty(&value)
+            .context("failed to re-serialize symphony receipt for canonical write")?;
+        std::fs::write(&dst_receipt, pretty + "\n").with_context(|| {
+            format!(
+                "failed to write canonical symphony receipt {}",
+                dst_receipt.display()
+            )
+        })?;
+    }
+
+    let task_receipts_rel = std::path::PathBuf::from(".auto/task-receipts").join(task_id);
+    let src_task_dir = lane_repo_root.join(&task_receipts_rel);
+    let dst_task_dir = canonical_root.join(&task_receipts_rel);
+    if src_task_dir.is_dir() {
+        std::fs::create_dir_all(&dst_task_dir).with_context(|| {
+            format!(
+                "failed to create canonical task-receipts dir {}",
+                dst_task_dir.display()
+            )
+        })?;
+        for entry in std::fs::read_dir(&src_task_dir).with_context(|| {
+            format!(
+                "failed to read lane task-receipts {}",
+                src_task_dir.display()
+            )
+        })? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let dst = dst_task_dir.join(entry.file_name());
+            if dst.exists() {
+                continue;
+            }
+            std::fs::copy(entry.path(), &dst).with_context(|| {
+                format!(
+                    "failed to copy lane task-receipt {} -> {}",
+                    entry.path().display(),
+                    dst.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_parallel_clean_no_commit(
@@ -7235,10 +7372,9 @@ fn mark_task_header_status(line: &str, status: LoopTaskStatus) -> String {
 }
 
 fn render_default_parallel_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
-    append_reference_repo_clause(
-        crate::loop_command::DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch),
-        reference_repos,
-    )
+    let base = crate::loop_command::DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch);
+    let parallel_guard = "\n\nParallel execution guard:\n- This lane implements exactly the assigned task. Do not maintain planning ledgers, write audits, or create report artifacts unless the assigned task explicitly owns them.\n- Preserve completion evidence in code, tests, generated receipts, and final stdout. The host owns queue updates, review handoff, and status reconciliation.\n- Prefer the smallest truthful source/test/runtime/UX proof that closes the task over bonus documentation or artifact volume.\n";
+    append_reference_repo_clause(format!("{base}{parallel_guard}"), reference_repos)
 }
 
 fn repo_forbids_legacy_review_trackers(repo_root: &Path) -> bool {
@@ -7574,6 +7710,8 @@ mod tests {
         assert!(prompt.contains("first actionable unfinished `- [ ]` or `- [~]` task"));
         assert!(prompt.contains("Completion path: <TASK-ID>"));
         assert!(prompt.contains("mark it `- [x]` only when local verification, review handoff, and required completion artifacts are actually in place"));
+        assert!(prompt.contains("Parallel execution guard"));
+        assert!(prompt.contains("Do not maintain planning ledgers, write audits, or create report artifacts unless the assigned task explicitly owns them"));
     }
 
     #[test]
@@ -7777,6 +7915,8 @@ mod tests {
         assert!(prompt.contains("Host preflight report:"));
         assert!(prompt.contains("Host recovery context:"));
         assert!(prompt.contains("Resolve the previous landing conflict."));
+        assert!(prompt.contains("AUTO_ALREADY_COMPLETE: TASK-001"));
+        assert!(!prompt.contains("plan-status-update editing IMPLEMENTATION_PLAN.md"));
     }
 
     #[test]
@@ -9816,7 +9956,8 @@ mod tests {
   Estimated scope: small
 "#;
 
-        let updated = update_task_completion_in_plan_text(plan, "AUDIT-94", LoopTaskStatus::Partial);
+        let updated =
+            update_task_completion_in_plan_text(plan, "AUDIT-94", LoopTaskStatus::Partial);
 
         assert!(
             updated.contains("- [x] `AUDIT-94` Already completed sibling"),

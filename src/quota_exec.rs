@@ -5,11 +5,48 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
-use crate::quota_config::{Provider, QuotaConfig};
+use crate::quota_config::{
+    codex_home_for_profile, codex_profile_uses_isolated_home, Provider, QuotaConfig,
+};
 use crate::quota_patterns::{self, QuotaVerdict};
 use crate::quota_selector;
 use crate::quota_state::QuotaState;
 use crate::util::write_0o600_if_unix;
+
+/// Information about the account the quota router selected for the
+/// current invocation. Passed to the `exec_fn` closure so the spawn
+/// site can inject per-profile env vars (e.g. `CODEX_HOME`).
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedAccount {
+    pub(crate) name: String,
+    pub(crate) provider: Provider,
+    pub(crate) profile_dir: PathBuf,
+}
+
+impl SelectedAccount {
+    /// True iff this Codex profile uses the isolated `codex-home/`
+    /// subdir layout. In that case the router skips the legacy
+    /// `~/.codex/auth.json` file swap and instead spawns codex with
+    /// `CODEX_HOME=<profile_dir>/codex-home`.
+    pub(crate) fn uses_isolated_codex_home(&self) -> bool {
+        matches!(self.provider, Provider::Codex)
+            && codex_profile_uses_isolated_home(&self.profile_dir)
+    }
+
+    /// Env vars to inject into the provider CLI process. Currently
+    /// emits `CODEX_HOME` for Codex profiles with an isolated home.
+    pub(crate) fn extra_env(&self) -> Vec<(String, String)> {
+        if self.uses_isolated_codex_home() {
+            let home = codex_home_for_profile(&self.profile_dir);
+            vec![(
+                "CODEX_HOME".to_string(),
+                home.to_string_lossy().into_owned(),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+}
 
 /// Guard that restores original auth files on drop.
 struct AuthRestoreGuard {
@@ -256,7 +293,16 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
     Ok(())
 }
 
-fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestoreGuard> {
+fn swap_credentials(account: &SelectedAccount) -> Result<AuthRestoreGuard> {
+    // Isolated Codex profiles use CODEX_HOME=<profile_dir>/codex-home at
+    // spawn time, so we don't need to swap `~/.codex/auth.json` at all.
+    // The empty guard makes restore a no-op.
+    if account.uses_isolated_codex_home() {
+        return Ok(AuthRestoreGuard::new(Vec::new()));
+    }
+
+    let provider = account.provider;
+    let profile_dir = account.profile_dir.as_path();
     let target = provider.auth_source();
     let backup_dir = QuotaConfig::config_dir().join("backup");
     fs::create_dir_all(&backup_dir).context("failed to create backup directory")?;
@@ -315,6 +361,16 @@ fn swap_credentials(provider: Provider, profile_dir: &Path) -> Result<AuthRestor
     Ok(guard)
 }
 
+#[cfg(test)]
+fn swap_credentials_legacy(provider: Provider, profile_dir: &Path) -> Result<AuthRestoreGuard> {
+    let account = SelectedAccount {
+        name: "test".to_string(),
+        provider,
+        profile_dir: profile_dir.to_path_buf(),
+    };
+    swap_credentials(&account)
+}
+
 fn acquire_provider_lock(provider: Provider) -> Result<fd_lock::RwLock<fs::File>> {
     let lock_path = QuotaConfig::config_dir().join(format!("swap-{}.lock", provider.label()));
     fs::create_dir_all(QuotaConfig::config_dir()).context("failed to create quota config dir")?;
@@ -342,7 +398,7 @@ fn reserve_account_and_swap<'a>(
         &'a crate::quota_config::AccountEntry,
         Option<crate::quota_usage::AccountUsage>,
     )],
-) -> Result<(String, AuthRestoreGuard)> {
+) -> Result<(SelectedAccount, AuthRestoreGuard)> {
     let mut lock = acquire_provider_lock(provider)?;
     let _write = lock.write().map_err(|e| {
         anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
@@ -363,11 +419,17 @@ fn reserve_account_and_swap<'a>(
         );
     }
 
+    let account = SelectedAccount {
+        name: account_name.clone(),
+        provider,
+        profile_dir,
+    };
+
     state.mark_selected(&account_name, Utc::now())?;
     state.save()?;
 
-    match swap_credentials(provider, &profile_dir) {
-        Ok(guard) => Ok((account_name, guard)),
+    match swap_credentials(&account) {
+        Ok(guard) => Ok((account, guard)),
         Err(error) => {
             state.release_lease(&account_name)?;
             state.save()?;
@@ -404,14 +466,16 @@ fn restore_and_update_state(
 
 /// Run a CLI command with quota-aware account selection and failover.
 ///
-/// `exec_fn` is called with no arguments (credential swap happens before).
+/// `exec_fn` is invoked with the `SelectedAccount` the router chose; the
+/// closure must merge `account.extra_env()` into its own env when spawning
+/// the provider CLI so isolated CODEX_HOME profiles route correctly.
 /// Returns `(ExitStatus, stderr_text)`.
 pub(crate) async fn run_with_quota<F, Fut>(
     provider: Provider,
     exec_fn: F,
 ) -> Result<QuotaExecResult>
 where
-    F: Fn() -> Fut + Send + Sync,
+    F: Fn(SelectedAccount) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<(std::process::ExitStatus, String)>> + Send,
 {
     let config = QuotaConfig::load()?;
@@ -419,14 +483,15 @@ where
 
     for attempt in 0..max_attempts {
         let scored = quota_selector::score_accounts(&config, provider).await?;
-        let (account_name, mut guard) = reserve_account_and_swap(provider, &config, &scored)?;
+        let (account, mut guard) = reserve_account_and_swap(provider, &config, &scored)?;
+        let account_name = account.name.clone();
 
         eprintln!(
             "[quota-router] attempt {}/{max_attempts}: using account '{account_name}'",
             attempt + 1,
         );
 
-        let result = exec_fn().await;
+        let result = exec_fn(account.clone()).await;
 
         match result {
             Ok((status, stderr_text)) => {
@@ -563,13 +628,18 @@ pub(crate) fn is_quota_available(provider: Provider) -> bool {
 pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Result<i32> {
     let config = QuotaConfig::load()?;
     let scored = quota_selector::score_accounts(&config, provider).await?;
-    let (account_name, mut restore_guard) = reserve_account_and_swap(provider, &config, &scored)?;
+    let (account, mut restore_guard) = reserve_account_and_swap(provider, &config, &scored)?;
+    let account_name = account.name.clone();
 
     eprintln!("[quota-router] selected account '{account_name}'");
 
     let bin = provider.label();
-    let status = std::process::Command::new(bin)
-        .args(args)
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    for (key, value) in account.extra_env() {
+        cmd.env(key, value);
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("failed to launch {bin}"))?;
 
@@ -637,7 +707,12 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
     let _lock_guard = lock.write().map_err(|e| {
         anyhow::anyhow!("failed to acquire {provider} lock for credential swap: {e}")
     })?;
-    copy_profile_to_active_auth(provider, &profile_dir)?;
+    // Isolated Codex profiles (`<profile_dir>/codex-home/auth.json`)
+    // route via CODEX_HOME at spawn time, so they don't need the legacy
+    // `~/.codex/auth.json` swap.
+    if !(matches!(provider, Provider::Codex) && codex_profile_uses_isolated_home(&profile_dir)) {
+        copy_profile_to_active_auth(provider, &profile_dir)?;
+    }
 
     let mut state = QuotaState::load()?;
     state.refresh_cooldowns(Utc::now());
@@ -655,13 +730,13 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 mod tests {
     use super::{
         claude_oauth_expires_at, quota_output_has_agent_progress, restore_credentials,
-        run_with_quota, swap_credentials, sync_newer_claude_credentials,
+        run_with_quota, swap_credentials_legacy as swap_credentials, sync_newer_claude_credentials,
     };
     use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
 
-    use std::fs;
     #[cfg(unix)]
     use std::ffi::OsString;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -850,7 +925,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_exec = Arc::clone(&calls);
-        let error = run_with_quota(Provider::Codex, move || {
+        let error = run_with_quota(Provider::Codex, move |_account| {
             let calls = Arc::clone(&calls_for_exec);
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -901,7 +976,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_exec = Arc::clone(&calls);
-        let result = run_with_quota(Provider::Codex, move || {
+        let result = run_with_quota(Provider::Codex, move |_account| {
             let calls = Arc::clone(&calls_for_exec);
             async move {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
@@ -1115,6 +1190,45 @@ mod tests {
         drop(guard);
 
         assert!(!active_auth.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_codex_home_skips_active_auth_swap() {
+        use crate::quota_exec::SelectedAccount;
+        let home = TempQuotaHome::new("quota-exec-isolated-codex");
+        let active_auth = home.home().join(".codex").join("auth.json");
+        fs::create_dir_all(active_auth.parent().unwrap())
+            .expect("failed to create active codex dir");
+        fs::write(&active_auth, br#"{"account":"untouched"}"#).expect("failed to seed active auth");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "isolated");
+        let codex_home = profile_dir.join("codex-home");
+        fs::create_dir_all(&codex_home).expect("failed to create codex-home subdir");
+        fs::write(codex_home.join("auth.json"), br#"{"account":"isolated"}"#)
+            .expect("failed to write isolated auth");
+        fs::write(codex_home.join("installation_id"), b"isolated-uuid\n")
+            .expect("failed to write isolated installation_id");
+
+        let account = SelectedAccount {
+            name: "isolated".to_string(),
+            provider: Provider::Codex,
+            profile_dir: profile_dir.clone(),
+        };
+        assert!(account.uses_isolated_codex_home());
+        let env = account.extra_env();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "CODEX_HOME");
+        assert_eq!(PathBuf::from(&env[0].1), codex_home);
+
+        let guard = super::swap_credentials(&account).expect("isolated swap should succeed");
+        // Active auth was NOT replaced — the worker is expected to read from
+        // CODEX_HOME=<profile_dir>/codex-home instead.
+        let active = fs::read(&active_auth).expect("active auth should remain");
+        assert_eq!(active, br#"{"account":"untouched"}"#);
+        drop(guard);
+        let active_after = fs::read(&active_auth).expect("active auth should still be present");
+        assert_eq!(active_after, br#"{"account":"untouched"}"#);
     }
 
     #[test]

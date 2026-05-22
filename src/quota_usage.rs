@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 
-use crate::quota_config::Provider;
+use crate::quota_config::{codex_home_for_profile, Provider};
 use crate::util::write_0o600_if_unix;
 
 // OAuth token endpoints and client IDs
@@ -392,7 +392,7 @@ fn codex_cli_bin() -> PathBuf {
 }
 
 fn load_codex_auth(profile_dir: &Path) -> Result<serde_json::Value> {
-    let auth_path = profile_dir.join("auth.json");
+    let auth_path = codex_home_for_profile(profile_dir).join("auth.json");
     let auth_text = fs::read_to_string(&auth_path)
         .with_context(|| format!("failed to read {}", auth_path.display()))?;
     serde_json::from_str(&auth_text)
@@ -430,7 +430,7 @@ fn refresh_codex_with_cli(profile_dir: &Path, codex_bin: &Path) -> Result<()> {
             "model_reasoning_effort=\"{CODEX_REFRESH_REASONING_EFFORT}\""
         ))
         .arg(CODEX_REFRESH_PROMPT)
-        .env("CODEX_HOME", profile_dir)
+        .env("CODEX_HOME", codex_home_for_profile(profile_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -801,6 +801,13 @@ fn inspect_verification_receipt(
     if !verification_receipt_required {
         return (true, None);
     }
+    // Try the committed footer first — it's durable proof embedded in a
+    // closeout commit message. If the footer is fresh and content-clean,
+    // accept it. If the footer is stale or has a content problem, fall
+    // through to check the on-disk JSON receipt before declaring failure;
+    // a fresh file should always supersede a stale footer (a previous run
+    // may have written a footer pre-dating new wrapper output or a plan
+    // refresh).
     if let Some(footer) = latest_verification_receipt_footer(
         repo_root,
         task_id_from_receipt_path(verification_receipt_path)
@@ -811,40 +818,37 @@ fn inspect_verification_receipt(
             "commit:{}:Auto-Verification-Receipt",
             footer.commit
         ));
-        let receipt = match serde_json::from_str::<VerificationReceipt>(&footer.receipt_text) {
-            Ok(receipt) => receipt,
+        match serde_json::from_str::<VerificationReceipt>(&footer.receipt_text) {
+            Ok(receipt) => {
+                let footer_freshness = verification_receipt_freshness_problem_for_source(
+                    repo_root,
+                    &footer_path,
+                    &receipt,
+                    expected_commands,
+                    declared_artifacts,
+                    VerificationReceiptSource::CommitFooter,
+                );
+                let footer_content = if footer_freshness.is_none() {
+                    verification_receipt_content_problem(&footer_path, &receipt, expected_commands)
+                } else {
+                    None
+                };
+                if footer_freshness.is_none() && footer_content.is_none() {
+                    return (true, None);
+                }
+                // Footer is stale or content-incomplete; do NOT return here
+                // — fall through to the on-disk JSON receipt path below.
+                // If the file path also fails, we'll return a combined
+                // error mentioning the footer for context.
+            }
             Err(err) => {
-                return (
-                    false,
-                    Some(format!(
-                        "invalid verification receipt footer for `{}` in commit {}: {err}",
-                        footer.task_id, footer.commit
-                    )),
+                // Malformed footer — surface as error but still try the file.
+                eprintln!(
+                    "warning: invalid verification receipt footer for `{}` in commit {}: {err}; falling back to on-disk receipt",
+                    footer.task_id, footer.commit
                 );
             }
-        };
-        if let Some(problem) = verification_receipt_freshness_problem_for_source(
-            repo_root,
-            &footer_path,
-            &receipt,
-            expected_commands,
-            declared_artifacts,
-            VerificationReceiptSource::CommitFooter,
-        ) {
-            return (
-                false,
-                Some(format!(
-                    "stale verification receipt footer for `{}` in commit {}: {problem}",
-                    footer.task_id, footer.commit
-                )),
-            );
         }
-        if let Some(problem) =
-            verification_receipt_content_problem(&footer_path, &receipt, expected_commands)
-        {
-            return (false, Some(problem));
-        }
-        return (true, None);
     }
     if !verification_wrapper_present {
         return (

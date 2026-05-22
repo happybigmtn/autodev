@@ -98,14 +98,15 @@ pub(crate) async fn run_codex_exec_with_env(
                 let context_label = context_label.to_owned();
                 let extra_env = extra_env.to_vec();
                 let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
-                let result = quota_exec::run_with_quota(Provider::Codex, move || {
+                let result = quota_exec::run_with_quota(Provider::Codex, move |account| {
                     let repo_root = repo_root.clone();
                     let full_prompt = full_prompt.clone();
                     let model = model.clone();
                     let reasoning_effort = reasoning_effort.clone();
                     let codex_bin = codex_bin.clone();
                     let context_label = context_label.clone();
-                    let extra_env = extra_env.clone();
+                    let mut extra_env = extra_env.clone();
+                    extra_env.extend(account.extra_env());
                     let stdout_log_path = stdout_log_path.clone();
                     async move {
                         spawn_codex(

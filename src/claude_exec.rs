@@ -94,7 +94,7 @@ pub(crate) async fn run_claude_exec_with_env(
         let context_label = context_label.to_owned();
         let extra_env = extra_env.to_vec();
         let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
-        let result = quota_exec::run_with_quota(Provider::Claude, move || {
+        let result = quota_exec::run_with_quota(Provider::Claude, move |_account| {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
             let resolved_model = resolved_model.clone();

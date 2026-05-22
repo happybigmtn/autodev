@@ -1,180 +1,209 @@
 # Assessment
 
-## How Might We
+## Problem Statement
 
-How might we turn `auto` from a powerful model-orchestration CLI into a production-trustworthy autonomous development control plane, where an operator can run corpus generation, plan generation, scheduler execution, evidence review, and release gating without guessing which markdown file, receipt, lane, or backend owns the truth?
+How might we make `auto` a trustworthy non-production control plane for model-backed repository work, so an operator can understand the current state, dispatch a bounded implementation slice, and accept or reject completion based on evidence rather than generated prose?
 
-## Target Users
+The current code shows a real product, not just a planning repo. The binary `auto` is a Rust CLI that generates plans, launches agents, reconciles queues, inspects verification receipts, routes quota-backed model calls, and gates shipping. The highest-leverage next cycle is not more corpus volume. It is restoring deterministic validation and aligning runtime source-of-truth behavior with the accepted decisions the operator already has.
 
-- Engineering operator: wants to run `auto corpus`, `auto gen`, `auto super`, `auto parallel`, and `auto ship` without babysitting ambiguous state.
-- Repository maintainer: wants root ledgers, generated corpora, receipts, and CI to agree.
-- Worker agent: needs exact, machine-readable tasks, dependencies, evidence requirements, and recovery instructions.
-- New contributor: needs a short first-run path with honest prerequisites and visible success.
+## Independent Review Addendum
 
-## Success Criteria
+This outside review inspected the staged corpus files, root control ledgers, README, AGENTS instructions, CI workflow, current decision docs, and targeted runtime owners in `src/main.rs`, `src/super_command.rs`, `src/generation.rs`, `src/doctor_command.rs`, `src/task_parser.rs`, `src/completion_artifacts.rs`, `src/parallel_command.rs`, `src/ship_command.rs`, `src/quota_config.rs`, `src/quota_state.rs`, and `src/quota_exec.rs`.
 
-- A cleared queue stays cleared unless fresh evidence says otherwise.
-- A pending row is executable only when dependencies, ownership, and evidence requirements are deterministic.
-- A completed row has current receipts, artifacts, and review handoff or an explicit accepted evidence class.
-- Credential profiles and saved state cannot escape intended directories.
-- `auto ship` runs release gates against the current synced tree and rechecks after model work.
-- First-run setup gets a new operator to `auto doctor`, installed binary smoke, and a meaningful non-mutating command quickly.
+Verified in this review:
 
-## Repo Constraints
+- No root `PLANS.md` or root `plans/` directory exists in the current checkout, so this staged corpus is not the active root planning surface.
+- Root `IMPLEMENTATION_PLAN.md` has no unchecked task rows, while `WORKLIST.md` still contains required follow-up items.
+- `cargo fmt --check` fails on formatting in `src/spec_command.rs`, `src/super_command.rs`, and `src/task_parser.rs`.
+- `cargo test tests::top_level_command_surface_matches_live_enum -- --nocapture` fails because live Clap output includes `audit-harvest`.
+- `cargo test generation::tests::generated_plan_rejects_multiple_cargo_test_filters -- --nocapture` fails, confirming generated-plan verification strictness drift.
+- `cargo test ship_command::tests::ship_gate_rejects_stale_completion_receipt -- --nocapture` fails, confirming receipt/ship gate drift.
+- `cargo test parallel_command::tests::lane_kind_routes_operator_and_evidence_tasks -- --nocapture` fails, confirming lane-kind drift.
+- `cargo test generation::tests::snapshot_only_generation_does_not_sync_root_outputs -- --nocapture` passes, so the generator has snapshot-only support; the remaining product drift is that `auto super` does not select it.
 
-- The product is a Rust CLI, not a service-backed web application.
-- The binary name is `auto`; required external tools include `claude`, `codex`, `pi`, and `gh`.
-- Generated/runtime state lives under `.auto/`, `bug/`, `nemesis/`, `gen-*`, and related audit/cache paths that must not be treated as normal source.
-- Root ledgers are the active execution surface; `genesis/` is subordinate planning input unless an operator promotes it.
-- Model-backed phases are inherently non-deterministic, so host-side validators, receipts, and dirty-state guards must own canonical truth.
-- CI currently covers Rust formatting, clippy, tests, install, and help smoke, but not live model execution.
+Supervisor revision before generation: split the original broad validation priority into two worker-sized implementation slices. The first owns rustfmt and live command-surface truth; the second owns generated-plan/spec-task proof validator strictness. Receipt/ship/lane failures remain in the evidence-contract slice. This prevents `auto gen` from producing one oversized "fix all red tests" task.
 
-## Project Claims Vs Code Reality
+Not independently rerun in this outside pass: full `cargo test` and clippy. The authoring pass's reported full-suite result is retained as prior evidence, while this review relies on the targeted failures above plus direct source inspection.
 
-| Area | Project says | Code shows | Status |
+## Project Claim vs Code Reality
+
+| Area | What the project says | What the code shows | Status |
 | --- | --- | --- | --- |
-| Product shape | Lightweight repo-root planning and execution toolchain. | Rust CLI binary `auto` with 21 commands in `src/main.rs` and CI smoke for major help surfaces. | Verified. |
-| Control truth | Runtime truth in `src/`; planning truth in root ledgers/specs/receipts; `genesis/` is input unless promoted. | `DESIGN.md`, `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, and generation discovery support this. No root `PLANS.md` exists. | Verified. |
-| Corpus generation | Complete genesis corpus with required files and full ExecPlans. | `run_corpus` validates generated outputs; this working tree now has 12 numbered ExecPlans. The authoring pass reported a degraded pre-refresh `genesis/`; independent review verified the current corpus, saved-state pointer, and archived snapshots rather than relying on that prior filesystem claim. | Current corpus verified; pre-refresh condition is recorded as authoring-pass evidence. |
-| Generation | `auto gen` uses saved planning root or `genesis`. | `src/state.rs` stores raw `PathBuf`; `src/generation.rs` reuses saved paths and later removes planning roots during corpus prep. | Half-built safety. |
-| Scheduler | `auto parallel` is the production scheduler with receipts and lane recovery. | Strong worker prompts and receipt checks exist, but split-brain ledger conventions and last-good plan fallback can mislead execution. | Works with safety gaps. |
-| Completion evidence | Receipts, artifacts, and review handoff prove completion. | `completion_artifacts.rs` enforces this, but current root rows are checked while `REVIEW.md` is intentionally empty, creating demotion risk. | Inconsistent. |
-| Quota routing | Credential profile safety and account routing. | Symlink and chmod protections exist, but account names become path components and failover can retry after progress. | High-risk gap. |
-| Design gate | Report-only by default with GO/NO-GO artifacts. | `design_command.rs` enforces artifacts and write boundaries, but verdict parsing accepts any matching line. | Mostly works. |
-| Release | `auto ship` gates release readiness. | Gate is evaluated before sync and not rerun after model pass. | Needs hardening. |
-| CI | Formatting, clippy, tests, installed binary smoke. | `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with warnings as errors, `cargo test`, `cargo install --locked`, and help smoke. | Strong baseline. |
+| Product identity | `README.md` presents `auto` as a repo-root planning and execution workflow with twenty-one commands. | `src/main.rs` exposes a broader control plane, including `audit-harvest`, planning, design, execution, review, QA, health, audit, ship, quota, and Symphony commands. | Useful but drifted. |
+| Active planning surface | Root ledgers and decisions are canonical; generated genesis snapshots are subordinate unless explicitly promoted. | Root `IMPLEMENTATION_PLAN.md` is fully checked, `WORKLIST.md` still has required validation-proof items, and current generated snapshots are historical/staging. | Root control remains active; corpus is advisory. |
+| Snapshot-first production control | Accepted decisions say snapshot creation should be reviewable and root sync should be explicit. | `src/super_command.rs` invokes generation with `snapshot_only: false`, which can sync root outputs during `auto super`. | Runtime/docs mismatch. |
+| Evidence model | Durable proof should travel in commit footers; `.auto/` JSON receipts are compatibility/staging data. | `src/completion_artifacts.rs`, `src/parallel_command.rs`, and `src/loop_command.rs` partly enforce evidence, but recent behavior changes made receipt freshness and fallback semantics fail tests. | Half-built and currently red. |
+| First-run story | `README.md` points new operators to `auto --version` and `auto doctor`. | `auto doctor` is useful, but it checks planning readiness early and external tools are treated differently across `AGENTS.md`, README, and code. | Good base with clarity gaps. |
+| CI readiness | `AGENTS.md` says validate with `cargo test` and clippy; CI also runs fmt, test, install, and help smoke. | Local `cargo fmt --check` and `cargo test` currently fail. | Broken now. |
+
+Exact package facts verified from `Cargo.toml`: package name `autodev`, binary name `auto`, version `0.2.0`, Rust edition `2021`. Dependency versions are governed by `Cargo.toml` and `Cargo.lock`; this assessment does not promote any guessed dependency update.
 
 ## What Works
 
-- CLI command surface is explicit and tested in `src/main.rs`.
-- CI validates formatting, clippy, tests, install, and major help surfaces.
-- `auto corpus` prompt/validation now requires focus briefs, assessment/spec/report/index, and full ExecPlan envelopes.
-- `auto design`, `auto qa-only`, and `auto health` enforce report-only write boundaries through dirty-state snapshots.
-- `auto audit --everything` has a mature resumable manifest, status/pause phases, file-quality rerating, and merge gates.
-- `completion_artifacts.rs` centralizes most task completion evidence checks.
-- `parallel_command.rs` contains stale-lane recovery, worker receipt instructions, and status rendering.
-- `util.rs` has checkpoint exclusions for `.auto`, `bug`, `nemesis`, `gen-*`, audit caches, and `.claude/worktrees`.
-- Quota credential copying rejects symlinked sources and writes copied credential files with owner-only permissions.
+- The repository has a substantial Rust CLI with focused modules for generation, corpus creation, design review, execution loops, parallel orchestration, completion evidence, quota routing, backend execution, QA, audit, health, and shipping.
+- `auto doctor` provides a no-model preflight and already separates some capability warnings from hard failures.
+- `auto parallel status` has useful operator state: host PID, tmux/session state, lane state, safety verdict, and health summary.
+- The quota account path hardening work is real: account names are slug-validated, profile directories are containment-checked, credential capture rejects symlinks, and owner-only writes are used in several paths.
+- CI is meaningful: `.github/workflows/ci.yml` runs formatting, clippy with denied warnings, tests, installed-binary proof, and help smoke.
+- Test density is high for a non-production tool. Explorer review counted roughly 589 annotated tests, concentrated around orchestration, generation, evidence, and quota behavior.
+- The repo already has decision records for promotion policy, receipt policy, first-run preflight, backend invocation, and quota prompt transport. These are useful when they match code.
 
-## Broken Or Half-Built
+## What Is Broken
 
-- The authoring pass reported a degraded pre-refresh `genesis/` while `.auto/state.json` pointed at it; this independent review verified the current corpus is complete, the saved state still points at `genesis/`, and runtime corpus preparation can remove the planning root before replacement validation.
-- `load_planning_corpus` accepts a planning root with an empty `plans/` directory; generated-output verification catches this later, but input loading can still produce a zero-plan corpus.
-- Saved `.auto/state.json` paths are raw `PathBuf`s and can steer later generation toward absolute or outside-repo planning roots.
-- `prepare_planning_root_for_corpus` removes the planning root after archiving without a containment gate.
-- Quota account names are interpolated into profile paths without slug validation.
-- Quota failover can retry a write-capable model invocation after detecting worker progress.
-- Current checked root rows plus an empty `REVIEW.md` can conflict with completion evidence rules and cause mass demotion.
-- `auto parallel` can continue from a last-good plan snapshot when current plan refresh fails.
-- Lane resume identity does not persist a stable task-body hash as a hard resume guard.
-- `auto ship` evaluates release gates before branch sync and does not rerun the gate after model execution.
-- GO/PASS verdict parsing in design, audit, and book accepts any matching line rather than exactly one terminal verdict.
-- Kimi/PI prompt delivery paths put full prompts in argv and have weaker timeout/preflight parity.
-- Large orchestrators (`generation.rs`, `parallel_command.rs`, `audit_everything.rs`, `audit_command.rs`) mix policy, IO, prompts, scheduling, and validation in files that are hard to review end to end.
+- `cargo fmt --check` fails on formatting in `src/spec_command.rs`, `src/super_command.rs`, and `src/task_parser.rs`.
+- The authoring pass reported a red full `cargo test` run: 569 passed and 16 failed. This outside review did not rerun the full suite, but independently reproduced representative failures in command-surface validation, generated-plan strictness, ship receipt freshness, and lane-kind routing.
+- `src/main.rs` exposes `audit-harvest`, but the top-level command-surface test and README command count are stale.
+- Current accepted docs say `auto super` should be snapshot-first, while runtime still calls generation in a root-syncing mode.
+- `WORKLIST.md` still records required hardening for generated verification commands and ambiguous receipts while root `IMPLEMENTATION_PLAN.md` is fully checked.
+- `.auto/symphony/verification-receipts/` was absent in the current checkout despite the plan ledger being fully checked; durable proof may exist in commit footers, but the current tree does not present a simple local receipt trail.
+
+## What Is Half-Built
+
+- Receipt inspection now tries commit footers and JSON staging receipts, but failing ship/completion tests show the precedence and freshness semantics are not settled.
+- `auto loop` demotes false `[x]` rows when evidence is missing, but durable footer behavior is not aligned with parallel closeout.
+- Operator/evidence lane semantics are split: docs and tests expect operator queue behavior, while live code disables operator routing and dispatches operator-labeled rows as autonomous code lanes.
+- The generated-corpus prompt in `src/generation.rs` has been steered toward compact priority plans and implementation focus, but the validator changes are part of the current red test cluster.
+- Quota profile isolation has strong pieces, including new isolated Codex home support in the dirty worktree, but atomic persistence, load-time validation, and Claude credential sync hardening still need one focused pass.
+- First-run UX has useful components (`doctor`, `parallel status`, `quota status`, health output), but they are scattered and sometimes disagree about whether missing tools or missing planning files are blockers.
 
 ## Tech Debt Inventory
 
-- Duplicated receipt freshness logic between release and completion surfaces.
-- Duplicated backend invocation paths for generation Claude execution versus shared Claude wrapper.
-- Markdown remains the main contract for queue rows, review handoffs, design reports, QA, health, and ship notes.
-- Active plan truth is spread across `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `ARCHIVED.md`, `COMPLETED.md`, receipts, and generated corpora.
-- Older specs still mention obsolete command counts even though README and `src/main.rs` now agree on 21 commands.
-- Report-only semantics differ across commands; `nemesis --report-only` can still update root planning artifacts.
-- Status output is strong in places but not backed by a single machine-readable run manifest for `auto parallel`.
-- Verification lint is narrow and does not cover enough shell, `rg`, wrapper, and narrative-proof cases.
+| Debt | Evidence | Impact | Priority |
+| --- | --- | --- | --- |
+| Validation strictness drift | Failing generation/spec/task-parser/verification lint tests. | Workers may accept weak proof, broad verification, or malformed plan rows. | P0 |
+| Runtime promotion mismatch | `src/super_command.rs` invokes generation with root-syncing flags despite snapshot-first decisions. | `auto super` can alter root ledgers when operator expects reviewable snapshots. | P0 |
+| Receipt semantics drift | Ship and completion-artifact tests fail; `.auto` receipt staging absent. | False green or false red ship decisions. | P1 |
+| Lane-kind ambiguity | Operator lane docs/tests disagree with live code. | Operators cannot predict whether tasks become code lanes or manual queues. | P1 |
+| Command-surface drift | README/test omit `audit-harvest`; help smoke incomplete. | First-run docs and automated guard disagree with product surface. | P1 |
+| Stale historical specs | Older specs claim no `doctor`, fewer commands, missing install proof, and older quota behavior. | New workers may follow outdated context. | P2 unless active instructions cite them. |
+| Non-atomic quota persistence | `QuotaConfig::save` and `QuotaState::save` write directly with owner-only mode but no temp+rename. | Crash or interruption can corrupt quota state. | P1 |
+| Prompt argv exposure for Kimi/PI | Accepted limitation in backend decision and tests. | Prompt content can appear in process listings. | P2 research unless provider supports safer transport. |
 
 ## Security Risks
 
-- High: quota account names can escape the profile namespace through `/`, `..`, absolute-like segments, or control characters.
-- High: saved `.auto/state.json` planning roots can influence destructive corpus operations unless constrained to the repository root or explicitly supplied.
-- High: quota failover after detected progress can duplicate model side effects.
-- High: Kimi/PI prompt-in-argv paths can leak prompts on multi-user systems.
-- Medium: quota config/state writes are owner-only but not atomic and can follow destination symlinks.
-- Medium: declared artifact paths are joined without an explicit containment check, so absolute or parent-relative paths need hard rejection.
-- Medium: raw provider refresh stderr/stdout can leak sensitive text if not passed through one sanitizer.
-- Medium: automatic dirty checkpointing preserves work, but production scheduling needs tighter ownership boundaries before committing arbitrary dirt.
+- Quota account path traversal is mostly mitigated by account slug validation and profile containment checks.
+- Credential capture rejects symlink inputs and writes owner-only files in the tested capture/swap paths.
+- Remaining security concern: quota config/state saves are owner-only but not atomic, so interrupted writes can corrupt the operator's routing state.
+- Remaining security concern: Claude credential sync uses raw copy behavior in one path before the same level of symlink refusal and owner-only enforcement is applied.
+- Remaining security concern: Kimi and PI prompt transport still passes full prompts through command arguments. This is currently an accepted limitation, not a verified provider-safe design.
+- Checkpoint exclusions in `src/util.rs` cover generated/runtime state including `.auto/`, `bug/`, `nemesis/`, and `gen-*`, consistent with repo instructions.
 
 ## Test Gaps
 
-- No test rejects unsafe quota account names across add, capture, remove, select, status, config load, and state load.
-- No state containment test covers corrupted `.auto/state.json` with absolute or outside-repo paths.
-- No regression proves checked rows plus accepted empty-review convention will not mass-demote unexpectedly.
-- No integration test covers last-good plan fallback versus fail-closed production dispatch.
-- No lane resume test rejects a changed task body under the same task id.
-- No release test proves `auto ship` gates after sync and again after model execution.
-- No shared verdict parser test rejects mixed GO/NO-GO or PASS/NO-GO reports.
-- No model-free end-to-end fixture harness exercises `qa`, `qa-only`, `health`, `review`, `design --resolve`, `nemesis --report-only`, `ship`, and `audit --everything`.
-- No CI check asserts tracked completion artifacts for `[x]` rows still exist.
+- The current top-level command-surface test is stale rather than protective; it fails because `audit-harvest` exists.
+- CI help smoke does not include `auto doctor --help` or `auto audit-harvest --help`.
+- Validation tests reveal real contract ambiguity around broad cargo filters, bin-only crates, malformed grep commands, bold-field parsing, and ownership field parsing.
+- Ship gate tests fail around stale completion receipts and shared receipt inspection.
+- Parallel tests fail around operator/evidence lanes and receipt propagation dirty-state handling.
+- Quota tests cover many security paths, but additional tests should cover load-time validation, atomic save behavior, and Claude credential sync mode/symlink handling.
 
 ## Documentation Staleness
 
-- README is closer to current code than older specs and now documents 21 commands.
-- Older specs still cite 13, 16, or 17 commands and should be marked historical or refreshed.
-- Some archived genesis warnings around `TASK-016` are superseded by current `COMPLETED.md` and receipts.
-- Root `DESIGN.md` accurately frames terminal/markdown as the user-facing surface.
-- `AGENTS.md` documents checkpoint exclusions but under-documents extra runtime boundaries like `.claude/worktrees` and audit caches.
-- Report-only wording should be sharpened for commands that still update root planning artifacts.
+- `README.md` command count and command list are stale relative to `src/main.rs`.
+- `AGENTS.md` says `claude`, `codex`, `pi`, and `gh` are required tools, while `auto doctor` and README treat missing model tools as capability warnings rather than baseline failure. This is a real policy choice that should be stated consistently.
+- `specs/220426-cli-command-surface.md` claims a smaller command surface and no `doctor`; current code and README contradict it.
+- `specs/230426-first-run-ci-and-installed-binary-proof.md` says CI lacks install/version proof and no `Doctor` variant exists; current CI and code contradict it.
+- `docs/decisions/loop-receipt-gating.md` says loop receipt enforcement is prompt-only and not Rust-side demotion; current `src/loop_command.rs` demotes missing-evidence completions.
+- Genesis plans retain old unchecked rows for work now checked in root `IMPLEMENTATION_PLAN.md`. This is acceptable only when genesis is treated as subordinate historical context.
 
-## Prior Claim / Plan Status
+## Implementation Status For Prior Claims And Plans
 
-| Claim or plan family | Current implementation status | Evidence reviewed |
+| Prior claim or plan | Current evidence | Assessment |
 | --- | --- | --- |
-| Design gate blockers reconciled | Root rows are checked and `REVIEW.md` is empty; runtime still has verdict parser and ledger-demotion risks. | `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `src/design_command.rs`, `src/completion_artifacts.rs`. |
-| Genesis is ready planning input | Current generated corpus is structurally ready as planning input; the degraded pre-refresh state is authoring-pass evidence, not a current filesystem fact. | `find genesis`, `.auto/state.json`, `git ls-tree HEAD genesis`, current corpus shape checks. |
-| Root queue ready for auto parallel | No executable unchecked rows exist. New campaign must be promoted first. | `IMPLEMENTATION_PLAN.md`, `REVIEW.md`. |
-| Quota safety hardened | Partially true: symlink/source copying is hardened; account-name and retry-after-progress gaps remain. | `src/quota_config.rs`, `src/quota_accounts.rs`, `src/quota_exec.rs`. |
-| Receipt freshness bound to release evidence | Partially true: strong checks exist; release ordering and duplicated logic remain risks. | `src/completion_artifacts.rs`, `src/ship_command.rs`. |
-| CI production baseline | Strong for Rust and help smoke; lacks end-to-end model-free workflow harness. | `.github/workflows/ci.yml`. |
-| Archived genesis plan set | Useful historical sequencing, not current truth. Some release-ledger claims are superseded. | `.auto/fresh-input/genesis-previous-20260430-180207/`. |
+| Root implementation plan is complete. | `IMPLEMENTATION_PLAN.md` rows are all `[x]`. | Claim is ledger-complete, but validation is red and `WORKLIST.md` still has required hardening. |
+| Genesis previous quota/security P0s are completed. | Quota traversal and credential capture tests exist; dirty worktree extends Codex home isolation. | Mostly implemented, but atomic save/load validation remains. |
+| Receipt JSON is staging data; durable proof belongs in commit footers. | Repo instructions and receipt docs say this; code has footer and JSON inspection. | Direction is right, current semantics fail tests. |
+| Snapshot-first promotion is accepted. | Decision docs and planning primacy tests support generated snapshots as subordinate. | Runtime `auto super` still needs to match. |
+| First-run preflight exists. | `src/doctor_command.rs` exists and is exposed by `src/main.rs`. | Useful, but policy and messaging need a focused pass. |
+| Generated corpus should be implementation-first. | Dirty `src/generation.rs` and prompt ethos changes move in that direction. | Correct direction, but plan validation failures show it is incomplete. |
 
 ## Code Review Coverage
 
-Direct line reads or targeted source review covered:
+Local review and explorer review covered these source and test areas:
 
-- Entry and CLI routing: `src/main.rs`, `Cargo.toml`, `build.rs`, `.github/workflows/ci.yml`.
-- Corpus and generation: `src/generation.rs`, `src/corpus.rs`, `src/state.rs`.
-- Scheduler and task truth: `src/parallel_command.rs`, `src/loop_command.rs`, `src/super_command.rs`, `src/steward_command.rs`, `src/task_parser.rs`, `src/completion_artifacts.rs`, `src/verification_lint.rs`, `tests/parallel_status.rs`.
-- Backend and quota: `src/backend_policy.rs`, `src/claude_exec.rs`, `src/codex_exec.rs`, `src/codex_stream.rs`, `src/kimi_backend.rs`, `src/pi_backend.rs`, `src/quota_config.rs`, `src/quota_accounts.rs`, `src/quota_exec.rs`, `src/quota_state.rs`, `src/quota_selector.rs`, `src/quota_patterns.rs`, `src/quota_status.rs`, `src/quota_usage.rs`.
-- Quality and release: `src/audit_everything.rs`, `src/audit_command.rs`, `src/qa_command.rs`, `src/qa_only_command.rs`, `src/review_command.rs`, `src/design_command.rs`, `src/nemesis.rs`, `src/book_command.rs`, `src/health_command.rs`, `src/ship_command.rs`, `src/audit_rubric.md`.
-- Shared utilities: `src/util.rs`.
-- Docs and ledgers: `README.md`, `DESIGN.md`, `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, `COMPLETED.md`, root specs, backend decision docs, and the archived previous genesis snapshot.
+- Entry and CLI surface: `src/main.rs`, `Cargo.toml`, `README.md`, `AGENTS.md`.
+- Generation and planning: `src/generation.rs`, `src/corpus.rs`, `src/spec_command.rs`, `src/design_command.rs`, root control ledgers, `genesis/`, prior snapshot under `.auto/fresh-input/`.
+- Execution and orchestration: `src/super_command.rs`, `src/parallel_command.rs`, `src/loop_command.rs`, `src/task_parser.rs`, `src/completion_artifacts.rs`, `src/verification_lint.rs`.
+- Operator surfaces: `src/doctor_command.rs`, `src/health_command.rs`, `src/qa_only_command.rs`, `src/audit_command.rs`, `src/audit_everything.rs`, `src/ship_command.rs`.
+- Quota and backend security: `src/quota_accounts.rs`, `src/quota_config.rs`, `src/quota_exec.rs`, `src/quota_patterns.rs`, `src/quota_selector.rs`, `src/quota_state.rs`, `src/quota_status.rs`, `src/quota_usage.rs`, `src/backend_policy.rs`, `src/codex_exec.rs`, `src/claude_exec.rs`, `src/kimi_backend.rs`, `src/pi_backend.rs`.
+- State and utilities: `src/state.rs`, `src/util.rs`.
+- CI and tests: `.github/workflows/ci.yml`, `tests/parallel_status.rs`, `tests/performance_status.rs`, `tests/lifecycle_flows.rs`, `tests/planning_primacy.rs`, plus embedded module tests reported by `cargo test`.
+- Docs and decisions: `docs/decisions/*.md`, `docs/verification-receipt-schema.md`, root `DESIGN.md`, `WORKLIST.md`, `REVIEW.md`, `COMPLETED.md`, `ARCHIVED.md`, and specs under `specs/`.
+
+## Target Users
+
+- Primary operator: a technical maintainer running `auto` in a repository to plan, dispatch, review, and ship model-backed work.
+- Lane worker: a model-backed implementation agent that consumes one task row and must preserve evidence in commits/logs instead of editing shared host-owned queue files directly.
+- Reviewer or release operator: a human or model phase deciding whether a claimed completion has enough proof.
+- Developer contributor: someone changing the `auto` CLI, tests, and orchestration internals.
+
+## Success Criteria
+
+- `cargo fmt --check`, `cargo test`, and clippy pass locally and in CI.
+- `auto super` creates reviewable snapshots unless the operator explicitly requests root promotion.
+- Completed tasks require durable evidence that survives checkout state and can be inspected by `auto ship`.
+- `auto doctor` and status surfaces tell the operator what is ready, blocked, and safe to run next.
+- The README and command-surface tests match live Clap behavior.
+- Quota account state and credential handling fail closed on unsafe persisted data and avoid corrupting state on interrupted writes.
+
+## Repo Constraints
+
+- The repository is a non-production but real operator tool; it should prefer small verified slices over release-scale ceremony.
+- Generated/runtime state under `.auto/`, `bug/`, `nemesis/`, and `gen-*` is excluded from checkpoints.
+- Host-owned parallel queue files include `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, legacy queue files, and `RECEIPTS-DRIFT.md`; lane workers should preserve evidence in commits/logs instead of editing those shared files directly.
+- Model tools may not all be present on first run; code already treats some as capability warnings.
+- The current worktree was dirty before this corpus pass in source files related to generation, prompt ethos, parallel receipts, quota, and backend execution. This assessment treats those changes as current working state and does not revert them.
 
 ## Assumption Ledger
 
-| Assumption | Status | Proof or next proof |
+| Assumption | Status | Proof or next check |
 | --- | --- | --- |
-| The repo is Codex-first for current instructions. | Verified. | `AGENTS.md` exists and was provided; no root `CLAUDE.md` governance override was found. |
-| Active planning truth is root ledgers, not `genesis/`. | Verified. | Root `DESIGN.md`; no root `PLANS.md` or root `plans/` directory. |
-| `genesis/` needs review before promotion. | Verified. | Current `genesis/` has mandatory top-level files and 12 numbered plans, while root ledgers remain active truth. |
-| Latest CI passed at current HEAD. | Reported by git-history reviewer, not locally rerun yet in this pass. | Re-run or check GitHub if release-critical. |
-| Quota profile traversal is exploitable. | Verified from code path shape; needs test reproduction. | Add failing tests around unsafe account names. |
-| Empty-review checked rows can mass-demote. | Strong code inference; needs regression test. | Build fixture with current ledgers and run completion audit. |
-| `auto ship` gate ordering can accept stale proof after sync. | Verified from code order. | Add release fixture test. |
-| Full production launch is safe after corpus generation. | Not proven. | Requires numbered plans and root queue promotion gate. |
+| `auto` is developer/operator-facing rather than end-user consumer software. | Verified. | CLI entry point, README lifecycle, root control ledgers. |
+| Root planning ledgers remain active control truth. | Verified. | Repo instructions, root ledgers, planning primacy decisions/tests; no root instruction makes this staging corpus primary. |
+| The current checkout is not validation-clean. | Verified. | `cargo fmt --check` failed; `cargo test` failed with 16 tests. |
+| Snapshot-first promotion is accepted product direction. | Verified as decision text; not implemented in runtime. | `docs/decisions/production-control-promotion.md`, `docs/decisions/super-snapshot-promotion-default.md`, `src/super_command.rs`. |
+| Receipt footers should outrank `.auto` JSON for durable proof. | Verified as policy; implementation currently unstable. | Repo instructions, receipt docs, failing ship/completion tests. |
+| Kimi/PI prompt argv transport can be replaced now. | Open question. | Current decision accepts argv as limitation pending provider-supported alternative. |
+| Missing model tools should not fail first-run baseline. | Mostly verified in code/docs, contradicted by `AGENTS.md`. | `src/doctor_command.rs`, README, `AGENTS.md`. |
 
 ## Focus Response
 
-The operator focus correctly emphasizes release blockers, operator trust, verification evidence, first-run DX, scheduler safety, runtime/design sync, and maintainable execution contracts. The code supports the direction: `auto` already has substantial scheduler, receipt, audit, and release machinery. The code also says the next move is not blind parallel execution. The current root queue has no open rows, the generated corpus is subordinate until promoted, and high-severity safety gaps remain in quota/profile paths, saved state, completion evidence conventions, and release-gate ordering.
-
-Non-focused risks that still outrank some focus items:
-
-- Quota account path traversal outranks terminal copy polish.
-- Saved planning-root containment outranks new generation throughput.
-- Checked-row/empty-review demotion risk outranks adding more queue rows.
-- Release-gate ordering outranks final release narrative.
+The operator focus emphasized implementation, product clarity, and engineering leverage over more artifact generation. The code supports that emphasis: the most urgent problems are failing validation, runtime/source-of-truth drift, evidence semantics, and operator status clarity. Non-focused risks that still matter are quota credential safety and prompt exposure. They do not outrank green validation and promotion semantics because they are narrower and mostly behind existing mitigations, but they should remain in the first implementation wave after the core loop is trustworthy.
 
 ## Opportunity Framing
 
-Strongest direction: preserve `auto corpus`, `auto gen`, `auto super`, and `auto parallel` as the control primitives, but make their state, evidence, and release contracts deterministic before scaling execution. This uses the repo's real leverage: a mature CLI, CI, receipt machinery, report-only guards, and audit manifests.
+Recommended direction: make `auto` a small, honest, evidence-first control plane for one complete autonomous slice at a time. The product should bias toward explicit state, strict proof, and safe promotion rather than generating more plans or reports.
 
-Rejected direction: build a web dashboard now. The repo's actual user surface is terminal output and markdown ledgers; a dashboard would duplicate truth before truth is settled.
+Alternative considered: build more corpus/reporting infrastructure first. Rejected because the checkout is red and more generated artifacts would not prove the product loop.
 
-Rejected direction: run `auto parallel` immediately from current root state. The active queue is empty and the next campaign needs promotion; launching lanes would operate on stale or absent work.
+Alternative considered: prioritize quota security before orchestration. Rejected as the top priority because quota has several working mitigations and tests, while the central validation/receipt/super path is currently failing.
 
-Rejected direction: replace markdown ledgers wholesale with a database. That may be a future architecture discussion, but the next 14 days should harden the current contracts and add machine-readable manifests where risk is highest.
+Alternative considered: add a new dashboard or UI first. Rejected as the immediate top priority because status clarity is useful only after validation and source-of-truth semantics stop contradicting themselves. A no-model status command remains a strong follow-up once the underlying facts are stable.
 
-Rejected direction: docs-only cleanup. It would improve confidence language but would not fix path containment, demotion risk, receipt freshness, or release ordering.
+## Not Doing
+
+- Do not create a large new documentation suite before fixing red validation.
+- Do not rewrite the CLI architecture or replace Clap.
+- Do not introduce a web UI; the current user-facing product is terminal and markdown ledgers.
+- Do not treat previous genesis snapshots as truth over current code.
+- Do not silently promote generated snapshots to root control truth.
+- Do not broaden scope to release packaging until the local validation and evidence gates are green.
+- Do not resolve Kimi/PI prompt transport by inventing unverified provider behavior.
+
+## Priority Focus Map
+
+| Focus area | User/operator value | Design clarity | Engineering leverage | Evidence | Parallel executability | Rank |
+| --- | --- | --- | --- | --- | --- | --- |
+| Restore fmt and public command-surface baseline. | High: operators need advertised validation and help truth. | High: pass/fail and command availability become clear. | Medium: small surface with immediate CI value. | `cargo fmt --check` and command-surface test failures. | High: one worker can own formatting plus command-list tests/docs. | 1 |
+| Re-tighten generated-plan and spec-task proof validators. | High: weak plans create unproductive parallel runs. | High: workers get concrete proof contracts. | High: repairs shared parser/validator behavior. | Generation/spec validation test failures. | High: one worker can own validator modules/tests. | 2 |
+| Make `auto super` snapshot-first by default. | High: prevents unexpected root ledger mutation. | High: snapshots vs promotion becomes understandable. | High: fixes source-of-truth drift. | Decision docs contradict `src/super_command.rs`. | Medium: one worker can modify super/generation tests. | 3 |
+| Repair receipt, loop, ship, and lane evidence semantics. | High: completion proof is core product truth. | Medium: reduces false green/false red states. | High: centralizes proof semantics. | Failing ship/parallel/completion tests and receipt docs. | Medium: focused but touches several modules. | 4 |
+| Align operator status and harden quota persistence. | Medium/high: operators need next safe command and safe account state. | Medium/high: readiness and failure modes become legible. | Medium: reuses doctor/status/quota helpers. | README/test drift and quota load/save gaps. | Medium/high: split into separate P1 worker slices. | 5 |
 
 ## DX Assessment
 
-First-run experience is credible but heavy. The repo has clear build commands, CI install smoke, `auto --help`, and `auto doctor`, but README length and command breadth make uncertainty high at T0. The fastest honest path should be: install, run `auto --version`, run `auto doctor`, run a non-mutating status or verify-only command, and see exactly which external tools or credentials are missing. Error clarity is good in several host-side gates but inconsistent across backend invocation paths. The onboarding examples are mostly honest about real work, but they need a compact learn-by-doing path that distinguishes report-only, mutating, queue-promoting, and release commands.
+First-run friction is lower than earlier specs suggest because CI has installed-binary proof and `auto doctor` exists. The current problem is honesty, not absence. `auto doctor` is positioned as the first success path, but it checks planning health in a way that can fail before the operator has created the planning surface. README and `AGENTS.md` also disagree about whether model tools are required at T0 or only for model-backed phases.
+
+Copy-paste onboarding is mostly honest for a repo that already has plans, but less honest for a fresh repo. The fastest meaningful success moment should be: build or install `auto`, run `auto doctor`, see baseline repository readiness, then receive a precise next command for planning or execution readiness. Today that path can blur baseline readiness with execution readiness.
+
+Error clarity is improving in validators and receipt inspectors, but the current failing tests show strictness has become inconsistent. The next DX win is not a tutorial. It is a no-model state summary that says which facts are verified, which checks are red, and which command is safe next.
