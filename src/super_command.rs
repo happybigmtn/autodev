@@ -1514,6 +1514,14 @@ fn verify_super_task(
     task: &SuperTaskBlock,
     all_task_ids: &std::collections::BTreeSet<&str>,
 ) -> Result<()> {
+    let verification = first_super_task_field_line(task, "Verification:").unwrap_or("");
+    if verification_looks_broad_or_malformed(verification) {
+        bail!(
+            "task `{}` uses package-wide cargo test verification; include a concrete test-name filter",
+            task.task_id
+        );
+    }
+
     let parsed_task = parse_tasks(&task.markdown)
         .into_iter()
         .find(|candidate| candidate.id == task.task_id)
@@ -1525,13 +1533,6 @@ fn verify_super_task(
         })?;
     validate_execution_row(&parsed_task, all_task_ids)
         .with_context(|| format!("task `{}` failed execution-row validation", task.task_id))?;
-    let verification = first_super_task_field_line(task, "Verification:").unwrap_or("");
-    if verification_looks_broad_or_malformed(verification) {
-        bail!(
-            "task `{}` uses package-wide cargo test verification; include a concrete test-name filter",
-            task.task_id
-        );
-    }
 
     for forbidden in [
         "TBD",

@@ -42,22 +42,41 @@ fn verify_cargo_test_command(
     command: &str,
     argv: &[String],
 ) -> Result<()> {
-    // Loosened: `cargo test --lib` is fine for crates that have a lib
-    // target. The previous check assumed the entire repo was bin-only,
-    // which is incorrect for mixed-target crates. Authors targeting a
-    // specific lib test filter should be allowed to use --lib without
-    // tripping a "stale" warning.
-    let _ = task_id;
-    let _ = field;
-    let _ = command;
+    if cargo_test_has_broad_scope_flag(argv) {
+        bail!(
+            "task `{task_id}` `{field}` uses broad verification command `{command}`; use one concrete affected test filter"
+        );
+    }
+    if cargo_test_has_lib_target_flag(argv) {
+        bail!(
+            "task `{task_id}` `{field}` uses stale `cargo test --lib` verification command `{command}` for this bin-only crate; use `cargo test <test-filter>` or `cargo clippy --bins`"
+        );
+    }
 
-    // Loosened: `cargo test -p hub-client filter1 filter2` is a valid
-    // cargo-test invocation that runs both filters. The previous policy
-    // required one filter per command, which forced authors to duplicate
-    // wrapping prose for what cargo handles natively.
-    let _ = cargo_test_filter_tokens(argv);
+    let filters = cargo_test_filter_tokens(argv);
+    if filters.is_empty() {
+        bail!(
+            "task `{task_id}` `{field}` uses package-wide cargo test verification command `{command}`; include one concrete test-name filter"
+        );
+    }
+    if filters.len() > 1 {
+        bail!(
+            "task `{task_id}` `{field}` uses multi-filter cargo test verification command `{command}` with filters `{}`; split proof into one concrete test filter per command",
+            filters.join("`, `")
+        );
+    }
 
     Ok(())
+}
+
+fn cargo_test_has_broad_scope_flag(argv: &[String]) -> bool {
+    argv.iter()
+        .skip(2)
+        .any(|token| matches!(token.as_str(), "--workspace" | "--all"))
+}
+
+fn cargo_test_has_lib_target_flag(argv: &[String]) -> bool {
+    argv.iter().skip(2).any(|token| token == "--lib")
 }
 
 fn verify_grep_command(task_id: &str, field: &str, command: &str, argv: &[String]) -> Result<()> {

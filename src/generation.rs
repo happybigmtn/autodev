@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, NaiveDate};
 
 use crate::codex_exec::run_codex_exec_max_context;
@@ -2956,13 +2956,13 @@ fn verify_generated_implementation_plan(output_dir: &Path) -> Result<PathBuf> {
     let blocks = extract_plan_task_blocks(&normalized)?;
     let lenient = std::env::var("AUTO_LENIENT_GATE").ok().as_deref() == Some("1")
         || std::env::var("AUTO_LENIENT_DEPS").ok().as_deref() == Some("1");
-    if let Err(err) = validate_execution_rows(&normalized)
-        .context("generated implementation plan failed shared execution-row validation")
-    {
+    if let Err(err) = validate_execution_rows(&normalized) {
         if lenient {
             eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
         } else {
-            return Err(err);
+            return Err(anyhow!(
+                "generated implementation plan failed shared execution-row validation: {err:#}"
+            ));
         }
     }
     for block in &blocks {
@@ -3250,7 +3250,6 @@ fn verify_completion_artifacts_are_concrete(block: &PlanTaskBlock, body: &str) -
 }
 
 fn verify_verification_commands_are_scoped(block: &PlanTaskBlock, body: &str) -> Result<()> {
-    verify_commands_are_runnable(&block.task_id, "Verification:", body)?;
     let lowercase = body.to_ascii_lowercase();
     for forbidden in [
         "cargo check --workspace",
@@ -3265,6 +3264,7 @@ fn verify_verification_commands_are_scoped(block: &PlanTaskBlock, body: &str) ->
             );
         }
     }
+    verify_commands_are_runnable(&block.task_id, "Verification:", body)?;
     for line in body.lines() {
         if cargo_test_command_is_package_wide(line) {
             bail!(
