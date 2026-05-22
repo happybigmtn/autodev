@@ -1,6 +1,5 @@
 mod audit_command;
 mod audit_everything;
-mod backend_policy;
 mod book_command;
 mod bug_command;
 mod claude_exec;
