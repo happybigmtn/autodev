@@ -841,6 +841,20 @@ fn build_design_prompt(
         }
     };
 
+    let apply_instructions = if apply {
+        r#"If applying edits is enabled:
+- Update `DESIGN.md` only with durable doctrine grounded in the live product and existing frontend.
+- In standalone mode, add or amend plan/spec items only for real unresolved work. In super mode, prefer amending the planning corpus so `auto gen` emits the queue unless this is a resolve pass.
+- In resolve mode, every unresolved NO-GO issue that requires source/runtime/UI changes must also be inserted into root `IMPLEMENTATION_PLAN.md` as an unchecked, dependency-ready task unless it has a concrete dependency. Use stable `DESIGN-*` task IDs, machine-readable `Dependencies:`, narrow `Owns:`, runtime owner, UI consumer, generated artifact, fixture boundary, and executable verification fields so `auto parallel` can pick it up immediately.
+- In resolve mode, do not leave the only actionable repair work inside `DESIGN-PLAN-ITEMS.md`; that file is an audit artifact, while `IMPLEMENTATION_PLAN.md` is the executor queue.
+- Do not mark any implementation item complete."#
+    } else {
+        r#"If report-only mode is enabled:
+- Do not edit root `DESIGN.md`, specs, root implementation plans, frontend/source files, or generated bindings.
+- Put all proposed doctrine changes, contract changes, and queue-ready implementation items in the output artifacts.
+- Make `DESIGN-REPORT.md` name the exact next command or promotion path needed before implementation."#
+    };
+
     format!(
         r#"{stage_clause}
 
@@ -906,12 +920,7 @@ Write these non-empty artifacts under `{output_dir}`:
    - Executive summary, files changed if any, recommended next workflow step, and GO/NO-GO for design-aware implementation.
    - In the `auto super` flow, `Verdict: NO-GO` blocks the CEO production campaign until design/runtime integrity is repaired.
 
-If `{apply_status}`:
-- Update `DESIGN.md` only with durable doctrine grounded in the live product and existing frontend.
-- In standalone mode, add or amend plan/spec items only for real unresolved work. In super mode, prefer amending the planning corpus so `auto gen` emits the queue unless this is a resolve pass.
-- In resolve mode, every unresolved NO-GO issue that requires source/runtime/UI changes must also be inserted into root `IMPLEMENTATION_PLAN.md` as an unchecked, dependency-ready task unless it has a concrete dependency. Use stable `DESIGN-*` task IDs, machine-readable `Dependencies:`, narrow `Owns:`, runtime owner, UI consumer, generated artifact, fixture boundary, and executable verification fields so `auto parallel` can pick it up immediately.
-- In resolve mode, do not leave the only actionable repair work inside `DESIGN-PLAN-ITEMS.md`; that file is an audit artifact, while `IMPLEMENTATION_PLAN.md` is the executor queue.
-- Do not mark any implementation item complete.
+{apply_instructions}
 
 Final line of `DESIGN-REPORT.md` must be exactly one of:
 - `Verdict: GO`
@@ -928,11 +937,7 @@ Final line of `DESIGN-REPORT.md` must be exactly one of:
         edit_clause = edit_clause,
         qa_clause = qa_clause,
         production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
-        apply_status = if apply {
-            "applying edits is enabled"
-        } else {
-            "report-only mode is enabled"
-        },
+        apply_instructions = apply_instructions,
     )
 }
 
@@ -1077,6 +1082,24 @@ mod tests {
         assert!(prompt.contains("reusable component systems"));
         assert!(prompt.contains("ENGINE-UI-CONTRACT.md"));
         assert!(prompt.contains("FRONTEND-QA.md"));
+    }
+
+    #[test]
+    fn design_prompt_report_only_does_not_request_root_edits() {
+        let prompt = build_design_prompt(
+            &PathBuf::from("/repo"),
+            Some(&PathBuf::from("/repo/genesis")),
+            &PathBuf::from("/repo/.auto/design/run"),
+            Some("make the UI better"),
+            false,
+            false,
+            DesignRunKind::Standalone,
+        );
+
+        assert!(prompt.contains("If report-only mode is enabled:"));
+        assert!(prompt.contains("Do not edit root `DESIGN.md`"));
+        assert!(prompt.contains("Put all proposed doctrine changes"));
+        assert!(!prompt.contains("If `report-only mode is enabled`:"));
     }
 
     #[test]
