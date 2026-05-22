@@ -15,7 +15,8 @@ The local CLI command is `auto`.
 - `auto spec` turns a prompt into a conformant, product-experience-first spec plus matching
   implementation-plan items. It defaults to Claude Opus (`opus`) with `xhigh` effort.
 - `auto design` perfects frontend/design doctrine with runtime/UI contract and QA proof.
-- `auto super` runs the all-in-one CEO production-race workflow: corpus, design gate, functional reviews, gen, gates, then parallel.
+- `auto super` runs the all-in-one CEO production-race workflow: corpus, design gate, functional
+  reviews, snapshot-only gen, and promotion gates.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
 - `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
 - `auto loop` runs the implementation loop on the repo's primary branch.
@@ -56,7 +57,7 @@ need to pass directories in the normal case.
   unless `--apply` is supplied
 - `auto super` runs corpus and generation with `gpt-5.5` `xhigh`, runs additional
   design-perfection, functional-review, production-readiness, and execution-gate reviews, then
-  launches `auto parallel` with `gpt-5.5` `high` workers unless `--no-execute` is supplied
+  leaves a reviewable `gen-*` snapshot for explicit promotion before any parallel implementation
 - `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
   state, worker PIDs, and latest lane log lines
 - `auto parallel` treats root queue files, receipt-drift triage, and operator-action files as
@@ -377,7 +378,8 @@ The commands originally formed this lifecycle:
 
 `auto super` is the high-agency composition for production-grade work: it runs
 `auto corpus`, blocks on design perfection, runs functional CEO reviews, runs
-`auto gen`, gates the generated root queue, and launches `auto parallel`.
+snapshot-only `auto gen`, gates the generated queue, and prints the explicit
+promotion command. The root queue remains unchanged until promotion.
 
 The other commands are side lanes:
 
@@ -692,7 +694,9 @@ What it reads:
 What it writes:
 
 - `genesis/` via the normal `auto corpus` control path
-- root `specs/*.md` and root `IMPLEMENTATION_PLAN.md` via the normal `auto gen` control path
+- reviewable `gen-*` specs and `gen-*/IMPLEMENTATION_PLAN.md` via the normal `auto gen`
+  snapshot path; root `specs/*.md` and root `IMPLEMENTATION_PLAN.md` stay unchanged until
+  explicit promotion
 - `.auto/super/<run-id>/manifest.json`
 - `.auto/super/<run-id>/design/`
 - `.auto/super/<run-id>/CEO-14-DAY-PLAN.md`
@@ -721,26 +725,32 @@ What it actually does:
   Security/Trust, Reliability/Ops, QA/Test, Data/Contracts, Performance, DX/Agent Workflow, and
   Release perspectives
 - Lets design and functional reviews amend `genesis/` before generation starts
-- Runs `auto gen` with GPT-5.5 `xhigh` and max Codex context
-- Runs an execution-gate review that may amend root specs and `IMPLEMENTATION_PLAN.md`
+- Runs `auto gen` with GPT-5.5 `xhigh`, max Codex context, and snapshot-only generation by
+  default
+- Prints the generated snapshot path and the explicit promotion command:
+  `auto gen --sync-only --output-dir <gen-dir>`
+- Runs an execution-gate review against the generated snapshot without amending root specs or the
+  root `IMPLEMENTATION_PLAN.md`
 - Requires `EXECUTION-GATE.md` to say exactly `Verdict: GO`
-- Runs a deterministic Rust gate that rejects empty queues, missing task fields, oversized task
-  scope, vague ownership, placeholders, and broad or malformed verification commands
+- Runs a deterministic Rust gate against `gen-*/IMPLEMENTATION_PLAN.md`; the gate artifact records
+  that the inspected plan is a generated snapshot and that root queue truth is unchanged
 - Writes cross-repo and closeout artifacts: `CROSS-REPO-MANIFEST.json`,
   `BRANCH-RECONCILIATION.md`, and `FINAL-SANITY.md`
-- Launches `auto parallel` only after both the model gate and deterministic gate pass
+- Skips `auto parallel` until the generated snapshot is explicitly promoted
 
 When to run it:
 
 - When the goal is broad production readiness rather than a narrow planning refresh
-- When you want one command to generate the corpus, produce the execution queue, validate it, and
-  start tmux-backed implementation
+- When you want one command to generate the corpus, produce a reviewable execution queue snapshot,
+  and validate it before promotion
 - When the repo needs a max-compute release-blocker campaign rather than a loose backlog
 
 Useful flags:
 
 - `auto super "make this repo production grade"` supplies the main steering prompt
 - `--no-execute` stops after corpus, generation, and gates without launching workers
+- Promote an accepted snapshot with `auto gen --sync-only --output-dir <gen-dir>`, then launch
+  implementation from the promoted root queue with `auto parallel`
 - `--skip-design` skips the design perfection gate; use only when an equivalent design/runtime
   review is already current and file-backed
 - `--design-resolve-passes <n>` controls how many design audit/parallel/reverify rounds can run

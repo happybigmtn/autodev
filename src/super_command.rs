@@ -32,6 +32,10 @@ const SUPER_REPORT_FILES: [&str; 7] = [
 ];
 const EXECUTION_GATE_FILE: &str = "EXECUTION-GATE.md";
 const IMPLEMENTATION_PLAN: &str = "IMPLEMENTATION_PLAN.md";
+const SUPER_GENERATION_MODE_SNAPSHOT_ONLY: &str = "snapshot-only";
+const SUPER_PLAN_SOURCE_GENERATED_SNAPSHOT: &str = "generated snapshot";
+const SUPER_PLAN_SOURCE_ROOT_LEDGER: &str = "root ledger";
+const SUPER_ROOT_PLAN_STATUS_UNCHANGED: &str = "unchanged";
 
 #[derive(Clone, Deserialize, Serialize)]
 struct SuperManifest {
@@ -64,6 +68,12 @@ struct SuperManifest {
     branch: Option<String>,
     reference_repos: Vec<String>,
     binary: String,
+    #[serde(default = "default_super_generation_mode")]
+    generation_mode: String,
+    #[serde(default = "default_super_root_plan_status")]
+    root_plan_status: String,
+    #[serde(default)]
+    promotion_command: Option<String>,
     stages: Vec<SuperStage>,
 }
 
@@ -81,6 +91,14 @@ struct SuperRepoRecord {
     branch: String,
     head: String,
     status: String,
+}
+
+fn default_super_generation_mode() -> String {
+    SUPER_GENERATION_MODE_SNAPSHOT_ONLY.to_string()
+}
+
+fn default_super_root_plan_status() -> String {
+    SUPER_ROOT_PLAN_STATUS_UNCHANGED.to_string()
 }
 
 pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
@@ -110,6 +128,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     println!("model:       {}", args.model);
     println!("effort:      {}", args.reasoning_effort);
     println!("workers:     {}", args.max_concurrent_workers.max(1));
+    println!("gen mode:    {SUPER_GENERATION_MODE_SNAPSHOT_ONLY}");
+    println!("root plan:   unchanged until explicit promotion");
     println!(
         "execute:     {}",
         if args.no_execute { "no" } else { "yes" }
@@ -121,6 +141,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             "stages:      corpus -> design perfection gate{} -> CEO functional review -> gen -> execution gate -> parallel",
             if args.skip_design { " (skipped)" } else { "" }
         );
+        println!("snapshot:    generated gen-* output is staged for review");
+        println!("promote:     auto gen --sync-only --output-dir <gen-dir>");
         if !args.skip_design && !args.no_execute {
             println!(
                 "design fix:  up to {} resolve pass(es)",
@@ -204,31 +226,25 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         super_stage_artifact(&manifest, "gen").or_else(|| args.output_dir.clone())
     } else {
         println!("stage:       gen");
-        generation::run_gen(GenerationArgs {
-            planning_root: Some(planning_root.clone()),
-            output_dir: args.output_dir.clone(),
-            model: args.model.clone(),
-            reasoning_effort: args.reasoning_effort.clone(),
-            codex_review_model: args.model.clone(),
-            codex_review_effort: args.reasoning_effort.clone(),
-            codex_bin: args.codex_bin.clone(),
-            skip_codex_review: false,
-            max_turns: args.max_turns,
-            parallelism: args.planning_parallelism,
-            plan_only: false,
-            snapshot_only: false,
-            sync_only: false,
-        })
-        .await?;
-        audit_generated_plan_against_operator_bans(
-            &repo_root,
-            args.prompt.as_deref().or(args.focus.as_deref()),
-        );
+        generation::run_gen(build_super_generation_args(&args, &planning_root)).await?;
         let state = load_state(&repo_root)?;
         let output_dir = state
             .latest_output_dir
             .clone()
             .or_else(|| args.output_dir.clone());
+        if let Some(output_dir) = output_dir.as_deref() {
+            let command = super_snapshot_promotion_command(output_dir);
+            manifest.output_dir = Some(output_dir.display().to_string());
+            manifest.promotion_command = Some(command.clone());
+            write_manifest(&super_root, &manifest)?;
+            println!("snapshot:    {}", output_dir.display());
+            println!("root plan:   unchanged");
+            println!("promote:     {command}");
+            audit_generated_plan_against_operator_bans(
+                &output_dir.join(IMPLEMENTATION_PLAN),
+                args.prompt.as_deref().or(args.focus.as_deref()),
+            );
+        }
         push_stage(
             &super_root,
             &mut manifest,
@@ -308,7 +324,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         read_deterministic_gate(&super_root)?
     } else {
         println!("stage:       deterministic execution gate");
-        let gate = verify_parallel_ready_plan(&repo_root.join(IMPLEMENTATION_PLAN))?;
+        let gate = verify_super_snapshot_ready_plan(output_dir.as_deref())?;
         let gate_artifact = super_root.join("DETERMINISTIC-GATE.json");
         atomic_write(&gate_artifact, &serde_json::to_vec_pretty(&gate)?)
             .with_context(|| format!("failed to write {}", gate_artifact.display()))?;
@@ -328,6 +344,31 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
     if args.no_execute {
         println!("auto super complete");
         println!("parallel:    skipped (--no-execute)");
+        println!("super root:  {}", super_root.display());
+        println!("elapsed:     {:?}", started_at.elapsed());
+        return Ok(());
+    }
+
+    let parallel_decision = super_snapshot_parallel_decision(output_dir.as_deref())?;
+    if !parallel_decision.launch {
+        push_stage(
+            &super_root,
+            &mut manifest,
+            "parallel",
+            "skipped",
+            output_dir.as_deref(),
+        )?;
+        println!("auto super complete");
+        println!(
+            "parallel:    skipped ({})",
+            parallel_decision
+                .skip_reason
+                .as_deref()
+                .unwrap_or("snapshot requires promotion")
+        );
+        if let Some(command) = parallel_decision.promotion_command {
+            println!("promote:     {command}");
+        }
         println!("super root:  {}", super_root.display());
         println!("elapsed:     {:?}", started_at.elapsed());
         return Ok(());
@@ -431,9 +472,55 @@ fn prepare_super_run(repo_root: &Path, args: &mut SuperArgs) -> Result<(PathBuf,
             .map(|path| path.display().to_string())
             .collect(),
         binary: binary_provenance_line(),
+        generation_mode: SUPER_GENERATION_MODE_SNAPSHOT_ONLY.to_string(),
+        root_plan_status: SUPER_ROOT_PLAN_STATUS_UNCHANGED.to_string(),
+        promotion_command: args
+            .output_dir
+            .as_ref()
+            .map(|path| super_snapshot_promotion_command(path)),
         stages: Vec::new(),
     };
     Ok((super_root, manifest))
+}
+
+fn build_super_generation_args(args: &SuperArgs, planning_root: &Path) -> GenerationArgs {
+    GenerationArgs {
+        planning_root: Some(planning_root.to_path_buf()),
+        output_dir: args.output_dir.clone(),
+        model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
+        codex_review_model: args.model.clone(),
+        codex_review_effort: args.reasoning_effort.clone(),
+        codex_bin: args.codex_bin.clone(),
+        skip_codex_review: false,
+        max_turns: args.max_turns,
+        parallelism: args.planning_parallelism,
+        plan_only: false,
+        snapshot_only: true,
+        sync_only: false,
+    }
+}
+
+fn super_snapshot_promotion_command(output_dir: &Path) -> String {
+    format!("auto gen --sync-only --output-dir {}", output_dir.display())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SuperParallelDecision {
+    launch: bool,
+    skip_reason: Option<String>,
+    promotion_command: Option<String>,
+}
+
+fn super_snapshot_parallel_decision(output_dir: Option<&Path>) -> Result<SuperParallelDecision> {
+    let output_dir = output_dir.context(
+        "auto super generated snapshot path is unavailable; cannot decide promotion-gated parallel launch",
+    )?;
+    Ok(SuperParallelDecision {
+        launch: false,
+        skip_reason: Some("snapshot requires explicit promotion".to_string()),
+        promotion_command: Some(super_snapshot_promotion_command(output_dir)),
+    })
 }
 
 fn absolutize_super_path(repo_root: &Path, path: &Path) -> PathBuf {
@@ -1413,10 +1500,11 @@ Edit boundary:
 - You may read the repository, `{planning_root}`, generated output, root `specs/`, and root `IMPLEMENTATION_PLAN.md`.
 - You may read `{super_root}/design`; design/runtime UI contract risks are execution-gate inputs, not decoration.
 - You must read `{super_root}/CEO-14-DAY-PLAN.md`, `{super_root}/FUNCTIONAL-REVIEWS.md`, `{super_root}/PRODUCTION-READINESS.md`, `{super_root}/RISK-REGISTER.md`, `{super_root}/QUALITY-GATES.md`, and `{super_root}/SYSTEM-MAP.md` when present.
-- You may edit only root `IMPLEMENTATION_PLAN.md`, root `specs/*.md`, and `{super_root}/EXECUTION-GATE.md`.
+- You may edit only `{super_root}/EXECUTION-GATE.md`.
+- Do not edit root `IMPLEMENTATION_PLAN.md` or root `specs/*.md`; default `auto super` keeps root queue truth unchanged until the operator promotes the generated snapshot.
 - Do not edit source code, `genesis/`, `gen-*`, skill definition directories, or worker artifacts.
 
-Review the root execution queue as if max-compute tmux-backed implementation workers will start immediately.
+Review the generated snapshot plan as a promotion candidate. Max-compute tmux-backed implementation workers cannot start from this super run until the operator promotes the snapshot with `auto gen --sync-only --output-dir <gen-dir>`.
 
 Gate criteria:
 - The queue must implement the CEO 14-day production race, not a generic cleanup backlog or capacity-trimmed wishlist.
@@ -1427,7 +1515,7 @@ Gate criteria:
 - Verification must be narrow and meaningful. Reject broad package-wide test commands, malformed shell snippets, zero-test filters, and directory greps as sole proof.
 - Security, credentials, generated executable workflow text, destructive operations, and external-service tasks must carry explicit scope boundaries and proof expectations.
 - Research or decision tasks must produce concrete artifacts and must not silently authorize implementation before the decision is made.
-- If the plan is not ready for parallel execution, amend it until it is ready or write a NO-GO verdict explaining the blocker.
+- If the generated snapshot is not ready for explicit promotion and later parallel execution, write a NO-GO verdict explaining the blocker.
 
 Write `{super_root}/EXECUTION-GATE.md` with:
 - `# SUPER EXECUTION GATE`
@@ -1435,9 +1523,9 @@ Write `{super_root}/EXECUTION-GATE.md` with:
 - Queue summary
 - Changes made
 - Remaining risks
-- Parallel launch notes
+- Promotion and later parallel launch notes
 
-Only write `Verdict: GO` if it is safe and useful for `auto parallel` to begin immediately after this gate.
+Only write `Verdict: GO` if the generated snapshot is safe and useful for the operator to promote explicitly before a later `auto parallel` run.
 "#,
         repo_root = repo_root.display(),
         planning_root = planning_root.display(),
@@ -1451,6 +1539,18 @@ struct DeterministicGateSummary {
     unchecked_tasks: usize,
     priority_tasks: usize,
     follow_on_tasks: usize,
+    #[serde(default)]
+    plan_path: Option<String>,
+    #[serde(default)]
+    plan_source: String,
+    #[serde(default)]
+    generation_mode: String,
+    #[serde(default)]
+    root_plan_status: String,
+    #[serde(default)]
+    promotion_required: bool,
+    #[serde(default)]
+    promotion_command: Option<String>,
 }
 
 fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSummary> {
@@ -1507,7 +1607,27 @@ fn verify_parallel_ready_plan(plan_path: &Path) -> Result<DeterministicGateSumma
             .iter()
             .filter(|task| task.section == SuperPlanSection::FollowOn)
             .count(),
+        plan_path: Some(plan_path.display().to_string()),
+        plan_source: SUPER_PLAN_SOURCE_ROOT_LEDGER.to_string(),
+        generation_mode: "root".to_string(),
+        root_plan_status: "inspected".to_string(),
+        promotion_required: false,
+        promotion_command: None,
     })
+}
+
+fn verify_super_snapshot_ready_plan(output_dir: Option<&Path>) -> Result<DeterministicGateSummary> {
+    let output_dir = output_dir.context(
+        "auto super generated snapshot path is unavailable; cannot run deterministic gate",
+    )?;
+    let plan_path = output_dir.join(IMPLEMENTATION_PLAN);
+    let mut gate = verify_parallel_ready_plan(&plan_path)?;
+    gate.plan_source = SUPER_PLAN_SOURCE_GENERATED_SNAPSHOT.to_string();
+    gate.generation_mode = SUPER_GENERATION_MODE_SNAPSHOT_ONLY.to_string();
+    gate.root_plan_status = SUPER_ROOT_PLAN_STATUS_UNCHANGED.to_string();
+    gate.promotion_required = true;
+    gate.promotion_command = Some(super_snapshot_promotion_command(output_dir));
+    Ok(gate)
 }
 
 fn verify_super_task(
@@ -1799,7 +1919,7 @@ fn push_stage(
     write_manifest(super_root, manifest)
 }
 
-fn audit_generated_plan_against_operator_bans(repo_root: &Path, operator_prompt: Option<&str>) {
+fn audit_generated_plan_against_operator_bans(plan_path: &Path, operator_prompt: Option<&str>) {
     // Best-effort observability: when the operator's prompt enumerates banned
     // path prefixes (typical pattern: "No new docs/ops/...", "No new
     // genesis/checkpoints/0XX-*.md"), count how often the generated plan
@@ -1810,8 +1930,7 @@ fn audit_generated_plan_against_operator_bans(repo_root: &Path, operator_prompt:
     let Some(prompt) = operator_prompt else {
         return;
     };
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
-    let Ok(plan) = std::fs::read_to_string(&plan_path) else {
+    let Ok(plan) = std::fs::read_to_string(plan_path) else {
         return;
     };
     let banned_substrings: Vec<&str> = prompt
@@ -1960,6 +2079,12 @@ mod tests {
             unchecked_tasks: 3,
             priority_tasks: 2,
             follow_on_tasks: 1,
+            plan_path: Some(root.join(IMPLEMENTATION_PLAN).display().to_string()),
+            plan_source: SUPER_PLAN_SOURCE_GENERATED_SNAPSHOT.to_string(),
+            generation_mode: SUPER_GENERATION_MODE_SNAPSHOT_ONLY.to_string(),
+            root_plan_status: SUPER_ROOT_PLAN_STATUS_UNCHANGED.to_string(),
+            promotion_required: true,
+            promotion_command: Some(super_snapshot_promotion_command(&artifact)),
         };
         fs::write(
             root.join("DETERMINISTIC-GATE.json"),
@@ -1992,6 +2117,9 @@ mod tests {
             branch: Some("main".to_string()),
             reference_repos: vec!["/ref".to_string()],
             binary: "auto test".to_string(),
+            generation_mode: SUPER_GENERATION_MODE_SNAPSHOT_ONLY.to_string(),
+            root_plan_status: SUPER_ROOT_PLAN_STATUS_UNCHANGED.to_string(),
+            promotion_command: Some(super_snapshot_promotion_command(&artifact)),
             stages: vec![
                 SuperStage {
                     name: "gen".to_string(),
@@ -2019,6 +2147,70 @@ mod tests {
         assert!(!super_stage_terminal(&loaded, "parallel"));
         assert_eq!(super_stage_artifact(&loaded, "gen"), Some(artifact));
         assert_eq!(read_deterministic_gate(&root).unwrap(), gate);
+    }
+
+    #[test]
+    fn super_default_generation_is_snapshot_only() {
+        let args = super_args();
+        let planning_root = PathBuf::from("/repo/genesis");
+
+        let generation_args = build_super_generation_args(&args, &planning_root);
+
+        assert_eq!(generation_args.planning_root, Some(planning_root));
+        assert!(generation_args.snapshot_only);
+        assert!(!generation_args.sync_only);
+        assert!(!generation_args.plan_only);
+    }
+
+    #[test]
+    fn super_deterministic_gate_reads_generated_snapshot_plan() {
+        let root = temp_dir("super-snapshot-gate");
+        let root_plan = root.join(IMPLEMENTATION_PLAN);
+        fs::write(
+            &root_plan,
+            "# IMPLEMENTATION_PLAN\n\n## Priority Work\n\n## Follow-On Work\n\n## Completed / Already Satisfied\n",
+        )
+        .unwrap();
+        let gen_dir = root.join("gen-snapshot");
+        fs::create_dir_all(&gen_dir).unwrap();
+        let generated_plan = gen_dir.join(IMPLEMENTATION_PLAN);
+        fs::write(
+            &generated_plan,
+            valid_plan(
+                "cargo test super_command::tests::super_deterministic_gate_reads_generated_snapshot_plan",
+            ),
+        )
+        .unwrap();
+
+        let gate = verify_super_snapshot_ready_plan(Some(&gen_dir)).unwrap();
+
+        assert_eq!(gate.unchecked_tasks, 1);
+        assert_eq!(gate.plan_path, Some(generated_plan.display().to_string()));
+        assert_eq!(gate.plan_source, SUPER_PLAN_SOURCE_GENERATED_SNAPSHOT);
+        assert_eq!(gate.generation_mode, SUPER_GENERATION_MODE_SNAPSHOT_ONLY);
+        assert_eq!(gate.root_plan_status, SUPER_ROOT_PLAN_STATUS_UNCHANGED);
+        assert!(gate.promotion_required);
+        assert_eq!(
+            gate.promotion_command,
+            Some(super_snapshot_promotion_command(&gen_dir))
+        );
+    }
+
+    #[test]
+    fn super_skips_parallel_until_snapshot_is_promoted() {
+        let gen_dir = PathBuf::from("/repo/gen-review");
+
+        let decision = super_snapshot_parallel_decision(Some(&gen_dir)).unwrap();
+
+        assert!(!decision.launch);
+        assert_eq!(
+            decision.skip_reason.as_deref(),
+            Some("snapshot requires explicit promotion")
+        );
+        assert_eq!(
+            decision.promotion_command,
+            Some("auto gen --sync-only --output-dir /repo/gen-review".to_string())
+        );
     }
 
     fn valid_plan(verification: &str) -> String {
@@ -2070,5 +2262,36 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn super_args() -> SuperArgs {
+        SuperArgs {
+            prompt: Some("snapshot proof".to_string()),
+            planning_root: None,
+            output_dir: None,
+            resume: None,
+            idea: None,
+            focus: None,
+            reference_repos: Vec::new(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "xhigh".to_string(),
+            codex_bin: PathBuf::from("codex"),
+            max_turns: 200,
+            planning_parallelism: 8,
+            max_concurrent_workers: 5,
+            max_iterations: None,
+            worker_model: "gpt-5.5".to_string(),
+            worker_reasoning_effort: "high".to_string(),
+            branch: None,
+            no_execute: false,
+            skip_super_review: false,
+            skip_design: false,
+            design_resolve_passes: 3,
+            with_audit: false,
+            audit_threads: 10,
+            audit_first_pass_retries: 3,
+            audit_run_id: None,
+            dry_run: false,
+        }
     }
 }
