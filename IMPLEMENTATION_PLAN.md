@@ -379,7 +379,7 @@
     Estimated scope: S
     Completion signal: Ship readiness gate facts describe the current branch state, not a stale pre-sync state.
 
-- [ ] `FOL-003` Complete lane assignment metadata and host-owned queue constants
+- [x] `FOL-003` Complete lane assignment metadata and host-owned queue constants
 
     Spec: `specs/220526-receipt-and-lane-evidence-contract.md`
     Why now: This is deferred until lane-kind routing is coherent; after that, assignment metadata and protected-file constants can remove remaining drift without blocking the core operator queue semantics.
