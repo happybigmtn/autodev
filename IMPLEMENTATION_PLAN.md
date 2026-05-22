@@ -127,7 +127,7 @@
     Estimated scope: S
     Completion signal: Super model gate uses the shared verdict parser and fails closed on ambiguous gate reports.
 
-- [~] `P0-006` Checkpoint snapshot and gate readiness
+- [x] `P0-006` Checkpoint snapshot and gate readiness
 
     Spec: `specs/220526-super-snapshot-first-runtime.md`
     Why now: This checkpoint follows the risky super behavior change so receipt, lane, and quota workers do not proceed while the macro command might still mutate root queue truth or approve execution ambiguously.
