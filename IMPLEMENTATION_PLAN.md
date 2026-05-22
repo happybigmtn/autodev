@@ -227,7 +227,7 @@
     Estimated scope: XS
     Completion signal: Evidence and lane contracts are consistent enough for quota/security hardening to proceed.
 
-- [ ] `P1-010` Reject unsafe persisted quota account names on load
+- [x] `P1-010` Reject unsafe persisted quota account names on load
 
     Spec: `specs/220526-quota-persistence-and-credential-hardening.md`
     Why now: This is the first quota P1 because unsafe persisted account identity can reach selection, cooldown, profile, or credential mutation before any new write happens; it outranks atomic-save work because invalid loaded state must fail closed before it is used.
