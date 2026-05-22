@@ -27,7 +27,7 @@
     Estimated scope: S
     Completion signal: Local formatting and the public command-surface regression are green, with README and CI smoke aligned to live Clap output.
 
-- [ ] `P0-002` Re-tighten shared proof command lint
+- [x] `P0-002` Re-tighten shared proof command lint
 
     Spec: `specs/220526-generated-plan-proof-validators.md`
     Why now: This is the second P0 because generated and spec-authored task rows feed parallel execution; it outranks status polish and quota hardening because weak proof commands can dispatch multiple workers on unprovable tasks.
