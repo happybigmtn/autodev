@@ -202,7 +202,7 @@
     Estimated scope: S
     Completion signal: Operator, evidence, and code rows route and render according to `LaneKind`.
 
-- [~] `P1-009` Checkpoint evidence and lane contracts
+- [x] `P1-009` Checkpoint evidence and lane contracts
 
     Spec: `specs/220526-receipt-and-lane-evidence-contract.md`
     Why now: This checkpoint comes after receipt freshness and lane routing because both feed release and parallel status decisions; it prevents quota/security work from hiding unresolved proof semantics.
