@@ -29,3 +29,11 @@
 - Validation: verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-001.json` has unsuperseded failed command(s): `cargo test`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-001.json` has unsuperseded failed command(s): `cargo test`
+
+## `FOL-001`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `README.md`, `src/doctor_command.rs`, `src/main.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-001.json` has unsuperseded failed command(s): `cargo test`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-001.json` has unsuperseded failed command(s): `cargo test`
