@@ -21,3 +21,11 @@
 - Validation: `cargo test spec_command::tests::auto_spec_accepts_developer_facing_text_plates`; `cargo test spec_command::tests::auto_spec_accepts_exact_command_status_output_surfaces`; `cargo test spec_command::tests::auto_spec_rejects_ui_contract_without_actual_design_plates`; `git diff --check -- src/spec_command.rs src/claude_exec.rs REVIEW.md`; `cargo install --path .`; `auto --help`.
 - Validation caveats: `cargo test spec_command::tests::auto_spec` still fails two pre-existing plan-validation tests (`auto_spec_plan_validation_rejects_prose_dependencies`, `auto_spec_plan_validation_rejects_multi_filter_verification_commands`) because the current checkout accepts those fixtures. `cargo fmt --check` also reports pre-existing formatting drift outside this change (`src/generation.rs`, `src/parallel_command.rs`, `src/quota_exec.rs`, `src/super_command.rs`, `src/task_parser.rs`).
 - Remaining blockers: none for this validator fix.
+
+## `P0-001`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `.github/workflows/ci.yml`, `README.md`, `src/audit_everything.rs`, `src/doctor_command.rs`, `src/generation.rs`, `src/main.rs`, `src/parallel_command.rs`, `src/quota_usage.rs`, `src/spec_command.rs`, `src/super_command.rs`, `src/task_parser.rs`
+- Scope exceptions: none recorded by host.
+- Validation: verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-001.json` has unsuperseded failed command(s): `cargo test`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff; verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P0-001.json` has unsuperseded failed command(s): `cargo test`
