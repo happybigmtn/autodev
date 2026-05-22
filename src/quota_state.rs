@@ -41,7 +41,10 @@ impl QuotaState {
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        let state: Self = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        state.validate_account_names()?;
+        Ok(state)
     }
 
     pub(crate) fn save(&self) -> Result<()> {
@@ -128,6 +131,13 @@ impl QuotaState {
             state.exhausted_at = None;
             state.active_leases = 0;
         }
+    }
+
+    fn validate_account_names(&self) -> Result<()> {
+        for name in self.accounts.keys() {
+            validate_account_name(name)?;
+        }
+        Ok(())
     }
 }
 
@@ -261,6 +271,35 @@ mod tests {
         assert!(!account.exhausted);
         assert!(account.exhausted_at.is_none());
         assert_eq!(account.last_success, Some(now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_unsafe_account_names() {
+        let _config_home = TempConfigHome::new("quota-state-load-unsafe");
+        let state_path = QuotaState::state_path();
+        let state_dir = state_path.parent().expect("state path should have parent");
+        fs::create_dir_all(state_dir).expect("failed to create quota state dir");
+
+        fs::write(
+            &state_path,
+            r#"{"accounts":{"work-codex":{"exhausted":false,"active_leases":1}}}"#,
+        )
+        .expect("failed to write valid persisted state");
+        let state = QuotaState::load().expect("valid persisted state should load");
+        assert_eq!(state.get("work-codex").active_leases, 1);
+
+        fs::write(
+            &state_path,
+            r#"{"accounts":{"../escape":{"exhausted":true,"active_leases":0}}}"#,
+        )
+        .expect("failed to write unsafe persisted state");
+        let error = QuotaState::load()
+            .expect_err("unsafe persisted account key must be rejected")
+            .to_string();
+
+        assert!(error.contains("invalid quota account name '../escape'"));
+        assert!(error.contains("lowercase ASCII letters"));
     }
 
     #[test]

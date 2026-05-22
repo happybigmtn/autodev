@@ -97,7 +97,10 @@ impl QuotaConfig {
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.validate_account_names()?;
+        Ok(config)
     }
 
     pub(crate) fn load_or_none() -> Result<Option<Self>> {
@@ -644,6 +647,48 @@ mod tests {
         assert_eq!(parsed.accounts[1].provider, Provider::Claude);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_unsafe_account_names() {
+        let _config_home = TempConfigHome::new("quota-config-load-unsafe");
+        let config_path = QuotaConfig::config_path();
+        let config_dir = config_path
+            .parent()
+            .expect("config path should have parent");
+        fs::create_dir_all(config_dir).expect("failed to create quota config dir");
+
+        fs::write(
+            &config_path,
+            r#"
+selected_codex_account = "work-codex"
+
+[[accounts]]
+name = "work-codex"
+provider = "codex"
+"#,
+        )
+        .expect("failed to write valid persisted config");
+        let config = QuotaConfig::load().expect("valid persisted config should load");
+        assert_eq!(config.accounts[0].name, "work-codex");
+        assert_eq!(config.selected_codex_account.as_deref(), Some("work-codex"));
+
+        fs::write(
+            &config_path,
+            r#"
+[[accounts]]
+name = "../escape"
+provider = "codex"
+"#,
+        )
+        .expect("failed to write unsafe persisted config");
+        let error = QuotaConfig::load()
+            .expect_err("unsafe persisted account name must be rejected")
+            .to_string();
+
+        assert!(error.contains("invalid quota account name '../escape'"));
+        assert!(error.contains("lowercase ASCII letters"));
+    }
+
     #[test]
     fn duplicate_account_rejected() {
         let mut config = QuotaConfig::default();
@@ -694,7 +739,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_account_names_fail_before_profile_mutation() {
+    fn profile_dir_rejects_unsafe_names() {
         let _home = TempConfigHome::new("quota-config-unsafe-names");
         let unsafe_names = [
             "",
