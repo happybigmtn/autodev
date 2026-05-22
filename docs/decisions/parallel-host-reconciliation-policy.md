@@ -35,6 +35,8 @@ Recent production-style runs exposed two scheduler foot-guns:
   rows are routed to `.auto/parallel/operator-actions.md` instead of code
   workers. Rows can also declare `Lane kind: evidence` for proof-only closeout
   work.
+- Operator routing is explicit. Prose about approvals, live authority, or human
+  review does not by itself remove a dependency-ready row from code dispatch.
 
 ## Why
 

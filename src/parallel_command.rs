@@ -719,16 +719,7 @@ fn finalize_task(task: SharedPlanTask) -> LoopTask {
 
 fn infer_lane_kind(title: &str, markdown: &str) -> LaneKind {
     let text = format!("{title}\n{markdown}").to_ascii_lowercase();
-    if text.contains("operator action")
-        || text.contains("operator-action")
-        || text.contains("operator queue")
-        || text.contains("operator must")
-        || text.contains("operator approval")
-        || text.contains("human approval")
-        || text.contains("real human")
-    {
-        LaneKind::Operator
-    } else if text.contains("evidence only")
+    if text.contains("evidence only")
         || text.contains("evidence-only")
         || text.contains("verification only")
         || text.contains("receipt refresh")
@@ -4836,14 +4827,7 @@ fn classify_task_execution_kind(task: &LoopTask) -> &'static str {
 }
 
 fn is_operator_task(task: &LoopTask) -> bool {
-    // Autonomous-execution mode: tasks tagged `Lane kind: operator` are
-    // dispatched as code lanes alongside everything else. The historical
-    // operator-queue concept (which shelved these tasks waiting on a human
-    // operator to run live commands) is retired -- the worker handles
-    // them with full tool access. Keep the parsed LaneKind value for
-    // observability but don't use it to gate dispatch.
-    let _ = task;
-    false
+    task.lane_kind == LaneKind::Operator
 }
 
 fn is_evidence_lane_task(task: &LoopTask) -> bool {
@@ -9473,11 +9457,12 @@ mod tests {
             &[],
             &[],
         );
-        assert!(verdict.contains("code lanes ready:"));
-        assert!(verdict.contains("CODE-001"));
+        assert_eq!(
+            verdict,
+            "GO: safe to launch or resume; code lanes ready: CODE-001; evidence queue: EVID-001; operator queue: OPS-001"
+        );
+        assert!(!verdict.contains("code lanes ready: OPS-001"));
         assert!(verdict.contains("evidence queue: EVID-001"));
-        assert!(verdict.contains("OPS-001"));
-        assert!(!verdict.contains("operator queue: OPS-001"));
     }
 
     #[test]
@@ -9487,9 +9472,11 @@ mod tests {
 - [ ] `LIVE-001` Autonomous loom mainnet canary
   Verification: `LAUNCH_GATE_AUTHORIZE_REAL_RBTC=1 bash scripts/e2e/canary.sh`
   Scope boundary: fail-closed live mainnet proof; emits AUTO_ENV_BLOCKER when credentials or authorization are absent.
+  Review/closeout: requires operator approval before any live run.
   Dependencies: none
 
 - [ ] `OPS-001` Human signoff ceremony
+  Lane kind: operator
   Verification: `ssh root@loom true`
   Review/closeout: requires operator approval before any live run.
   Dependencies: none
@@ -9507,9 +9494,11 @@ mod tests {
             &[],
             &[],
         );
-        assert!(verdict.contains("code lanes ready: LIVE-001"));
-        assert!(verdict.contains("OPS-001"));
-        assert!(!verdict.contains("operator queue: OPS-001"));
+        assert_eq!(
+            verdict,
+            "GO: safe to launch or resume; code lanes ready: LIVE-001; operator queue: OPS-001"
+        );
+        assert!(!verdict.contains("operator queue: LIVE-001"));
     }
 
     #[test]
