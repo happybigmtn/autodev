@@ -2058,6 +2058,7 @@ Review the actual codebase first, not just docs:
   - Use these decision principles: choose completeness, inspect broadly when the problem requires it, stay pragmatic, avoid redundant artifacts, prefer explicit contracts over clever prose, and bias toward action when evidence is sufficient.
 - Apply the priority focus lens when ranking outputs: a small implementation slice that proves the core loop, fixes a runtime/source-of-truth gap, or makes a user/operator path clear should outrank a large documentation, audit, or artifact-only exercise unless the artifact directly unblocks that slice.
 - Apply the production orchestration discipline when the repo already has an active queue: the corpus should steer, reconcile, and reorder the next executor cycle, not expand lower-priority evidence work ahead of executable blockers.
+- Before finishing, make an explicit autodev lever decision: whether the operator should run `auto design`, run `auto gen`, run `auto parallel`, continue/supervise an existing run, or stop for a human decision. Tie that recommendation to repo evidence, conflict risk, and the top dependency that must be true first.
 
 {idea_context_clause}
 {focus_context_clause}
@@ -2076,6 +2077,7 @@ ASSESSMENT.md must include:
 - focus-response section: what the operator focus emphasized, what the code says about it, and any non-focused risks that still outrank it
 - opportunity framing: strongest direction, rejected directions, and why they were rejected
 - priority focus map: the top 3-5 focus areas, each scored qualitatively against user/operator value, design clarity, engineering leverage, evidence, and parallel executability
+- autodev lever decision: the recommended next command path across `auto design`, `auto gen`, `auto parallel`, and any active run, including restart/conflict risk
 - for developer-facing repos: a short DX assessment covering first-run friction, copy-paste onboarding honesty, error clarity, and whether the fastest path produces a meaningful success moment
 
 SPEC.md must summarize the repo as a product/system with concrete behaviors grounded in the code and near-term direction.
@@ -2084,6 +2086,8 @@ SPEC.md must summarize the repo as a product/system with concrete behaviors grou
 
 GENESIS-REPORT.md must start with `## Priority Focus` before general findings. That section must list the top 3-5 focus areas in priority order and explain why each outranks plausible documentation, audit, artifact, or process work right now.
 GENESIS-REPORT.md must summarize the corpus refresh, major findings, recommended direction, top next priorities, and the explicit "Not Doing" list.
+GENESIS-REPORT.md must include a `## Next Autodev Lever` section that recommends exactly one immediate lever path from `auto design`, `auto gen`, `auto parallel`, continuing/supervising the active run, or human decision. If the repo has meaningful UI/TUI/frontend surfaces, explicitly decide whether `auto design` should run before generation or parallel execution.
+GENESIS-REPORT.md must include a `## Delete Or Demote` section naming stale, evidence-only, docs-only, or lower-priority tracks that should not consume the next executor cycle unless they directly unlock a named implementation slice.
 If a focus seed exists, GENESIS-REPORT.md must also say how it changed the recommended priority order and call out any higher-priority issues that escaped the requested focus.
 GENESIS-REPORT.md must also include a concise decision audit trail with `Mechanical`, `Taste`, and `User Challenge` classifications for major scope and sequencing choices.
 
@@ -2111,6 +2115,7 @@ Every numbered plan under `{planning_root}/plans/` must include these non-empty 
 
 Section requirements for numbered priority plans:
 - `## Priority Decision` states P0/P1/P2, the score/rationale, and why this outranks plausible alternatives.
+- `## Priority Decision` also states which autodev lever this plan feeds (`auto design`, `auto gen`, `auto parallel`, active-run supervision, or human decision) and why that lever is the right next control point.
 - `## User / Operator Outcome` explains what a user or operator gains and how they can see it working.
 - `## Evidence` names repository-relative code, tests, logs, commands, or docs that prove this priority is real.
 - `## Scope Boundary` states what the plan intentionally does not change, especially docs/audits/artifacts that are not needed now.
@@ -2244,11 +2249,14 @@ Corpus-specific validation:
 - If active root plans already exist under `plans/` and the repo's own instructions do not designate another active planning root, the generated corpus must explicitly reconcile to them and must not present itself as a second active planning surface.
 - If repo-root instructions explicitly designate `{planning_root}` as the active planning corpus, the generated corpus should say that plainly and should not invent root-level primacy.
 - `GENESIS-REPORT.md` must start with `## Priority Focus` and explain why the chosen top focus areas outrank plausible documentation, audit, artifact, or process work right now.
+- `GENESIS-REPORT.md` must include `## Next Autodev Lever` with one immediate command-path recommendation across `auto design`, `auto gen`, `auto parallel`, continuing/supervising an active run, or human decision. For repos with meaningful UI/TUI/frontend surfaces, the recommendation must explicitly decide whether `auto design` should run before generation or parallel execution.
+- `GENESIS-REPORT.md` must include `## Delete Or Demote` naming stale, evidence-only, docs-only, or lower-priority tracks that should not consume the next executor cycle unless they directly unlock a named implementation slice.
 - Every numbered plan under `{planning_root}/plans/` must use the compact priority-plan shape rather than the old high-level `Objective` / `Description` / `Acceptance Criteria` / `Verification` / `Dependencies` stub shape or the bulky 15-section audit-style ExecPlan shape.
 - Numbered priority plans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
 - Reject or rewrite any absolute repo-root path that appears in the corpus. Use repository-relative references, "the repository root" in prose, or `cd "$(git rev-parse --show-toplevel)"` in shell examples instead.
 - Every numbered priority plan must include non-empty sections for `Priority Decision`, `User / Operator Outcome`, `Evidence`, `Scope Boundary`, `Implementation Slice`, `Verification`, and `Deferred`.
 - `Priority Decision` must state P0/P1/P2 and why the slice outranks plausible docs/audit/artifact work. `Implementation Slice` must name goal, dependencies, files to create or modify, tests to add or modify, and approach. For research-only or checkpoint work, name the decision artifact and explain why no code test is expected.
+- `Priority Decision` must state which autodev lever the plan feeds and why that lever is the right next control point.
 - Add checkpoint or decision-gate plans only when later work depends on unresolved evidence.
 
 Validation expectations:
@@ -2482,6 +2490,7 @@ Required output contract:
 - In gen mode, preserve intended future direction from the corpus, but keep future intent under recommendations or hypotheses until code or primary-source evidence proves otherwise
 - Generate specs for the highest-priority product/system focus areas first. Do not multiply specs for docs, audits, reports, or artifacts unless they directly unblock an executable implementation slice.
 - In live partially complete repos, generate specs that tighten the next executable implementation queue. Do not spend the spec pass inventing new evidence-only tracks while runtime, user/operator workflow, or reusable UI/runtime contract blockers remain.
+- If the corpus recommends `auto design` or the repo has meaningful UI/TUI/frontend gaps, preserve that as a reusable runtime-backed design contract. Do not reduce it to one-off screen polish, screenshot acceptance, or fixture-specific presentation work.
 
 Cover the main product and system surfaces represented in the repo. Use the codebase and the planning corpus to decide the right spec set."#,
         repo_root = repo_root.display(),
@@ -2564,6 +2573,7 @@ Before writing the plan, do the real planning work:
 - In `## Priority Work`, prefer tasks that change source code, tests, runtime contracts, user/operator flows, or executable verification. Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work` unless they directly unblock implementation or correct stale guidance that would otherwise make workers implement the wrong thing.
 - Do not turn the priority queue into a documentation or audit campaign for a repo that is not production-ready yet. Make the next `auto parallel` run land the highest-leverage executable improvements.
 - For active repos, preserve useful existing queue intent but rewrite ordering and task contracts so the next `auto parallel` run can select production blockers first. Evidence, receipts, checkpoints, and report generation may appear only when they name the exact implementation decision they unlock.
+- Encode the immediate autodev lever in the first priority tasks: `auto design` for reusable UI/runtime contract gaps, `auto gen` only when root doctrine or queue shape must be regenerated, `auto parallel` when dependency-ready implementation can start, and active-run supervision when a running executor is already attacking the top blockers.
 
 Output requirements:
 - Write exactly one file: `{output_dir}/IMPLEMENTATION_PLAN.md`
@@ -4444,6 +4454,9 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(prompt.contains("Priority focus lens"));
         assert!(prompt.contains("Production orchestration discipline"));
         assert!(prompt.contains("live production playground"));
+        assert!(prompt.contains("Next Autodev Lever"));
+        assert!(prompt.contains("Delete Or Demote"));
+        assert!(prompt.contains("whether the operator should run `auto design`"));
         assert!(prompt
             .contains("product leverage, user-visible clarity, and engineering feasibility/tests"));
         assert!(prompt.contains("Never emit the absolute repository-root path"));
@@ -4491,6 +4504,9 @@ Spec: `specs/050426-deterministic-transcripts.md`
         );
         assert!(corpus_prompt.contains("Priority focus lens"));
         assert!(corpus_prompt.contains("production orchestration discipline"));
+        assert!(corpus_prompt.contains("`## Next Autodev Lever`"));
+        assert!(corpus_prompt.contains("`## Delete Or Demote`"));
+        assert!(corpus_prompt.contains("`auto design` should run before generation"));
         assert!(corpus_prompt.contains("`Mechanical`, `Taste`, or `User Challenge`"));
         assert!(corpus_prompt.contains(
             "Every numbered plan under `/tmp/repo/genesis/plans/` must use the compact priority-plan shape"
@@ -4515,6 +4531,8 @@ Spec: `specs/050426-deterministic-transcripts.md`
         assert!(generation_prompt.contains("Priority focus lens"));
         assert!(generation_prompt.contains("active production blockers"));
         assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
+        assert!(generation_prompt.contains("`auto design`"));
+        assert!(generation_prompt.contains("continuing or supervising an existing run"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
 

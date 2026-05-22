@@ -449,8 +449,13 @@ What it actually does:
   - what assumptions are verified vs unverified
   - what candidate directions exist
   - what is explicitly out of scope right now
+  - the next autodev lever decision: `auto design`, `auto gen`, `auto parallel`, continuing an active run, or human decision
+  - stale evidence-only or lower-priority tracks to delete, demote, or mark not-doing before the next executor cycle
 - For developer-facing repos, also assesses first-run DX, onboarding honesty, error clarity, and
   whether the fastest path leads to a real success moment
+- For repos with UI, TUI, or frontend surfaces, explicitly decides whether `auto design` should run
+  before generation or parallel implementation, and frames design work as reusable runtime-backed
+  components/contracts rather than one-off screen polish
 - Emits stage-by-stage observability to stdout, including binary provenance, repo root, prompt log
   path, Claude phase start/finish markers, Claude PID, cwd, and elapsed timings so long runs are
   inspectable instead of silent
