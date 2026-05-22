@@ -88,7 +88,7 @@ impl GenerationMode {
     }
 }
 
-struct GeneratedSpecDocument {
+pub(crate) struct GeneratedSpecDocument {
     path: PathBuf,
     text: String,
 }

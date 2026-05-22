@@ -795,7 +795,7 @@ mod tests {
         FileQualityRatingState, FileState, GroupState, StageStatus,
     };
     use crate::audit_everything::prompts::CODEBASE_IMPROVEMENT_POLICY;
-    use crate::audit_everything::run_paths::{RunPaths, PAUSE_REQUEST_FILE};
+    use crate::audit_everything::run_paths::RunPaths;
     use crate::audit_everything::tests::{group_for_test, manifest_with_groups};
     use std::path::{Path, PathBuf};
 

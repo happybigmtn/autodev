@@ -421,26 +421,6 @@ mod tests {
         assert!(status.success(), "git init should succeed");
     }
 
-    fn run_git_in<'a>(path: &PathBuf, args: impl IntoIterator<Item = &'a str>) {
-        let output = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=Autodev Tests",
-                "-c",
-                "user.email=autodev-tests@example.com",
-            ])
-            .args(args)
-            .current_dir(path)
-            .output()
-            .expect("failed to run git");
-        assert!(
-            output.status.success(),
-            "git command failed: {}\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
     fn commit_empty_change(path: &PathBuf) {
         let status = std::process::Command::new("git")
             .args([
