@@ -252,7 +252,7 @@
     Estimated scope: S
     Completion signal: Quota config/state loads fail closed on unsafe persisted account names.
 
-- [ ] `P1-011` Make quota config and state writes atomic owner-only
+- [~] `P1-011` Make quota config and state writes atomic owner-only
 
     Spec: `specs/220526-quota-persistence-and-credential-hardening.md`
     Why now: This follows load validation because account state is now trusted enough to persist; it outranks credential refresh hardening because config/state truncation can corrupt the router's canonical account truth during ordinary quota operations.

@@ -133,3 +133,11 @@
 - Validation: host observed verification receipt at `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-003.json`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff
+
+## `P1-011`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/quota_config.rs`, `src/quota_state.rs`, `src/util.rs`
+- Scope exceptions: none recorded by host.
+- Validation: stale verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P1-011.json`: commit mismatch, recorded `82cb93a45a83ec7b437981d19acca4ace48bdd53` is not current HEAD `81abd4ecfa95b5375c7bd26fa6d00f122fb0410e` or an ancestor
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff; stale verification receipt `/home/r/coding/autodev/.auto/symphony/verification-receipts/P1-011.json`: commit mismatch, recorded `82cb93a45a83ec7b437981d19acca4ace48bdd53` is not current HEAD `81abd4ecfa95b5375c7bd26fa6d00f122fb0410e` or an ancestor
