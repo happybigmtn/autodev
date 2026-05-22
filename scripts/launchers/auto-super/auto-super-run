@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# auto-super-run — entrypoint invoked by ~/.config/systemd/user/auto-super@.service.
+#
+# Reads /home/r/.config/auto-super/<instance>.env for:
+#   AUTO_SUPER_REPO       — absolute path to the repo
+#   AUTO_SUPER_PROMPT     — absolute path to the prompt file
+#   AUTO_SUPER_FLAGS      — extra flags (e.g. --skip-design --with-audit)
+#   AUTO_SUPER_MODEL      — model (default: claude-opus-4-7 per current direction)
+#   AUTO_SUPER_RESUME     — optional run-id to resume
+#   AUTO_SUPER_AUDIT_RUN  — optional audit-run-id to reuse
+#
+# Loads the env, then execs `auto super` so systemd owns the actual process.
+
+set -euo pipefail
+
+instance="${1:?usage: auto-super-run <instance>}"
+env_file="/home/r/.config/auto-super/${instance}.env"
+
+if [[ ! -f "$env_file" ]]; then
+    echo "auto-super-run: missing env file $env_file" >&2
+    exit 2
+fi
+
+# shellcheck disable=SC1090
+. "$env_file"
+
+: "${AUTO_SUPER_REPO:?AUTO_SUPER_REPO must be set}"
+: "${AUTO_SUPER_PROMPT:?AUTO_SUPER_PROMPT must be set}"
+: "${AUTO_SUPER_FLAGS:=}"
+: "${AUTO_SUPER_MODEL:=claude-opus-4-7}"
+: "${AUTO_SUPER_RESUME:=}"
+: "${AUTO_SUPER_AUDIT_RUN:=}"
+
+if [[ ! -d "$AUTO_SUPER_REPO" ]]; then
+    echo "auto-super-run: AUTO_SUPER_REPO not a directory: $AUTO_SUPER_REPO" >&2
+    exit 2
+fi
+if [[ ! -f "$AUTO_SUPER_PROMPT" ]]; then
+    echo "auto-super-run: AUTO_SUPER_PROMPT not a file: $AUTO_SUPER_PROMPT" >&2
+    exit 2
+fi
+
+cd "$AUTO_SUPER_REPO"
+
+# Read prompt body up-front so we don't depend on the shell at exec time.
+prompt_body="$(cat "$AUTO_SUPER_PROMPT")"
+
+cmd=(auto super --model "$AUTO_SUPER_MODEL" $AUTO_SUPER_FLAGS)
+if [[ -n "$AUTO_SUPER_RESUME" ]]; then
+    cmd+=(--resume "$AUTO_SUPER_RESUME")
+fi
+if [[ -n "$AUTO_SUPER_AUDIT_RUN" ]]; then
+    cmd+=(--audit-run-id "$AUTO_SUPER_AUDIT_RUN")
+fi
+cmd+=("$prompt_body")
+
+echo "[auto-super-run] instance=$instance repo=$AUTO_SUPER_REPO" >&2
+echo "[auto-super-run] cmd=${cmd[*]:0:6} ... <prompt>" >&2
+
+exec "${cmd[@]}"
