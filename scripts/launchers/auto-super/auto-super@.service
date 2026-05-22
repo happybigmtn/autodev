@@ -1,0 +1,35 @@
+[Unit]
+Description=auto super run for %i
+After=network-online.target
+Documentation=https://github.com/happybigmtn/autodev
+
+[Service]
+# %i is the instance name. The launcher script reads /home/r/.config/auto-super/%i.env
+# for repo path, prompt file, and any extra flags. This keeps the unit generic
+# while letting each repo run be configured independently of systemd reloads.
+
+Type=simple
+EnvironmentFile=%h/.config/auto-super/%i.env
+
+# WorkingDirectory= cannot expand $VARS from EnvironmentFile, so auto-super-run
+# does `cd "$AUTO_SUPER_REPO"` itself before exec'ing `auto super`.
+ExecStart=/home/r/.local/bin/auto-super-run %i
+
+# Restart on unexpected failure but not on clean exits (so a successful
+# completion does not loop forever).
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+# auto super spawns codex/playwright/node children that can be heavy.
+# Use a process group so the service can clean up its whole tree.
+KillMode=control-group
+TimeoutStopSec=120
+
+# Capture stdout/stderr to a per-instance log under ~/.local/state.
+StandardOutput=append:/home/r/.local/state/auto-super/%i.log
+StandardError=append:/home/r/.local/state/auto-super/%i.log
+
+[Install]
+WantedBy=default.target
