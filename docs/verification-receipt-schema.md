@@ -36,7 +36,9 @@ receipts as a compatibility/staging fallback.
   compatibility alias for `exit_code`, but new receipts should emit
   `exit_code`.
 - `declared_artifacts[].path` and `declared_artifacts[].sha256`: hash evidence
-  for declared completion artifacts when the task row requires them.
+  for declared completion artifacts when the task row requires them. Older
+  repo-local wrappers that wrote `completion_artifacts` are accepted as a
+  compatibility alias.
 
 ## Evidence Classes
 

@@ -735,7 +735,7 @@ struct VerificationReceipt {
     dirty_state: Option<VerificationDirtyState>,
     #[serde(default)]
     plan_hash: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "completion_artifacts")]
     declared_artifacts: Vec<VerificationReceiptArtifact>,
     #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
@@ -2507,6 +2507,21 @@ Dependencies: none
 
         assert_eq!(command.exit_code, Some(0));
         assert!(super::verification_receipt_command_passed(&command));
+    }
+
+    #[test]
+    fn receipt_artifacts_accept_completion_artifacts_alias() {
+        let receipt = serde_json::from_str::<VerificationReceipt>(
+            r#"{"completion_artifacts":[{"path":"proof.md","sha256":"abc123"}]}"#,
+        )
+        .expect("legacy completion_artifacts receipt should parse");
+
+        assert_eq!(receipt.declared_artifacts.len(), 1);
+        assert_eq!(receipt.declared_artifacts[0].path, "proof.md");
+        assert_eq!(
+            receipt.declared_artifacts[0].sha256.as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
