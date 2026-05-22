@@ -102,7 +102,7 @@
     Estimated scope: M
     Completion signal: Default super creates reviewable snapshot output and cannot silently replace or execute root queue truth.
 
-- [ ] `P1-005` Use exact terminal verdict parsing in the super execution gate
+- [x] `P1-005` Use exact terminal verdict parsing in the super execution gate
 
     Spec: `specs/220526-release-gates-and-verdict-readiness.md`
     Why now: This is paired with snapshot-first super because a permissive model gate can approve execution from ambiguous report prose; it outranks broader release reports because the shared exact parser already exists and is a narrow fail-closed fix.
