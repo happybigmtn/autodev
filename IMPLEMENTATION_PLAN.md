@@ -354,7 +354,7 @@
     Estimated scope: S
     Completion signal: Operators can run `auto doctor` and distinguish baseline readiness from model-backed workflow readiness.
 
-- [ ] `FOL-002` Prove ship gate ordering around checkpoint and remote sync
+- [x] `FOL-002` Prove ship gate ordering around checkpoint and remote sync
 
     Spec: `specs/220526-release-gates-and-verdict-readiness.md`
     Why now: This is deferred until stale receipt semantics are fixed because gate ordering is only useful when the gate itself rejects stale proof; it matters before release prep can be considered ready.

@@ -117,3 +117,11 @@
 - Validation: host observed verification receipt at `/home/r/coding/autodev/.auto/symphony/verification-receipts/P1-010.json`
 - Completion artifacts: none
 - Remaining blockers: missing REVIEW.md handoff
+
+## `FOL-002`
+- Source: auto parallel host handoff synthesized after lane landing.
+- Files: `src/ship_command.rs`
+- Scope exceptions: none recorded by host.
+- Validation: host observed verification receipt at `/home/r/coding/autodev/.auto/symphony/verification-receipts/FOL-002.json`
+- Completion artifacts: none
+- Remaining blockers: missing REVIEW.md handoff
