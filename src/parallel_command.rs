@@ -35,19 +35,12 @@ use crate::util::{
 use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
 const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
-const SHARED_QUEUE_FILES: [&str; 6] = [
+const HOST_QUEUE_STATE_FILES: [&str; 7] = [
     "IMPLEMENTATION_PLAN.md",
     "COMPLETED.md",
     "WORKLIST.md",
     "REVIEW.md",
     "AGENTS.md",
-    "RECEIPTS-DRIFT.md",
-];
-const HOST_QUEUE_STATE_FILES: [&str; 6] = [
-    "IMPLEMENTATION_PLAN.md",
-    "COMPLETED.md",
-    "WORKLIST.md",
-    "REVIEW.md",
     "ARCHIVED.md",
     "RECEIPTS-DRIFT.md",
 ];
@@ -61,7 +54,7 @@ const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
 Repo-specific direct `REVIEW.md` handoff:
 - This repo normally records completion notes in `REVIEW.md`, but `auto parallel` treats queue and review files as host-owned state.
-- Do not edit `REVIEW.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, `ARCHIVED.md`, or `RECEIPTS-DRIFT.md` from a lane.
+- Do not edit `REVIEW.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, `AGENTS.md`, `ARCHIVED.md`, or `RECEIPTS-DRIFT.md` from a lane.
 - Preserve blocker or completion evidence in your committed code/tests and command output; the host will reconcile queue and review docs after landing."#;
 const LANE_TASK_ID_FILE: &str = "task-id";
 const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
@@ -862,6 +855,52 @@ impl LaneRunConfig {
         }
         extra_env
     }
+
+    fn assignment_worker_metadata(&self) -> LaneWorkerMetadata {
+        if self.claude {
+            let mut command = vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "--verbose".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                self.model.clone(),
+                "--effort".to_string(),
+                self.reasoning_effort.clone(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+            ];
+            if let Some(max_turns) = self.max_turns {
+                command.push("--max-turns".to_string());
+                command.push(max_turns.to_string());
+            }
+            return LaneWorkerMetadata {
+                harness: "claude".to_string(),
+                command,
+                model: self.model.clone(),
+                reasoning_effort: self.reasoning_effort.clone(),
+                max_turns: self.max_turns,
+            };
+        }
+
+        LaneWorkerMetadata {
+            harness: "codex".to_string(),
+            command: vec![
+                self.codex_bin.display().to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "-m".to_string(),
+                self.model.clone(),
+                "-c".to_string(),
+                format!("model_reasoning_effort=\"{}\"", self.reasoning_effort),
+            ],
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            max_turns: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -894,6 +933,15 @@ struct LaneResumeCandidate {
     host_recovery_note: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+struct LaneWorkerMetadata {
+    harness: String,
+    command: Vec<String>,
+    model: String,
+    reasoning_effort: String,
+    max_turns: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LaneAssignmentMetadata {
     task_id: String,
@@ -902,6 +950,8 @@ struct LaneAssignmentMetadata {
     task_hash: u64,
     dependency_hash: u64,
     verification_hash: u64,
+    worker: LaneWorkerMetadata,
+    assignment_hash: u64,
 }
 
 #[derive(Debug)]
@@ -2200,8 +2250,14 @@ async fn run_parallel_loop(
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
-    let mut resumable_lanes =
-        discover_resume_candidates(repo_root, run_root, target_branch, &plan, parallel_logger)?;
+    let mut resumable_lanes = discover_resume_candidates(
+        repo_root,
+        run_root,
+        target_branch,
+        &lane_config,
+        &plan,
+        parallel_logger,
+    )?;
     landed += harvest_resumable_lane_results(
         repo_root,
         target_branch,
@@ -2222,8 +2278,14 @@ async fn run_parallel_loop(
     )
     .await?;
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
-    let mut rediscovered_lanes =
-        discover_resume_candidates(repo_root, run_root, target_branch, &plan, parallel_logger)?;
+    let mut rediscovered_lanes = discover_resume_candidates(
+        repo_root,
+        run_root,
+        target_branch,
+        &lane_config,
+        &plan,
+        parallel_logger,
+    )?;
     preserve_resume_recovery_notes(&mut rediscovered_lanes, &resumable_lanes);
     resumable_lanes = rediscovered_lanes;
     let mut last_idle_summary = None::<String>;
@@ -2363,6 +2425,7 @@ async fn run_parallel_loop(
                         repo_root,
                         run_root,
                         target_branch,
+                        &lane_config,
                         lane_index,
                         candidate.task.clone(),
                         resume_candidate,
@@ -2512,6 +2575,7 @@ async fn run_parallel_loop(
                 repo_root,
                 run_root,
                 target_branch,
+                &lane_config,
                 lane_index,
                 task.clone(),
                 resume_candidate,
@@ -5353,10 +5417,12 @@ fn prepare_parallel_lane_assignment(
     repo_root: &Path,
     run_root: &Path,
     target_branch: &str,
+    lane_config: &LaneRunConfig,
     lane_index: usize,
     task: LoopTask,
     resume_candidate: Option<LaneResumeCandidate>,
 ) -> Result<ActiveLaneAssignment> {
+    let worker_metadata = lane_config.assignment_worker_metadata();
     if let Some(candidate) = resume_candidate {
         write_lane_task_id(&candidate.lane_root, &task.id)?;
         write_lane_assignment_metadata(
@@ -5364,6 +5430,7 @@ fn prepare_parallel_lane_assignment(
             target_branch,
             &candidate.base_commit,
             &task,
+            &worker_metadata,
         )?;
         return Ok(ActiveLaneAssignment {
             lane_index: candidate.lane_index,
@@ -5388,7 +5455,13 @@ fn prepare_parallel_lane_assignment(
     clone_loop_lane_repo(repo_root, target_branch, &lane_repo_root)?;
     let base_commit = git_stdout(&lane_repo_root, ["rev-parse", "HEAD"])?;
     write_lane_task_id(&lane_root, &task.id)?;
-    write_lane_assignment_metadata(&lane_root, target_branch, base_commit.trim(), &task)?;
+    write_lane_assignment_metadata(
+        &lane_root,
+        target_branch,
+        base_commit.trim(),
+        &task,
+        &worker_metadata,
+    )?;
     Ok(ActiveLaneAssignment {
         lane_index,
         attempts: 0,
@@ -5456,6 +5529,7 @@ fn prepare_parallel_lane_assignment_with_fallback(
     repo_root: &Path,
     run_root: &Path,
     target_branch: &str,
+    lane_config: &LaneRunConfig,
     lane_index: usize,
     task: LoopTask,
     resume_candidate: Option<LaneResumeCandidate>,
@@ -5465,6 +5539,7 @@ fn prepare_parallel_lane_assignment_with_fallback(
         repo_root,
         run_root,
         target_branch,
+        lane_config,
         lane_index,
         task.clone(),
         resume_candidate,
@@ -5482,6 +5557,7 @@ fn prepare_parallel_lane_assignment_with_fallback(
                 repo_root,
                 run_root,
                 target_branch,
+                lane_config,
                 lane_index,
                 task,
                 None,
@@ -5494,6 +5570,7 @@ fn discover_resume_candidates(
     repo_root: &Path,
     run_root: &Path,
     target_branch: &str,
+    lane_config: &LaneRunConfig,
     plan: &LoopPlanSnapshot,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<BTreeMap<usize, LaneResumeCandidate>> {
@@ -5542,7 +5619,23 @@ fn discover_resume_candidates(
         let Some(task) = pending_tasks.get(&task_id).cloned() else {
             continue;
         };
-        if let Err(err) = validate_lane_assignment_metadata(&lane_root, target_branch, &task) {
+        let base_commit = match infer_lane_base_commit(&lane_repo_root, target_branch) {
+            Ok(base_commit) => base_commit,
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping resumable lane-{} because its base commit could not be inferred: {err:#}",
+                    lane_index
+                );
+                continue;
+            }
+        };
+        if let Err(err) = validate_lane_assignment_metadata(
+            &lane_root,
+            target_branch,
+            &base_commit,
+            &lane_config.assignment_worker_metadata(),
+            &task,
+        ) {
             eprintln!(
                 "warning: skipping resumable lane-{} `{}` because assignment metadata is stale or missing: {err:#}",
                 lane_index, task_id
@@ -5617,16 +5710,6 @@ fn discover_resume_candidates(
             }
         }
 
-        let base_commit = match infer_lane_base_commit(&lane_repo_root, target_branch) {
-            Ok(base_commit) => base_commit,
-            Err(err) => {
-                eprintln!(
-                    "warning: skipping resumable lane-{} because its base commit could not be inferred: {err:#}",
-                    lane_index
-                );
-                continue;
-            }
-        };
         let mut host_recovery_note = match inspect_lane_repo_progress(&lane_repo_root, &base_commit)
         {
             Ok(LaneRepoProgress::None) => continue,
@@ -6143,18 +6226,32 @@ fn write_lane_assignment_metadata(
     target_branch: &str,
     base_commit: &str,
     task: &LoopTask,
+    worker: &LaneWorkerMetadata,
 ) -> Result<()> {
+    let task_hash = hash_stable(&task.markdown);
+    let dependency_hash = hash_stable(&task.dependencies);
+    let verification_hash = hash_stable(&task_field_body(
+        &task.markdown,
+        "Verification:",
+        "Required tests:",
+    ));
     let metadata = LaneAssignmentMetadata {
         task_id: task.id.clone(),
         target_branch: target_branch.to_string(),
         base_commit: base_commit.to_string(),
-        task_hash: hash_stable(&task.markdown),
-        dependency_hash: hash_stable(&task.dependencies),
-        verification_hash: hash_stable(&task_field_body(
-            &task.markdown,
-            "Verification:",
-            "Required tests:",
-        )),
+        task_hash,
+        dependency_hash,
+        verification_hash,
+        worker: worker.clone(),
+        assignment_hash: lane_assignment_hash(
+            &task.id,
+            target_branch,
+            base_commit,
+            task_hash,
+            dependency_hash,
+            verification_hash,
+            worker,
+        ),
     };
     let json = serde_json::to_vec_pretty(&metadata)?;
     atomic_write(&lane_root.join(LANE_ASSIGNMENT_FILE), &json).with_context(|| {
@@ -6168,6 +6265,8 @@ fn write_lane_assignment_metadata(
 fn validate_lane_assignment_metadata(
     lane_root: &Path,
     target_branch: &str,
+    base_commit: &str,
+    worker: &LaneWorkerMetadata,
     task: &LoopTask,
 ) -> Result<LaneAssignmentMetadata> {
     let metadata_path = lane_root.join(LANE_ASSIGNMENT_FILE);
@@ -6188,6 +6287,36 @@ fn validate_lane_assignment_metadata(
             metadata.target_branch
         );
     }
+    if metadata.base_commit != base_commit {
+        bail!(
+            "base commit changed from `{}` to `{base_commit}`",
+            metadata.base_commit
+        );
+    }
+    if metadata.worker.model != worker.model {
+        bail!(
+            "worker model changed from `{}` to `{}`",
+            metadata.worker.model,
+            worker.model
+        );
+    }
+    if metadata.worker.command != worker.command {
+        bail!("worker command changed");
+    }
+    if metadata.worker.reasoning_effort != worker.reasoning_effort {
+        bail!(
+            "worker reasoning effort changed from `{}` to `{}`",
+            metadata.worker.reasoning_effort,
+            worker.reasoning_effort
+        );
+    }
+    if metadata.worker.max_turns != worker.max_turns {
+        bail!(
+            "worker max turns changed from `{:?}` to `{:?}`",
+            metadata.worker.max_turns,
+            worker.max_turns
+        );
+    }
     if metadata.verification_hash
         != hash_stable(&task_field_body(
             &task.markdown,
@@ -6203,6 +6332,18 @@ fn validate_lane_assignment_metadata(
     if metadata.dependency_hash != hash_stable(&task.dependencies) {
         bail!("dependency hash changed");
     }
+    let expected_assignment_hash = lane_assignment_hash(
+        &task.id,
+        target_branch,
+        &metadata.base_commit,
+        metadata.task_hash,
+        metadata.dependency_hash,
+        metadata.verification_hash,
+        worker,
+    );
+    if metadata.assignment_hash != expected_assignment_hash {
+        bail!("assignment hash changed");
+    }
     Ok(metadata)
 }
 
@@ -6210,6 +6351,26 @@ fn hash_stable<T: Hash>(value: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn lane_assignment_hash(
+    task_id: &str,
+    target_branch: &str,
+    base_commit: &str,
+    task_hash: u64,
+    dependency_hash: u64,
+    verification_hash: u64,
+    worker: &LaneWorkerMetadata,
+) -> u64 {
+    hash_stable(&(
+        task_id,
+        target_branch,
+        base_commit,
+        task_hash,
+        dependency_hash,
+        verification_hash,
+        worker,
+    ))
 }
 
 fn read_lane_task_id(lane_root: &Path) -> Result<Option<String>> {
@@ -6438,7 +6599,7 @@ fn build_parallel_lane_prompt(
     } else {
         task.dependencies.join(", ")
     };
-    let protected_files = SHARED_QUEUE_FILES
+    let protected_files = HOST_QUEUE_STATE_FILES
         .into_iter()
         .map(|file| format!("`{file}`"))
         .collect::<Vec<_>>()
@@ -7674,11 +7835,31 @@ mod tests {
         try_checkpoint_parallel_host_queue_changes, update_task_completion_in_plan_text,
         validate_lane_assignment_metadata, write_lane_assignment_metadata,
         write_operator_actions_for_ready_tasks, ActiveLaneAssignment, CherryPickFailurePolicy,
-        LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LinearAutoSyncState,
-        LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind, ParallelEventLogger,
-        ParallelPreflightNeeds, ParallelStartupPrep, ParallelUnblockCandidateKind,
-        PartialFollowUpDisposition,
+        LaneLandingRecoveryPrep, LaneRepoProgress, LaneResumeCandidate, LaneWorkerMetadata,
+        LinearAutoSyncState, LoopQueueSnapshot, LoopTask, LoopTaskStatus, ParallelBlockerKind,
+        ParallelEventLogger, ParallelPreflightNeeds, ParallelStartupPrep,
+        ParallelUnblockCandidateKind, PartialFollowUpDisposition, HOST_QUEUE_STATE_FILES,
     };
+
+    fn sample_worker_metadata() -> LaneWorkerMetadata {
+        LaneWorkerMetadata {
+            harness: "codex".to_string(),
+            command: vec![
+                "codex".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "-m".to_string(),
+                "gpt-5.5".to_string(),
+                "-c".to_string(),
+                "model_reasoning_effort=\"high\"".to_string(),
+            ],
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            max_turns: None,
+        }
+    }
 
     #[test]
     fn default_prompt_uses_resolved_branch() {
@@ -9013,13 +9194,15 @@ mod tests {
             lane_kind: LaneKind::Code,
             markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
         };
-        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
             .expect("metadata should write");
 
         let mut changed = task.clone();
         changed.markdown.push_str("Extra body\n");
-        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
-            .expect_err("changed body rejected");
+        let err =
+            validate_lane_assignment_metadata(&lane_root, "main", "abc123", &worker, &changed)
+                .expect_err("changed body rejected");
         assert!(format!("{err:#}").contains("task body hash changed"));
         fs::remove_dir_all(lane_root).ok();
     }
@@ -9038,13 +9221,15 @@ mod tests {
             lane_kind: LaneKind::Code,
             markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: `TASK-000`\n".to_string(),
         };
-        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
             .expect("metadata should write");
 
         let mut changed = task.clone();
         changed.dependencies = vec![];
-        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
-            .expect_err("changed dependencies rejected");
+        let err =
+            validate_lane_assignment_metadata(&lane_root, "main", "abc123", &worker, &changed)
+                .expect_err("changed dependencies rejected");
         assert!(format!("{err:#}").contains("dependency hash changed"));
         fs::remove_dir_all(lane_root).ok();
     }
@@ -9063,17 +9248,126 @@ mod tests {
             lane_kind: LaneKind::Code,
             markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
         };
-        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task)
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
             .expect("metadata should write");
 
         let mut changed = task.clone();
         changed.markdown = changed
             .markdown
             .replace("cargo test task_one", "cargo test task_two");
-        let err = validate_lane_assignment_metadata(&lane_root, "main", &changed)
-            .expect_err("changed verification rejected");
+        let err =
+            validate_lane_assignment_metadata(&lane_root, "main", "abc123", &worker, &changed)
+                .expect_err("changed verification rejected");
         assert!(format!("{err:#}").contains("verification text hash changed"));
         fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_base_commit() {
+        let lane_root = unique_temp_dir("lane-assignment-base-commit");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
+        };
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
+            .expect("metadata should write");
+
+        let err = validate_lane_assignment_metadata(&lane_root, "main", "def456", &worker, &task)
+            .expect_err("changed base commit rejected");
+        assert!(format!("{err:#}").contains("base commit changed"));
+        fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_worker_model() {
+        let lane_root = unique_temp_dir("lane-assignment-worker-model");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
+        };
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
+            .expect("metadata should write");
+
+        let mut changed_worker = worker.clone();
+        changed_worker.model = "gpt-6".to_string();
+        let err =
+            validate_lane_assignment_metadata(&lane_root, "main", "abc123", &changed_worker, &task)
+                .expect_err("changed worker model rejected");
+        assert!(format!("{err:#}").contains("worker model changed"));
+        fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn lane_assignment_metadata_rejects_changed_worker_command() {
+        let lane_root = unique_temp_dir("lane-assignment-worker-command");
+        fs::create_dir_all(&lane_root).expect("failed to create lane root");
+        let task = LoopTask {
+            id: "TASK-001".to_string(),
+            title: "Initial".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-001` Initial\nVerification: `cargo test task_one`\nRequired tests: `cargo test task_one`\nDependencies: none\n".to_string(),
+        };
+        let worker = sample_worker_metadata();
+        write_lane_assignment_metadata(&lane_root, "main", "abc123", &task, &worker)
+            .expect("metadata should write");
+
+        let mut changed_worker = worker.clone();
+        changed_worker.command.push("--new-worker-flag".to_string());
+        let err =
+            validate_lane_assignment_metadata(&lane_root, "main", "abc123", &changed_worker, &task)
+                .expect_err("changed worker command rejected");
+        assert!(format!("{err:#}").contains("worker command changed"));
+        fs::remove_dir_all(lane_root).ok();
+    }
+
+    #[test]
+    fn worker_prompt_lists_host_owned_queue_files() {
+        let snapshot = parse_loop_plan(
+            r#"- [ ] `TASK-001` First task
+  Verification: `cargo test task_one`
+  Required tests: `cargo test task_one`
+  Dependencies: none
+"#,
+        );
+        let task = snapshot.tasks.first().expect("task should parse");
+        let prompt = build_parallel_lane_prompt(
+            "base prompt",
+            &snapshot,
+            task,
+            "main",
+            "Use the host-provided `CARGO_TARGET_DIR`; this run gives each lane its own target directory.",
+            "",
+            None,
+        );
+
+        for file in HOST_QUEUE_STATE_FILES {
+            assert!(
+                prompt.contains(&format!("`{file}`")),
+                "prompt should list host-owned queue file {file}"
+            );
+        }
+        assert!(prompt.contains("The host owns queue reconciliation in parallel mode"));
     }
 
     #[test]
