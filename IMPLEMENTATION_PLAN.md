@@ -152,7 +152,7 @@
     Estimated scope: XS
     Completion signal: Super snapshot sovereignty and gate parsing are green as a cluster.
 
-- [ ] `P1-007` Reject stale release JSON receipts in the ship gate
+- [x] `P1-007` Reject stale release JSON receipts in the ship gate
 
     Spec: `specs/220526-receipt-and-lane-evidence-contract.md`
     Why now: This is the highest-leverage receipt slice because release readiness is currently red and can accept stale JSON proof; it outranks lane metadata cleanup because operators need ship blockers to mean the same thing as completion evidence before any release decision.
