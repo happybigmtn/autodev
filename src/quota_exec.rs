@@ -200,7 +200,7 @@ fn sync_newer_claude_credentials(profile_dir: &Path, active_dir: &Path) -> Resul
         return Ok(());
     }
 
-    fs::copy(&active_creds, &profile_creds).with_context(|| {
+    copy_file_0o600(&active_creds, &profile_creds).with_context(|| {
         format!(
             "failed to refresh Claude profile credentials from {} -> {}",
             active_creds.display(),
@@ -216,8 +216,24 @@ fn sync_newer_claude_credentials(profile_dir: &Path, active_dir: &Path) -> Resul
 }
 
 fn claude_oauth_expires_at(path: &Path) -> Result<Option<i64>> {
-    if !path.exists() {
-        return Ok(None);
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to read symlinked credential path {}",
+            path.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "refusing to read non-regular credential path {}",
+            path.display()
+        );
     }
 
     let text =
@@ -1271,5 +1287,80 @@ mod tests {
             synced["claudeAiOauth"]["refreshToken"].as_str(),
             Some("profile-refresh")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_newer_claude_credentials_rejects_symlinked_profile_credentials() {
+        let profile = TempDir::new();
+        let active = TempDir::new();
+        let real_profile_creds = profile.path().join("real-credentials.json");
+        write_claude_creds(profile.path(), 100, "old-refresh");
+        fs::rename(
+            profile.path().join(".credentials.json"),
+            &real_profile_creds,
+        )
+        .expect("failed to move profile credentials");
+        std::os::unix::fs::symlink(
+            &real_profile_creds,
+            profile.path().join(".credentials.json"),
+        )
+        .expect("failed to create profile credential symlink");
+        write_claude_creds(active.path(), 200, "new-refresh");
+
+        let error = sync_newer_claude_credentials(profile.path(), active.path())
+            .expect_err("symlinked profile credentials should be rejected");
+
+        assert!(error.to_string().contains("symlinked credential path"));
+        let profile_expires_at =
+            claude_oauth_expires_at(&real_profile_creds).expect("read should succeed");
+        assert_eq!(profile_expires_at, Some(100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_newer_claude_credentials_rejects_symlinked_active_credentials() {
+        let profile = TempDir::new();
+        let active = TempDir::new();
+        let real_active_creds = active.path().join("real-credentials.json");
+        write_claude_creds(profile.path(), 100, "old-refresh");
+        write_claude_creds(active.path(), 200, "new-refresh");
+        fs::rename(active.path().join(".credentials.json"), &real_active_creds)
+            .expect("failed to move active credentials");
+        std::os::unix::fs::symlink(&real_active_creds, active.path().join(".credentials.json"))
+            .expect("failed to create active credential symlink");
+
+        let error = sync_newer_claude_credentials(profile.path(), active.path())
+            .expect_err("symlinked active credentials should be rejected");
+
+        assert!(error.to_string().contains("symlinked credential path"));
+        let synced: serde_json::Value = serde_json::from_slice(
+            &fs::read(profile.path().join(".credentials.json")).expect("profile creds should read"),
+        )
+        .expect("profile creds should parse");
+        assert_eq!(
+            synced["claudeAiOauth"]["refreshToken"].as_str(),
+            Some("old-refresh")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_newer_claude_credentials_preserves_owner_only_mode() {
+        let profile = TempDir::new();
+        let active = TempDir::new();
+        let profile_creds = profile.path().join(".credentials.json");
+        write_claude_creds(profile.path(), 100, "old-refresh");
+        write_claude_creds(active.path(), 200, "new-refresh");
+        set_mode(&profile_creds, 0o644);
+
+        sync_newer_claude_credentials(profile.path(), active.path()).expect("sync should succeed");
+
+        let mode = fs::metadata(&profile_creds)
+            .expect("failed to stat refreshed profile credentials")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
