@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
 use crate::codex_exec::run_codex_exec_max_context;
+use crate::qa_only_command::format_final_status_block;
 use crate::util::{
     atomic_write, binary_provenance_line, ensure_repo_layout, git_repo_root, git_stdout, run_git,
     timestamp_slug,
@@ -345,6 +346,7 @@ pub(crate) async fn run_audit_everything(args: AuditArgs) -> Result<()> {
     }
 
     if matches!(args.everything_phase, AuditEverythingPhase::Status) {
+        write_run_status_if_possible(&paths, &manifest)?;
         print_status(&paths, &manifest);
         return Ok(());
     }
@@ -4045,6 +4047,10 @@ fn first_verdict_line(text: &str) -> Option<String> {
 }
 
 fn print_status(paths: &RunPaths, manifest: &EverythingManifest) {
+    print!("{}", render_status_stdout(paths, manifest));
+}
+
+fn render_status_stdout(paths: &RunPaths, manifest: &EverythingManifest) -> String {
     let files_done = manifest
         .files
         .iter()
@@ -4065,60 +4071,235 @@ fn print_status(paths: &RunPaths, manifest: &EverythingManifest) {
         .iter()
         .filter(|task| matches!(task.status, StageStatus::Complete))
         .count();
-    println!("status");
-    println!("context:     {:?}", manifest.context.status);
-    println!("files:       {files_done}/{}", manifest.files.len());
-    println!("synthesis:   {synthesis_done}/{}", manifest.groups.len());
-    println!("remediation: {remediation_done}/{}", manifest.groups.len());
-    println!("remed plan:  {:?}", manifest.remediation_plan.status);
-    println!(
+    let mut output = String::new();
+    output.push_str("status\n");
+    output.push_str(&format!("context:     {:?}\n", manifest.context.status));
+    output.push_str(&format!(
+        "files:       {files_done}/{}\n",
+        manifest.files.len()
+    ));
+    output.push_str(&format!(
+        "synthesis:   {synthesis_done}/{}\n",
+        manifest.groups.len()
+    ));
+    output.push_str(&format!(
+        "remediation: {remediation_done}/{}\n",
+        manifest.groups.len()
+    ));
+    output.push_str(&format!(
+        "remed plan:  {:?}\n",
+        manifest.remediation_plan.status
+    ));
+    output.push_str(&format!(
         "remed tasks: {remediation_tasks_done}/{}",
         manifest.remediation_tasks.len()
-    );
+    ));
+    output.push('\n');
     let branch_summary = audit_branch_summary(manifest);
-    println!(
+    output.push_str(&format!(
         "primary:     {} {}",
         manifest.branch,
         branch_summary
             .primary_head
             .as_deref()
             .unwrap_or("(unknown)")
-    );
-    println!(
+    ));
+    output.push('\n');
+    output.push_str(&format!(
         "audit branch: {} {}",
         manifest.audit_branch,
         branch_summary.audit_head.as_deref().unwrap_or("(unknown)")
-    );
-    println!("branch state: {}", branch_summary.state);
-    println!(
+    ));
+    output.push('\n');
+    output.push_str(&format!("branch state: {}\n", branch_summary.state));
+    output.push_str(&format!(
         "running remed: {}",
         format_task_ids_by_status(manifest, StageStatus::Running, 10)
-    );
-    println!(
+    ));
+    output.push('\n');
+    output.push_str(&format!(
         "failed remed: {}",
         format_task_ids_by_status(manifest, StageStatus::Failed, 10)
-    );
+    ));
+    output.push('\n');
     if let Some((task, unmet)) = first_dependency_blocked_remediation_task(manifest) {
-        println!("blocked next: {} waiting on {}", task.id, unmet.join(", "));
+        output.push_str(&format!(
+            "blocked next: {} waiting on {}\n",
+            task.id,
+            unmet.join(", ")
+        ));
     }
-    println!(
+    output.push_str(&format!(
         "paused:      {}",
         if pause_requested(paths) { "yes" } else { "no" }
-    );
-    println!("pause file:  {}", paths.pause_path.display());
-    println!("status doc:  {}", run_status_markdown_path(paths).display());
-    println!(
+    ));
+    output.push('\n');
+    output.push_str(&format!("pause file:  {}\n", paths.pause_path.display()));
+    output.push_str(&format!(
+        "status doc:  {}\n",
+        run_status_markdown_path(paths).display()
+    ));
+    output.push_str(&format!(
         "remed plan:  {}",
         remediation_plan_markdown_path(paths).display()
-    );
-    println!(
+    ));
+    output.push('\n');
+    output.push_str(&format!(
         "codebase book: {}",
         codebase_book_root_path(paths).display()
-    );
-    println!("final review:{:?}", manifest.final_review.status);
-    println!("file quality:{:?}", manifest.file_quality.status);
-    println!("change summary:{:?}", manifest.change_summary.status);
-    println!("merge:       {:?}", manifest.merge.status);
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "final review:{:?}\n",
+        manifest.final_review.status
+    ));
+    output.push_str(&format!(
+        "file quality:{:?}\n",
+        manifest.file_quality.status
+    ));
+    output.push_str(&format!(
+        "change summary:{:?}\n",
+        manifest.change_summary.status
+    ));
+    output.push_str(&format!("merge:       {:?}\n", manifest.merge.status));
+    output.push('\n');
+    output.push_str("final status\n");
+    output.push_str(&audit_status_final_block(paths, manifest));
+    output.push('\n');
+    output
+}
+
+fn audit_status_final_block(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    let status = audit_status_label(paths, manifest);
+    let files_written = audit_status_files(paths);
+    let blockers = audit_status_blockers(paths, manifest);
+    let next_step = audit_status_next_step(paths, manifest);
+    format_final_status_block(&status, &files_written, &blockers, &next_step)
+}
+
+fn audit_status_files(paths: &RunPaths) -> Vec<String> {
+    vec![
+        format!(
+            "RUN-STATUS.md: {}",
+            run_status_markdown_path(paths).display()
+        ),
+        format!(
+            "REMEDIATION-PLAN.md: {}",
+            remediation_plan_markdown_path(paths).display()
+        ),
+        format!(
+            "CODEBASE-BOOK: {}",
+            codebase_book_root_path(paths).display()
+        ),
+    ]
+}
+
+fn audit_status_label(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    if pause_requested(paths) {
+        return "paused".to_string();
+    }
+    if remediation_task_count(manifest, StageStatus::Failed) > 0
+        || final_review_has_actionable_blockers(paths)
+    {
+        return "blocked".to_string();
+    }
+    if remediation_task_count(manifest, StageStatus::Running) > 0 {
+        return "running".to_string();
+    }
+    if matches!(manifest.merge.status, StageStatus::Complete)
+        && matches!(manifest.final_status.status, StageStatus::Complete)
+    {
+        return "complete".to_string();
+    }
+    "ready to continue".to_string()
+}
+
+fn audit_status_blockers(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    let failed_tasks = format_task_ids_by_status(manifest, StageStatus::Failed, 10);
+    if pause_requested(paths) {
+        return format!("pause requested via {}", paths.pause_path.display());
+    }
+    if failed_tasks != "none" {
+        return format!("failed remediation tasks: {failed_tasks}");
+    }
+    if let Some((task, unmet)) = first_dependency_blocked_remediation_task(manifest) {
+        return format!("{} waiting on {}", task.id, unmet.join(", "));
+    }
+    if final_review_has_actionable_blockers(paths) {
+        return format!(
+            "required blockers remain in {}",
+            final_review_markdown_path(paths).display()
+        );
+    }
+    "none".to_string()
+}
+
+fn audit_status_next_step(paths: &RunPaths, manifest: &EverythingManifest) -> String {
+    if pause_requested(paths) {
+        return "run `auto audit --everything --everything-phase unpause` when ready to resume"
+            .to_string();
+    }
+    let failed_tasks = format_task_ids_by_status(manifest, StageStatus::Failed, 10);
+    if failed_tasks != "none" {
+        return format!(
+            "inspect failed remediation tasks ({failed_tasks}), fix blockers, then rerun `auto audit --everything --everything-phase remediate`"
+        );
+    }
+    if let Some((task, unmet)) = first_dependency_blocked_remediation_task(manifest) {
+        return format!(
+            "complete {} before dispatching {}",
+            unmet.join(", "),
+            task.id
+        );
+    }
+    let running_tasks = format_task_ids_by_status(manifest, StageStatus::Running, 10);
+    if running_tasks != "none" {
+        return format!(
+            "wait for running remediation tasks ({running_tasks}) or rerun `auto audit --everything --everything-phase status`"
+        );
+    }
+    if !matches!(manifest.context.status, StageStatus::Complete) {
+        return "run `auto audit --everything --everything-phase init-context`".to_string();
+    }
+    if manifest
+        .files
+        .iter()
+        .any(|file| !matches!(file.status, StageStatus::Complete))
+    {
+        return "run `auto audit --everything --everything-phase first-pass`".to_string();
+    }
+    if manifest
+        .groups
+        .iter()
+        .any(|group| !matches!(group.synthesis_status, StageStatus::Complete))
+    {
+        return "run `auto audit --everything --everything-phase synthesize`".to_string();
+    }
+    if !matches!(manifest.remediation_plan.status, StageStatus::Complete) {
+        return "run `auto audit --everything --everything-phase plan-remediation`".to_string();
+    }
+    if manifest
+        .remediation_tasks
+        .iter()
+        .any(|task| matches!(task.status, StageStatus::Pending | StageStatus::Running))
+    {
+        return "run `auto audit --everything --everything-phase remediate`".to_string();
+    }
+    if !matches!(manifest.final_review.status, StageStatus::Complete) {
+        return "run `auto audit --everything --everything-phase final-review`".to_string();
+    }
+    if !matches!(manifest.merge.status, StageStatus::Complete) {
+        return "run `auto audit --everything --everything-phase merge`".to_string();
+    }
+    "review RUN-STATUS.md and final audit artifacts".to_string()
+}
+
+fn remediation_task_count(manifest: &EverythingManifest, status: StageStatus) -> usize {
+    manifest
+        .remediation_tasks
+        .iter()
+        .filter(|task| task.status == status)
+        .count()
 }
 
 fn write_manifest(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
@@ -4387,6 +4568,10 @@ fn write_run_status_markdown(paths: &RunPaths, manifest: &EverythingManifest) ->
         body.push_str(&format!("- Final status note: {}\n", one_line(note)));
     }
     body.push('\n');
+    body.push_str("## Final Status\n\n");
+    body.push_str("```text\n");
+    body.push_str(&audit_status_final_block(paths, manifest));
+    body.push_str("\n```\n\n");
     body.push_str("## Branch State\n\n");
     body.push_str(&format!("- Primary branch: `{}`", manifest.branch));
     if let Some(head) = branch_summary.primary_head.as_deref() {
@@ -5533,6 +5718,54 @@ mod tests {
     }
 
     #[test]
+    fn audit_status_prints_final_status_block_and_next_step() {
+        let dir = std::env::temp_dir().join(format!(
+            "auto-audit-status-final-block-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let report_root = dir.join("worktree/audit/everything/test-run");
+        fs::create_dir_all(&report_root).expect("failed to create report root");
+        let paths = RunPaths {
+            host_root: dir.clone(),
+            manifest_path: dir.join("MANIFEST.json"),
+            latest_path: dir.join("latest-run"),
+            worktree_root: dir.join("worktree"),
+            report_root,
+            pause_path: dir.join(PAUSE_REQUEST_FILE),
+            in_place: false,
+        };
+        let mut manifest = manifest_with_groups(vec![group_for_test(
+            "crates/core",
+            &["crates/core/src/lib.rs"],
+        )]);
+        manifest.files = vec![FileState {
+            path: "crates/core/src/lib.rs".to_string(),
+            group: "crates/core".to_string(),
+            content_hash: "hash".to_string(),
+            artifact_dir: "artifact".to_string(),
+            status: StageStatus::Complete,
+        }];
+        manifest.remediation_tasks = vec![task_for_test("AUD-REM-001", "crates/core", &[])];
+        manifest.remediation_tasks[0].status = StageStatus::Running;
+
+        let status = render_status_stdout(&paths, &manifest);
+
+        assert!(status.contains("final status\n"), "{status}");
+        assert!(status.contains("status:"), "{status}");
+        assert!(status.contains("files written:"), "{status}");
+        assert!(status.contains("RUN-STATUS.md"), "{status}");
+        assert!(status.contains("blockers:"), "{status}");
+        assert!(status.contains("next step:"), "{status}");
+        assert!(
+            status.contains("wait for running remediation tasks"),
+            "{status}"
+        );
+
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
     fn run_status_markdown_records_pause_paths_and_task_counts() {
         let dir =
             std::env::temp_dir().join(format!("auto-audit-run-status-{}", std::process::id()));
@@ -5578,6 +5811,11 @@ mod tests {
         assert!(status.contains("REMEDIATION-PLAN.md"));
         assert!(status.contains("CODEBASE-BOOK"));
         assert!(status.contains("Final status refresh:"));
+        assert!(status.contains("## Final Status"));
+        assert!(status.contains("files written:"));
+        assert!(status.contains("blockers:    pause requested via"));
+        assert!(status
+            .contains("next step:   run `auto audit --everything --everything-phase unpause`"));
         assert!(status.contains("Evidence Class Checklist"));
         assert!(status.contains("Live production or mainnet/on-chain validation"));
 
