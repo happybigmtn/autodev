@@ -422,6 +422,14 @@ fn missing_corpus_sections(markdown: &str, sections: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// True when the line marks a research/decision/checkpoint plan with no test
+/// expectation. Accepts the ASCII (`--`), em-dash (`—`, U+2014), and en-dash
+/// (`–`, U+2013) typographies the corpus authoring model emits interchangeably.
+fn line_marks_test_expectation_none(line: &str) -> bool {
+    let normalized = line.to_ascii_lowercase().replace(['—', '–'], "--");
+    normalized.contains("test expectation: none --")
+}
+
 fn verify_corpus_priority_plan(plan_path: &Path, markdown: &str) -> Result<()> {
     let has_code_slice = ["goal", "files", "test"].into_iter().all(|fragment| {
         markdown_section_contains(markdown, "## Implementation Slice", |line| {
@@ -430,8 +438,7 @@ fn verify_corpus_priority_plan(plan_path: &Path, markdown: &str) -> Result<()> {
     });
     let has_decision_slice =
         markdown_section_contains(markdown, "## Implementation Slice", |line| {
-            line.to_ascii_lowercase()
-                .contains("test expectation: none --")
+            line_marks_test_expectation_none(line)
         }) && markdown_section_contains(markdown, "## Implementation Slice", |line| {
             let lowered = line.to_ascii_lowercase();
             ["decision", "checkpoint", "research", "validation", "gate"]
@@ -464,8 +471,7 @@ fn verify_corpus_legacy_execplan(plan_path: &Path, markdown: &str) -> Result<()>
     });
     let has_artifact_only_unit_shape =
         markdown_section_contains(markdown, "## Implementation Units", |line| {
-            line.to_ascii_lowercase()
-                .contains("test expectation: none --")
+            line_marks_test_expectation_none(line)
         }) && markdown_section_contains(markdown, "## Implementation Units", |line| {
             let lowered = line.to_ascii_lowercase();
             ["artifact", "index", "checkpoint", "report", "note", "file"]
@@ -498,13 +504,40 @@ fn verify_corpus_legacy_execplan(plan_path: &Path, markdown: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::{
-        sanitize_corpus_numbered_plan_shapes, sanitize_corpus_repo_root_paths,
-        verify_corpus_execplan, verify_corpus_outputs, verify_corpus_outputs_read_only,
+        line_marks_test_expectation_none, sanitize_corpus_numbered_plan_shapes,
+        sanitize_corpus_repo_root_paths, verify_corpus_execplan, verify_corpus_outputs,
+        verify_corpus_outputs_read_only,
     };
     use crate::generation::planning_root::ActivePlanSurface;
     use crate::generation::tests::{temp_dir, valid_corpus_report, write_valid_corpus};
     use std::fs;
     use std::time::Instant;
+
+    #[test]
+    fn test_expectation_none_accepts_ascii_em_dash_and_en_dash() {
+        // The corpus authoring model emits em-dash (`—`) and en-dash (`–`)
+        // typography interchangeably with ASCII `--`; verification must accept
+        // all three so a decision-only plan does not crash the race over
+        // typography alone.
+        assert!(line_marks_test_expectation_none(
+            "**Test expectation: none -- index-only file, no code behavior change.**"
+        ));
+        assert!(line_marks_test_expectation_none(
+            "**Test expectation: none — research/decision artifact, no code behavior changes.**"
+        ));
+        assert!(line_marks_test_expectation_none(
+            "**Test expectation: none – research/decision artifact, no code behavior changes.**"
+        ));
+        assert!(line_marks_test_expectation_none(
+            "TEST EXPECTATION: NONE — case-insensitive matching."
+        ));
+        assert!(!line_marks_test_expectation_none(
+            "Test expectation: add a focused regression test."
+        ));
+        assert!(!line_marks_test_expectation_none(
+            "Test expectation: none, single hyphen here is not enough."
+        ));
+    }
 
     #[test]
     fn corpus_execplan_validator_accepts_full_plans_md_shape() {
