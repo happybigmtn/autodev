@@ -430,6 +430,20 @@ fn line_marks_test_expectation_none(line: &str) -> bool {
     normalized.contains("test expectation: none --")
 }
 
+/// True when the `## Implementation Slice` reads as a master-plan or dispatch
+/// index — a plan whose deliverable is the list of slice plans below it, not a
+/// code change or single decision. Master plans are produced as `001-*.md` by
+/// the corpus authoring model and have no code-slice or decision-slice shape.
+fn impl_slice_is_dispatch_index(markdown: &str) -> bool {
+    markdown_section_contains(markdown, "## Implementation Slice", |line| {
+        let lowered = line.to_ascii_lowercase();
+        lowered.contains("plan dispatch")
+            || lowered.contains("master plan delivers")
+            || lowered.contains("dispatch index")
+            || lowered.contains("master-plan index")
+    })
+}
+
 fn verify_corpus_priority_plan(plan_path: &Path, markdown: &str) -> Result<()> {
     let has_code_slice = ["goal", "files", "test"].into_iter().all(|fragment| {
         markdown_section_contains(markdown, "## Implementation Slice", |line| {
@@ -445,9 +459,10 @@ fn verify_corpus_priority_plan(plan_path: &Path, markdown: &str) -> Result<()> {
                 .into_iter()
                 .any(|fragment| lowered.contains(fragment))
         });
-    if !has_code_slice && !has_decision_slice {
+    let has_index_slice = impl_slice_is_dispatch_index(markdown);
+    if !has_code_slice && !has_decision_slice && !has_index_slice {
         bail!(
-            "corpus plan {} must describe an implementation-slice goal/files/tests or an explicit decision/checkpoint slice in `## Implementation Slice`",
+            "corpus plan {} must describe an implementation-slice goal/files/tests, an explicit decision/checkpoint slice, or a master-plan dispatch index in `## Implementation Slice`",
             plan_path.display()
         );
     }
@@ -504,9 +519,9 @@ fn verify_corpus_legacy_execplan(plan_path: &Path, markdown: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::{
-        line_marks_test_expectation_none, sanitize_corpus_numbered_plan_shapes,
-        sanitize_corpus_repo_root_paths, verify_corpus_execplan, verify_corpus_outputs,
-        verify_corpus_outputs_read_only,
+        impl_slice_is_dispatch_index, line_marks_test_expectation_none,
+        sanitize_corpus_numbered_plan_shapes, sanitize_corpus_repo_root_paths,
+        verify_corpus_execplan, verify_corpus_outputs, verify_corpus_outputs_read_only,
     };
     use crate::generation::planning_root::ActivePlanSurface;
     use crate::generation::tests::{temp_dir, valid_corpus_report, write_valid_corpus};
@@ -537,6 +552,40 @@ mod tests {
         assert!(!line_marks_test_expectation_none(
             "Test expectation: none, single hyphen here is not enough."
         ));
+    }
+
+    #[test]
+    fn impl_slice_is_dispatch_index_recognizes_master_plan_shapes() {
+        // The 001-master-plan.md emitted by the corpus authoring model is a
+        // dispatch index, not a code-slice or decision-slice. It must verify
+        // without forcing the model to fake a code-slice shape.
+        let master = r#"
+## Implementation Slice
+
+The master plan delivers one artifact: this file. The slice plans below are the actual implementation work.
+
+**Plan dispatch (numbered priority plans in this corpus):**
+
+1. **002 — first slice.**
+"#;
+        assert!(impl_slice_is_dispatch_index(master));
+
+        let code_slice = r#"
+## Implementation Slice
+
+**Goal:** ship the foo.
+**Files to modify:** src/foo.rs.
+**Tests:** add bar_test.
+"#;
+        assert!(!impl_slice_is_dispatch_index(code_slice));
+
+        let decision_slice = r#"
+## Implementation Slice
+
+**Test expectation: none -- research/decision artifact, no code behavior changes.**
+Decision G1, G2, G3 documented in artifact.
+"#;
+        assert!(!impl_slice_is_dispatch_index(decision_slice));
     }
 
     #[test]
