@@ -129,7 +129,7 @@ pub(crate) struct SpecArgs {
     #[arg(long)]
     pub(crate) plan_path: Option<PathBuf>,
 
-    /// Model used for spec authoring. Default `opus` resolves to the installed Claude Opus 4.7 alias.
+    /// Model used for spec authoring. Default `opus` resolves to the latest installed Claude Opus alias.
     #[arg(long, default_value = "opus")]
     pub(crate) model: String,
 

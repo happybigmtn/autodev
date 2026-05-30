@@ -7,7 +7,7 @@
 #   auto-super-opus bitino /tmp/bitino-super-prompt.txt
 #       --flags "--with-audit"
 #       [--resume <super-run-id>] [--audit-run <audit-run-id>]
-#       [--model <model>]   # default: claude-opus-4-7
+#       [--model <model>]   # default: opus (latest installed Opus)
 #       [--repo <path>]     # default: /home/r/Coding/<instance>
 #
 # Examples:
@@ -36,7 +36,7 @@ shift 2
 flags=""
 resume=""
 audit_run=""
-model="claude-opus-4-7"
+model="opus"
 repo=""
 
 while (( $# )); do
