@@ -1184,10 +1184,17 @@ pub(crate) async fn run_parallel_loop(
                         attempted_partial_followups.remove(&assignment.task.id);
                         deferred_partial_tasks.remove(&assignment.task.id);
                         unblock_attempt_counts.remove(&assignment.task.id);
+                        let closed_landed_partial =
+                            assignment.task.status == LoopTaskStatus::Partial;
                         parallel_logger.info(format!(
-                            "self-heal:   [{}] {} closed from canonical evidence after lane-{} exited cleanly without a commit (total landed: {})",
+                            "self-heal:   [{}] {} {} after lane-{} exited cleanly without a commit (total landed: {})",
                             classify_task_execution_kind(&assignment.task),
                             assignment.task.id,
+                            if closed_landed_partial {
+                                "finalized a landed [~] task to done (no further work needed)"
+                            } else {
+                                "closed from complete canonical evidence"
+                            },
                             assignment.lane_index,
                             landed
                         ));
@@ -1195,7 +1202,11 @@ pub(crate) async fn run_parallel_loop(
                             &assignment.stdout_log_path,
                             assignment.lane_index,
                             &assignment.task.id,
-                            "self-heal: worker exited cleanly without a commit, but canonical review/receipt/artifact evidence is complete; host marked the task done",
+                            if closed_landed_partial {
+                                "self-heal: worker exited cleanly without a commit; task already landed as [~], host finalized it to done (no further code needed)"
+                            } else {
+                                "self-heal: worker exited cleanly without a commit, but canonical review/receipt/artifact evidence is complete; host marked the task done"
+                            },
                         );
                         last_idle_summary = None;
                         continue;

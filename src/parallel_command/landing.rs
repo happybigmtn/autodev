@@ -727,7 +727,14 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
     };
     let evidence_after =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
-    if !evidence_after.is_fully_evidenced() {
+    // A clean re-dispatch (no new commit) of an already-`Partial` task confirms
+    // its implementation landed in a prior attempt and there is no further code
+    // to write — `[~]` reflects thin completion receipts, not missing work.
+    // Finalize it to Done so the queue converges instead of re-shelving the same
+    // landed task every round. A task that never landed (not `Partial`) still
+    // needs real evidence, so it shelves as before.
+    let landed_partial = assignment.task.status == LoopTaskStatus::Partial;
+    if !evidence_after.is_fully_evidenced() && !landed_partial {
         return Ok(false);
     }
 
@@ -772,11 +779,12 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
             ));
         }
     }
-    write_clean_no_commit_verdict(
-        assignment,
-        "task-already-done",
-        "canonical review, receipt, and declared artifact evidence are complete; host created an evidence closeout",
-    )?;
+    let verdict_detail = if evidence_after.is_fully_evidenced() {
+        "canonical review, receipt, and declared artifact evidence are complete; host created an evidence closeout"
+    } else {
+        "task already landed its implementation as [~]; a clean re-dispatch produced no further work, so the host finalized it to done"
+    };
+    write_clean_no_commit_verdict(assignment, "task-already-done", verdict_detail)?;
 
     Ok(true)
 }
@@ -1435,6 +1443,119 @@ mod tests {
         assert!(!lane_repo_has_active_cherry_pick(&lane));
         let log = run_git_in(&lane, ["log", "--format=%s", "-2"]);
         assert_eq!(log, "lane change\nmain change\n");
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    fn clean_no_commit_assignment(
+        root: &std::path::Path,
+        repo: &std::path::Path,
+        id: &str,
+        status: LoopTaskStatus,
+        markdown: &str,
+    ) -> ActiveLaneAssignment {
+        ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: id.to_string(),
+                title: "closeout".to_string(),
+                status,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: markdown.to_string(),
+            },
+            resumed: false,
+            lane_root: root.join("lane-root"),
+            lane_repo_root: repo.to_path_buf(),
+            base_commit: String::new(),
+            stdout_log_path: root.join("lane.stdout.log"),
+            stderr_log_path: root.join("lane.stderr.log"),
+            worker_pid_path: root.join("lane.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        }
+    }
+
+    /// A landed `[~]` task whose re-dispatch produces no commit and still lacks
+    /// full receipts must be finalized to Done (its code already landed), not
+    /// re-shelved forever. This is the convergence half of the partial-task fix:
+    /// `[~]` no longer blocks dependents, and now no longer churns indefinitely.
+    #[test]
+    fn clean_no_commit_finalizes_landed_partial_to_done() {
+        let (root, _remote, upstream, _worker) =
+            init_remote_and_clones("parallel-partial-closeout", "main");
+        // Declare a completion artifact that is never created, so the host
+        // cannot self-complete the evidence: `is_fully_evidenced()` stays false
+        // and only the landed-`[~]` status can finalize the task.
+        let markdown =
+            "- [~] `TASK-PARTIAL` closeout\nCompletion artifacts:\n  - `docs/closeout-evidence.md`\n";
+        fs::write(upstream.join("IMPLEMENTATION_PLAN.md"), markdown)
+            .expect("failed to write plan");
+        run_git_in(&upstream, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&upstream, ["commit", "-m", "seed partial task"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+
+        let logger = ParallelEventLogger::new(&root).expect("logger should init");
+        let assignment = clean_no_commit_assignment(
+            &root,
+            &upstream,
+            "TASK-PARTIAL",
+            LoopTaskStatus::Partial,
+            markdown,
+        );
+
+        let closed = reconcile_parallel_clean_no_commit(&upstream, "main", &assignment, &logger)
+            .expect("reconcile should not error");
+        assert!(closed, "a landed [~] task must finalize to done on clean re-dispatch");
+        let plan = fs::read_to_string(upstream.join("IMPLEMENTATION_PLAN.md"))
+            .expect("plan should be readable");
+        assert!(
+            plan.contains("- [x] `TASK-PARTIAL`"),
+            "the partial task should be marked done, got:\n{plan}"
+        );
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    /// A `Pending` task that never landed and produces no commit or evidence must
+    /// still shelve (return false) — the finalize path is reserved for tasks whose
+    /// code already landed, so genuinely-empty work is never masked as done.
+    #[test]
+    fn clean_no_commit_still_shelves_unlanded_pending_task() {
+        let (root, _remote, upstream, _worker) =
+            init_remote_and_clones("parallel-pending-shelve", "main");
+        // Same incomplete-evidence shape as the partial test (a declared
+        // artifact that never appears); only the `Pending` status differs.
+        let markdown =
+            "- [ ] `TASK-PENDING` closeout\nCompletion artifacts:\n  - `docs/closeout-evidence.md`\n";
+        fs::write(upstream.join("IMPLEMENTATION_PLAN.md"), markdown)
+            .expect("failed to write plan");
+        run_git_in(&upstream, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&upstream, ["commit", "-m", "seed pending task"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+
+        let logger = ParallelEventLogger::new(&root).expect("logger should init");
+        let assignment = clean_no_commit_assignment(
+            &root,
+            &upstream,
+            "TASK-PENDING",
+            LoopTaskStatus::Pending,
+            markdown,
+        );
+
+        let closed = reconcile_parallel_clean_no_commit(&upstream, "main", &assignment, &logger)
+            .expect("reconcile should not error");
+        assert!(!closed, "an unlanded pending task must not be finalized to done");
+        let plan = fs::read_to_string(upstream.join("IMPLEMENTATION_PLAN.md"))
+            .expect("plan should be readable");
+        assert!(
+            plan.contains("- [ ] `TASK-PENDING`"),
+            "the pending task must stay open, got:\n{plan}"
+        );
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
