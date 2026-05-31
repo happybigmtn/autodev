@@ -714,6 +714,21 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
         "needs-human-triage",
         "lane exited cleanly without a local commit; canonical evidence will be inspected before shelving",
     )?;
+    // A worker (typically a verification gate) may have run the verification
+    // wrapper and written a receipt to its lane worktree without producing a
+    // commit — the prompt forbids committing receipts. The commit-landing path
+    // propagates those receipts to canonical so the host can read them; do the
+    // same here, or a gate that genuinely passed its checks shelves because the
+    // host can't see `verification_receipt_present`. Missing receipts stay a
+    // no-op, so a worker that produced no evidence still shelves below.
+    if let Err(err) =
+        propagate_lane_receipts(&assignment.lane_repo_root, repo_root, &assignment.task.id)
+    {
+        parallel_logger.warn(format!(
+            "warning: failed propagating lane-{} receipts for `{}` during clean no-commit reconcile: {err:#}",
+            assignment.lane_index, assignment.task.id
+        ));
+    }
     let evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     let review_can_complete_evidence = !evidence_before.has_review_handoff
@@ -1555,6 +1570,54 @@ mod tests {
         assert!(
             plan.contains("- [ ] `TASK-PENDING`"),
             "the pending task must stay open, got:\n{plan}"
+        );
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    /// A verification gate writes its receipt to the lane worktree without
+    /// committing it (the prompt forbids committing receipts). The clean
+    /// no-commit reconcile path must propagate that receipt to canonical — just
+    /// like the commit-landing path does — so the host can see the gate's
+    /// verification evidence instead of shelving a gate that genuinely passed.
+    #[test]
+    fn clean_no_commit_propagates_lane_verification_receipt_to_canonical() {
+        let (root, _remote, upstream, _worker) =
+            init_remote_and_clones("parallel-receipt-propagation", "main");
+        let markdown = "- [~] `TASK-GATE` verification gate\n";
+        fs::write(upstream.join("IMPLEMENTATION_PLAN.md"), markdown)
+            .expect("failed to write plan");
+        run_git_in(&upstream, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_git_in(&upstream, ["commit", "-m", "seed gate task"]);
+        run_git_in(&upstream, ["push", "origin", "main"]);
+
+        // The lane worktree holds an uncommitted passing receipt; canonical has none.
+        let lane = root.join("lane-gate");
+        let lane_receipts = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&lane_receipts).expect("failed to create lane receipts dir");
+        fs::write(
+            lane_receipts.join("TASK-GATE.json"),
+            r#"{"commit":"deadbeef","commands":[{"command":"cargo test gate","exit_code":0,"status":"passed"}],"declared_artifacts":[]}"#,
+        )
+        .expect("failed to write lane receipt");
+        let canonical_receipt =
+            upstream.join(".auto/symphony/verification-receipts/TASK-GATE.json");
+        assert!(!canonical_receipt.exists(), "canonical must start without the receipt");
+
+        let logger = ParallelEventLogger::new(&root).expect("logger should init");
+        let assignment = clean_no_commit_assignment(
+            &root,
+            &lane,
+            "TASK-GATE",
+            LoopTaskStatus::Partial,
+            markdown,
+        );
+
+        reconcile_parallel_clean_no_commit(&upstream, "main", &assignment, &logger)
+            .expect("reconcile should not error");
+        assert!(
+            canonical_receipt.exists(),
+            "the lane's verification receipt must be propagated to canonical during reconcile"
         );
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
