@@ -785,12 +785,16 @@ mod tests {
     }
 
     #[test]
-    fn parallel_blocker_frontier_classifies_shelved_and_deferred_dependencies() {
+    fn parallel_blocker_frontier_lists_unlanded_shelved_not_landed_partial() {
+        // TASK-S is an unlanded `[ ]` blocker (shelved this run) -> it still
+        // blocks its dependent and belongs on the frontier. TASK-P is a `[~]`
+        // partial whose code already landed (only its closeout is deferred), so
+        // it must NOT block its dependent and must not appear as a blocker.
         let plan = parse_loop_plan(
             r#"
 - [ ] `TASK-A` waits on shelved
   Dependencies: `TASK-S`
-- [ ] `TASK-B` waits on deferred
+- [ ] `TASK-B` waits on partial
   Dependencies: `TASK-P`
 - [ ] `TASK-S` shelved blocker
   Dependencies: none
@@ -805,10 +809,13 @@ mod tests {
         let deferred = BTreeSet::from(["TASK-P".to_string()]);
 
         let frontier = parallel_blocker_frontier(&plan, &BTreeSet::new(), &shelved, &deferred);
-        assert_eq!(frontier[0].task_id, "TASK-P");
-        assert_eq!(frontier[0].kind, ParallelBlockerKind::DeferredPartial);
-        assert_eq!(frontier[1].task_id, "TASK-S");
-        assert_eq!(frontier[1].kind, ParallelBlockerKind::Shelved);
+        assert_eq!(frontier.len(), 1);
+        assert_eq!(frontier[0].task_id, "TASK-S");
+        assert_eq!(frontier[0].kind, ParallelBlockerKind::Shelved);
+        assert!(
+            frontier.iter().all(|blocker| blocker.task_id != "TASK-P"),
+            "a landed `[~]` partial must not appear as a dependency blocker"
+        );
     }
 
     #[test]
