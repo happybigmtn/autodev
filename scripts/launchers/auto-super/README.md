@@ -7,7 +7,7 @@ Claude session boundaries, terminal exits, and parent-SIGTERM cleanups.
 
 - `auto-super-opus` — operator-facing launcher. Writes a per-instance env
   file at `~/.config/auto-super/<instance>.env`, enables and starts
-  `auto-super@<instance>.service`. Defaults `--model claude-opus-4-7`.
+  `auto-super@<instance>.service`. Defaults `--model opus` (latest installed Opus).
 - `auto-super-run` — entrypoint the systemd unit invokes. Sources the env
   file, `cd`s into the repo, execs `auto super` so systemd owns the process
   tree.
@@ -29,7 +29,7 @@ systemctl --user daemon-reload
 ```bash
 # launch
 auto-super-opus autonomy /tmp/autonomy-super-prompt.txt \
-  --flags '--skip-design --with-audit --worker-model claude-opus-4-7 --worker-reasoning-effort xhigh'
+  --flags '--skip-design --with-audit --worker-model opus --worker-reasoning-effort xhigh'
 
 # watch
 journalctl --user -fu auto-super@autonomy.service
@@ -40,7 +40,7 @@ systemctl --user stop auto-super@autonomy.service
 
 # resume from a partial run
 auto-super-opus autonomy /tmp/autonomy-super-prompt.txt \
-  --flags '--skip-design --with-audit --worker-model claude-opus-4-7 --worker-reasoning-effort xhigh' \
+  --flags '--skip-design --with-audit --worker-model opus --worker-reasoning-effort xhigh' \
   --resume /home/r/Coding/autonomy/.auto/super/<run-id>
 ```
 

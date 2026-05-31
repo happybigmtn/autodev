@@ -5,7 +5,7 @@
 #   AUTO_SUPER_REPO       — absolute path to the repo
 #   AUTO_SUPER_PROMPT     — absolute path to the prompt file
 #   AUTO_SUPER_FLAGS      — extra flags (e.g. --skip-design --with-audit)
-#   AUTO_SUPER_MODEL      — model (default: claude-opus-4-7 per current direction)
+#   AUTO_SUPER_MODEL      — model (default: opus — latest installed Opus)
 #   AUTO_SUPER_RESUME     — optional run-id to resume
 #   AUTO_SUPER_AUDIT_RUN  — optional audit-run-id to reuse
 #
@@ -27,7 +27,7 @@ fi
 : "${AUTO_SUPER_REPO:?AUTO_SUPER_REPO must be set}"
 : "${AUTO_SUPER_PROMPT:?AUTO_SUPER_PROMPT must be set}"
 : "${AUTO_SUPER_FLAGS:=}"
-: "${AUTO_SUPER_MODEL:=claude-opus-4-7}"
+: "${AUTO_SUPER_MODEL:=opus}"
 : "${AUTO_SUPER_RESUME:=}"
 : "${AUTO_SUPER_AUDIT_RUN:=}"
 

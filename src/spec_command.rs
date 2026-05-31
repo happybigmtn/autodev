@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn auto_spec_routes_opus_defaults_to_claude_author() {
         assert!(spec_author_uses_claude_model("opus"));
-        assert!(spec_author_uses_claude_model("claude-opus-4-7"));
+        assert!(spec_author_uses_claude_model("claude-opus-4-8"));
         assert!(!spec_author_uses_claude_model("gpt-5.5"));
     }
 

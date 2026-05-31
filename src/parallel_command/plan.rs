@@ -110,9 +110,17 @@ impl LoopPlanSnapshot {
             .tasks
             .iter()
             .filter(|task| {
+                // A `Partial` (`[~]`) upstream has already landed its code to
+                // canonical main; it is `Partial` only because its completion
+                // receipts/evidence are not yet fully recorded. Dependents are
+                // created from canonical main and build on that committed code,
+                // so a missing receipt must not block them. Treating `Partial`
+                // as unresolved self-blocks every downstream task in a queue
+                // where work routinely lands `[~]` before receipts close out.
+                // Only genuinely-unlanded upstreams gate dependents.
                 matches!(
                     task.status,
-                    LoopTaskStatus::Pending | LoopTaskStatus::Blocked | LoopTaskStatus::Partial
+                    LoopTaskStatus::Pending | LoopTaskStatus::Blocked
                 )
             })
             .filter(|task| !self.is_completion_path_placeholder(task))
@@ -673,7 +681,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_loop_plan_treats_partial_tasks_as_unfinished_dependencies() {
+    fn partial_dependency_is_satisfied_so_dependent_is_ready() {
+        // A `[~]` upstream has already landed its code to canonical main; it is
+        // `Partial` only because its completion receipts are still outstanding.
+        // Both the upstream (still actionable for closeout) and its dependent
+        // are pending, but the dependent must be READY — its code dependency is
+        // satisfied. Regression: treating `Partial` as an unresolved dependency
+        // self-blocked every downstream task in a queue where work routinely
+        // lands `[~]` before receipts close out.
         let plan = r#"
 - [~] `TASK-001` Evidence gap
   Dependencies: none
@@ -686,13 +701,13 @@ mod tests {
         let snapshot = parse_loop_plan(plan);
         let queue = snapshot.queue_snapshot();
         assert_eq!(queue.pending_ids, vec!["TASK-001", "TASK-002"]);
-        assert!(
+        assert_eq!(
             snapshot
                 .ready_tasks(&Default::default())
                 .into_iter()
                 .map(|task| task.id)
-                .collect::<Vec<_>>()
-                == vec!["TASK-001"]
+                .collect::<Vec<_>>(),
+            vec!["TASK-001", "TASK-002"]
         );
     }
 
