@@ -175,6 +175,37 @@ fn pilot_dev_auto_finalizes_selected_task_before_closeout() {
     assert!(finalize.contains("\"before_status\": \"pending\""));
     assert!(finalize.contains("\"after_status\": \"done\""));
     assert!(finalize.contains("\"pushed\": true"));
+    let execution =
+        fs::read_to_string(run_root.join("pilot-execution.json")).expect("execution manifest");
+    let execution: serde_json::Value =
+        serde_json::from_str(&execution).expect("execution manifest json");
+    let task_finalize: serde_json::Value =
+        serde_json::from_str(&finalize).expect("task finalize json");
+    let implementation_commit = git_output(&repo, &["rev-parse", "HEAD~1"])
+        .trim()
+        .to_string();
+    let finalize_commit = git_output(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        execution["git"]["commit"].as_str(),
+        Some(implementation_commit.as_str())
+    );
+    assert_eq!(
+        execution["git"]["implementation_commit"].as_str(),
+        Some(implementation_commit.as_str())
+    );
+    assert_eq!(
+        execution["git"]["finalize_commit"].as_str(),
+        Some(finalize_commit.as_str())
+    );
+    assert_eq!(
+        task_finalize["git"]["implementation_commit"].as_str(),
+        Some(implementation_commit.as_str())
+    );
+    assert_eq!(
+        task_finalize["git"]["finalize_commit"].as_str(),
+        Some(finalize_commit.as_str())
+    );
+    assert_ne!(implementation_commit, finalize_commit);
 
     let log = git_output(&repo, &["log", "--oneline", "-2"]);
     assert!(log.contains("pilot-finalize-fixture: finalize TASK-001 plan state"));

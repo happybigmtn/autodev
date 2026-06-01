@@ -680,7 +680,11 @@ deviate:
 The worker should not hand-edit checklist state for a selected task after
 execution. It must keep `selected_task.source_plan` accurate, and then let the
 wrapper write `task-finalize.json` before closeout. If task finalization fails,
-the run is an orchestration failure, not a successful closeout.
+the run is an orchestration failure, not a successful closeout. After
+finalization, `pilot-execution.json` preserves the implementation commit in
+`git.commit` and `git.implementation_commit`, and records the checklist commit
+separately as `git.finalize_commit` with `git.finalize_pushed` /
+`git.finalize_push_ref` when pushed.
 
 Promotion policy: promote the generated snapshot automatically only when
 `auto gen --snapshot-only` exits 0, the newest `gen-*` directory contains

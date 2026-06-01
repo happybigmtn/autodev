@@ -1370,6 +1370,20 @@ fn write_project_rollup(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
         .as_ref()
         .map(|value| string_at(value, &["git", "commit"]).to_string())
         .unwrap_or_default();
+    let implementation_commit = execution
+        .as_ref()
+        .map(|value| {
+            first_nonempty(&[
+                string_at(value, &["git", "implementation_commit"]),
+                string_at(value, &["git", "commit"]),
+            ])
+            .to_string()
+        })
+        .unwrap_or_default();
+    let finalize_commit = execution
+        .as_ref()
+        .map(|value| string_at(value, &["git", "finalize_commit"]).to_string())
+        .unwrap_or_default();
     let no_commit_reason = execution
         .as_ref()
         .map(|value| string_at(value, &["git", "no_commit_reason"]).to_string())
@@ -1428,6 +1442,8 @@ fn write_project_rollup(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
             "selected_task_title": selected_task_title,
             "verification_summary": verification_summary,
             "commit": execution_commit,
+            "implementation_commit": implementation_commit,
+            "finalize_commit": finalize_commit,
             "pushed": pushed,
             "no_commit_reason": no_commit_reason,
             "manifest": paths.run_root.join("pilot-execution.json")
@@ -1541,6 +1557,12 @@ fn finalize_selected_task(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     let mut pushed = false;
     let mut finalize_commit = String::new();
     let mut push_ref = String::new();
+    let previous_execution_commit = string_at(&execution, &["git", "commit"]).to_string();
+    let implementation_commit = first_nonempty(&[
+        string_at(&execution, &["git", "implementation_commit"]),
+        &previous_execution_commit,
+    ])
+    .to_string();
     if args.task_finalize_push && !args.task_finalize_commit {
         bail!("--task-finalize-push requires --task-finalize-commit");
     }
@@ -1550,7 +1572,20 @@ fn finalize_selected_task(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
             commit_task_finalize_changes(args, &paths.workdir, &task_id, &changed_paths)?;
         committed = !finalize_commit.is_empty();
         if committed {
-            set_string(&mut execution, &["git", "commit"], &finalize_commit);
+            if !implementation_commit.is_empty() {
+                set_string(
+                    &mut execution,
+                    &["git", "implementation_commit"],
+                    &implementation_commit,
+                );
+            } else {
+                set_string(&mut execution, &["git", "commit"], &finalize_commit);
+            }
+            set_string(
+                &mut execution,
+                &["git", "finalize_commit"],
+                &finalize_commit,
+            );
             set_string(&mut execution, &["git", "no_commit_reason"], "");
             let branch = current_branch(&paths.workdir);
             if !branch.is_empty() {
@@ -1566,6 +1601,8 @@ fn finalize_selected_task(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
             pushed = true;
             set_bool(&mut execution, &["git", "pushed"], true);
             set_string(&mut execution, &["git", "push_ref"], &push_ref);
+            set_bool(&mut execution, &["git", "finalize_pushed"], true);
+            set_string(&mut execution, &["git", "finalize_push_ref"], &push_ref);
         }
         atomic_write(
             &execution_manifest_path,
@@ -1598,6 +1635,9 @@ fn finalize_selected_task(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
             "commit_requested": args.task_finalize_commit,
             "committed": committed,
             "commit": finalize_commit,
+            "implementation_commit": implementation_commit,
+            "previous_execution_commit": previous_execution_commit,
+            "finalize_commit": finalize_commit,
             "push_requested": args.task_finalize_push,
             "pushed": pushed,
             "push_ref": push_ref
@@ -1754,6 +1794,8 @@ fn render_project_rollup_markdown(
     let selected_task_title = string_at(manifest, &["execution", "selected_task_title"]);
     let verification_summary = string_at(manifest, &["execution", "verification_summary"]);
     let execution_commit = string_at(manifest, &["execution", "commit"]);
+    let implementation_commit = string_at(manifest, &["execution", "implementation_commit"]);
+    let finalize_commit = string_at(manifest, &["execution", "finalize_commit"]);
     let no_commit_reason = string_at(manifest, &["execution", "no_commit_reason"]);
     let pushed = bool_at(manifest, &["execution", "pushed"]);
     let closeout_status = string_at(manifest, &["closeout", "status"]);
@@ -1789,6 +1831,8 @@ tags:
 - Push policy: `{}`
 - Pushed: `{}`
 - Commit evidence: `{}`
+- Implementation commit: `{}`
+- Task-finalize commit: `{}`
 - No-commit reason: `{}`
 
 ## Execution
@@ -1825,6 +1869,8 @@ tags:
         empty_label(landing_policy, "unknown"),
         pushed,
         empty_label(execution_commit, "none"),
+        empty_label(implementation_commit, "none"),
+        empty_label(finalize_commit, "none"),
         empty_label(no_commit_reason, "none"),
         empty_label(closeout_status, "unknown"),
         empty_label(execution_status, "unknown"),
@@ -2191,6 +2237,14 @@ fn loop_task_status_label(status: LoopTaskStatus) -> &'static str {
         LoopTaskStatus::Partial => "partial",
         LoopTaskStatus::Done => "done",
     }
+}
+
+fn first_nonempty<'a>(values: &[&'a str]) -> &'a str {
+    values
+        .iter()
+        .copied()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or("")
 }
 
 fn string_at<'a>(value: &'a Value, path: &[&str]) -> &'a str {
