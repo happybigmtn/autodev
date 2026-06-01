@@ -619,6 +619,34 @@ auto review \
   --reasoning-effort "$WORK_EFFORT"
 ```
 
+Closeout gate:
+
+```bash
+auto pilot <repo-slug> "<operator intent>" \
+  --closeout-only \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT"
+```
+
+`pilot-dev` runs this typed closeout gate by default through
+`PILOT_TYPED_CLOSEOUT=1` after Codex exits. The gate writes
+`pilot-closeout.json` and rejects success when required artifacts are missing
+or incomplete:
+
+- `pilot-preflight.json`
+- `pilot-planning.json`
+- `autodev-command-selection.json`
+- `autodev-command-selection.md`
+- `receipt.md`
+- selected/deferred/skipped decisions and reasons for every discovered command
+- no `UNDECIDED` entries in the markdown companion
+- required planning phases recorded as successful in `pilot-planning.json`
+- steward promotion decisions when `steward-preflight/PROMOTIONS.md` exists
+
+Hermes may send a successful Telegram summary only after the typed closeout
+gate passes. If it fails, the wrapper reports the run as an orchestration
+failure and links `pilot-closeout.json` plus `orchestration-failure.md`.
+
 Hermes returns this Telegram summary shape:
 
 ```text

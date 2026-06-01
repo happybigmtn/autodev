@@ -95,14 +95,35 @@ pub(crate) struct PilotArgs {
     /// Run typed preflight plus the autodev planning spine, then stop before execution.
     #[arg(long)]
     pub(crate) planning_only: bool,
+
+    /// Validate a completed pilot run's closeout artifacts, then stop.
+    #[arg(long)]
+    pub(crate) closeout_only: bool,
 }
 
 pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
-    if args.preflight_only && args.planning_only {
-        bail!("--preflight-only and --planning-only are mutually exclusive");
+    let selected_modes = [args.preflight_only, args.planning_only, args.closeout_only]
+        .iter()
+        .filter(|selected| **selected)
+        .count();
+    if selected_modes > 1 {
+        bail!("--preflight-only, --planning-only, and --closeout-only are mutually exclusive");
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
+    if args.closeout_only {
+        validate_closeout(&args, &paths)?;
+        println!("repo: {}", args.repo_slug);
+        println!("workdir: {}", paths.workdir.display());
+        println!("run: {}", paths.run_id);
+        println!("run_root: {}", paths.run_root.display());
+        println!(
+            "closeout: {}",
+            paths.run_root.join("pilot-closeout.json").display()
+        );
+        println!("pilot closeout ok");
+        return Ok(());
+    }
     fs::create_dir_all(paths.run_root.join("gbrain"))?;
     fs::create_dir_all(paths.run_root.join("codex"))?;
     fs::create_dir_all(paths.run_root.join("logs"))?;
@@ -214,6 +235,7 @@ planning_mode={planning_mode}
 require_planning_spine={require_planning_spine}
 preflight_only={preflight_only}
 planning_only={planning_only}
+closeout_only={closeout_only}
 reference_repos={reference_repos}
 autodev_source={autodev_source}
 remote_sync_mode={remote_sync_mode}
@@ -235,6 +257,7 @@ created={created}
         require_planning_spine = if args.require_planning_spine { 1 } else { 0 },
         preflight_only = if args.preflight_only { 1 } else { 0 },
         planning_only = if args.planning_only { 1 } else { 0 },
+        closeout_only = if args.closeout_only { 1 } else { 0 },
         autodev_source = args.autodev_source.display(),
         created = Utc::now().format("%FT%TZ"),
     );
@@ -632,6 +655,229 @@ fn write_preflight_manifest(
     )
 }
 
+fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
+    let mut errors = Vec::new();
+    require_nonempty_artifact(
+        &paths.run_root.join("pilot-preflight.json"),
+        "preflight manifest",
+        &mut errors,
+    );
+    let planning_manifest_path = paths.run_root.join("pilot-planning.json");
+    require_nonempty_artifact(&planning_manifest_path, "planning manifest", &mut errors);
+    require_nonempty_artifact(
+        &paths.run_root.join("autodev-command-selection.json"),
+        "command-selection json",
+        &mut errors,
+    );
+    require_nonempty_artifact(
+        &paths.run_root.join("autodev-command-selection.md"),
+        "command-selection markdown",
+        &mut errors,
+    );
+    require_nonempty_artifact(&paths.run_root.join("receipt.md"), "receipt", &mut errors);
+
+    validate_command_selection(&paths.run_root, &mut errors);
+    validate_receipt(&paths.run_root.join("receipt.md"), &mut errors);
+    validate_planning_manifest(&planning_manifest_path, &mut errors);
+    validate_steward_promotion_decisions(&paths.run_root, &mut errors);
+
+    let success = errors.is_empty();
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "status": if success { "ok" } else { "failed" },
+        "errors": errors,
+        "artifacts": {
+            "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
+            "planning_manifest": planning_manifest_path,
+            "closeout_manifest": paths.run_root.join("pilot-closeout.json"),
+            "command_selection_json": paths.run_root.join("autodev-command-selection.json"),
+            "command_selection_markdown": paths.run_root.join("autodev-command-selection.md"),
+            "receipt": paths.run_root.join("receipt.md"),
+            "orchestration_failure": paths.run_root.join("orchestration-failure.md")
+        }
+    });
+    atomic_write(
+        &paths.run_root.join("pilot-closeout.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
+    if !success {
+        let rendered = manifest["errors"]
+            .as_array()
+            .map_or_else(String::new, |errors| {
+                errors
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|error| format!("- {error}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        atomic_write(
+            &paths.run_root.join("orchestration-failure.md"),
+            format!("# Orchestration Failure\n\n{rendered}\n").as_bytes(),
+        )?;
+        bail!(
+            "pilot closeout validation failed; see {}",
+            paths.run_root.join("pilot-closeout.json").display()
+        );
+    }
+    Ok(())
+}
+
+fn require_nonempty_artifact(path: &Path, label: &str, errors: &mut Vec<String>) {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+        _ => errors.push(format!("missing required {label}: {}", path.display())),
+    }
+}
+
+fn validate_command_selection(run_root: &Path, errors: &mut Vec<String>) {
+    let json_path = run_root.join("autodev-command-selection.json");
+    let Ok(text) = fs::read_to_string(&json_path) else {
+        return;
+    };
+    let Ok(selection) = serde_json::from_str::<Value>(&text) else {
+        errors.push(format!(
+            "invalid command-selection json: {}",
+            json_path.display()
+        ));
+        return;
+    };
+    let Some(commands) = selection.get("commands").and_then(Value::as_array) else {
+        errors.push("command-selection json has no commands array".to_string());
+        return;
+    };
+    if commands.is_empty() {
+        errors.push("command-selection json has an empty commands array".to_string());
+    }
+    for command in commands {
+        validate_decision_node(command, "command", errors);
+    }
+
+    let markdown_path = run_root.join("autodev-command-selection.md");
+    if let Ok(markdown) = fs::read_to_string(&markdown_path) {
+        if markdown.contains("UNDECIDED") {
+            errors.push(format!(
+                "command-selection markdown still contains UNDECIDED: {}",
+                markdown_path.display()
+            ));
+        }
+    }
+}
+
+fn validate_decision_node(node: &Value, path: &str, errors: &mut Vec<String>) {
+    let command = node.get("command").and_then(Value::as_str).unwrap_or(path);
+    let decision = node.get("decision").and_then(Value::as_str).unwrap_or("");
+    let reason = node.get("reason").and_then(Value::as_str).unwrap_or("");
+    if decision.is_empty() || decision == "UNDECIDED" {
+        errors.push(format!("missing decision for {command}"));
+    }
+    if reason.trim().is_empty() {
+        errors.push(format!("missing reason for {command}"));
+    }
+    for key in ["actions", "subcommands"] {
+        if let Some(children) = node.get(key).and_then(Value::as_array) {
+            for child in children {
+                validate_decision_node(child, command, errors);
+            }
+        }
+    }
+}
+
+fn validate_receipt(path: &Path, errors: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let lower = text.to_ascii_lowercase();
+    for required in [
+        "inputs",
+        "commands",
+        "artifacts",
+        "tests",
+        "commit",
+        "risk",
+        "next",
+    ] {
+        if !lower.contains(required) {
+            errors.push(format!(
+                "receipt missing required closeout term `{required}`: {}",
+                path.display()
+            ));
+        }
+    }
+}
+
+fn validate_planning_manifest(path: &Path, errors: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&text) else {
+        errors.push(format!(
+            "invalid planning manifest json: {}",
+            path.display()
+        ));
+        return;
+    };
+    let require_spine = manifest
+        .get("require_planning_spine")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let effective_mode = manifest
+        .get("effective_planning_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let commands = manifest
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if require_spine && effective_mode != "none" {
+        require_successful_phase(&commands, "corpus", errors);
+        require_successful_phase(&commands, "gen", errors);
+    }
+    if matches!(effective_mode, "steward" | "full") {
+        require_successful_phase(&commands, "steward", errors);
+    }
+}
+
+fn require_successful_phase(commands: &[Value], phase: &str, errors: &mut Vec<String>) {
+    let ok = commands.iter().any(|command| {
+        command.get("phase").and_then(Value::as_str) == Some(phase)
+            && command
+                .get("status")
+                .and_then(|status| status.get("success"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    if !ok {
+        errors.push(format!(
+            "planning manifest missing successful `{phase}` phase"
+        ));
+    }
+}
+
+fn validate_steward_promotion_decisions(run_root: &Path, errors: &mut Vec<String>) {
+    let promotions = run_root.join("steward-preflight/PROMOTIONS.md");
+    if !promotions.exists() {
+        return;
+    }
+    let decisions = run_root.join("steward-promotion-decisions.md");
+    require_nonempty_artifact(&decisions, "steward promotion decisions", errors);
+    if let Ok(text) = fs::read_to_string(&decisions) {
+        if text.contains("UNDECIDED") {
+            errors.push(format!(
+                "steward promotion decisions still contain UNDECIDED: {}",
+                decisions.display()
+            ));
+        }
+    }
+}
+
 fn command_selection_from_surface(surface: &Value, run_id: &str, repo: &str) -> Value {
     let commands = surface
         .get("commands")
@@ -864,7 +1110,7 @@ mod tests {
 
     use super::{
         command_selection_from_surface, effective_planning_mode, render_command_selection_markdown,
-        safe_artifact_slug,
+        safe_artifact_slug, validate_closeout, PilotPaths,
     };
 
     #[test]
@@ -909,6 +1155,26 @@ mod tests {
         };
         assert!(args.preflight_only);
         assert!(args.planning_only);
+    }
+
+    #[test]
+    fn pilot_args_parse_closeout_only() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--run-root",
+            "/tmp/pilot-run",
+            "--closeout-only",
+        ])
+        .expect("pilot args parse");
+
+        let Command::Pilot(args) = cli.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.closeout_only);
+        assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
     }
 
     #[test]
@@ -1006,5 +1272,152 @@ mod tests {
             safe_artifact_slug("manuals/hermes-orchestrator-development-memory"),
             "manuals__hermes-orchestrator-development-memory"
         );
+    }
+
+    #[test]
+    fn closeout_validation_accepts_complete_artifacts() {
+        let root = unique_temp_dir("closeout-ok");
+        write_complete_closeout_artifacts(&root, false);
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        validate_closeout(&args, &paths).expect("valid closeout");
+
+        assert!(root.join("pilot-closeout.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closeout_validation_rejects_undecided_selection() {
+        let root = unique_temp_dir("closeout-undecided");
+        write_complete_closeout_artifacts(&root, true);
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        let err = validate_closeout(&args, &paths).expect_err("invalid closeout");
+
+        assert!(err.to_string().contains("pilot closeout validation failed"));
+        let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
+            .expect("failure artifact");
+        assert!(failure.contains("missing decision"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "autodev-pilot-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn test_pilot_args(run_root: std::path::PathBuf) -> super::PilotArgs {
+        super::PilotArgs {
+            repo_slug: "repo".to_string(),
+            intent: vec!["intent".to_string()],
+            base_dir: run_root.parent().unwrap_or(Path::new("/tmp")).to_path_buf(),
+            run_id: Some("run".to_string()),
+            run_root: Some(run_root),
+            autodev_source: Path::new("/srv/dev/repos/autodev").to_path_buf(),
+            allow_local_only: true,
+            min_disk_kb: 1,
+            focus: "focus".to_string(),
+            model: "model".to_string(),
+            effort: "high".to_string(),
+            plan_effort: "xhigh".to_string(),
+            threads: 1,
+            planning_mode: "none".to_string(),
+            require_planning_spine: false,
+            plan: None,
+            reference_repos: Vec::new(),
+            preflight_only: false,
+            planning_only: false,
+            closeout_only: true,
+        }
+    }
+
+    fn test_pilot_paths(run_root: std::path::PathBuf) -> PilotPaths {
+        PilotPaths {
+            repo: run_root.clone(),
+            workdir: run_root.clone(),
+            run_id: "run".to_string(),
+            run_root,
+        }
+    }
+
+    fn write_complete_closeout_artifacts(root: &Path, undecided: bool) {
+        std::fs::write(root.join("pilot-preflight.json"), "{}\n").expect("preflight");
+        std::fs::write(
+            root.join("pilot-planning.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "effective_planning_mode": "none",
+                "require_planning_spine": false,
+                "commands": []
+            }))
+            .expect("planning json"),
+        )
+        .expect("planning");
+        let decision = if undecided { "UNDECIDED" } else { "selected" };
+        let reason = if undecided {
+            ""
+        } else {
+            "operator chose the planning path"
+        };
+        std::fs::write(
+            root.join("autodev-command-selection.json"),
+            serde_json::to_string_pretty(&json!({
+                "commands": [
+                    {
+                        "command": "auto pilot",
+                        "decision": decision,
+                        "reason": reason,
+                        "actions": [],
+                        "subcommands": []
+                    }
+                ]
+            }))
+            .expect("selection json"),
+        )
+        .expect("selection");
+        let markdown_decision = if undecided { "UNDECIDED" } else { "selected" };
+        std::fs::write(
+            root.join("autodev-command-selection.md"),
+            format!("| `auto pilot` | {markdown_decision} | {reason} |\n"),
+        )
+        .expect("selection md");
+        std::fs::write(
+            root.join("receipt.md"),
+            "\
+# Receipt
+
+## Inputs
+gbrain context and planning manifest
+
+## Commands
+auto pilot --planning-only
+
+## Artifacts
+pilot-planning.json
+
+## Tests
+cargo test pilot_command
+
+## Commit
+not required for fixture
+
+## Risks
+none
+
+## Next Command
+auto pilot --closeout-only
+",
+        )
+        .expect("receipt");
     }
 }

@@ -25,6 +25,8 @@ Environment:
                                       for the artifact spine when available.
   PILOT_TYPED_PLANNING=1              Use typed `auto pilot --planning-only`
                                       for doctor/corpus/gen/steward planning.
+  PILOT_TYPED_CLOSEOUT=1              Use typed `auto pilot --closeout-only`
+                                      after Codex execution.
   PILOT_WRAPPER_PREFLIGHT_ONLY=0      Stop after wrapper preflight/planning
                                       gates; useful for no-Codex smoke tests.
 
@@ -75,10 +77,13 @@ TYPED_PREFLIGHT="${PILOT_TYPED_PREFLIGHT:-1}"
 TYPED_PREFLIGHT_REQUIRED="${PILOT_TYPED_PREFLIGHT_REQUIRED:-0}"
 TYPED_PLANNING="${PILOT_TYPED_PLANNING:-1}"
 TYPED_PLANNING_REQUIRED="${PILOT_TYPED_PLANNING_REQUIRED:-0}"
+TYPED_CLOSEOUT="${PILOT_TYPED_CLOSEOUT:-1}"
+TYPED_CLOSEOUT_REQUIRED="${PILOT_TYPED_CLOSEOUT_REQUIRED:-0}"
 WRAPPER_PREFLIGHT_ONLY="${PILOT_WRAPPER_PREFLIGHT_ONLY:-0}"
 MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
 TYPED_PREFLIGHT_RAN=0
 TYPED_PLANNING_RAN=0
+TYPED_CLOSEOUT_RAN=0
 REMOTE_SYNC_MODE="normal"
 CURRENT_BRANCH="unknown"
 
@@ -153,6 +158,8 @@ auto_version_commit() {
   echo "typed_preflight_required=$TYPED_PREFLIGHT_REQUIRED"
   echo "typed_planning_requested=$TYPED_PLANNING"
   echo "typed_planning_required=$TYPED_PLANNING_REQUIRED"
+  echo "typed_closeout_requested=$TYPED_CLOSEOUT"
+  echo "typed_closeout_required=$TYPED_CLOSEOUT_REQUIRED"
   echo "wrapper_preflight_only=$WRAPPER_PREFLIGHT_ONLY"
   echo "min_disk_kb=$MIN_DISK_KB"
   echo "remote_sync_mode=$REMOTE_SYNC_MODE"
@@ -617,6 +624,57 @@ CODEX_STATUS=$?
 set -e
 
 CONTRACT_STATUS=0
+if [[ "$TYPED_CLOSEOUT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
+  TYPED_CLOSEOUT_ARGS=(
+    pilot
+    "$REPO_SLUG"
+    "$PROMPT"
+    --base-dir "$BASE_DIR"
+    --run-id "$RUN_ID"
+    --run-root "$RUN_ROOT"
+    --autodev-source "$AUTODEV_SOURCE"
+    --min-disk-kb "$MIN_DISK_KB"
+    --planning-mode "$PLANNING_MODE"
+    --closeout-only
+  )
+  if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+    TYPED_CLOSEOUT_ARGS+=(--allow-local-only)
+  fi
+  if [[ "$REQUIRE_PLANNING_SPINE" == "0" ]]; then
+    TYPED_CLOSEOUT_ARGS+=(--require-planning-spine false)
+  fi
+  if [[ -n "$PLAN_PATH" ]]; then
+    TYPED_CLOSEOUT_ARGS+=(--plan "$PLAN_PATH")
+  fi
+  TYPED_CLOSEOUT_ARGS+=("${REFERENCE_ARGS[@]}")
+
+  if (
+    cd "$WORKDIR"
+    auto "${TYPED_CLOSEOUT_ARGS[@]}"
+  ) > "$RUN_ROOT/logs/auto-pilot-closeout.log" 2>&1; then
+    TYPED_CLOSEOUT_RAN=1
+    {
+      echo "typed_closeout_ran=1"
+      echo "typed_closeout_status=ok"
+      echo "typed_closeout_log=$RUN_ROOT/logs/auto-pilot-closeout.log"
+    } >> "$RUN_ROOT/run.env"
+  else
+    TYPED_CLOSEOUT_RAN=1
+    CONTRACT_STATUS=72
+    {
+      echo "typed_closeout_ran=1"
+      echo "typed_closeout_status=failed"
+      echo "typed_closeout_log=$RUN_ROOT/logs/auto-pilot-closeout.log"
+    } >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_CLOSEOUT_REQUIRED" == "1" ]]; then
+      :
+    fi
+  fi
+else
+  echo "typed_closeout_ran=0" >> "$RUN_ROOT/run.env"
+fi
+
+if [[ "$TYPED_CLOSEOUT_RAN" != "1" ]]; then
 if [[ -s "$RUN_ROOT/logs/auto-commands.txt" ]]; then
   if [[ -s "$RUN_ROOT/autodev-command-selection.json" ]] && command -v jq >/dev/null 2>&1; then
     if ! jq -e '
@@ -718,6 +776,7 @@ if [[ "$CONTRACT_STATUS" -eq 0 && -s "$RUN_ROOT/steward-preflight/PROMOTIONS.md"
       echo "Artifact: $RUN_ROOT/steward-promotion-decisions.md"
     } > "$RUN_ROOT/orchestration-failure.md"
   fi
+fi
 fi
 
 if [[ "$CODEX_STATUS" -eq 0 && "$CONTRACT_STATUS" -ne 0 ]]; then
