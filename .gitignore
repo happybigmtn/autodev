@@ -1,6 +1,7 @@
 /target
 /.codex
 /.auto/
+/.gbrain-source
 /bug/
 /nemesis/
 /gen-*/
