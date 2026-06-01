@@ -595,6 +595,7 @@ Generated implementation plan validation:
 - Runtime-impacting tasks should implement runtime/API truth before UI consumers, regenerate contracts before consumer adaptation, and include an independent closeout proof that catches the original drift.
 - Priority work should be code/test/UX/runtime-contract forward. Documentation, audit, report, or generated-artifact-only tasks need explicit `Why now:` evidence that they unblock implementation; otherwise demote them to follow-on work.
 - Every `Spec:` reference must point to a spec file that exists under `{output_dir}/specs/`.
+- `Dependencies:` is scheduler input, not prose. When editing `{output_dir}/IMPLEMENTATION_PLAN.md`, keep each `Dependencies:` field exactly `none` or only comma-separated/backticked task IDs such as ``Dependencies: `TASK-001`, `TASK-002` ``. Put readiness notes, completed-task context, and sequencing explanations in `Why now:`, `Codebase evidence:`, `Integration touchpoints:`, or `Review/closeout:` instead.
 - Behavior-changing tasks should prefer a prove-it validation path: failing test or repro first, green proof, then broader regression check.
 - Research or design tasks must name the closing artifact or decision and must not promise implementation details before the prerequisite evidence exists.
 
@@ -1076,6 +1077,11 @@ mod tests {
         assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
         assert!(generation_prompt.contains("`auto design`"));
         assert!(generation_prompt.contains("continuing or supervising an existing run"));
+        assert!(generation_prompt.contains("`Dependencies:` is scheduler input, not prose"));
+        assert!(
+            generation_prompt
+                .contains("Put readiness notes, completed-task context, and sequencing explanations")
+        );
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
 
