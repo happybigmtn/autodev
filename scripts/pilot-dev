@@ -23,6 +23,8 @@ Environment:
   PILOT_AUTODEV_INSTALL_ROOT=$HOME/.local
   PILOT_TYPED_PREFLIGHT=1             Use typed `auto pilot --preflight-only`
                                       for the artifact spine when available.
+  PILOT_TYPED_PLANNING=1              Use typed `auto pilot --planning-only`
+                                      for doctor/corpus/gen/steward planning.
   PILOT_WRAPPER_PREFLIGHT_ONLY=0      Stop after wrapper preflight/planning
                                       gates; useful for no-Codex smoke tests.
 
@@ -71,9 +73,12 @@ AUTODEV_AUTOINSTALL="${PILOT_AUTODEV_AUTOINSTALL:-1}"
 AUTODEV_INSTALL_ROOT="${PILOT_AUTODEV_INSTALL_ROOT:-$HOME/.local}"
 TYPED_PREFLIGHT="${PILOT_TYPED_PREFLIGHT:-1}"
 TYPED_PREFLIGHT_REQUIRED="${PILOT_TYPED_PREFLIGHT_REQUIRED:-0}"
+TYPED_PLANNING="${PILOT_TYPED_PLANNING:-1}"
+TYPED_PLANNING_REQUIRED="${PILOT_TYPED_PLANNING_REQUIRED:-0}"
 WRAPPER_PREFLIGHT_ONLY="${PILOT_WRAPPER_PREFLIGHT_ONLY:-0}"
 MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
 TYPED_PREFLIGHT_RAN=0
+TYPED_PLANNING_RAN=0
 REMOTE_SYNC_MODE="normal"
 CURRENT_BRANCH="unknown"
 
@@ -146,6 +151,8 @@ auto_version_commit() {
   echo "autodev_install_root=$AUTODEV_INSTALL_ROOT"
   echo "typed_preflight_requested=$TYPED_PREFLIGHT"
   echo "typed_preflight_required=$TYPED_PREFLIGHT_REQUIRED"
+  echo "typed_planning_requested=$TYPED_PLANNING"
+  echo "typed_planning_required=$TYPED_PLANNING_REQUIRED"
   echo "wrapper_preflight_only=$WRAPPER_PREFLIGHT_ONLY"
   echo "min_disk_kb=$MIN_DISK_KB"
   echo "remote_sync_mode=$REMOTE_SYNC_MODE"
@@ -206,6 +213,14 @@ if [[ -z "${AUTODEV_INSTALLED_AFTER:-}" && -z "$AUTODEV_SOURCE_HEAD" ]]; then
 fi
 
 if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
+  TYPED_PILOT_MODE_FLAG="--preflight-only"
+  TYPED_PILOT_PHASE="preflight"
+  TYPED_PILOT_LOG="$RUN_ROOT/logs/auto-pilot-preflight.log"
+  if [[ "$TYPED_PLANNING" == "1" ]]; then
+    TYPED_PILOT_MODE_FLAG="--planning-only"
+    TYPED_PILOT_PHASE="planning"
+    TYPED_PILOT_LOG="$RUN_ROOT/logs/auto-pilot-planning.log"
+  fi
   TYPED_PREFLIGHT_ARGS=(
     pilot
     "$REPO_SLUG"
@@ -221,7 +236,7 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
     --plan-effort "$PLAN_EFFORT"
     --threads "$THREADS"
     --planning-mode "$PLANNING_MODE"
-    --preflight-only
+    "$TYPED_PILOT_MODE_FLAG"
   )
   if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
     TYPED_PREFLIGHT_ARGS+=(--allow-local-only)
@@ -237,29 +252,37 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
   if (
     cd "$WORKDIR"
     auto "${TYPED_PREFLIGHT_ARGS[@]}"
-  ) > "$RUN_ROOT/logs/auto-pilot-preflight.log" 2>&1; then
+  ) > "$TYPED_PILOT_LOG" 2>&1; then
     TYPED_PREFLIGHT_RAN=1
+    if [[ "$TYPED_PILOT_PHASE" == "planning" ]]; then
+      TYPED_PLANNING_RAN=1
+    fi
     {
       echo "autodev_source_head=${AUTODEV_SOURCE_HEAD:-unknown}"
       echo "autodev_installed_commit_before=${AUTODEV_INSTALLED_BEFORE:-missing}"
       echo "autodev_installed_commit_after=${AUTODEV_INSTALLED_AFTER:-missing}"
       echo "typed_preflight_ran=1"
-      echo "typed_preflight_log=$RUN_ROOT/logs/auto-pilot-preflight.log"
+      echo "typed_planning_ran=$TYPED_PLANNING_RAN"
+      echo "typed_pilot_phase=$TYPED_PILOT_PHASE"
+      echo "typed_pilot_log=$TYPED_PILOT_LOG"
     } >> "$RUN_ROOT/run.env"
   else
     {
       echo "typed_preflight_ran=0"
-      echo "typed_preflight_error_log=$RUN_ROOT/logs/auto-pilot-preflight.log"
+      echo "typed_planning_ran=0"
+      echo "typed_pilot_phase=$TYPED_PILOT_PHASE"
+      echo "typed_pilot_error_log=$TYPED_PILOT_LOG"
     } >> "$RUN_ROOT/run.env"
-    if [[ "$TYPED_PREFLIGHT_REQUIRED" == "1" ]]; then
+    if [[ "$TYPED_PREFLIGHT_REQUIRED" == "1" || ( "$TYPED_PILOT_PHASE" == "planning" && "$TYPED_PLANNING_REQUIRED" == "1" ) ]]; then
       fail_orchestration 80 \
-        "Typed \`auto pilot --preflight-only\` failed and \`PILOT_TYPED_PREFLIGHT_REQUIRED=1\`." \
+        "Typed \`auto pilot $TYPED_PILOT_MODE_FLAG\` failed and typed pilot was required." \
         "" \
-        "Log: \`$RUN_ROOT/logs/auto-pilot-preflight.log\`"
+        "Log: \`$TYPED_PILOT_LOG\`"
     fi
   fi
 else
   echo "typed_preflight_ran=0" >> "$RUN_ROOT/run.env"
+  echo "typed_planning_ran=0" >> "$RUN_ROOT/run.env"
 fi
 
 send_telegram "[pilot-dev]" "starting $REPO_SLUG
@@ -413,47 +436,49 @@ if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
     run_logged "$RUN_ROOT/doctor.log" auto doctor
   fi
 
-  if [[ "$REQUIRE_PLANNING_SPINE" == "1" && "$EFFECTIVE_PLANNING_MODE" != "none" ]]; then
-    run_logged "$RUN_ROOT/corpus.log" \
-      auto corpus \
-        --idea "$PROMPT" \
-        --focus "$FOCUS" \
-        --model "$MODEL" \
-        --reasoning-effort "$PLAN_EFFORT" \
-        --review-model "$MODEL" \
-        --review-effort "$PLAN_EFFORT" \
-        "${REFERENCE_ARGS[@]}"
-
-    run_logged "$RUN_ROOT/gen.log" \
-      auto gen \
-        --snapshot-only \
-        --model "$MODEL" \
-        --reasoning-effort "$PLAN_EFFORT" \
-        --review-model "$MODEL" \
-        --review-effort "$PLAN_EFFORT"
-  fi
-
-  case "$EFFECTIVE_PLANNING_MODE" in
-    greenfield)
-      ;;
-    steward|full)
-      run_logged "$RUN_ROOT/steward-preflight.log" \
-        auto steward \
-          --report-only \
-          --output-dir "$RUN_ROOT/steward-preflight" \
+  if [[ "$TYPED_PLANNING_RAN" != "1" ]]; then
+    if [[ "$REQUIRE_PLANNING_SPINE" == "1" && "$EFFECTIVE_PLANNING_MODE" != "none" ]]; then
+      run_logged "$RUN_ROOT/corpus.log" \
+        auto corpus \
+          --idea "$PROMPT" \
+          --focus "$FOCUS" \
           --model "$MODEL" \
-          --reasoning-effort "$EFFORT" \
-          --finalizer-model "$MODEL" \
-          --finalizer-effort "$EFFORT" \
+          --reasoning-effort "$PLAN_EFFORT" \
+          --review-model "$MODEL" \
+          --review-effort "$PLAN_EFFORT" \
           "${REFERENCE_ARGS[@]}"
-      ;;
-    none)
-      ;;
-    *)
-      echo "unsupported PILOT_PLANNING_MODE: $PLANNING_MODE" >&2
-      exit 2
-      ;;
-  esac
+
+      run_logged "$RUN_ROOT/gen.log" \
+        auto gen \
+          --snapshot-only \
+          --model "$MODEL" \
+          --reasoning-effort "$PLAN_EFFORT" \
+          --review-model "$MODEL" \
+          --review-effort "$PLAN_EFFORT"
+    fi
+
+    case "$EFFECTIVE_PLANNING_MODE" in
+      greenfield)
+        ;;
+      steward|full)
+        run_logged "$RUN_ROOT/steward-preflight.log" \
+          auto steward \
+            --report-only \
+            --output-dir "$RUN_ROOT/steward-preflight" \
+            --model "$MODEL" \
+            --reasoning-effort "$EFFORT" \
+            --finalizer-model "$MODEL" \
+            --finalizer-effort "$EFFORT" \
+            "${REFERENCE_ARGS[@]}"
+        ;;
+      none)
+        ;;
+      *)
+        echo "unsupported PILOT_PLANNING_MODE: $PLANNING_MODE" >&2
+        exit 2
+        ;;
+    esac
+  fi
 fi
 
 if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v gbrain >/dev/null 2>&1; then
@@ -477,10 +502,11 @@ fi
 
 if [[ "$WRAPPER_PREFLIGHT_ONLY" == "1" ]]; then
   echo "wrapper_preflight_only_exit=1" >> "$RUN_ROOT/run.env"
-  send_telegram "[pilot-dev]" "preflight complete $REPO_SLUG
+send_telegram "[pilot-dev]" "preflight complete $REPO_SLUG
 run: $RUN_ID
 run_root: $RUN_ROOT
-typed_preflight: $TYPED_PREFLIGHT_RAN"
+typed_preflight: $TYPED_PREFLIGHT_RAN
+typed_planning: $TYPED_PLANNING_RAN"
   exit 0
 fi
 

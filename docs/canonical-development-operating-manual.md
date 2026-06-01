@@ -530,22 +530,26 @@ then invokes the wrapper from the repo or `/srv/dev/repos` context. The wrapper
 is the one-command contract; Hermes should not reimplement its shell in
 Telegram handlers.
 
-Required wrapper preflight:
+Required wrapper planning entrypoint:
 
 ```bash
 auto pilot <repo-slug> "<operator intent>" \
-  --preflight-only \
+  --planning-only \
   --base-dir "$PILOT_BASE_DIR" \
   --run-id "$RUN_ID" \
   --run-root "$RUN_ROOT" \
   --autodev-source "$PILOT_AUTODEV_SOURCE"
 ```
 
-`pilot-dev` runs this typed preflight by default through
-`PILOT_TYPED_PREFLIGHT=1`. If the typed preflight succeeds, the wrapper skips
-legacy shell duplicate collection for command surface, doctor logs, and gbrain
-context. If it fails and `PILOT_TYPED_PREFLIGHT_REQUIRED=1`, the wrapper exits
-with an orchestration failure.
+`pilot-dev` runs this typed planning path by default through
+`PILOT_TYPED_PREFLIGHT=1` and `PILOT_TYPED_PLANNING=1`. The typed planning path
+includes preflight, command-surface capture, doctor logs, gbrain context,
+`auto corpus`, `auto gen --snapshot-only`, and optional `auto steward
+--report-only` according to `PILOT_PLANNING_MODE` and
+`PILOT_REQUIRE_PLANNING_SPINE`. If typed planning succeeds, the wrapper skips
+legacy shell duplicate collection and planning execution. If it fails and
+`PILOT_TYPED_PREFLIGHT_REQUIRED=1` or `PILOT_TYPED_PLANNING_REQUIRED=1`, the
+wrapper exits with an orchestration failure.
 
 Required typed preflight artifacts:
 
@@ -559,6 +563,7 @@ Required typed preflight artifacts:
 - `logs/auto-help-<command>.log`
 - `autodev-command-selection.json`
 - `autodev-command-selection.md`
+- `pilot-planning.json` when `--planning-only` runs
 - `gbrain/*.md`
 - optional `plan-input.md`
 
@@ -570,14 +575,16 @@ PILOT_PLANNING_MODE=none \
 PILOT_REQUIRE_PLANNING_SPINE=0 \
 PILOT_WRAPPER_PREFLIGHT_ONLY=1 \
 PILOT_TYPED_PREFLIGHT_REQUIRED=1 \
+PILOT_TYPED_PLANNING_REQUIRED=1 \
 pilot-dev <repo-slug> "<operator intent>"
 ```
 
-The smoke proof must create `pilot-preflight.json`, typed command-surface logs,
-and gbrain context, then exit without `codex/codex-exec.jsonl`.
+The smoke proof must create `pilot-preflight.json`, `pilot-planning.json`,
+typed command-surface logs, and gbrain context, then exit without
+`codex/codex-exec.jsonl`.
 
-Default policy for `pilot-dev`: run the typed preflight first, then run the
-planning spine unless disabled. Normal production pilots use:
+Default policy for `pilot-dev`: run typed planning first, then launch Codex only
+after the planning artifact exists. Normal production pilots use:
 
 - `auto doctor`
 - `auto corpus --idea "$PROMPT" --focus "$FOCUS"`

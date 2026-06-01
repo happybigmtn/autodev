@@ -91,9 +91,16 @@ pub(crate) struct PilotArgs {
     /// Only run typed preflight/setup. Execution remains owned by the caller.
     #[arg(long)]
     pub(crate) preflight_only: bool,
+
+    /// Run typed preflight plus the autodev planning spine, then stop before execution.
+    #[arg(long)]
+    pub(crate) planning_only: bool,
 }
 
 pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
+    if args.preflight_only && args.planning_only {
+        bail!("--preflight-only and --planning-only are mutually exclusive");
+    }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
     fs::create_dir_all(paths.run_root.join("gbrain"))?;
@@ -119,6 +126,15 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
     );
     if args.preflight_only {
         println!("pilot preflight ok");
+        return Ok(());
+    }
+    if args.planning_only {
+        run_planning_phase(&args, &paths, &intent)?;
+        println!(
+            "planning: {}",
+            paths.run_root.join("pilot-planning.json").display()
+        );
+        println!("pilot planning ok");
     }
     Ok(())
 }
@@ -196,6 +212,8 @@ threads={threads}
 plan_path={plan_path}
 planning_mode={planning_mode}
 require_planning_spine={require_planning_spine}
+preflight_only={preflight_only}
+planning_only={planning_only}
 reference_repos={reference_repos}
 autodev_source={autodev_source}
 remote_sync_mode={remote_sync_mode}
@@ -215,6 +233,8 @@ created={created}
         threads = args.threads,
         planning_mode = args.planning_mode,
         require_planning_spine = if args.require_planning_spine { 1 } else { 0 },
+        preflight_only = if args.preflight_only { 1 } else { 0 },
+        planning_only = if args.planning_only { 1 } else { 0 },
         autodev_source = args.autodev_source.display(),
         created = Utc::now().format("%FT%TZ"),
     );
@@ -285,6 +305,201 @@ fn capture_auto_surface(paths: &PilotPaths, repo_slug: &str) -> Result<()> {
         render_command_selection_markdown(&selection, &paths.run_id).as_bytes(),
     )?;
     Ok(())
+}
+
+fn run_planning_phase(args: &PilotArgs, paths: &PilotPaths, intent: &str) -> Result<()> {
+    let current_exe =
+        std::env::current_exe().context("failed to resolve current auto executable")?;
+    let effective_mode = effective_planning_mode(&args.planning_mode, &paths.workdir)?;
+    let mut records = Vec::new();
+
+    if args.require_planning_spine && effective_mode != "none" {
+        let mut corpus_args = vec![
+            "corpus".to_string(),
+            "--idea".to_string(),
+            intent.to_string(),
+            "--focus".to_string(),
+            args.focus.clone(),
+            "--model".to_string(),
+            args.model.clone(),
+            "--reasoning-effort".to_string(),
+            args.plan_effort.clone(),
+            "--review-model".to_string(),
+            args.model.clone(),
+            "--review-effort".to_string(),
+            args.plan_effort.clone(),
+        ];
+        append_reference_repo_args(&mut corpus_args, &args.reference_repos);
+        let record = run_logged_auto(
+            &paths.workdir,
+            &current_exe,
+            corpus_args,
+            &paths.run_root.join("corpus.log"),
+            "corpus",
+        )?;
+        let success = command_record_success(&record);
+        records.push(record);
+        if !success {
+            write_planning_manifest(args, paths, &effective_mode, &records)?;
+            bail!(
+                "auto corpus failed; see {}",
+                paths.run_root.join("corpus.log").display()
+            );
+        }
+
+        let gen_args = vec![
+            "gen".to_string(),
+            "--snapshot-only".to_string(),
+            "--model".to_string(),
+            args.model.clone(),
+            "--reasoning-effort".to_string(),
+            args.plan_effort.clone(),
+            "--review-model".to_string(),
+            args.model.clone(),
+            "--review-effort".to_string(),
+            args.plan_effort.clone(),
+        ];
+        let record = run_logged_auto(
+            &paths.workdir,
+            &current_exe,
+            gen_args,
+            &paths.run_root.join("gen.log"),
+            "gen",
+        )?;
+        let success = command_record_success(&record);
+        records.push(record);
+        if !success {
+            write_planning_manifest(args, paths, &effective_mode, &records)?;
+            bail!(
+                "auto gen failed; see {}",
+                paths.run_root.join("gen.log").display()
+            );
+        }
+    }
+
+    if matches!(effective_mode.as_str(), "steward" | "full") {
+        let mut steward_args = vec![
+            "steward".to_string(),
+            "--report-only".to_string(),
+            "--output-dir".to_string(),
+            paths
+                .run_root
+                .join("steward-preflight")
+                .display()
+                .to_string(),
+            "--model".to_string(),
+            args.model.clone(),
+            "--reasoning-effort".to_string(),
+            args.effort.clone(),
+            "--finalizer-model".to_string(),
+            args.model.clone(),
+            "--finalizer-effort".to_string(),
+            args.effort.clone(),
+        ];
+        append_reference_repo_args(&mut steward_args, &args.reference_repos);
+        let record = run_logged_auto(
+            &paths.workdir,
+            &current_exe,
+            steward_args,
+            &paths.run_root.join("steward-preflight.log"),
+            "steward",
+        )?;
+        let success = command_record_success(&record);
+        records.push(record);
+        if !success {
+            write_planning_manifest(args, paths, &effective_mode, &records)?;
+            bail!(
+                "auto steward failed; see {}",
+                paths.run_root.join("steward-preflight.log").display()
+            );
+        }
+    }
+
+    write_planning_manifest(args, paths, &effective_mode, &records)
+}
+
+fn effective_planning_mode(requested: &str, workdir: &Path) -> Result<String> {
+    match requested {
+        "auto" => {
+            if workdir.join("IMPLEMENTATION_PLAN.md").exists()
+                || workdir.join("WORKLIST.md").exists()
+            {
+                Ok("full".to_string())
+            } else {
+                Ok("greenfield".to_string())
+            }
+        }
+        "greenfield" | "steward" | "full" | "none" => Ok(requested.to_string()),
+        other => bail!("unsupported planning mode: {other}"),
+    }
+}
+
+fn append_reference_repo_args(args: &mut Vec<String>, reference_repos: &[PathBuf]) {
+    for repo in reference_repos {
+        args.push("--reference-repo".to_string());
+        args.push(repo.display().to_string());
+    }
+}
+
+fn run_logged_auto(
+    cwd: &Path,
+    command: &Path,
+    args: Vec<String>,
+    log_path: &Path,
+    phase: &str,
+) -> Result<Value> {
+    let output = run_command_strings(cwd, command, &args)?;
+    atomic_write(log_path, render_output(&output).as_bytes())?;
+    Ok(json!({
+        "phase": phase,
+        "argv": args,
+        "log": log_path,
+        "status": {
+            "success": output.status.success(),
+            "code": output.status.code()
+        }
+    }))
+}
+
+fn command_record_success(record: &Value) -> bool {
+    record
+        .get("status")
+        .and_then(|status| status.get("success"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn write_planning_manifest(
+    args: &PilotArgs,
+    paths: &PilotPaths,
+    effective_mode: &str,
+    records: &[Value],
+) -> Result<()> {
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "requested_planning_mode": args.planning_mode,
+        "effective_planning_mode": effective_mode,
+        "require_planning_spine": args.require_planning_spine,
+        "commands": records,
+        "artifacts": {
+            "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
+            "planning_manifest": paths.run_root.join("pilot-planning.json"),
+            "corpus_log": paths.run_root.join("corpus.log"),
+            "gen_log": paths.run_root.join("gen.log"),
+            "steward_preflight_log": paths.run_root.join("steward-preflight.log"),
+            "steward_preflight_dir": paths.run_root.join("steward-preflight")
+        }
+    });
+    atomic_write(
+        &paths.run_root.join("pilot-planning.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )
 }
 
 fn run_doctor_preflights(
@@ -602,6 +817,18 @@ fn run_command(cwd: &Path, command: &Path, args: &[&str]) -> Result<std::process
         .with_context(|| format!("failed to run {} {}", command.display(), args.join(" ")))
 }
 
+fn run_command_strings(
+    cwd: &Path,
+    command: &Path,
+    args: &[String],
+) -> Result<std::process::Output> {
+    Command::new(command)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run {} {}", command.display(), args.join(" ")))
+}
+
 fn render_output(output: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -636,7 +863,8 @@ mod tests {
     use crate::cli::{Cli, Command};
 
     use super::{
-        command_selection_from_surface, render_command_selection_markdown, safe_artifact_slug,
+        command_selection_from_surface, effective_planning_mode, render_command_selection_markdown,
+        safe_artifact_slug,
     };
 
     #[test]
@@ -662,6 +890,53 @@ mod tests {
         assert_eq!(args.run_id.as_deref(), Some("run-1"));
         assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
         assert!(args.preflight_only);
+    }
+
+    #[test]
+    fn pilot_args_reject_preflight_and_planning_only_together() {
+        let err = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--preflight-only",
+            "--planning-only",
+        ])
+        .expect("clap allows both flags; runtime rejects this");
+
+        let Command::Pilot(args) = err.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.preflight_only);
+        assert!(args.planning_only);
+    }
+
+    #[test]
+    fn effective_planning_mode_auto_detects_active_plan() {
+        let temp = std::env::temp_dir().join(format!(
+            "autodev-pilot-mode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        assert_eq!(
+            effective_planning_mode("auto", &temp).expect("mode"),
+            "greenfield"
+        );
+        std::fs::write(temp.join("IMPLEMENTATION_PLAN.md"), "# Plan\n").expect("write plan");
+        assert_eq!(
+            effective_planning_mode("auto", &temp).expect("mode"),
+            "full"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn effective_planning_mode_rejects_unknown_mode() {
+        assert!(effective_planning_mode("surprise", Path::new("/tmp")).is_err());
     }
 
     #[test]
