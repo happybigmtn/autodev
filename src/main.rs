@@ -7,6 +7,7 @@ mod claude_exec;
 mod cli;
 mod codex_exec;
 mod codex_stream;
+mod command_surface;
 mod completion_artifacts;
 mod corpus;
 mod design_command;
@@ -49,10 +50,11 @@ use clap::Parser;
 // root so existing `crate::<ArgsType>` paths in command modules keep resolving.
 pub(crate) use crate::cli::{
     AccountsCommand, AuditArgs, AuditEverythingPhase, AuditHarvestArgs, AuditResumeMode, BookArgs,
-    BugArgs, Cli, Command, CorpusArgs, DesignArgs, GenerationArgs, HardeningProfile, HealthArgs,
-    LoopArgs, NemesisArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, QaArgs, QaOnlyArgs,
-    QaTier, QuotaSubcommand, ReviewArgs, ShipArgs, SpecArgs, StewardArgs, SuperArgs, SymphonyArgs,
-    SymphonyRunArgs, SymphonySubcommand, SymphonySyncArgs, SymphonyWorkflowArgs,
+    BugArgs, Cli, Command, CommandSurfaceArgs, CorpusArgs, DesignArgs, GenerationArgs,
+    HardeningProfile, HealthArgs, LoopArgs, NemesisArgs, ParallelAction, ParallelArgs,
+    ParallelCargoTarget, QaArgs, QaOnlyArgs, QaTier, QuotaSubcommand, ReviewArgs, ShipArgs,
+    SpecArgs, StewardArgs, SuperArgs, SymphonyArgs, SymphonyRunArgs, SymphonySubcommand,
+    SymphonySyncArgs, SymphonyWorkflowArgs,
 };
 
 #[tokio::main]
@@ -72,6 +74,7 @@ async fn main() -> Result<()> {
         Command::Health(args) => health_command::run_health(args).await,
         Command::Book(args) => book_command::run_book(args).await,
         Command::Doctor(args) => doctor_command::run_doctor(args).await,
+        Command::CommandSurface(args) => command_surface::run_command_surface(args),
         Command::Review(args) => review_command::run_review(args).await,
         Command::Steward(args) => steward_command::run_steward(args).await,
         Command::Audit(args) => audit_command::run_audit(args).await,
@@ -128,6 +131,7 @@ mod tests {
             "health",
             "book",
             "doctor",
+            "command-surface",
             "review",
             "steward",
             "audit",

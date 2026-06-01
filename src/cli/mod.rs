@@ -3,7 +3,7 @@ mod args_ops;
 mod args_plan;
 mod args_quota;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::util::CLI_LONG_VERSION;
 
@@ -31,6 +31,13 @@ pub(crate) use args_quota::{AccountsCommand, QuotaArgs, QuotaSubcommand};
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct CommandSurfaceArgs {
+    /// Emit the command surface as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Subcommand)]
@@ -64,6 +71,8 @@ pub(crate) enum Command {
     Book(BookArgs),
     /// Run a no-model first-run preflight for baseline and execution readiness
     Doctor(crate::doctor_command::DoctorArgs),
+    /// Print a machine-readable inventory of autodev commands and options
+    CommandSurface(CommandSurfaceArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
     /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.5)
