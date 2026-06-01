@@ -87,7 +87,10 @@ need to pass directories in the normal case.
 
 The canonical lifecycle is the **Perfect Development Playbook** below. It is
 the doctrine path for agents building projects with `autodev`, including
-Autonomy-world agents generating GDP through their own software projects.
+Autonomy-world agents generating GDP through their own software projects. The
+operator manual with exact cross-repo workflows, gbrain closeout rules, and
+Hermes command contract lives at
+[`docs/canonical-development-operating-manual.md`](docs/canonical-development-operating-manual.md).
 
 ### Perfect Development Playbook
 
@@ -249,6 +252,12 @@ writes a design audit, design-system proposal, engine/UI contract, frontend QA
 report, queue-ready design plan items, and a GO/NO-GO report. It rejects fake
 mockups, manual frontend truth, fixture fallbacks, and pretty UI proposals that
 are not wired to runtime-owned facts.
+
+For TUI work, `auto design` also acts as the Ratatui/TachyonFX quality gate:
+it requires terminal-size plates, reusable layout/component contracts,
+tokenized typography/color, deterministic headless rendering or buffer
+snapshots, keyboard-state coverage, and animation-frame proof for post-render
+effects before implementation is considered ready.
 
 #### 4. Execute The Queue With Parallel Workers
 
@@ -682,6 +691,8 @@ auto spec "sync the portfolio UI with runtime-owned account balances"
 Purpose:
 
 - Perfect product-specific frontend/design doctrine before implementation
+- Perfect terminal-native TUI doctrine when the repo has Ratatui, Crossterm,
+  TachyonFX, or equivalent terminal UI surfaces
 - Tie every UI proposal to runtime/API/generated source of truth
 - Find existing breaks between frontend surfaces and engine/runtime contracts
 - Produce queue-ready plan items for unresolved design/runtime gaps
@@ -690,6 +701,8 @@ What it reads:
 
 - `AGENTS.md`, product doctrine, `DESIGN.md`, specs, plans, and review history
 - Frontend routes, components, styles, tokens, tests, and build/dev scripts
+- Ratatui widgets, terminal event loops, style/theme tokens, headless renderers,
+  buffer/snapshot tests, and TachyonFX animation managers when present
 - Runtime/engine/API code that owns facts rendered by the UI
 - Generated clients, schemas, hooks, stores, and regeneration commands
 
@@ -710,6 +723,9 @@ What it enforces:
 - No duplicated frontend constants, catalogs, balances, risk classes, eligibility rules, or status
   derivations when runtime/API/generated truth exists
 - No fixture/demo/sample data as production fallback truth
+- For TUI work, no acceptance without breakpoint plates, deterministic buffer or
+  headless render proof, keyboard-state coverage, and bounded post-render
+  animation evidence when motion is used
 - Every design improvement names the runtime owner, API/schema or generator impact, UI consumer,
   and proof that would catch drift returning
 - `DESIGN-REPORT.md` must end with `Verdict: GO` or `Verdict: NO-GO`

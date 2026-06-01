@@ -132,6 +132,7 @@ Use these lenses together:
 - Design consultation: infer or improve a coherent product-specific system: aesthetic direction, safe category conventions, deliberate creative risks, typography, color, spacing, layout, motion, and component vocabulary.
 - Web interface guidelines: fetch or recall current web UI/a11y best practices and apply them to actual frontend files, not generic screenshots.
 - Frontend design craft: avoid generic AI aesthetics, overused fonts, purple-gradient defaults, meaningless cards, generic dashboard widgets, and product-copy fog. Existing design tokens and component patterns outrank generic advice.
+- TUI/Ratatui/TachyonFX craft: treat terminal UI as a first-class frontend. Design around stable rectangles, sparse hierarchy, deliberate foreground/background tokens, readable command affordances, breakpoint plates such as 80x24/120x32/160x48, direct buffer/cell assertions, and post-render effects that enhance state transitions without becoming visual noise.
 - QA discipline: test what a real user can do, check console/runtime errors after interactions, verify responsive states, and capture evidence or exact blockers.
 - Additional skills.sh design synthesis: use product-frontend critique for message clarity, frontend-ui-ux engineering for accessible polish and micro-interactions, and design-token extraction discipline from design-system skills. Do not require external paid design tools or infinite-canvas mockup systems.
 
@@ -140,6 +141,7 @@ Required first reads:
 - Product doctrine: `README.md`, `DESIGN.md`, GDD/OS/invariant docs when present.
 - Planning truth: `IMPLEMENTATION_PLAN.md`, `REVIEW.md`, active `specs/`, and `{planning_root_display}` when present.
 - Frontend code: app/routes/components/styles/design tokens/tests/build scripts.
+- TUI code: Ratatui widgets, terminal init/restore, event loops, layout helpers, style/theme tokens, buffer snapshot tests, headless render/export paths, and TachyonFX or other animation managers when present.
 - Runtime/engine/API code that owns facts displayed by UI.
 - Generated bindings/schemas/client code and their regeneration commands when present.
 
@@ -153,6 +155,7 @@ Hard rules:
 - A design improvement is not complete unless it names the engine/API contract and the proof that would fail if UI drifts again.
 - Existing queues matter: if root `IMPLEMENTATION_PLAN.md` or another active queue already exists, reconcile design findings into that queue and promote the highest-leverage shared UI/runtime work. Do not create a parallel design backlog that leaves executable runtime or user-facing blockers untouched.
 - Design tasks must prefer reusable component systems, shared layout/state primitives, and runtime-backed interaction contracts over one-off presentations for a single screen, route, game, or fixture.
+- For Ratatui or other TUIs, acceptance must include terminal-size plates, deterministic headless rendering or buffer snapshots, cell-level assertions for critical geometry/style, keyboard/input-state coverage, and animation-frame proof for TachyonFX effects. Effects must run after base widgets render and must be bounded, stateful, and scoped to meaningful regions.
 
 {edit_clause}
 {qa_clause}
@@ -161,17 +164,20 @@ Write these non-empty artifacts under `{output_dir}`:
 1. `DESIGN-AUDIT.md`
    - Current UI/design-system inventory.
    - Existing frontend design signals and reusable components/tokens.
+   - For TUI surfaces, current layout geometry, breakpoint behavior, command density, typography/color token discipline, and motion/animation usage.
    - 0-10 ratings for the seven plan-design-review dimensions.
    - AI-slop risks and modern/stunning UI opportunities specific to this product.
 2. `DESIGN-SYSTEM-PROPOSAL.md`
    - Proposed or revised `DESIGN.md` doctrine.
    - Aesthetic thesis, safe choices, deliberate risks, typography, color, spacing, layout, motion, components, empty/error/loading states, responsive and accessibility rules.
+   - For TUIs, terminal-native component contracts: viewport grid, panel hierarchy, card/table/list geometry, color roles, focus/selection states, command bar, animation policy, and fallback behavior for small terminals.
    - Explicitly explain what belongs in real product UI versus non-authoritative concept previews.
 3. `ENGINE-UI-CONTRACT.md`
    - Table of UI surfaces, runtime/API source of truth, existing helpers/bindings, generated artifacts, fixture boundary, and required drift guard.
    - Call out every manual binding or duplicated frontend derivation found.
 4. `FRONTEND-QA.md`
    - Commands/URLs/tools used, screenshots or artifact paths if produced, console/runtime findings, responsive findings, and exact blockers.
+   - For TUIs, include terminal dimensions tested, headless exports or buffer snapshots, interaction transcript, animation-frame evidence, and any terminal capability assumptions.
    - Separate confirmed breaks from hypotheses and from skipped/unavailable checks.
 5. `DESIGN-PLAN-ITEMS.md`
    - Queue-ready plan items for unresolved design/runtime gaps using the repo's implementation-plan field style.
@@ -226,6 +232,26 @@ mod tests {
         assert!(prompt.contains("reusable component systems"));
         assert!(prompt.contains("ENGINE-UI-CONTRACT.md"));
         assert!(prompt.contains("FRONTEND-QA.md"));
+    }
+
+    #[test]
+    fn design_prompt_includes_terminal_ui_quality_gate() {
+        let prompt = build_design_prompt(
+            &PathBuf::from("/repo"),
+            None,
+            &PathBuf::from("/repo/.auto/design/run"),
+            Some("make the TUI beautiful"),
+            true,
+            false,
+            DesignRunKind::Standalone,
+        );
+
+        assert!(prompt.contains("TUI/Ratatui/TachyonFX craft"));
+        assert!(prompt.contains("breakpoint plates such as 80x24/120x32/160x48"));
+        assert!(prompt.contains("buffer/cell assertions"));
+        assert!(prompt.contains("TachyonFX effects"));
+        assert!(prompt.contains("Effects must run after base widgets render"));
+        assert!(prompt.contains("animation-frame evidence"));
     }
 
     #[test]
