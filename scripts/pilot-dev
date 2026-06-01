@@ -629,7 +629,7 @@ Required process:
 1. Read the gbrain context copied under $RUN_ROOT/gbrain and the optional plan input.
 2. Inspect the real repo/workspace. For Autonomy Bitino, clone or inspect happybigmtn/autonomy and happybigmtn/bitino if they are missing and needed. Do not accept an empty skeleton as sufficient source context.
 3. Fill $RUN_ROOT/autodev-command-selection.json if it exists, and fill $RUN_ROOT/autodev-command-selection.md before execution. Every command, action, and subcommand from the live command surface must be selected, deferred, or skipped with a reason. Include phase-specific options discovered in $RUN_ROOT/logs/auto-command-surface.json and $RUN_ROOT/logs/auto-help-<command>.log. Do not leave any UNDECIDED rows.
-4. Fill $RUN_ROOT/pilot-execution.json before execution. Replace pending/UNDECIDED fields with the selected task or no-task reason, executor kind/command/reason, expected verification path, git branch, runtime restart expectation, and Telegram summary placeholders. Update the same file again after validation with final status, tests, commit or no-commit reason, push ref when applicable, restart evidence when required, and next command.
+4. Update $RUN_ROOT/pilot-execution.json with \`auto pilot "$REPO_SLUG" "$PROMPT" --execution-update-only --run-id "$RUN_ID" --run-root "$RUN_ROOT" ...\` before execution. Record the selected task or no-task reason, executor kind/command/reason, expected verification path, git branch, runtime restart expectation, and Telegram summary placeholders. Run the same update helper again after validation with final status, tests, commit or no-commit reason, push ref when applicable, restart evidence when required, and next command. Do not hand-edit the JSON unless the helper itself is the blocker, and then record that degraded path.
 5. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
    $RUN_ROOT/orchestrator-doctor.log
    $RUN_ROOT/doctor.log
@@ -652,7 +652,7 @@ Required process:
 Evidence discipline:
 - Do not claim success without command output and file paths.
 - Every skipped autodev command, and every relevant skipped subcommand/action discovered from per-command help, needs a reason.
-- Typed closeout will fail unless $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary.
+- Typed closeout will fail unless $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary. Prefer \`auto pilot --execution-update-only\` for every manifest update.
 - If Telegram is needed, verify with hermes send before claiming it is unavailable.
 EOF
 

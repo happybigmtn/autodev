@@ -610,8 +610,35 @@ auto pilot <repo-slug> "<operator intent>" \
 `PILOT_TYPED_EXECUTION_MANIFEST=1` before launching Codex. The command writes
 `pilot-execution.json` with pending fields for selected task, executor,
 verification, git, runtime restart policy, artifacts, and Telegram summary.
-Codex must fill the file before and after execution. A successful closeout
-cannot leave status as `pending`, executor as `UNDECIDED`, verification empty,
+Codex must update the file before and after execution with the deterministic
+helper, not by hand-editing JSON:
+
+```bash
+auto pilot <repo-slug> "<operator intent>" \
+  --execution-update-only \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT" \
+  --execution-status blocked \
+  --no-task-reason "no safe execution slice selected" \
+  --executor-kind none \
+  --executor-reason "stopped before execution" \
+  --verification-summary "planning and closeout gates only" \
+  --no-commit-reason "no repository code changed" \
+  --runtime-no-restart-reason "no runtime code changed" \
+  --summary-branch-commit "main@no-commit" \
+  --summary-plan "$RUN_ROOT/pilot-planning.json" \
+  --summary-design "none" \
+  --summary-execution "$RUN_ROOT/pilot-execution.json" \
+  --summary-tests "not run; blocked before execution" \
+  --summary-closeout "$RUN_ROOT/pilot-closeout.json" \
+  --summary-next "auto pilot --closeout-only ..."
+```
+
+For successful execution, use `--execution-status executed`, provide
+`--task-id`, `--executor-command`, at least one `--verification-command` or
+`--verification-receipt`, `--git-commit` or `--no-commit-reason`, and runtime
+restart evidence or a no-restart reason. A successful closeout cannot leave
+status as `pending`, executor as `UNDECIDED`, verification empty,
 commit/no-commit evidence absent, runtime restart/no-restart evidence absent,
 or Telegram summary fields blank.
 

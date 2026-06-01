@@ -100,6 +100,122 @@ pub(crate) struct PilotArgs {
     #[arg(long)]
     pub(crate) execution_manifest_only: bool,
 
+    /// Update the typed execution contract, then stop.
+    #[arg(long)]
+    pub(crate) execution_update_only: bool,
+
+    /// Execution status for --execution-update-only.
+    #[arg(long)]
+    pub(crate) execution_status: Option<String>,
+
+    /// Selected task id for --execution-update-only.
+    #[arg(long)]
+    pub(crate) task_id: Option<String>,
+
+    /// Selected task title for --execution-update-only.
+    #[arg(long)]
+    pub(crate) task_title: Option<String>,
+
+    /// Selected task source plan for --execution-update-only.
+    #[arg(long)]
+    pub(crate) task_source_plan: Option<String>,
+
+    /// No-task reason for --execution-update-only.
+    #[arg(long)]
+    pub(crate) no_task_reason: Option<String>,
+
+    /// Executor kind for --execution-update-only, for example codex, auto-parallel, none.
+    #[arg(long)]
+    pub(crate) executor_kind: Option<String>,
+
+    /// Executor command for --execution-update-only.
+    #[arg(long)]
+    pub(crate) executor_command: Option<String>,
+
+    /// Mark execution as a degraded fallback path.
+    #[arg(long)]
+    pub(crate) executor_degraded_fallback: bool,
+
+    /// Executor reason for --execution-update-only.
+    #[arg(long)]
+    pub(crate) executor_reason: Option<String>,
+
+    /// Verification command; repeat for multiple commands.
+    #[arg(long = "verification-command")]
+    pub(crate) verification_commands: Vec<String>,
+
+    /// Verification receipt path; repeat for multiple receipts.
+    #[arg(long = "verification-receipt")]
+    pub(crate) verification_receipts: Vec<String>,
+
+    /// Verification summary for --execution-update-only.
+    #[arg(long)]
+    pub(crate) verification_summary: Option<String>,
+
+    /// Git branch for --execution-update-only.
+    #[arg(long)]
+    pub(crate) git_branch: Option<String>,
+
+    /// Git commit for --execution-update-only.
+    #[arg(long)]
+    pub(crate) git_commit: Option<String>,
+
+    /// Mark the git commit as pushed.
+    #[arg(long)]
+    pub(crate) git_pushed: bool,
+
+    /// Pushed git ref for --execution-update-only.
+    #[arg(long)]
+    pub(crate) git_push_ref: Option<String>,
+
+    /// No-commit reason for --execution-update-only.
+    #[arg(long)]
+    pub(crate) no_commit_reason: Option<String>,
+
+    /// Runtime restart is required.
+    #[arg(long)]
+    pub(crate) runtime_restart_required: bool,
+
+    /// Runtime was restarted.
+    #[arg(long)]
+    pub(crate) runtime_restarted: bool,
+
+    /// Runtime restart evidence for --execution-update-only.
+    #[arg(long)]
+    pub(crate) runtime_restart_evidence: Option<String>,
+
+    /// No-restart reason for --execution-update-only.
+    #[arg(long)]
+    pub(crate) runtime_no_restart_reason: Option<String>,
+
+    /// Telegram summary branch/commit field.
+    #[arg(long)]
+    pub(crate) summary_branch_commit: Option<String>,
+
+    /// Telegram summary plan field.
+    #[arg(long)]
+    pub(crate) summary_plan: Option<String>,
+
+    /// Telegram summary design field.
+    #[arg(long)]
+    pub(crate) summary_design: Option<String>,
+
+    /// Telegram summary execution field.
+    #[arg(long)]
+    pub(crate) summary_execution: Option<String>,
+
+    /// Telegram summary tests field.
+    #[arg(long)]
+    pub(crate) summary_tests: Option<String>,
+
+    /// Telegram summary closeout field.
+    #[arg(long)]
+    pub(crate) summary_closeout: Option<String>,
+
+    /// Telegram summary next command field.
+    #[arg(long)]
+    pub(crate) summary_next: Option<String>,
+
     /// Validate a completed pilot run's closeout artifacts, then stop.
     #[arg(long)]
     pub(crate) closeout_only: bool,
@@ -110,13 +226,14 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
         args.preflight_only,
         args.planning_only,
         args.execution_manifest_only,
+        args.execution_update_only,
         args.closeout_only,
     ]
     .iter()
     .filter(|selected| **selected)
     .count();
     if selected_modes > 1 {
-        bail!("--preflight-only, --planning-only, --execution-manifest-only, and --closeout-only are mutually exclusive");
+        bail!("--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, and --closeout-only are mutually exclusive");
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
@@ -147,6 +264,19 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
             paths.run_root.join("pilot-execution.json").display()
         );
         println!("pilot execution manifest ok");
+        return Ok(());
+    }
+    if args.execution_update_only {
+        update_execution_manifest(&args, &paths)?;
+        println!("repo: {}", args.repo_slug);
+        println!("workdir: {}", paths.workdir.display());
+        println!("run: {}", paths.run_id);
+        println!("run_root: {}", paths.run_root.display());
+        println!(
+            "execution: {}",
+            paths.run_root.join("pilot-execution.json").display()
+        );
+        println!("pilot execution update ok");
         return Ok(());
     }
     fs::create_dir_all(paths.run_root.join("gbrain"))?;
@@ -755,6 +885,200 @@ fn write_execution_manifest(
     )
 }
 
+fn update_execution_manifest(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
+    let path = paths.run_root.join("pilot-execution.json");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read execution manifest {}", path.display()))?;
+    let mut manifest: Value = serde_json::from_str(&text)
+        .with_context(|| format!("invalid execution manifest json: {}", path.display()))?;
+
+    set_string_if_present(&mut manifest, &["status"], args.execution_status.as_deref());
+    set_string_if_present(
+        &mut manifest,
+        &["selected_task", "id"],
+        args.task_id.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["selected_task", "title"],
+        args.task_title.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["selected_task", "source_plan"],
+        args.task_source_plan.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["selected_task", "no_task_reason"],
+        args.no_task_reason.as_deref(),
+    );
+
+    set_string_if_present(
+        &mut manifest,
+        &["executor", "kind"],
+        args.executor_kind.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["executor", "command"],
+        args.executor_command.as_deref(),
+    );
+    if args.executor_degraded_fallback {
+        set_bool(&mut manifest, &["executor", "degraded_fallback"], true);
+    }
+    set_string_if_present(
+        &mut manifest,
+        &["executor", "reason"],
+        args.executor_reason.as_deref(),
+    );
+
+    if !args.verification_commands.is_empty() {
+        set_string_array(
+            &mut manifest,
+            &["verification", "commands"],
+            &args.verification_commands,
+        );
+    }
+    if !args.verification_receipts.is_empty() {
+        set_string_array(
+            &mut manifest,
+            &["verification", "receipts"],
+            &args.verification_receipts,
+        );
+    }
+    set_string_if_present(
+        &mut manifest,
+        &["verification", "summary"],
+        args.verification_summary.as_deref(),
+    );
+
+    set_string_if_present(
+        &mut manifest,
+        &["git", "branch"],
+        args.git_branch.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["git", "commit"],
+        args.git_commit.as_deref(),
+    );
+    if args.git_pushed {
+        set_bool(&mut manifest, &["git", "pushed"], true);
+    }
+    set_string_if_present(
+        &mut manifest,
+        &["git", "push_ref"],
+        args.git_push_ref.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["git", "no_commit_reason"],
+        args.no_commit_reason.as_deref(),
+    );
+
+    if args.runtime_restart_required {
+        set_bool(&mut manifest, &["runtime", "restart_required"], true);
+    }
+    if args.runtime_restarted {
+        set_bool(&mut manifest, &["runtime", "restarted"], true);
+    }
+    set_string_if_present(
+        &mut manifest,
+        &["runtime", "restart_evidence"],
+        args.runtime_restart_evidence.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["runtime", "no_restart_reason"],
+        args.runtime_no_restart_reason.as_deref(),
+    );
+
+    set_string(
+        &mut manifest,
+        &["telegram_summary", "repo"],
+        &args.repo_slug,
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "branch_commit"],
+        args.summary_branch_commit.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "plan"],
+        args.summary_plan.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "design"],
+        args.summary_design.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "execution"],
+        args.summary_execution.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "tests"],
+        args.summary_tests.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "closeout"],
+        args.summary_closeout.as_deref(),
+    );
+    set_string_if_present(
+        &mut manifest,
+        &["telegram_summary", "next"],
+        args.summary_next.as_deref(),
+    );
+    set_string(
+        &mut manifest,
+        &["updated"],
+        &Utc::now().format("%FT%TZ").to_string(),
+    );
+
+    atomic_write(&path, serde_json::to_string_pretty(&manifest)?.as_bytes())
+}
+
+fn set_string_if_present(value: &mut Value, path: &[&str], new_value: Option<&str>) {
+    if let Some(new_value) = new_value {
+        set_string(value, path, new_value);
+    }
+}
+
+fn set_string(value: &mut Value, path: &[&str], new_value: &str) {
+    set_value(value, path, Value::String(new_value.to_string()));
+}
+
+fn set_bool(value: &mut Value, path: &[&str], new_value: bool) {
+    set_value(value, path, Value::Bool(new_value));
+}
+
+fn set_string_array(value: &mut Value, path: &[&str], new_values: &[String]) {
+    set_value(
+        value,
+        path,
+        Value::Array(new_values.iter().cloned().map(Value::String).collect()),
+    );
+}
+
+fn set_value(value: &mut Value, path: &[&str], new_value: Value) {
+    let Some((leaf, parents)) = path.split_last() else {
+        return;
+    };
+    let mut current = value;
+    for key in parents {
+        if !current.get(*key).is_some_and(Value::is_object) {
+            current[*key] = json!({});
+        }
+        current = &mut current[*key];
+    }
+    current[*leaf] = new_value;
+}
+
 fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     let mut errors = Vec::new();
     require_nonempty_artifact(
@@ -1334,7 +1658,8 @@ mod tests {
 
     use super::{
         command_selection_from_surface, effective_planning_mode, render_command_selection_markdown,
-        safe_artifact_slug, validate_closeout, write_execution_manifest, PilotPaths,
+        safe_artifact_slug, update_execution_manifest, validate_closeout, write_execution_manifest,
+        PilotPaths,
     };
 
     #[test]
@@ -1419,6 +1744,47 @@ mod tests {
         };
         assert!(args.execution_manifest_only);
         assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
+    }
+
+    #[test]
+    fn pilot_args_parse_execution_update_only() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--run-root",
+            "/tmp/pilot-run",
+            "--execution-update-only",
+            "--execution-status",
+            "blocked",
+            "--no-task-reason",
+            "no model proof",
+            "--executor-kind",
+            "none",
+            "--executor-reason",
+            "stopped before execution",
+            "--verification-summary",
+            "manifest update proof",
+            "--no-commit-reason",
+            "no repo change",
+            "--runtime-no-restart-reason",
+            "no runtime change",
+            "--summary-next",
+            "auto pilot --closeout-only",
+        ])
+        .expect("pilot args parse");
+
+        let Command::Pilot(args) = cli.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.execution_update_only);
+        assert_eq!(args.execution_status.as_deref(), Some("blocked"));
+        assert_eq!(args.executor_kind.as_deref(), Some("none"));
+        assert_eq!(
+            args.summary_next.as_deref(),
+            Some("auto pilot --closeout-only")
+        );
     }
 
     #[test]
@@ -1551,6 +1917,46 @@ mod tests {
     }
 
     #[test]
+    fn execution_update_helper_fills_closeout_valid_manifest() {
+        let root = unique_temp_dir("execution-update");
+        write_complete_closeout_artifacts(&root, false);
+        let mut args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+        write_execution_manifest(&args, &paths, "operator intent", "main")
+            .expect("pending execution manifest");
+
+        args.execution_status = Some("blocked".to_string());
+        args.no_task_reason = Some("no-model proof stops before execution".to_string());
+        args.executor_kind = Some("none".to_string());
+        args.executor_reason = Some("no-model proof".to_string());
+        args.verification_summary = Some("execution manifest update helper ran".to_string());
+        args.git_branch = Some("main".to_string());
+        args.no_commit_reason = Some("no repo change in helper proof".to_string());
+        args.runtime_no_restart_reason = Some("no runtime change in helper proof".to_string());
+        args.summary_branch_commit = Some("main@no-commit".to_string());
+        args.summary_plan = Some("pilot-planning.json".to_string());
+        args.summary_design = Some("none".to_string());
+        args.summary_execution = Some("pilot-execution.json".to_string());
+        args.summary_tests = Some("cargo test pilot_command".to_string());
+        args.summary_closeout = Some("pilot-closeout.json".to_string());
+        args.summary_next = Some("auto pilot --closeout-only".to_string());
+
+        update_execution_manifest(&args, &paths).expect("update execution manifest");
+        validate_closeout(&args, &paths).expect("valid closeout");
+
+        let text = std::fs::read_to_string(root.join("pilot-execution.json"))
+            .expect("execution manifest text");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("execution json");
+        assert_eq!(manifest["status"], "blocked");
+        assert_eq!(manifest["executor"]["kind"], "none");
+        assert_eq!(
+            manifest["telegram_summary"]["next"],
+            "auto pilot --closeout-only"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn closeout_validation_rejects_missing_execution_manifest() {
         let root = unique_temp_dir("closeout-missing-execution");
         write_complete_closeout_artifacts(&root, false);
@@ -1637,6 +2043,35 @@ mod tests {
             preflight_only: false,
             planning_only: false,
             execution_manifest_only: false,
+            execution_update_only: false,
+            execution_status: None,
+            task_id: None,
+            task_title: None,
+            task_source_plan: None,
+            no_task_reason: None,
+            executor_kind: None,
+            executor_command: None,
+            executor_degraded_fallback: false,
+            executor_reason: None,
+            verification_commands: Vec::new(),
+            verification_receipts: Vec::new(),
+            verification_summary: None,
+            git_branch: None,
+            git_commit: None,
+            git_pushed: false,
+            git_push_ref: None,
+            no_commit_reason: None,
+            runtime_restart_required: false,
+            runtime_restarted: false,
+            runtime_restart_evidence: None,
+            runtime_no_restart_reason: None,
+            summary_branch_commit: None,
+            summary_plan: None,
+            summary_design: None,
+            summary_execution: None,
+            summary_tests: None,
+            summary_closeout: None,
+            summary_next: None,
             closeout_only: true,
         }
     }
