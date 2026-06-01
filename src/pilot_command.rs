@@ -7,7 +7,9 @@ use chrono::Utc;
 use clap::Args;
 use serde_json::{Value, json};
 
-use crate::parallel_command::{LoopTaskStatus, parse_loop_plan};
+use crate::parallel_command::{
+    LoopTaskStatus, parse_loop_plan, update_task_completion_in_plan_text,
+};
 use crate::util::atomic_write;
 
 const DEFAULT_FOCUS: &str =
@@ -224,6 +226,26 @@ pub(crate) struct PilotArgs {
     /// Write project rollup artifacts from the completed pilot run, then stop.
     #[arg(long)]
     pub(crate) project_rollup_only: bool,
+
+    /// Finalize the selected execution task in the source plan, then stop.
+    #[arg(long)]
+    pub(crate) task_finalize_only: bool,
+
+    /// Task state written by --task-finalize-only: partial or done.
+    #[arg(long, default_value = "partial")]
+    pub(crate) task_finalize_status: String,
+
+    /// Commit task-finalize state changes to the current branch.
+    #[arg(long)]
+    pub(crate) task_finalize_commit: bool,
+
+    /// Push the task-finalize commit to origin.
+    #[arg(long)]
+    pub(crate) task_finalize_push: bool,
+
+    /// Optional commit message for --task-finalize-commit.
+    #[arg(long)]
+    pub(crate) task_finalize_message: Option<String>,
 }
 
 pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
@@ -234,17 +256,31 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
         args.execution_update_only,
         args.closeout_only,
         args.project_rollup_only,
+        args.task_finalize_only,
     ]
     .iter()
     .filter(|selected| **selected)
     .count();
     if selected_modes > 1 {
         bail!(
-            "--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, --closeout-only, and --project-rollup-only are mutually exclusive"
+            "--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, --closeout-only, --project-rollup-only, and --task-finalize-only are mutually exclusive"
         );
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
+    if args.task_finalize_only {
+        finalize_selected_task(&args, &paths)?;
+        println!("repo: {}", args.repo_slug);
+        println!("workdir: {}", paths.workdir.display());
+        println!("run: {}", paths.run_id);
+        println!("run_root: {}", paths.run_root.display());
+        println!(
+            "task_finalize: {}",
+            paths.run_root.join("task-finalize.json").display()
+        );
+        println!("pilot task finalize ok");
+        return Ok(());
+    }
     if args.project_rollup_only {
         write_project_rollup(&args, &paths)?;
         println!("repo: {}", args.repo_slug);
@@ -1428,6 +1464,276 @@ fn write_project_rollup(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     )
 }
 
+fn finalize_selected_task(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
+    fs::create_dir_all(&paths.run_root)?;
+    let execution_manifest_path = paths.run_root.join("pilot-execution.json");
+    let Some(mut execution) = read_json_artifact(&execution_manifest_path) else {
+        bail!(
+            "missing or invalid execution manifest: {}",
+            execution_manifest_path.display()
+        );
+    };
+    let execution_status = string_at(&execution, &["status"]);
+    if !matches!(execution_status, "executed" | "degraded") {
+        bail!(
+            "--task-finalize-only requires execution status `executed` or `degraded`; found `{}`",
+            empty_label(execution_status, "missing")
+        );
+    }
+    let task_id = string_at(&execution, &["selected_task", "id"]).to_string();
+    if task_id.is_empty() {
+        bail!("--task-finalize-only requires `selected_task.id` in pilot-execution.json");
+    }
+    let target_status = parse_task_finalize_status(&args.task_finalize_status)?;
+    let plan_path = selected_task_plan_path(&paths.workdir, &paths.run_root, &execution)
+        .unwrap_or_else(|| paths.workdir.join("IMPLEMENTATION_PLAN.md"));
+    if !plan_path.exists() {
+        bail!(
+            "--task-finalize-only could not find selected task plan {}",
+            plan_path.display()
+        );
+    }
+    let before_text = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let before_plan = parse_loop_plan(&before_text);
+    let Some(before_task) = before_plan.task(&task_id) else {
+        bail!(
+            "--task-finalize-only could not find selected task `{task_id}` in {}",
+            plan_path.display()
+        );
+    };
+    let before_status = before_task.status;
+    let after_text = update_task_completion_in_plan_text(&before_text, &task_id, target_status);
+    let plan_updated = after_text != before_text;
+    if plan_updated {
+        atomic_write(&plan_path, after_text.as_bytes())
+            .with_context(|| format!("failed to write {}", plan_path.display()))?;
+    }
+    let after_plan = parse_loop_plan(
+        &fs::read_to_string(&plan_path)
+            .with_context(|| format!("failed to reread finalized plan {}", plan_path.display()))?,
+    );
+    let after_status = after_plan
+        .task(&task_id)
+        .map(|task| task.status)
+        .unwrap_or(before_status);
+    if after_status != target_status {
+        bail!(
+            "--task-finalize-only could not update task `{task_id}` to `{}` in {}",
+            loop_task_status_label(target_status),
+            plan_path.display()
+        );
+    }
+    let verification_receipts = string_array_at(&execution, &["verification", "receipts"]);
+    let verification_receipt_states = verification_receipts
+        .iter()
+        .map(|receipt| {
+            let path = resolve_workdir_or_run_path(&paths.workdir, &paths.run_root, receipt);
+            json!({
+                "path": receipt,
+                "resolved_path": path,
+                "exists": path.exists()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut committed = false;
+    let mut pushed = false;
+    let mut finalize_commit = String::new();
+    let mut push_ref = String::new();
+    if args.task_finalize_push && !args.task_finalize_commit {
+        bail!("--task-finalize-push requires --task-finalize-commit");
+    }
+    if args.task_finalize_commit {
+        let changed_paths = task_finalize_commit_paths(&paths.workdir, &plan_path)?;
+        finalize_commit =
+            commit_task_finalize_changes(args, &paths.workdir, &task_id, &changed_paths)?;
+        committed = !finalize_commit.is_empty();
+        if committed {
+            set_string(&mut execution, &["git", "commit"], &finalize_commit);
+            set_string(&mut execution, &["git", "no_commit_reason"], "");
+            let branch = current_branch(&paths.workdir);
+            if !branch.is_empty() {
+                set_string(
+                    &mut execution,
+                    &["telegram_summary", "branch_commit"],
+                    &format!("{}@{}", branch, short_commit(&finalize_commit)),
+                );
+            }
+        }
+        if args.task_finalize_push {
+            push_ref = push_current_branch(&paths.workdir)?;
+            pushed = true;
+            set_bool(&mut execution, &["git", "pushed"], true);
+            set_string(&mut execution, &["git", "push_ref"], &push_ref);
+        }
+        atomic_write(
+            &execution_manifest_path,
+            serde_json::to_string_pretty(&execution)?.as_bytes(),
+        )?;
+    }
+
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "selected_task": {
+            "id": task_id,
+            "title": string_at(&execution, &["selected_task", "title"]),
+            "source_plan": plan_path,
+            "before_status": loop_task_status_label(before_status),
+            "requested_status": loop_task_status_label(target_status),
+            "after_status": loop_task_status_label(after_status),
+            "plan_updated": plan_updated
+        },
+        "verification": {
+            "commands": string_array_at(&execution, &["verification", "commands"]),
+            "receipts": verification_receipt_states
+        },
+        "git": {
+            "commit_requested": args.task_finalize_commit,
+            "committed": committed,
+            "commit": finalize_commit,
+            "push_requested": args.task_finalize_push,
+            "pushed": pushed,
+            "push_ref": push_ref
+        },
+        "artifacts": {
+            "execution_manifest": execution_manifest_path,
+            "task_finalize": paths.run_root.join("task-finalize.json")
+        }
+    });
+    atomic_write(
+        &paths.run_root.join("task-finalize.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )
+}
+
+fn parse_task_finalize_status(value: &str) -> Result<LoopTaskStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "partial" | "~" | "[~]" => Ok(LoopTaskStatus::Partial),
+        "done" | "complete" | "completed" | "x" | "[x]" => Ok(LoopTaskStatus::Done),
+        other => bail!("unsupported task finalize status `{other}`; use `partial` or `done`"),
+    }
+}
+
+fn resolve_workdir_or_run_path(workdir: &Path, run_root: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let workdir_path = workdir.join(path);
+    if workdir_path.exists() {
+        return workdir_path;
+    }
+    run_root.join(path)
+}
+
+fn task_finalize_commit_paths(workdir: &Path, plan_path: &Path) -> Result<Vec<PathBuf>> {
+    let relative = plan_path.strip_prefix(workdir).with_context(|| {
+        format!(
+            "task finalize plan {} is outside workdir {}",
+            plan_path.display(),
+            workdir.display()
+        )
+    })?;
+    Ok(vec![relative.to_path_buf()])
+}
+
+fn commit_task_finalize_changes(
+    args: &PilotArgs,
+    workdir: &Path,
+    task_id: &str,
+    changed_paths: &[PathBuf],
+) -> Result<String> {
+    if changed_paths.is_empty() {
+        return Ok(String::new());
+    }
+    let preexisting_staged =
+        git_output(workdir, &["diff", "--cached", "--name-only"]).unwrap_or_default();
+    if !preexisting_staged.trim().is_empty() {
+        bail!(
+            "refusing to create task-finalize commit with pre-existing staged files: {}",
+            preexisting_staged
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut add = Command::new("git");
+    add.current_dir(workdir).args(["add", "--"]);
+    for path in changed_paths {
+        add.arg(path);
+    }
+    let add_status = add.status().context("failed to run git add")?;
+    if !add_status.success() {
+        bail!("git add failed while finalizing task `{task_id}`");
+    }
+    let staged = git_output_for_paths(
+        workdir,
+        &["diff", "--cached", "--name-only", "--"],
+        changed_paths,
+    )
+    .unwrap_or_default();
+    if staged.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let message = args
+        .task_finalize_message
+        .clone()
+        .unwrap_or_else(|| format!("{}: finalize {task_id} state", args.repo_slug));
+    let commit_status = Command::new("git")
+        .current_dir(workdir)
+        .args(["commit", "-m", &message])
+        .status()
+        .context("failed to run git commit")?;
+    if !commit_status.success() {
+        bail!("git commit failed while finalizing task `{task_id}`");
+    }
+    Ok(git_output(workdir, &["rev-parse", "HEAD"]).unwrap_or_default())
+}
+
+fn git_output_for_paths(workdir: &Path, args: &[&str], paths: &[PathBuf]) -> Result<String> {
+    let mut command = Command::new("git");
+    command.current_dir(workdir).args(args);
+    for path in paths {
+        command.arg(path);
+    }
+    let output = command.output().context("failed to run git")?;
+    if !output.status.success() {
+        bail!(
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn push_current_branch(workdir: &Path) -> Result<String> {
+    let branch = current_branch(workdir);
+    if branch.is_empty() {
+        bail!("refusing to push task-finalize commit from detached HEAD");
+    }
+    let refspec = format!("HEAD:{branch}");
+    let status = Command::new("git")
+        .current_dir(workdir)
+        .args(["push", "origin", &refspec])
+        .status()
+        .context("failed to run git push")?;
+    if !status.success() {
+        bail!("git push failed for task-finalize commit");
+    }
+    Ok(format!("origin/{branch}"))
+}
+
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(7).collect()
+}
+
 fn render_project_rollup_markdown(
     args: &PilotArgs,
     paths: &PilotPaths,
@@ -1920,6 +2226,28 @@ fn array_nonempty_at(value: &Value, path: &[&str]) -> bool {
     current.as_array().is_some_and(|items| !items.is_empty())
 }
 
+fn string_array_at(value: &Value, path: &[&str]) -> Vec<String> {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return Vec::new();
+        };
+        current = next;
+    }
+    current
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn validate_receipt(path: &Path, errors: &mut Vec<String>) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
@@ -2241,9 +2569,9 @@ mod tests {
 
     use super::{
         PilotPaths, command_selection_from_surface, effective_planning_mode,
-        render_command_selection_markdown, safe_artifact_slug, update_execution_manifest,
-        validate_closeout, validate_landing_manifest, write_execution_manifest,
-        write_landing_manifest, write_project_rollup,
+        finalize_selected_task, render_command_selection_markdown, safe_artifact_slug,
+        update_execution_manifest, validate_closeout, validate_landing_manifest,
+        write_execution_manifest, write_landing_manifest, write_project_rollup,
     };
 
     #[test]
@@ -2327,6 +2655,39 @@ mod tests {
             panic!("expected pilot command");
         };
         assert!(args.project_rollup_only);
+        assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
+    }
+
+    #[test]
+    fn pilot_args_parse_task_finalize_only() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--run-root",
+            "/tmp/pilot-run",
+            "--task-finalize-only",
+            "--task-finalize-status",
+            "done",
+            "--task-finalize-commit",
+            "--task-finalize-push",
+            "--task-finalize-message",
+            "autonomy-bitino: finalize TASK-011 state",
+        ])
+        .expect("pilot args parse");
+
+        let Command::Pilot(args) = cli.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.task_finalize_only);
+        assert_eq!(args.task_finalize_status, "done");
+        assert!(args.task_finalize_commit);
+        assert!(args.task_finalize_push);
+        assert_eq!(
+            args.task_finalize_message.as_deref(),
+            Some("autonomy-bitino: finalize TASK-011 state")
+        );
         assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
     }
 
@@ -2713,6 +3074,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn task_finalize_updates_selected_task_state() {
+        let root = unique_temp_dir("task-finalize");
+        write_complete_closeout_artifacts(&root, false);
+        std::fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "\
+# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `TASK-001` Fixture slice
+  Verification:
+    - `cargo test pilot_command`
+  Dependencies: none
+",
+        )
+        .expect("plan");
+        let mut args = test_pilot_args(root.clone());
+        args.task_finalize_status = "done".to_string();
+        let paths = test_pilot_paths(root.clone());
+
+        finalize_selected_task(&args, &paths).expect("task finalize");
+        validate_closeout(&args, &paths).expect("closeout accepts finalized task");
+
+        let plan = std::fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("plan");
+        assert!(plan.contains("- [x] `TASK-001` Fixture slice"));
+        let text =
+            std::fs::read_to_string(root.join("task-finalize.json")).expect("task finalize json");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("finalize json");
+        assert_eq!(manifest["selected_task"]["before_status"], "pending");
+        assert_eq!(manifest["selected_task"]["after_status"], "done");
+        assert_eq!(manifest["git"]["committed"], false);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "autodev-pilot-{name}-{}-{}",
@@ -2779,6 +3176,11 @@ mod tests {
             summary_next: None,
             closeout_only: true,
             project_rollup_only: false,
+            task_finalize_only: false,
+            task_finalize_status: "partial".to_string(),
+            task_finalize_commit: false,
+            task_finalize_push: false,
+            task_finalize_message: None,
         }
     }
 
