@@ -161,6 +161,10 @@ pub(crate) struct ParallelArgs {
     #[arg(value_enum)]
     pub(crate) action: Option<ParallelAction>,
 
+    /// For `auto parallel receipt-backfill`: synthesize missing REVIEW.md handoffs.
+    #[arg(long)]
+    pub(crate) apply_receipt_backfill_handoffs: bool,
+
     /// Stop after this many successful parallel lands. Default is unlimited.
     #[arg(long)]
     pub(crate) max_iterations: Option<usize>,
@@ -230,6 +234,8 @@ pub(crate) struct ParallelArgs {
 pub(crate) enum ParallelAction {
     /// Print host, tmux, and lane health for the current repo's parallel run.
     Status,
+    /// Write a no-model plan for closing historical receipt drift.
+    ReceiptBackfill,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

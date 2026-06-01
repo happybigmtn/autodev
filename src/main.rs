@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Cli, Command, SymphonySubcommand};
+    use crate::{Cli, Command, ParallelAction, SymphonySubcommand};
     use clap::{CommandFactory, Parser};
     use std::path::Path;
 
@@ -183,6 +183,23 @@ mod tests {
             panic!("expected review command");
         };
         assert!(args.include_siblings);
+    }
+
+    #[test]
+    fn parallel_receipt_backfill_action_is_parseable() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "parallel",
+            "receipt-backfill",
+            "--apply-receipt-backfill-handoffs",
+        ])
+        .expect("cli parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+
+        assert_eq!(args.action, Some(ParallelAction::ReceiptBackfill));
+        assert!(args.apply_receipt_backfill_handoffs);
     }
 
     #[test]

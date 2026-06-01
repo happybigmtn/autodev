@@ -246,6 +246,7 @@ mod tests {
     fn parallel_run_root_resolves_relative_override_under_repo_root() {
         let args = ParallelArgs {
             action: None,
+            apply_receipt_backfill_handoffs: false,
             max_iterations: None,
             max_concurrent_workers: 5,
             cargo_build_jobs: None,
@@ -423,6 +424,7 @@ mod tests {
     fn parallel_claude_has_no_implicit_turn_budget() {
         let args = ParallelArgs {
             action: None,
+            apply_receipt_backfill_handoffs: false,
             max_iterations: None,
             max_concurrent_workers: 5,
             cargo_build_jobs: None,

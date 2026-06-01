@@ -43,6 +43,7 @@ mod orchestrator;
 mod plan;
 mod preflight;
 mod prompt;
+mod receipt_backfill;
 mod recovery_notes;
 mod scheduling;
 mod status;
@@ -56,6 +57,7 @@ pub(crate) use orchestrator::*;
 pub(crate) use plan::*;
 pub(crate) use preflight::*;
 pub(crate) use prompt::*;
+pub(crate) use receipt_backfill::*;
 pub(crate) use recovery_notes::*;
 pub(crate) use scheduling::*;
 pub(crate) use status::*;
@@ -102,6 +104,9 @@ pub(crate) const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
         return run_parallel_status(&args);
+    }
+    if args.action == Some(ParallelAction::ReceiptBackfill) {
+        return run_parallel_receipt_backfill(&args);
     }
 
     if args.max_concurrent_workers == 0 {

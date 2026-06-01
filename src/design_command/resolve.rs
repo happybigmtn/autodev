@@ -271,6 +271,7 @@ async fn run_design_parallel_pass(
         .with_context(|| format!("failed to write {}", prompt_path.display()))?;
     parallel_command::run_parallel_inline(ParallelArgs {
         action: None::<ParallelAction>,
+        apply_receipt_backfill_handoffs: false,
         max_iterations: args.max_iterations,
         max_concurrent_workers: args.max_concurrent_workers.max(1),
         cargo_build_jobs: None,

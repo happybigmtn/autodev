@@ -234,6 +234,7 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         parts.push(
             match action {
                 ParallelAction::Status => "status",
+                ParallelAction::ReceiptBackfill => "receipt-backfill",
             }
             .to_string(),
         );
@@ -415,6 +416,7 @@ mod tests {
     fn parallel_tmux_command_persists_host_logs_and_keeps_shell_open() {
         let args = ParallelArgs {
             action: None,
+            apply_receipt_backfill_handoffs: false,
             max_iterations: Some(3),
             max_concurrent_workers: 8,
             cargo_build_jobs: Some(2),
@@ -451,6 +453,7 @@ mod tests {
     fn parallel_tmux_command_renders_status_action_when_requested() {
         let args = ParallelArgs {
             action: Some(ParallelAction::Status),
+            apply_receipt_backfill_handoffs: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,

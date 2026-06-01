@@ -331,6 +331,7 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
         println!("stage:       parallel");
         parallel_command::run_parallel(ParallelArgs {
             action: None::<ParallelAction>,
+            apply_receipt_backfill_handoffs: false,
             max_iterations: args.max_iterations,
             max_concurrent_workers: args.max_concurrent_workers.max(1),
             cargo_build_jobs: None,
