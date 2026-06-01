@@ -147,7 +147,9 @@ def artifact_paths_from_line(line: str) -> list[str]:
         fragments = re.split(r"[\s,;]+", line)
     paths: list[str] = []
     for fragment in fragments:
-        candidate = fragment.strip().strip("`").strip(".,;")
+        candidate = fragment.strip().strip("`").strip(",;")
+        if candidate.endswith(".") and not candidate.startswith("."):
+            candidate = candidate[:-1]
         if not candidate or candidate == "none":
             continue
         if "/" in candidate or candidate.endswith((".md", ".rs", ".json", ".toml", ".lock")):
