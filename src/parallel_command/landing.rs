@@ -852,24 +852,27 @@ pub(crate) fn reconcile_parallel_landed_task(
     assignment: &ActiveLaneAssignment,
     changed_files: &[String],
 ) -> Result<LoopTaskStatus> {
-    let evidence_before =
-        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
-    let review_added = ensure_host_review_handoff(
-        repo_root,
-        &assignment.task.id,
-        changed_files,
-        &evidence_before,
-    )?;
-    let evidence_after =
-        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    let mut task = assignment.task.clone();
+    reconcile_parallel_landed_task_state(repo_root, &mut task, changed_files)
+}
+
+pub(crate) fn reconcile_parallel_landed_task_state(
+    repo_root: &Path,
+    task: &mut LoopTask,
+    changed_files: &[String],
+) -> Result<LoopTaskStatus> {
+    let evidence_before = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    let review_added =
+        ensure_host_review_handoff(repo_root, &task.id, changed_files, &evidence_before)?;
+    let evidence_after = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
     let completion_status = if evidence_after.is_fully_evidenced() {
         LoopTaskStatus::Done
     } else {
         LoopTaskStatus::Partial
     };
 
-    let plan_updated =
-        update_task_completion_in_plan(repo_root, &assignment.task.id, completion_status)?;
+    task.status = completion_status;
+    let plan_updated = update_task_completion_in_plan(repo_root, &task.id, completion_status)?;
     if review_added || plan_updated {
         let mut queue_files = Vec::new();
         if review_added {
@@ -1363,6 +1366,66 @@ mod tests {
         assert!(files.contains(&"IMPLEMENTATION_PLAN.md"));
         assert!(files.contains(&"COMPLETED.md"));
         assert!(!files.contains(&"WORKLIST.md"));
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn landed_task_reconciliation_marks_partial_when_receipt_wrapper_is_missing() {
+        let repo = unique_temp_dir("parallel-landed-task-missing-wrapper");
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [ ] `TASK-003` Add event envelopes\nVerification:\n  - `cargo test -p ab-events`\nCompletion artifacts: `crates/ab-events/`\nDependencies: none\n",
+        )
+        .expect("failed to write plan");
+        fs::create_dir_all(repo.join("crates/ab-events/src"))
+            .expect("failed to create artifact dir");
+        fs::write(
+            repo.join("crates/ab-events/src/lib.rs"),
+            "pub fn event() {}\n",
+        )
+        .expect("failed to write artifact");
+        run_git_in(
+            &repo,
+            [
+                "add",
+                "IMPLEMENTATION_PLAN.md",
+                "crates/ab-events/src/lib.rs",
+            ],
+        );
+        run_git_in(&repo, ["commit", "-m", "seed task"]);
+
+        let mut task = LoopTask {
+            id: "TASK-003".to_string(),
+            title: "Add event envelopes".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: Vec::new(),
+            estimated_scope: Some("M".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-003` Add event envelopes\nVerification:\n  - `cargo test -p ab-events`\nCompletion artifacts: `crates/ab-events/`\nDependencies: none\n".to_string(),
+        };
+
+        let status = reconcile_parallel_landed_task_state(
+            &repo,
+            &mut task,
+            &["crates/ab-events/src/lib.rs".to_string()],
+        )
+        .expect("landing reconciliation should complete");
+
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md"))
+            .expect("plan should be readable");
+        assert!(plan.contains("- [~] `TASK-003` Add event envelopes"));
+        let review = fs::read_to_string(repo.join("REVIEW.md")).expect("review should be written");
+        assert!(review.contains("`TASK-003`"));
+        assert!(review.contains("crates/ab-events/src/lib.rs"));
+        assert!(review.contains("missing scripts/run-task-verification.sh"));
+        let staged = run_git_in(&repo, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("IMPLEMENTATION_PLAN.md"));
+        assert!(staged.contains("REVIEW.md"));
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }

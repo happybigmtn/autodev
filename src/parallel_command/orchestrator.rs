@@ -170,8 +170,8 @@ pub(crate) async fn run_serial_loop(
             break;
         }
 
-        let current_task = ready[0].id.clone();
-        println!("next task:   {}", current_task);
+        let current_task = ready[0].clone();
+        println!("next task:   {}", current_task.id);
         if !queue.blocked_ids.is_empty() {
             println!("blocked:     {}", queue.blocked_ids.join(", "));
         }
@@ -275,7 +275,29 @@ pub(crate) async fn run_serial_loop(
 
         let state_after = collect_tracked_repo_states(repo_root, reference_repos)?;
         match summarize_repo_progress(&state_before, &state_after) {
-            RepoProgress::NewCommits => {}
+            RepoProgress::NewCommits => {
+                let mut task_for_reconciliation = current_task.clone();
+                let changed_files =
+                    primary_repo_changed_files(repo_root, &state_before, &state_after)?;
+                let completion_status = reconcile_parallel_landed_task_state(
+                    repo_root,
+                    &mut task_for_reconciliation,
+                    &changed_files,
+                )?;
+                if repo_has_staged_queue_updates(repo_root)? {
+                    let message = format!(
+                        "{}: {} queue sync",
+                        repo_name(repo_root),
+                        task_for_reconciliation.id
+                    );
+                    commit_task_closeout(repo_root, &task_for_reconciliation.id, &message, false)?;
+                }
+                println!(
+                    "host sync:   {} -> {}",
+                    task_for_reconciliation.id,
+                    loop_task_status_label(completion_status)
+                );
+            }
             RepoProgress::DirtyChanges(repos) => {
                 bail!(
                     "tracked repo changes were left uncommitted in: {}; commit or revert them before continuing",
@@ -311,6 +333,40 @@ pub(crate) async fn run_serial_loop(
     }
 
     Ok(())
+}
+
+fn primary_repo_changed_files(
+    repo_root: &Path,
+    before: &[TrackedRepoState],
+    after: &[TrackedRepoState],
+) -> Result<Vec<String>> {
+    let Some(before_state) = before.iter().find(|state| state.path == repo_root) else {
+        return Ok(Vec::new());
+    };
+    let Some(after_state) = after.iter().find(|state| state.path == repo_root) else {
+        return Ok(Vec::new());
+    };
+    if before_state.head == after_state.head {
+        return Ok(Vec::new());
+    }
+
+    let range = format!("{}..{}", before_state.head, after_state.head);
+    let output = git_stdout(repo_root, ["diff", "--name-only", range.as_str()])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn loop_task_status_label(status: LoopTaskStatus) -> &'static str {
+    match status {
+        LoopTaskStatus::Pending => "[ ]",
+        LoopTaskStatus::Blocked => "[!]",
+        LoopTaskStatus::Partial => "[~]",
+        LoopTaskStatus::Done => "[x]",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
