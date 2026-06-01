@@ -25,6 +25,8 @@ Environment:
                                       for the artifact spine when available.
   PILOT_TYPED_PLANNING=1              Use typed `auto pilot --planning-only`
                                       for doctor/corpus/gen/steward planning.
+  PILOT_TYPED_EXECUTION_MANIFEST=1    Use typed `auto pilot --execution-manifest-only`
+                                      before Codex execution.
   PILOT_TYPED_CLOSEOUT=1              Use typed `auto pilot --closeout-only`
                                       after Codex execution.
   PILOT_WRAPPER_PREFLIGHT_ONLY=0      Stop after wrapper preflight/planning
@@ -77,12 +79,15 @@ TYPED_PREFLIGHT="${PILOT_TYPED_PREFLIGHT:-1}"
 TYPED_PREFLIGHT_REQUIRED="${PILOT_TYPED_PREFLIGHT_REQUIRED:-0}"
 TYPED_PLANNING="${PILOT_TYPED_PLANNING:-1}"
 TYPED_PLANNING_REQUIRED="${PILOT_TYPED_PLANNING_REQUIRED:-0}"
+TYPED_EXECUTION_MANIFEST="${PILOT_TYPED_EXECUTION_MANIFEST:-1}"
+TYPED_EXECUTION_MANIFEST_REQUIRED="${PILOT_TYPED_EXECUTION_MANIFEST_REQUIRED:-0}"
 TYPED_CLOSEOUT="${PILOT_TYPED_CLOSEOUT:-1}"
 TYPED_CLOSEOUT_REQUIRED="${PILOT_TYPED_CLOSEOUT_REQUIRED:-0}"
 WRAPPER_PREFLIGHT_ONLY="${PILOT_WRAPPER_PREFLIGHT_ONLY:-0}"
 MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
 TYPED_PREFLIGHT_RAN=0
 TYPED_PLANNING_RAN=0
+TYPED_EXECUTION_MANIFEST_RAN=0
 TYPED_CLOSEOUT_RAN=0
 REMOTE_SYNC_MODE="normal"
 CURRENT_BRANCH="unknown"
@@ -158,6 +163,8 @@ auto_version_commit() {
   echo "typed_preflight_required=$TYPED_PREFLIGHT_REQUIRED"
   echo "typed_planning_requested=$TYPED_PLANNING"
   echo "typed_planning_required=$TYPED_PLANNING_REQUIRED"
+  echo "typed_execution_manifest_requested=$TYPED_EXECUTION_MANIFEST"
+  echo "typed_execution_manifest_required=$TYPED_EXECUTION_MANIFEST_REQUIRED"
   echo "typed_closeout_requested=$TYPED_CLOSEOUT"
   echo "typed_closeout_required=$TYPED_CLOSEOUT_REQUIRED"
   echo "wrapper_preflight_only=$WRAPPER_PREFLIGHT_ONLY"
@@ -290,6 +297,62 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
 else
   echo "typed_preflight_ran=0" >> "$RUN_ROOT/run.env"
   echo "typed_planning_ran=0" >> "$RUN_ROOT/run.env"
+fi
+
+if [[ "$TYPED_EXECUTION_MANIFEST" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
+  TYPED_EXECUTION_MANIFEST_ARGS=(
+    pilot
+    "$REPO_SLUG"
+    "$PROMPT"
+    --base-dir "$BASE_DIR"
+    --run-id "$RUN_ID"
+    --run-root "$RUN_ROOT"
+    --autodev-source "$AUTODEV_SOURCE"
+    --min-disk-kb "$MIN_DISK_KB"
+    --focus "$FOCUS"
+    --model "$MODEL"
+    --effort "$EFFORT"
+    --plan-effort "$PLAN_EFFORT"
+    --threads "$THREADS"
+    --planning-mode "$PLANNING_MODE"
+    --execution-manifest-only
+  )
+  if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+    TYPED_EXECUTION_MANIFEST_ARGS+=(--allow-local-only)
+  fi
+  if [[ "$REQUIRE_PLANNING_SPINE" == "0" ]]; then
+    TYPED_EXECUTION_MANIFEST_ARGS+=(--require-planning-spine false)
+  fi
+  if [[ -n "$PLAN_PATH" ]]; then
+    TYPED_EXECUTION_MANIFEST_ARGS+=(--plan "$PLAN_PATH")
+  fi
+  TYPED_EXECUTION_MANIFEST_ARGS+=("${REFERENCE_ARGS[@]}")
+
+  if (
+    cd "$WORKDIR"
+    auto "${TYPED_EXECUTION_MANIFEST_ARGS[@]}"
+  ) > "$RUN_ROOT/logs/auto-pilot-execution-manifest.log" 2>&1; then
+    TYPED_EXECUTION_MANIFEST_RAN=1
+    {
+      echo "typed_execution_manifest_ran=1"
+      echo "typed_execution_manifest_status=ok"
+      echo "typed_execution_manifest_log=$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
+    } >> "$RUN_ROOT/run.env"
+  else
+    {
+      echo "typed_execution_manifest_ran=0"
+      echo "typed_execution_manifest_status=failed"
+      echo "typed_execution_manifest_log=$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
+    } >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_EXECUTION_MANIFEST_REQUIRED" == "1" ]]; then
+      fail_orchestration 81 \
+        "Typed \`auto pilot --execution-manifest-only\` failed and typed execution manifest was required." \
+        "" \
+        "Log: \`$RUN_ROOT/logs/auto-pilot-execution-manifest.log\`"
+    fi
+  fi
+else
+  echo "typed_execution_manifest_ran=0" >> "$RUN_ROOT/run.env"
 fi
 
 send_telegram "[pilot-dev]" "starting $REPO_SLUG
@@ -566,33 +629,36 @@ Required process:
 1. Read the gbrain context copied under $RUN_ROOT/gbrain and the optional plan input.
 2. Inspect the real repo/workspace. For Autonomy Bitino, clone or inspect happybigmtn/autonomy and happybigmtn/bitino if they are missing and needed. Do not accept an empty skeleton as sufficient source context.
 3. Fill $RUN_ROOT/autodev-command-selection.json if it exists, and fill $RUN_ROOT/autodev-command-selection.md before execution. Every command, action, and subcommand from the live command surface must be selected, deferred, or skipped with a reason. Include phase-specific options discovered in $RUN_ROOT/logs/auto-command-surface.json and $RUN_ROOT/logs/auto-help-<command>.log. Do not leave any UNDECIDED rows.
-4. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
+4. Fill $RUN_ROOT/pilot-execution.json before execution. Replace pending/UNDECIDED fields with the selected task or no-task reason, executor kind/command/reason, expected verification path, git branch, runtime restart expectation, and Telegram summary placeholders. Update the same file again after validation with final status, tests, commit or no-commit reason, push ref when applicable, restart evidence when required, and next command.
+5. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
    $RUN_ROOT/orchestrator-doctor.log
    $RUN_ROOT/doctor.log
    $RUN_ROOT/corpus.log
    $RUN_ROOT/gen.log
    $RUN_ROOT/steward-preflight.log for mid-flight stewardship when present
-5. Run and capture any additional appropriate autodev commands selected from the live inventory. Every normal pilot run starts with this planning spine:
+6. Run and capture any additional appropriate autodev commands selected from the live inventory. Every normal pilot run starts with this planning spine:
    auto doctor
    auto corpus --idea "$PROMPT" --focus "$FOCUS"
    auto gen --snapshot-only
    Use --reference-repo for sibling source repos when relevant.
-6. If the repo already has active planning surfaces, use auto steward in addition to corpus/gen unless the operator explicitly disables planning with PILOT_PLANNING_MODE=none and records why. When \`$RUN_ROOT/steward-preflight/PROMOTIONS.md\` exists, write \`$RUN_ROOT/steward-promotion-decisions.md\` before execution with one row per ready/proposed promotion and a decision of \`accepted\`, \`rejected\`, or \`deferred\`, plus evidence. If an accepted ready promotion changes the active frontier, update the root plan first, rerun \`auto parallel status\`, and execute the corrected frontier. Do not run \`auto parallel\` against a stale queue while a ready steward promotion is undecided.
-7. If the generated plan touches a product/design/TUI/operator surface, run the design gate and save the design artifact. Use Claude only for design/product-plan critique when explicitly needed.
-8. Before accepting a task with executable Verification commands, make sure the repo has the autodev verification receipt wrapper \`scripts/run-task-verification.sh\` plus its recorder \`scripts/verification_receipt.py\`. If the wrapper is missing, treat installing or generating it as a prerequisite slice; do not claim \`[x]\` from prose logs alone.
-9. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
-10. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
-11. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
-12. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
+7. If the repo already has active planning surfaces, use auto steward in addition to corpus/gen unless the operator explicitly disables planning with PILOT_PLANNING_MODE=none and records why. When \`$RUN_ROOT/steward-preflight/PROMOTIONS.md\` exists, write \`$RUN_ROOT/steward-promotion-decisions.md\` before execution with one row per ready/proposed promotion and a decision of \`accepted\`, \`rejected\`, or \`deferred\`, plus evidence. If an accepted ready promotion changes the active frontier, update the root plan first, rerun \`auto parallel status\`, and execute the corrected frontier. Do not run \`auto parallel\` against a stale queue while a ready steward promotion is undecided.
+8. If the generated plan touches a product/design/TUI/operator surface, run the design gate and save the design artifact. Use Claude only for design/product-plan critique when explicitly needed.
+9. Before accepting a task with executable Verification commands, make sure the repo has the autodev verification receipt wrapper \`scripts/run-task-verification.sh\` plus its recorder \`scripts/verification_receipt.py\`. If the wrapper is missing, treat installing or generating it as a prerequisite slice; do not claim \`[x]\` from prose logs alone.
+10. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
+11. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
+12. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
+13. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
 
 Evidence discipline:
 - Do not claim success without command output and file paths.
 - Every skipped autodev command, and every relevant skipped subcommand/action discovered from per-command help, needs a reason.
+- Typed closeout will fail unless $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary.
 - If Telegram is needed, verify with hermes send before claiming it is unavailable.
 EOF
 
 if ! grep -F "\`$RUN_ROOT/steward-preflight/PROMOTIONS.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "\`$RUN_ROOT/steward-promotion-decisions.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
+   ! grep -F "$RUN_ROOT/pilot-execution.json" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "\`auto parallel status\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null; then
   {
     echo "# Orchestration Failure"

@@ -96,18 +96,27 @@ pub(crate) struct PilotArgs {
     #[arg(long)]
     pub(crate) planning_only: bool,
 
+    /// Write the typed execution contract, then stop before worker execution.
+    #[arg(long)]
+    pub(crate) execution_manifest_only: bool,
+
     /// Validate a completed pilot run's closeout artifacts, then stop.
     #[arg(long)]
     pub(crate) closeout_only: bool,
 }
 
 pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
-    let selected_modes = [args.preflight_only, args.planning_only, args.closeout_only]
-        .iter()
-        .filter(|selected| **selected)
-        .count();
+    let selected_modes = [
+        args.preflight_only,
+        args.planning_only,
+        args.execution_manifest_only,
+        args.closeout_only,
+    ]
+    .iter()
+    .filter(|selected| **selected)
+    .count();
     if selected_modes > 1 {
-        bail!("--preflight-only, --planning-only, and --closeout-only are mutually exclusive");
+        bail!("--preflight-only, --planning-only, --execution-manifest-only, and --closeout-only are mutually exclusive");
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
@@ -122,6 +131,22 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
             paths.run_root.join("pilot-closeout.json").display()
         );
         println!("pilot closeout ok");
+        return Ok(());
+    }
+    if args.execution_manifest_only {
+        fs::create_dir_all(paths.run_root.join("codex"))?;
+        fs::create_dir_all(paths.run_root.join("logs"))?;
+        let current_branch = current_branch(&paths.workdir);
+        write_execution_manifest(&args, &paths, &intent, &current_branch)?;
+        println!("repo: {}", args.repo_slug);
+        println!("workdir: {}", paths.workdir.display());
+        println!("run: {}", paths.run_id);
+        println!("run_root: {}", paths.run_root.display());
+        println!(
+            "execution: {}",
+            paths.run_root.join("pilot-execution.json").display()
+        );
+        println!("pilot execution manifest ok");
         return Ok(());
     }
     fs::create_dir_all(paths.run_root.join("gbrain"))?;
@@ -655,6 +680,81 @@ fn write_preflight_manifest(
     )
 }
 
+fn write_execution_manifest(
+    args: &PilotArgs,
+    paths: &PilotPaths,
+    intent: &str,
+    current_branch: &str,
+) -> Result<()> {
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "intent": intent,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "status": "pending",
+        "selected_task": {
+            "id": "",
+            "title": "",
+            "source_plan": "",
+            "no_task_reason": ""
+        },
+        "executor": {
+            "kind": "UNDECIDED",
+            "command": "",
+            "degraded_fallback": false,
+            "reason": ""
+        },
+        "verification": {
+            "commands": [],
+            "receipts": [],
+            "summary": ""
+        },
+        "git": {
+            "branch": current_branch,
+            "commit": "",
+            "pushed": false,
+            "push_ref": "",
+            "no_commit_reason": ""
+        },
+        "runtime": {
+            "restart_required": false,
+            "restarted": false,
+            "restart_evidence": "",
+            "no_restart_reason": ""
+        },
+        "artifacts": {
+            "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
+            "planning_manifest": paths.run_root.join("pilot-planning.json"),
+            "execution_manifest": paths.run_root.join("pilot-execution.json"),
+            "closeout_manifest": paths.run_root.join("pilot-closeout.json"),
+            "command_selection_json": paths.run_root.join("autodev-command-selection.json"),
+            "command_selection_markdown": paths.run_root.join("autodev-command-selection.md"),
+            "codex_prompt": paths.run_root.join("codex/worker-prompt.md"),
+            "codex_log": paths.run_root.join("codex/codex-exec.jsonl"),
+            "codex_final": paths.run_root.join("codex/final.md"),
+            "receipt": paths.run_root.join("receipt.md")
+        },
+        "telegram_summary": {
+            "repo": args.repo_slug,
+            "branch_commit": "",
+            "plan": "",
+            "design": "",
+            "execution": "",
+            "tests": "",
+            "closeout": "",
+            "next": ""
+        }
+    });
+    atomic_write(
+        &paths.run_root.join("pilot-execution.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )
+}
+
 fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     let mut errors = Vec::new();
     require_nonempty_artifact(
@@ -674,9 +774,12 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
         "command-selection markdown",
         &mut errors,
     );
+    let execution_manifest_path = paths.run_root.join("pilot-execution.json");
+    require_nonempty_artifact(&execution_manifest_path, "execution manifest", &mut errors);
     require_nonempty_artifact(&paths.run_root.join("receipt.md"), "receipt", &mut errors);
 
     validate_command_selection(&paths.run_root, &mut errors);
+    validate_execution_manifest(&execution_manifest_path, &mut errors);
     validate_receipt(&paths.run_root.join("receipt.md"), &mut errors);
     validate_planning_manifest(&planning_manifest_path, &mut errors);
     validate_steward_promotion_decisions(&paths.run_root, &mut errors);
@@ -695,6 +798,7 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
         "artifacts": {
             "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
             "planning_manifest": planning_manifest_path,
+            "execution_manifest": execution_manifest_path,
             "closeout_manifest": paths.run_root.join("pilot-closeout.json"),
             "command_selection_json": paths.run_root.join("autodev-command-selection.json"),
             "command_selection_markdown": paths.run_root.join("autodev-command-selection.md"),
@@ -787,6 +891,126 @@ fn validate_decision_node(node: &Value, path: &str, errors: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn validate_execution_manifest(path: &Path, errors: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&text) else {
+        errors.push(format!(
+            "invalid execution manifest json: {}",
+            path.display()
+        ));
+        return;
+    };
+
+    let status = string_at(&manifest, &["status"]);
+    if status.is_empty() || matches!(status, "pending" | "UNDECIDED") {
+        errors.push("execution manifest status is still pending".to_string());
+    }
+
+    let task_id = string_at(&manifest, &["selected_task", "id"]);
+    let no_task_reason = string_at(&manifest, &["selected_task", "no_task_reason"]);
+    if task_id.is_empty() && no_task_reason.is_empty() {
+        errors.push("execution manifest missing selected task or no-task reason".to_string());
+    }
+
+    let executor_kind = string_at(&manifest, &["executor", "kind"]);
+    let executor_reason = string_at(&manifest, &["executor", "reason"]);
+    if executor_kind.is_empty() || executor_kind == "UNDECIDED" {
+        errors.push("execution manifest missing executor kind".to_string());
+    }
+    if executor_reason.is_empty() {
+        errors.push("execution manifest missing executor reason".to_string());
+    }
+    if matches!(status, "executed" | "degraded")
+        && string_at(&manifest, &["executor", "command"]).is_empty()
+    {
+        errors.push("execution manifest missing executor command".to_string());
+    }
+
+    let verification_summary = string_at(&manifest, &["verification", "summary"]);
+    let verification_commands = array_nonempty_at(&manifest, &["verification", "commands"]);
+    let verification_receipts = array_nonempty_at(&manifest, &["verification", "receipts"]);
+    if verification_summary.is_empty() {
+        errors.push("execution manifest missing verification summary".to_string());
+    }
+    if matches!(status, "executed" | "degraded") && !verification_commands && !verification_receipts
+    {
+        errors.push("execution manifest missing verification commands or receipts".to_string());
+    }
+
+    if string_at(&manifest, &["git", "branch"]).is_empty() {
+        errors.push("execution manifest missing git branch".to_string());
+    }
+    if string_at(&manifest, &["git", "commit"]).is_empty()
+        && string_at(&manifest, &["git", "no_commit_reason"]).is_empty()
+    {
+        errors.push("execution manifest missing commit or no-commit reason".to_string());
+    }
+
+    let restart_required = bool_at(&manifest, &["runtime", "restart_required"]);
+    let restarted = bool_at(&manifest, &["runtime", "restarted"]);
+    let restart_evidence = string_at(&manifest, &["runtime", "restart_evidence"]);
+    let no_restart_reason = string_at(&manifest, &["runtime", "no_restart_reason"]);
+    if restart_required {
+        if !restarted || restart_evidence.is_empty() {
+            errors.push("execution manifest missing runtime restart proof".to_string());
+        }
+    } else if no_restart_reason.is_empty() {
+        errors.push("execution manifest missing no-restart reason".to_string());
+    }
+
+    for key in [
+        "repo",
+        "branch_commit",
+        "plan",
+        "design",
+        "execution",
+        "tests",
+        "closeout",
+        "next",
+    ] {
+        if string_at(&manifest, &["telegram_summary", key]).is_empty() {
+            errors.push(format!(
+                "execution manifest missing telegram summary `{key}`"
+            ));
+        }
+    }
+}
+
+fn string_at<'a>(value: &'a Value, path: &[&str]) -> &'a str {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return "";
+        };
+        current = next;
+    }
+    current.as_str().map(str::trim).unwrap_or("")
+}
+
+fn bool_at(value: &Value, path: &[&str]) -> bool {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return false;
+        };
+        current = next;
+    }
+    current.as_bool().unwrap_or(false)
+}
+
+fn array_nonempty_at(value: &Value, path: &[&str]) -> bool {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return false;
+        };
+        current = next;
+    }
+    current.as_array().is_some_and(|items| !items.is_empty())
 }
 
 fn validate_receipt(path: &Path, errors: &mut Vec<String>) {
@@ -1110,7 +1334,7 @@ mod tests {
 
     use super::{
         command_selection_from_surface, effective_planning_mode, render_command_selection_markdown,
-        safe_artifact_slug, validate_closeout, PilotPaths,
+        safe_artifact_slug, validate_closeout, write_execution_manifest, PilotPaths,
     };
 
     #[test]
@@ -1174,6 +1398,26 @@ mod tests {
             panic!("expected pilot command");
         };
         assert!(args.closeout_only);
+        assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
+    }
+
+    #[test]
+    fn pilot_args_parse_execution_manifest_only() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--run-root",
+            "/tmp/pilot-run",
+            "--execution-manifest-only",
+        ])
+        .expect("pilot args parse");
+
+        let Command::Pilot(args) = cli.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.execution_manifest_only);
         assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
     }
 
@@ -1288,6 +1532,61 @@ mod tests {
     }
 
     #[test]
+    fn execution_manifest_writer_creates_pending_contract() {
+        let root = unique_temp_dir("execution-contract");
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        write_execution_manifest(&args, &paths, "operator intent", "main")
+            .expect("execution manifest");
+
+        let text = std::fs::read_to_string(root.join("pilot-execution.json"))
+            .expect("execution manifest text");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("execution json");
+        assert_eq!(manifest["status"], "pending");
+        assert_eq!(manifest["executor"]["kind"], "UNDECIDED");
+        assert_eq!(manifest["git"]["branch"], "main");
+        assert_eq!(manifest["telegram_summary"]["repo"], "repo");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closeout_validation_rejects_missing_execution_manifest() {
+        let root = unique_temp_dir("closeout-missing-execution");
+        write_complete_closeout_artifacts(&root, false);
+        std::fs::remove_file(root.join("pilot-execution.json")).expect("remove execution manifest");
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        let err = validate_closeout(&args, &paths).expect_err("invalid closeout");
+
+        assert!(err.to_string().contains("pilot closeout validation failed"));
+        let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
+            .expect("failure artifact");
+        assert!(failure.contains("missing required execution manifest"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closeout_validation_rejects_pending_execution_manifest() {
+        let root = unique_temp_dir("closeout-pending-execution");
+        write_complete_closeout_artifacts(&root, false);
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+        write_execution_manifest(&args, &paths, "operator intent", "main")
+            .expect("pending execution manifest");
+
+        let err = validate_closeout(&args, &paths).expect_err("invalid closeout");
+
+        assert!(err.to_string().contains("pilot closeout validation failed"));
+        let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
+            .expect("failure artifact");
+        assert!(failure.contains("execution manifest status is still pending"));
+        assert!(failure.contains("execution manifest missing executor kind"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn closeout_validation_rejects_undecided_selection() {
         let root = unique_temp_dir("closeout-undecided");
         write_complete_closeout_artifacts(&root, true);
@@ -1337,6 +1636,7 @@ mod tests {
             reference_repos: Vec::new(),
             preflight_only: false,
             planning_only: false,
+            execution_manifest_only: false,
             closeout_only: true,
         }
     }
@@ -1391,6 +1691,55 @@ mod tests {
             format!("| `auto pilot` | {markdown_decision} | {reason} |\n"),
         )
         .expect("selection md");
+        std::fs::write(
+            root.join("pilot-execution.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "status": "executed",
+                "selected_task": {
+                    "id": "pilot-fixture",
+                    "title": "Fixture slice",
+                    "source_plan": "pilot-planning.json",
+                    "no_task_reason": ""
+                },
+                "executor": {
+                    "kind": "codex",
+                    "command": "codex exec - < worker-prompt.md",
+                    "degraded_fallback": false,
+                    "reason": "fixture executed through Codex"
+                },
+                "verification": {
+                    "commands": ["cargo test pilot_command"],
+                    "receipts": [],
+                    "summary": "focused pilot_command tests passed"
+                },
+                "git": {
+                    "branch": "main",
+                    "commit": "",
+                    "pushed": false,
+                    "push_ref": "",
+                    "no_commit_reason": "fixture does not create a commit"
+                },
+                "runtime": {
+                    "restart_required": false,
+                    "restarted": false,
+                    "restart_evidence": "",
+                    "no_restart_reason": "fixture does not change runtime code"
+                },
+                "telegram_summary": {
+                    "repo": "repo",
+                    "branch_commit": "main@fixture",
+                    "plan": "pilot-planning.json",
+                    "design": "none",
+                    "execution": "codex/codex-exec.jsonl",
+                    "tests": "cargo test pilot_command",
+                    "closeout": "pilot-closeout.json",
+                    "next": "auto pilot --closeout-only"
+                }
+            }))
+            .expect("execution json"),
+        )
+        .expect("execution manifest");
         std::fs::write(
             root.join("receipt.md"),
             "\

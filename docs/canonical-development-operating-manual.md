@@ -564,6 +564,7 @@ Required typed preflight artifacts:
 - `autodev-command-selection.json`
 - `autodev-command-selection.md`
 - `pilot-planning.json` when `--planning-only` runs
+- `pilot-execution.json` when `--execution-manifest-only` runs
 - `gbrain/*.md`
 - optional `plan-input.md`
 
@@ -580,7 +581,7 @@ pilot-dev <repo-slug> "<operator intent>"
 ```
 
 The smoke proof must create `pilot-preflight.json`, `pilot-planning.json`,
-typed command-surface logs, and gbrain context, then exit without
+`pilot-execution.json`, typed command-surface logs, and gbrain context, then exit without
 `codex/codex-exec.jsonl`.
 
 Default policy for `pilot-dev`: run typed planning first, then launch Codex only
@@ -595,6 +596,24 @@ after the planning artifact exists. Normal production pilots use:
 For UI/TUI/operator surfaces, the worker must run or justify skipping
 `auto design`. Claude may critique design/product plans only; Codex owns repo
 analysis, planning, execution, review, and closeout.
+
+Execution contract:
+
+```bash
+auto pilot <repo-slug> "<operator intent>" \
+  --execution-manifest-only \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT"
+```
+
+`pilot-dev` runs this typed execution contract by default through
+`PILOT_TYPED_EXECUTION_MANIFEST=1` before launching Codex. The command writes
+`pilot-execution.json` with pending fields for selected task, executor,
+verification, git, runtime restart policy, artifacts, and Telegram summary.
+Codex must fill the file before and after execution. A successful closeout
+cannot leave status as `pending`, executor as `UNDECIDED`, verification empty,
+commit/no-commit evidence absent, runtime restart/no-restart evidence absent,
+or Telegram summary fields blank.
 
 Promotion policy: promote the generated snapshot automatically only when
 `auto gen --snapshot-only` exits 0, the newest `gen-*` directory contains
@@ -635,9 +654,13 @@ or incomplete:
 
 - `pilot-preflight.json`
 - `pilot-planning.json`
+- `pilot-execution.json`
 - `autodev-command-selection.json`
 - `autodev-command-selection.md`
 - `receipt.md`
+- non-pending execution status, executor path, selected task/no-task reason,
+  verification summary, commit/no-commit evidence, runtime restart/no-restart
+  evidence, and Telegram summary fields in `pilot-execution.json`
 - selected/deferred/skipped decisions and reasons for every discovered command
 - no `UNDECIDED` entries in the markdown companion
 - required planning phases recorded as successful in `pilot-planning.json`
