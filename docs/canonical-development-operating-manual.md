@@ -513,48 +513,86 @@ Hermes exposes one operator command:
 pilot-dev <repo-slug> "<operator intent>"
 ```
 
+Canonical wrapper source:
+
+```bash
+scripts/pilot-dev
+```
+
+Installed orchestrator path:
+
+```bash
+/usr/local/bin/pilot-dev -> /home/dev/.local/bin/pilot-dev
+```
+
 Hermes resolves `<repo-slug>` to a repo path through gbrain project metadata,
-then runs:
+then invokes the wrapper from the repo or `/srv/dev/repos` context. The wrapper
+is the one-command contract; Hermes should not reimplement its shell in
+Telegram handlers.
+
+Required wrapper preflight:
 
 ```bash
-cd "$REPO"
-export PROMPT="<operator intent>"
-export FOCUS="${FOCUS:-prove canonical autodev/gbrain/Hermes loop}"
-export MODEL="${MODEL:-gpt-5.5}"
-export PLAN_EFFORT="${PLAN_EFFORT:-xhigh}"
-export WORK_EFFORT="${WORK_EFFORT:-high}"
-export THREADS="${THREADS:-5}"
-
-auto doctor
-auto corpus \
-  --idea "$PROMPT" \
-  --focus "$FOCUS" \
-  --model "$MODEL" \
-  --reasoning-effort "$PLAN_EFFORT" \
-  --review-model "$MODEL" \
-  --review-effort "$PLAN_EFFORT"
-auto gen \
-  --snapshot-only \
-  --model "$MODEL" \
-  --reasoning-effort "$PLAN_EFFORT" \
-  --review-model "$MODEL" \
-  --review-effort "$PLAN_EFFORT"
+auto pilot <repo-slug> "<operator intent>" \
+  --preflight-only \
+  --base-dir "$PILOT_BASE_DIR" \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT" \
+  --autodev-source "$PILOT_AUTODEV_SOURCE"
 ```
 
-For UI/TUI/operator surfaces, Hermes runs:
+`pilot-dev` runs this typed preflight by default through
+`PILOT_TYPED_PREFLIGHT=1`. If the typed preflight succeeds, the wrapper skips
+legacy shell duplicate collection for command surface, doctor logs, and gbrain
+context. If it fails and `PILOT_TYPED_PREFLIGHT_REQUIRED=1`, the wrapper exits
+with an orchestration failure.
+
+Required typed preflight artifacts:
+
+- `run.env`
+- `pilot-preflight.json`
+- `orchestrator-doctor.log`
+- `doctor.log`
+- `logs/auto-version.log`
+- `logs/auto-help.log`
+- `logs/auto-command-surface.json`
+- `logs/auto-help-<command>.log`
+- `autodev-command-selection.json`
+- `autodev-command-selection.md`
+- `gbrain/*.md`
+- optional `plan-input.md`
+
+No-Codex smoke proof:
 
 ```bash
-auto design "$PROMPT" \
-  --planning-root genesis \
-  --model "$MODEL" \
-  --reasoning-effort "$WORK_EFFORT" \
-  --apply
+PILOT_RUN_ID=wrapper-proof \
+PILOT_PLANNING_MODE=none \
+PILOT_REQUIRE_PLANNING_SPINE=0 \
+PILOT_WRAPPER_PREFLIGHT_ONLY=1 \
+PILOT_TYPED_PREFLIGHT_REQUIRED=1 \
+pilot-dev <repo-slug> "<operator intent>"
 ```
 
-Default policy for `pilot-dev`: promote the generated snapshot automatically
-only when `auto gen --snapshot-only` exits 0, the newest `gen-*` directory
-contains `IMPLEMENTATION_PLAN.md`, and the design gate is either not applicable
-or reports `Verdict: GO`. Otherwise Hermes stops and returns the next command
+The smoke proof must create `pilot-preflight.json`, typed command-surface logs,
+and gbrain context, then exit without `codex/codex-exec.jsonl`.
+
+Default policy for `pilot-dev`: run the typed preflight first, then run the
+planning spine unless disabled. Normal production pilots use:
+
+- `auto doctor`
+- `auto corpus --idea "$PROMPT" --focus "$FOCUS"`
+- `auto gen --snapshot-only`
+- `auto steward --report-only` when the repo already has active planning
+  surfaces
+
+For UI/TUI/operator surfaces, the worker must run or justify skipping
+`auto design`. Claude may critique design/product plans only; Codex owns repo
+analysis, planning, execution, review, and closeout.
+
+Promotion policy: promote the generated snapshot automatically only when
+`auto gen --snapshot-only` exits 0, the newest `gen-*` directory contains
+`IMPLEMENTATION_PLAN.md`, and the design gate is either not applicable or
+reports `Verdict: GO`. Otherwise Hermes stops and returns the next command
 without running implementation.
 
 Promotion and execution:

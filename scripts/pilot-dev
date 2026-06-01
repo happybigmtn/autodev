@@ -1,0 +1,727 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  pilot-dev <repo-slug> "<operator intent>"
+
+Environment:
+  PILOT_PLAN=/path/to/plan.md       Optional authoritative plan file.
+  PILOT_RUN_ID=...                  Optional deterministic run id.
+  PILOT_FOCUS="..."                 Optional autodev focus override.
+  PILOT_MODEL=gpt-5.5               Codex/autodev model hint.
+  PILOT_EFFORT=high                 Codex/autodev work effort hint.
+  PILOT_PLAN_EFFORT=xhigh           Autodev planning effort hint.
+  PILOT_THREADS=3                   Autodev worker lane hint.
+  PILOT_PLANNING_MODE=auto           auto, greenfield, steward, full, or none.
+  PILOT_REQUIRE_PLANNING_SPINE=1      Require auto corpus + auto gen --snapshot-only.
+  PILOT_REFERENCE_REPOS="..."        Optional whitespace-separated reference repo roots.
+  PILOT_AUTODEV_SOURCE=/srv/dev/repos/autodev
+                                      Local autodev source used to refresh stale auto.
+  PILOT_AUTODEV_AUTOINSTALL=1         Install current local autodev source when auto is stale.
+  PILOT_AUTODEV_INSTALL_ROOT=$HOME/.local
+  PILOT_TYPED_PREFLIGHT=1             Use typed `auto pilot --preflight-only`
+                                      for the artifact spine when available.
+  PILOT_WRAPPER_PREFLIGHT_ONLY=0      Stop after wrapper preflight/planning
+                                      gates; useful for no-Codex smoke tests.
+
+This command is intended to be called by Hermes. It supervises a Codex worker
+instead of trying to do repo execution inside Hermes itself.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+REPO_SLUG="$1"
+shift
+PROMPT="$*"
+
+BASE_DIR="${PILOT_BASE_DIR:-/srv/dev/repos}"
+REPO="$BASE_DIR/$REPO_SLUG"
+RUN_ID="${PILOT_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$REPO_SLUG}"
+
+if [[ -d "$REPO" ]]; then
+  WORKDIR="$REPO"
+  RUN_ROOT="$REPO/.auto/orchestrator/$RUN_ID"
+else
+  WORKDIR="$BASE_DIR"
+  RUN_ROOT="${PILOT_RUN_ROOT:-/home/dev/orchestrator-runs/$RUN_ID}"
+fi
+
+MODEL="${PILOT_MODEL:-gpt-5.5}"
+EFFORT="${PILOT_EFFORT:-high}"
+PLAN_EFFORT="${PILOT_PLAN_EFFORT:-xhigh}"
+THREADS="${PILOT_THREADS:-3}"
+FOCUS="${PILOT_FOCUS:-prove Hermes/gbrain/autodev/Codex/Claude orchestration with supervised Codex workers}"
+PLAN_PATH="${PILOT_PLAN:-}"
+PLANNING_MODE="${PILOT_PLANNING_MODE:-auto}"
+REQUIRE_PLANNING_SPINE="${PILOT_REQUIRE_PLANNING_SPINE:-1}"
+REFERENCE_REPOS="${PILOT_REFERENCE_REPOS:-}"
+AUTODEV_SOURCE="${PILOT_AUTODEV_SOURCE:-/srv/dev/repos/autodev}"
+AUTODEV_AUTOINSTALL="${PILOT_AUTODEV_AUTOINSTALL:-1}"
+AUTODEV_INSTALL_ROOT="${PILOT_AUTODEV_INSTALL_ROOT:-$HOME/.local}"
+TYPED_PREFLIGHT="${PILOT_TYPED_PREFLIGHT:-1}"
+TYPED_PREFLIGHT_REQUIRED="${PILOT_TYPED_PREFLIGHT_REQUIRED:-0}"
+WRAPPER_PREFLIGHT_ONLY="${PILOT_WRAPPER_PREFLIGHT_ONLY:-0}"
+MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
+TYPED_PREFLIGHT_RAN=0
+REMOTE_SYNC_MODE="normal"
+CURRENT_BRANCH="unknown"
+
+REFERENCE_ARGS=()
+if [[ -n "$REFERENCE_REPOS" ]]; then
+  read -r -a REFERENCE_ARGS_RAW <<< "$REFERENCE_REPOS"
+  for ref in "${REFERENCE_ARGS_RAW[@]}"; do
+    REFERENCE_ARGS+=(--reference-repo "$ref")
+  done
+fi
+
+if [[ -d "$REPO/.git" ]] && ! git -C "$REPO" remote get-url origin >/dev/null 2>&1; then
+  export AUTO_SKIP_REMOTE_SYNC="${AUTO_SKIP_REMOTE_SYNC:-1}"
+  REMOTE_SYNC_MODE="local-no-origin"
+fi
+
+if [[ -d "$WORKDIR/.git" ]]; then
+  CURRENT_BRANCH="$(git -C "$WORKDIR" branch --show-current 2>/dev/null || true)"
+  CURRENT_BRANCH="${CURRENT_BRANCH:-detached}"
+fi
+
+mkdir -p "$RUN_ROOT"/{gbrain,codex,logs}
+
+send_telegram() {
+  local subject="$1"
+  local body="$2"
+  if command -v hermes >/dev/null 2>&1; then
+    printf '%s\n' "$body" | hermes send --to telegram --subject "$subject" --file - >/dev/null 2>&1 || true
+  fi
+}
+
+fail_orchestration() {
+  local code="$1"
+  shift
+  {
+    echo "# Orchestration Failure"
+    echo
+    printf '%s\n' "$@"
+  } > "$RUN_ROOT/orchestration-failure.md"
+  send_telegram "[pilot-dev]" "failed $REPO_SLUG
+run: $RUN_ID
+status: $code
+failure: $RUN_ROOT/orchestration-failure.md"
+  exit "$code"
+}
+
+auto_version_commit() {
+  command -v auto >/dev/null 2>&1 || return 1
+  auto --version 2>/dev/null | awk '/^commit:/ { print $2; exit }'
+}
+
+{
+  echo "repo_slug=$REPO_SLUG"
+  echo "repo=$REPO"
+  echo "workdir=$WORKDIR"
+  echo "run_id=$RUN_ID"
+  echo "run_root=$RUN_ROOT"
+  echo "prompt=$PROMPT"
+  echo "focus=$FOCUS"
+  echo "model=$MODEL"
+  echo "effort=$EFFORT"
+  echo "plan_effort=$PLAN_EFFORT"
+  echo "threads=$THREADS"
+  echo "plan_path=${PLAN_PATH:-none}"
+  echo "planning_mode=$PLANNING_MODE"
+  echo "require_planning_spine=$REQUIRE_PLANNING_SPINE"
+  echo "reference_repos=${REFERENCE_REPOS:-none}"
+  echo "autodev_source=$AUTODEV_SOURCE"
+  echo "autodev_autoinstall=$AUTODEV_AUTOINSTALL"
+  echo "autodev_install_root=$AUTODEV_INSTALL_ROOT"
+  echo "typed_preflight_requested=$TYPED_PREFLIGHT"
+  echo "typed_preflight_required=$TYPED_PREFLIGHT_REQUIRED"
+  echo "wrapper_preflight_only=$WRAPPER_PREFLIGHT_ONLY"
+  echo "min_disk_kb=$MIN_DISK_KB"
+  echo "remote_sync_mode=$REMOTE_SYNC_MODE"
+  echo "current_branch=$CURRENT_BRANCH"
+  echo "AUTO_SKIP_REMOTE_SYNC=${AUTO_SKIP_REMOTE_SYNC:-}"
+  echo "created=$(date -u +%FT%TZ)"
+} > "$RUN_ROOT/run.env"
+
+AUTODEV_SOURCE_HEAD=""
+if [[ -d "$AUTODEV_SOURCE/.git" && -f "$AUTODEV_SOURCE/Cargo.toml" ]]; then
+  AUTODEV_SOURCE_HEAD="$(git -C "$AUTODEV_SOURCE" rev-parse --short HEAD 2>/dev/null || true)"
+fi
+AUTODEV_INSTALLED_BEFORE="$(auto_version_commit || true)"
+{
+  echo "autodev_source_head=${AUTODEV_SOURCE_HEAD:-unknown}"
+  echo "autodev_installed_commit_before=${AUTODEV_INSTALLED_BEFORE:-missing}"
+} >> "$RUN_ROOT/run.env"
+
+if [[ -n "$AUTODEV_SOURCE_HEAD" && "${AUTODEV_INSTALLED_BEFORE:-}" != "$AUTODEV_SOURCE_HEAD" ]]; then
+  if [[ "$AUTODEV_AUTOINSTALL" != "1" ]]; then
+    fail_orchestration 79 \
+      "Installed \`auto\` is stale and \`PILOT_AUTODEV_AUTOINSTALL\` is disabled." \
+      "" \
+      "Expected autodev source commit: \`$AUTODEV_SOURCE_HEAD\`" \
+      "Installed auto commit: \`${AUTODEV_INSTALLED_BEFORE:-missing}\`" \
+      "Source: \`$AUTODEV_SOURCE\`"
+  fi
+  (
+    cd "$AUTODEV_SOURCE"
+    PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/home/dev/.cargo/bin:/home/dev/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH" \
+      cargo install --path . --locked --root "$AUTODEV_INSTALL_ROOT"
+  ) > "$RUN_ROOT/logs/autodev-install.log" 2>&1 || fail_orchestration 79 \
+      "Failed to install current autodev source before running pilot-dev." \
+      "" \
+      "Source: \`$AUTODEV_SOURCE\`" \
+      "Log: \`$RUN_ROOT/logs/autodev-install.log\`"
+  hash -r || true
+fi
+
+AUTODEV_INSTALLED_AFTER="$(auto_version_commit || true)"
+echo "autodev_installed_commit_after=${AUTODEV_INSTALLED_AFTER:-missing}" >> "$RUN_ROOT/run.env"
+if [[ -n "$AUTODEV_SOURCE_HEAD" && "${AUTODEV_INSTALLED_AFTER:-}" != "$AUTODEV_SOURCE_HEAD" ]]; then
+  fail_orchestration 79 \
+    "Installed \`auto\` still does not match local autodev source after refresh." \
+    "" \
+    "Expected autodev source commit: \`$AUTODEV_SOURCE_HEAD\`" \
+    "Installed auto commit: \`${AUTODEV_INSTALLED_AFTER:-missing}\`" \
+    "Source: \`$AUTODEV_SOURCE\`" \
+    "Install log: \`$RUN_ROOT/logs/autodev-install.log\`"
+fi
+
+if [[ -z "${AUTODEV_INSTALLED_AFTER:-}" && -z "$AUTODEV_SOURCE_HEAD" ]]; then
+  fail_orchestration 79 \
+    "No usable \`auto\` binary and no local autodev source were found." \
+    "" \
+    "Expected binary: \`auto\` in PATH" \
+    "Expected source: \`$AUTODEV_SOURCE\`"
+fi
+
+if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
+  TYPED_PREFLIGHT_ARGS=(
+    pilot
+    "$REPO_SLUG"
+    "$PROMPT"
+    --base-dir "$BASE_DIR"
+    --run-id "$RUN_ID"
+    --run-root "$RUN_ROOT"
+    --autodev-source "$AUTODEV_SOURCE"
+    --min-disk-kb "$MIN_DISK_KB"
+    --focus "$FOCUS"
+    --model "$MODEL"
+    --effort "$EFFORT"
+    --plan-effort "$PLAN_EFFORT"
+    --threads "$THREADS"
+    --planning-mode "$PLANNING_MODE"
+    --preflight-only
+  )
+  if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+    TYPED_PREFLIGHT_ARGS+=(--allow-local-only)
+  fi
+  if [[ "$REQUIRE_PLANNING_SPINE" == "0" ]]; then
+    TYPED_PREFLIGHT_ARGS+=(--require-planning-spine false)
+  fi
+  if [[ -n "$PLAN_PATH" ]]; then
+    TYPED_PREFLIGHT_ARGS+=(--plan "$PLAN_PATH")
+  fi
+  TYPED_PREFLIGHT_ARGS+=("${REFERENCE_ARGS[@]}")
+
+  if (
+    cd "$WORKDIR"
+    auto "${TYPED_PREFLIGHT_ARGS[@]}"
+  ) > "$RUN_ROOT/logs/auto-pilot-preflight.log" 2>&1; then
+    TYPED_PREFLIGHT_RAN=1
+    {
+      echo "autodev_source_head=${AUTODEV_SOURCE_HEAD:-unknown}"
+      echo "autodev_installed_commit_before=${AUTODEV_INSTALLED_BEFORE:-missing}"
+      echo "autodev_installed_commit_after=${AUTODEV_INSTALLED_AFTER:-missing}"
+      echo "typed_preflight_ran=1"
+      echo "typed_preflight_log=$RUN_ROOT/logs/auto-pilot-preflight.log"
+    } >> "$RUN_ROOT/run.env"
+  else
+    {
+      echo "typed_preflight_ran=0"
+      echo "typed_preflight_error_log=$RUN_ROOT/logs/auto-pilot-preflight.log"
+    } >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_PREFLIGHT_REQUIRED" == "1" ]]; then
+      fail_orchestration 80 \
+        "Typed \`auto pilot --preflight-only\` failed and \`PILOT_TYPED_PREFLIGHT_REQUIRED=1\`." \
+        "" \
+        "Log: \`$RUN_ROOT/logs/auto-pilot-preflight.log\`"
+    fi
+  fi
+else
+  echo "typed_preflight_ran=0" >> "$RUN_ROOT/run.env"
+fi
+
+send_telegram "[pilot-dev]" "starting $REPO_SLUG
+run: $RUN_ID
+workdir: $WORKDIR
+intent: $PROMPT"
+
+if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v auto >/dev/null 2>&1; then
+  auto --version > "$RUN_ROOT/logs/auto-version.log" 2>&1 || true
+  auto --help > "$RUN_ROOT/logs/auto-help.log" 2>&1 || true
+  if auto command-surface --json > "$RUN_ROOT/logs/auto-command-surface.json" 2>/dev/null && command -v jq >/dev/null 2>&1; then
+    jq -r '.commands[].name' "$RUN_ROOT/logs/auto-command-surface.json" > "$RUN_ROOT/logs/auto-commands.txt" || true
+  else
+    rm -f "$RUN_ROOT/logs/auto-command-surface.json"
+    awk '
+      /^Commands:/ { in_commands=1; next }
+      in_commands && /^Options:/ { in_commands=0 }
+      in_commands && $1 ~ /^[[:alnum:]-]+$/ { print $1 }
+    ' "$RUN_ROOT/logs/auto-help.log" > "$RUN_ROOT/logs/auto-commands.txt" || true
+  fi
+
+  if [[ -s "$RUN_ROOT/logs/auto-commands.txt" ]]; then
+    while IFS= read -r cmd; do
+      [[ -z "$cmd" ]] && continue
+      auto "$cmd" --help > "$RUN_ROOT/logs/auto-help-$cmd.log" 2>&1 || true
+    done < "$RUN_ROOT/logs/auto-commands.txt"
+
+    if [[ -s "$RUN_ROOT/logs/auto-command-surface.json" ]] && command -v jq >/dev/null 2>&1; then
+      jq \
+        --arg run_id "$RUN_ID" \
+        --arg repo "$REPO_SLUG" \
+        '{
+          schema_version: 1,
+          run_id: $run_id,
+          repo: $repo,
+          source: "auto command-surface --json",
+          commands: [
+            .commands[] as $cmd | {
+              name: $cmd.name,
+              about: ($cmd.about // ""),
+              usage: ($cmd.usage // ""),
+              command: ("auto " + $cmd.name),
+              decision: "UNDECIDED",
+              reason: "",
+              subcommands: [
+                $cmd.subcommands[]? as $sub | {
+                  name: $sub.name,
+                  about: ($sub.about // ""),
+                  usage: ($sub.usage // ""),
+                  command: ("auto " + $cmd.name + " " + $sub.name),
+                  decision: "UNDECIDED",
+                  reason: "",
+                  subcommands: [
+                    $sub.subcommands[]? as $nested | {
+                      name: $nested.name,
+                      about: ($nested.about // ""),
+                      usage: ($nested.usage // ""),
+                      command: ("auto " + $cmd.name + " " + $sub.name + " " + $nested.name),
+                      decision: "UNDECIDED",
+                      reason: ""
+                    }
+                  ]
+                }
+              ],
+              actions: [
+                $cmd.arguments[]?
+                | select(.id == "action")
+                | .possible_values[]? as $action
+                | {
+                  name: $action.name,
+                  help: ($action.help // ""),
+                  command: ("auto " + $cmd.name + " " + $action.name),
+                  decision: "UNDECIDED",
+                  reason: ""
+                }
+              ]
+            }
+          ]
+        }' \
+        "$RUN_ROOT/logs/auto-command-surface.json" > "$RUN_ROOT/autodev-command-selection.json" || true
+    fi
+
+    {
+      echo "# Autodev Command Selection"
+      echo
+      echo "Run: \`$RUN_ID\`"
+      echo "Repo: \`$REPO_SLUG\`"
+      echo
+      if [[ -s "$RUN_ROOT/autodev-command-selection.json" ]]; then
+        echo "Structured ledger: \`$RUN_ROOT/autodev-command-selection.json\`"
+        echo
+      fi
+      echo "Every command, action, and subcommand discovered from the live \`auto\`"
+      echo "surface must be marked \`selected\`, \`deferred\`, or \`skipped\`"
+      echo "before implementation."
+      echo "Inspect \`logs/auto-help-<command>.log\` for phase-specific options"
+      echo "before choosing raw shell."
+      echo "Replace every \`UNDECIDED\` value and include concrete evidence or a"
+      echo "specific reason."
+      echo
+      echo "| Surface | Decision | Reason and Evidence |"
+      echo "|---|---|---|"
+      if [[ -s "$RUN_ROOT/autodev-command-selection.json" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '
+          def clean: (. // "" | gsub("\\|"; "/"));
+          .commands[] as $cmd
+          | "| `\($cmd.command)` | UNDECIDED | command: \(($cmd.about // "") | clean) |",
+            ($cmd.actions[]? | "| `\(.command)` | UNDECIDED | action of `\($cmd.command)`: \((.help // "") | clean) |"),
+            ($cmd.subcommands[]? as $sub
+              | "| `\($sub.command)` | UNDECIDED | subcommand of `\($cmd.command)`: \(($sub.about // "") | clean) |",
+                ($sub.subcommands[]? | "| `\(.command)` | UNDECIDED | subcommand of `\($sub.command)`: \((.about // "") | clean) |"))
+        ' "$RUN_ROOT/autodev-command-selection.json"
+      else
+        while IFS= read -r cmd; do
+          [[ -z "$cmd" ]] && continue
+          printf '| `auto %s` | UNDECIDED |  |\n' "$cmd"
+        done < "$RUN_ROOT/logs/auto-commands.txt"
+      fi
+    } > "$RUN_ROOT/autodev-command-selection.md"
+  fi
+fi
+
+run_logged() {
+  local log_path="$1"
+  shift
+  (
+    cd "$WORKDIR"
+    set -o pipefail
+    "$@" 2>&1 | tee "$log_path"
+  )
+}
+
+EFFECTIVE_PLANNING_MODE="$PLANNING_MODE"
+if [[ "$PLANNING_MODE" == "auto" ]]; then
+  if [[ -f "$WORKDIR/IMPLEMENTATION_PLAN.md" || -f "$WORKDIR/WORKLIST.md" ]]; then
+    EFFECTIVE_PLANNING_MODE="full"
+  else
+    EFFECTIVE_PLANNING_MODE="greenfield"
+  fi
+fi
+
+echo "effective_planning_mode=$EFFECTIVE_PLANNING_MODE" >> "$RUN_ROOT/run.env"
+
+if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
+  ORCHESTRATOR_DOCTOR_ARGS=(doctor --orchestrator --autodev-source "$AUTODEV_SOURCE")
+  if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+    ORCHESTRATOR_DOCTOR_ARGS+=(--allow-local-only)
+  fi
+  if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]]; then
+    run_logged "$RUN_ROOT/orchestrator-doctor.log" auto "${ORCHESTRATOR_DOCTOR_ARGS[@]}"
+    run_logged "$RUN_ROOT/doctor.log" auto doctor
+  fi
+
+  if [[ "$REQUIRE_PLANNING_SPINE" == "1" && "$EFFECTIVE_PLANNING_MODE" != "none" ]]; then
+    run_logged "$RUN_ROOT/corpus.log" \
+      auto corpus \
+        --idea "$PROMPT" \
+        --focus "$FOCUS" \
+        --model "$MODEL" \
+        --reasoning-effort "$PLAN_EFFORT" \
+        --review-model "$MODEL" \
+        --review-effort "$PLAN_EFFORT" \
+        "${REFERENCE_ARGS[@]}"
+
+    run_logged "$RUN_ROOT/gen.log" \
+      auto gen \
+        --snapshot-only \
+        --model "$MODEL" \
+        --reasoning-effort "$PLAN_EFFORT" \
+        --review-model "$MODEL" \
+        --review-effort "$PLAN_EFFORT"
+  fi
+
+  case "$EFFECTIVE_PLANNING_MODE" in
+    greenfield)
+      ;;
+    steward|full)
+      run_logged "$RUN_ROOT/steward-preflight.log" \
+        auto steward \
+          --report-only \
+          --output-dir "$RUN_ROOT/steward-preflight" \
+          --model "$MODEL" \
+          --reasoning-effort "$EFFORT" \
+          --finalizer-model "$MODEL" \
+          --finalizer-effort "$EFFORT" \
+          "${REFERENCE_ARGS[@]}"
+      ;;
+    none)
+      ;;
+    *)
+      echo "unsupported PILOT_PLANNING_MODE: $PLANNING_MODE" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v gbrain >/dev/null 2>&1; then
+  for slug in \
+    manuals/canonical-development-operating-manual \
+    manuals/hermes-codex-supervisor-workflow \
+    manuals/hermes-orchestrator-development-memory \
+    infrastructure/dev-orchestrator-machine-registry-2026-06-01 \
+    infrastructure/dev-orchestrator-security-baseline-2026-06-01 \
+    "projects/$REPO_SLUG"
+  do
+    safe_slug="${slug//\//__}"
+    gbrain get "$slug" > "$RUN_ROOT/gbrain/$safe_slug.md" 2> "$RUN_ROOT/gbrain/$safe_slug.err" || true
+  done
+fi
+
+if [[ -n "$PLAN_PATH" && -f "$PLAN_PATH" ]]; then
+  cp "$PLAN_PATH" "$RUN_ROOT/plan-input.md"
+  sha256sum "$PLAN_PATH" > "$RUN_ROOT/plan-input.sha256"
+fi
+
+if [[ "$WRAPPER_PREFLIGHT_ONLY" == "1" ]]; then
+  echo "wrapper_preflight_only_exit=1" >> "$RUN_ROOT/run.env"
+  send_telegram "[pilot-dev]" "preflight complete $REPO_SLUG
+run: $RUN_ID
+run_root: $RUN_ROOT
+typed_preflight: $TYPED_PREFLIGHT_RAN"
+  exit 0
+fi
+
+cat > "$RUN_ROOT/codex/worker-prompt.md" <<EOF
+You are a Codex worker supervised by Hermes through the pilot-dev command.
+
+Operator intent:
+$PROMPT
+
+Repository slug:
+$REPO_SLUG
+
+Workdir:
+$WORKDIR
+
+Run root:
+$RUN_ROOT
+
+Pilot planning mode:
+$EFFECTIVE_PLANNING_MODE
+
+Reference repos:
+${REFERENCE_REPOS:-none}
+
+Remote sync mode:
+$REMOTE_SYNC_MODE
+
+Current git branch:
+$CURRENT_BRANCH
+
+AUTO_SKIP_REMOTE_SYNC:
+${AUTO_SKIP_REMOTE_SYNC:-unset}
+
+Authoritative optional plan:
+${PLAN_PATH:-none}
+
+Hard role split:
+- gbrain is durable shared memory and artifact index.
+- Hermes is the human-facing Telegram/control-plane supervisor.
+- autodev is the workflow engine. Read $RUN_ROOT/logs/auto-command-surface.json when present, plus $RUN_ROOT/logs/auto-help.log, $RUN_ROOT/logs/auto-commands.txt, and $RUN_ROOT/logs/auto-help-<command>.log before choosing raw shell. Treat the live machine-readable inventory and per-command help logs as source of truth; do not rely on a static command list.
+- Codex is responsible for repo analysis, planning, implementation, testing, review, and closeout.
+- Claude is only for design/product-plan critique or UX/design plan quality gates.
+
+Safety:
+- Do not use private keys, funds, production authority, live deployment, or destructive infrastructure changes.
+- Avoid branch forests. Use one working branch and repo .auto/ artifacts.
+- Commit only a coherent verified product delta.
+
+Required process:
+1. Read the gbrain context copied under $RUN_ROOT/gbrain and the optional plan input.
+2. Inspect the real repo/workspace. For Autonomy Bitino, clone or inspect happybigmtn/autonomy and happybigmtn/bitino if they are missing and needed. Do not accept an empty skeleton as sufficient source context.
+3. Fill $RUN_ROOT/autodev-command-selection.json if it exists, and fill $RUN_ROOT/autodev-command-selection.md before execution. Every command, action, and subcommand from the live command surface must be selected, deferred, or skipped with a reason. Include phase-specific options discovered in $RUN_ROOT/logs/auto-command-surface.json and $RUN_ROOT/logs/auto-help-<command>.log. Do not leave any UNDECIDED rows.
+4. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
+   $RUN_ROOT/orchestrator-doctor.log
+   $RUN_ROOT/doctor.log
+   $RUN_ROOT/corpus.log
+   $RUN_ROOT/gen.log
+   $RUN_ROOT/steward-preflight.log for mid-flight stewardship when present
+5. Run and capture any additional appropriate autodev commands selected from the live inventory. Every normal pilot run starts with this planning spine:
+   auto doctor
+   auto corpus --idea "$PROMPT" --focus "$FOCUS"
+   auto gen --snapshot-only
+   Use --reference-repo for sibling source repos when relevant.
+6. If the repo already has active planning surfaces, use auto steward in addition to corpus/gen unless the operator explicitly disables planning with PILOT_PLANNING_MODE=none and records why. When \`$RUN_ROOT/steward-preflight/PROMOTIONS.md\` exists, write \`$RUN_ROOT/steward-promotion-decisions.md\` before execution with one row per ready/proposed promotion and a decision of \`accepted\`, \`rejected\`, or \`deferred\`, plus evidence. If an accepted ready promotion changes the active frontier, update the root plan first, rerun \`auto parallel status\`, and execute the corrected frontier. Do not run \`auto parallel\` against a stale queue while a ready steward promotion is undecided.
+7. If the generated plan touches a product/design/TUI/operator surface, run the design gate and save the design artifact. Use Claude only for design/product-plan critique when explicitly needed.
+8. Before accepting a task with executable Verification commands, make sure the repo has the autodev verification receipt wrapper \`scripts/run-task-verification.sh\` plus its recorder \`scripts/verification_receipt.py\`. If the wrapper is missing, treat installing or generating it as a prerequisite slice; do not claim \`[x]\` from prose logs alone.
+9. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
+10. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
+11. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
+12. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
+
+Evidence discipline:
+- Do not claim success without command output and file paths.
+- Every skipped autodev command, and every relevant skipped subcommand/action discovered from per-command help, needs a reason.
+- If Telegram is needed, verify with hermes send before claiming it is unavailable.
+EOF
+
+if ! grep -F "\`$RUN_ROOT/steward-preflight/PROMOTIONS.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
+   ! grep -F "\`$RUN_ROOT/steward-promotion-decisions.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
+   ! grep -F "\`auto parallel status\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null; then
+  {
+    echo "# Orchestration Failure"
+    echo
+    echo "Rendered Codex worker prompt failed integrity checks."
+    echo
+    echo "Expected literal steward promotion paths and autodev command names to survive prompt rendering."
+    echo
+    echo "Artifact: $RUN_ROOT/codex/worker-prompt.md"
+  } > "$RUN_ROOT/orchestration-failure.md"
+  exit 78
+fi
+
+CODEX_LOG="$RUN_ROOT/codex/codex-exec.jsonl"
+CODEX_FINAL="$RUN_ROOT/codex/final.md"
+
+set +e
+codex exec \
+  --cd "$WORKDIR" \
+  --add-dir "$BASE_DIR" \
+  --add-dir /home/dev/orchestrator-inputs \
+  --sandbox danger-full-access \
+  -c 'approval_policy="never"' \
+  --json \
+  --output-last-message "$CODEX_FINAL" \
+  - < "$RUN_ROOT/codex/worker-prompt.md" \
+  > "$CODEX_LOG" 2>&1
+CODEX_STATUS=$?
+set -e
+
+CONTRACT_STATUS=0
+if [[ -s "$RUN_ROOT/logs/auto-commands.txt" ]]; then
+  if [[ -s "$RUN_ROOT/autodev-command-selection.json" ]] && command -v jq >/dev/null 2>&1; then
+    if ! jq -e '
+      def decided:
+        (.decision != "UNDECIDED") and
+        (.decision | length > 0) and
+        (.reason | length > 0);
+      (.commands | length > 0) and
+      all(.commands[];
+        decided and
+        all(.actions[]?; decided) and
+        all(.subcommands[]?;
+          decided and
+          all(.subcommands[]?; decided)
+        )
+      )
+    ' "$RUN_ROOT/autodev-command-selection.json" >/dev/null; then
+      CONTRACT_STATUS=72
+      {
+        echo "# Orchestration Failure"
+        echo
+        echo "Structured autodev command-selection artifact still contains incomplete decisions."
+        echo
+        echo "Artifact: $RUN_ROOT/autodev-command-selection.json"
+      } > "$RUN_ROOT/orchestration-failure.md"
+    fi
+  fi
+
+  if [[ "$CONTRACT_STATUS" -eq 0 && ! -s "$RUN_ROOT/autodev-command-selection.md" ]]; then
+    CONTRACT_STATUS=70
+    {
+      echo "# Orchestration Failure"
+      echo
+      echo "Missing required autodev command-selection artifact."
+      echo
+      echo "Expected: $RUN_ROOT/autodev-command-selection.md"
+    } > "$RUN_ROOT/orchestration-failure.md"
+  elif [[ "$CONTRACT_STATUS" -eq 0 ]] && grep -q 'UNDECIDED' "$RUN_ROOT/autodev-command-selection.md"; then
+    CONTRACT_STATUS=71
+    {
+      echo "# Orchestration Failure"
+      echo
+      echo "Autodev command-selection artifact still contains UNDECIDED rows."
+      echo
+      echo "Artifact: $RUN_ROOT/autodev-command-selection.md"
+    } > "$RUN_ROOT/orchestration-failure.md"
+  fi
+fi
+
+if [[ "$CONTRACT_STATUS" -eq 0 && ! -s "$RUN_ROOT/receipt.md" ]]; then
+  CONTRACT_STATUS=73
+  {
+    echo "# Orchestration Failure"
+    echo
+    echo "Missing required closeout receipt."
+    echo
+    echo "Expected: $RUN_ROOT/receipt.md"
+    echo
+    echo "The worker must write a Telegram-ready closeout receipt with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command."
+  } > "$RUN_ROOT/orchestration-failure.md"
+fi
+
+if [[ "$CONTRACT_STATUS" -eq 0 && "$REQUIRE_PLANNING_SPINE" == "1" && "$EFFECTIVE_PLANNING_MODE" != "none" ]]; then
+  if [[ ! -s "$RUN_ROOT/corpus.log" || ! -s "$RUN_ROOT/gen.log" ]]; then
+    CONTRACT_STATUS=74
+    {
+      echo "# Orchestration Failure"
+      echo
+      echo "Missing required autodev planning spine logs."
+      echo
+      echo "Expected:"
+      echo "- $RUN_ROOT/corpus.log"
+      echo "- $RUN_ROOT/gen.log"
+      echo
+      echo "Normal pilot runs must execute auto corpus and auto gen --snapshot-only before implementation."
+    } > "$RUN_ROOT/orchestration-failure.md"
+  fi
+fi
+
+if [[ "$CONTRACT_STATUS" -eq 0 && -s "$RUN_ROOT/steward-preflight/PROMOTIONS.md" ]]; then
+  if [[ ! -s "$RUN_ROOT/steward-promotion-decisions.md" ]]; then
+    CONTRACT_STATUS=75
+    {
+      echo "# Orchestration Failure"
+      echo
+      echo "Missing required steward promotion decision artifact."
+      echo
+      echo "Expected: $RUN_ROOT/steward-promotion-decisions.md"
+      echo
+      echo "When auto steward produces PROMOTIONS.md, the supervisor must accept, reject, or defer each ready/proposed promotion before execution."
+    } > "$RUN_ROOT/orchestration-failure.md"
+  elif grep -q UNDECIDED "$RUN_ROOT/steward-promotion-decisions.md"; then
+    CONTRACT_STATUS=76
+    {
+      echo "# Orchestration Failure"
+      echo
+      echo "Steward promotion decisions still contain UNDECIDED entries."
+      echo
+      echo "Artifact: $RUN_ROOT/steward-promotion-decisions.md"
+    } > "$RUN_ROOT/orchestration-failure.md"
+  fi
+fi
+
+if [[ "$CODEX_STATUS" -eq 0 && "$CONTRACT_STATUS" -ne 0 ]]; then
+  CODEX_STATUS="$CONTRACT_STATUS"
+fi
+
+{
+  echo "codex_status=$CODEX_STATUS"
+  echo "completed=$(date -u +%FT%TZ)"
+} >> "$RUN_ROOT/run.env"
+
+if [[ -f "$RUN_ROOT/receipt.md" ]]; then
+  NEXT_LINE="$(awk '/^## Next Command/{flag=1; next} flag && NF {print; exit}' "$RUN_ROOT/receipt.md" 2>/dev/null || true)"
+else
+  NEXT_LINE="inspect $RUN_ROOT/codex/final.md and $RUN_ROOT/codex/codex-exec.jsonl"
+fi
+
+send_telegram "[pilot-dev]" "finished $REPO_SLUG
+run: $RUN_ID
+codex_status: $CODEX_STATUS
+receipt: $RUN_ROOT/receipt.md
+next: ${NEXT_LINE:-inspect receipt}"
+
+echo "repo: $REPO_SLUG"
+echo "workdir: $WORKDIR"
+echo "run: $RUN_ID"
+echo "run_root: $RUN_ROOT"
+echo "codex_status: $CODEX_STATUS"
+echo "codex_log: $CODEX_LOG"
+echo "codex_final: $CODEX_FINAL"
+echo "receipt: $RUN_ROOT/receipt.md"
+
+exit "$CODEX_STATUS"
