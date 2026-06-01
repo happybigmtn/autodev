@@ -862,8 +862,10 @@ pub(crate) fn reconcile_parallel_landed_task_state(
     changed_files: &[String],
 ) -> Result<LoopTaskStatus> {
     let evidence_before = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    let mut review_evidence = evidence_before.clone();
+    review_evidence.has_review_handoff = true;
     let review_added =
-        ensure_host_review_handoff(repo_root, &task.id, changed_files, &evidence_before)?;
+        ensure_host_review_handoff(repo_root, &task.id, changed_files, &review_evidence)?;
     let evidence_after = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
     let completion_status = if evidence_after.is_fully_evidenced() {
         LoopTaskStatus::Done
@@ -872,7 +874,8 @@ pub(crate) fn reconcile_parallel_landed_task_state(
     };
 
     task.status = completion_status;
-    let plan_updated = update_task_completion_in_plan(repo_root, &task.id, completion_status)?;
+    let plan_updated =
+        update_reconciled_task_completion_in_plan(repo_root, task, completion_status)?;
     if review_added || plan_updated {
         let mut queue_files = Vec::new();
         if review_added {
@@ -1423,6 +1426,7 @@ mod tests {
         assert!(review.contains("`TASK-003`"));
         assert!(review.contains("crates/ab-events/src/lib.rs"));
         assert!(review.contains("missing scripts/run-task-verification.sh"));
+        assert!(!review.contains("missing REVIEW.md handoff"));
         let staged = run_git_in(&repo, ["diff", "--cached", "--name-only"]);
         assert!(staged.contains("IMPLEMENTATION_PLAN.md"));
         assert!(staged.contains("REVIEW.md"));

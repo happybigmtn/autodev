@@ -370,6 +370,28 @@ pub(crate) fn update_task_completion_in_plan(
     Ok(true)
 }
 
+pub(crate) fn update_reconciled_task_completion_in_plan(
+    repo_root: &Path,
+    task: &LoopTask,
+    status: LoopTaskStatus,
+) -> Result<bool> {
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    if !plan_path.exists() {
+        return Ok(false);
+    }
+
+    let plan = fs::read_to_string(&plan_path)
+        .with_context(|| format!("failed to read {}", plan_path.display()))?;
+    let updated = update_reconciled_task_completion_in_plan_text(&plan, task, status);
+    if updated == plan {
+        return Ok(false);
+    }
+
+    atomic_write(&plan_path, updated.as_bytes())
+        .with_context(|| format!("failed to write {}", plan_path.display()))?;
+    Ok(true)
+}
+
 pub(crate) fn update_task_completion_in_plan_text(
     plan: &str,
     task_id: &str,
@@ -391,7 +413,42 @@ pub(crate) fn update_task_completion_in_plan_text(
     updated
 }
 
+pub(crate) fn update_reconciled_task_completion_in_plan_text(
+    plan: &str,
+    task: &LoopTask,
+    status: LoopTaskStatus,
+) -> String {
+    let mut updated = String::new();
+    let mut matched_exact_row = false;
+
+    for chunk in plan.split_inclusive('\n') {
+        let line = chunk.trim_end_matches('\n').trim_end_matches('\r');
+        if let Some((_, current_task_id, current_title)) = parse_task_header(line) {
+            if current_task_id == task.id && current_title == task.title {
+                updated.push_str(&mark_task_header_status_with_policy(chunk, status, true));
+                matched_exact_row = true;
+                continue;
+            }
+        }
+        updated.push_str(chunk);
+    }
+
+    if matched_exact_row {
+        updated
+    } else {
+        update_task_completion_in_plan_text(plan, &task.id, status)
+    }
+}
+
 pub(crate) fn mark_task_header_status(line: &str, status: LoopTaskStatus) -> String {
+    mark_task_header_status_with_policy(line, status, false)
+}
+
+fn mark_task_header_status_with_policy(
+    line: &str,
+    status: LoopTaskStatus,
+    allow_done_demotion: bool,
+) -> String {
     let newline = if line.ends_with("\r\n") {
         "\r\n"
     } else if line.ends_with('\n') {
@@ -420,7 +477,7 @@ pub(crate) fn mark_task_header_status(line: &str, status: LoopTaskStatus) -> Str
     // automated reconcile pass must not demote it. This guards against
     // duplicate-ID rows in IMPLEMENTATION_PLAN.md where landing one row would
     // otherwise rewrite a sibling [x] row that shares the same task ID.
-    if existing_done && status != LoopTaskStatus::Done {
+    if existing_done && status != LoopTaskStatus::Done && !allow_done_demotion {
         return line.to_string();
     }
     let marker = match status {
@@ -836,6 +893,31 @@ mod tests {
             updated.contains("- [~] `AUDIT-94` Newly assigned duplicate-id row"),
             "still-pending duplicate must be marked partial: {updated}"
         );
+    }
+
+    #[test]
+    fn update_reconciled_task_completion_in_plan_text_can_demote_exact_done_row() {
+        let plan = r#"- [x] `TASK-004` Checkpoint skeleton readiness before widening
+  Dependencies: `TASK-003`
+- [x] `TASK-004` Historical duplicate with a different title
+  Dependencies: none
+"#;
+        let task = LoopTask {
+            id: "TASK-004".to_string(),
+            title: "Checkpoint skeleton readiness before widening".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec!["TASK-003".to_string()],
+            estimated_scope: Some("XS".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-004` Checkpoint skeleton readiness before widening\nDependencies: `TASK-003`\n".to_string(),
+        };
+
+        let updated =
+            update_reconciled_task_completion_in_plan_text(plan, &task, LoopTaskStatus::Partial);
+
+        assert!(updated.contains("- [~] `TASK-004` Checkpoint skeleton readiness before widening"));
+        assert!(updated.contains("- [x] `TASK-004` Historical duplicate with a different title"));
     }
 
     #[test]
