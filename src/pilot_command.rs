@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::Args;
 use serde_json::{Value, json};
 
+use crate::parallel_command::{LoopTaskStatus, parse_loop_plan};
 use crate::util::atomic_write;
 
 const DEFAULT_FOCUS: &str =
@@ -1228,6 +1229,12 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     validate_command_selection(&paths.run_root, &mut errors);
     validate_landing_manifest(&landing_manifest_path, &mut errors);
     validate_execution_manifest(&execution_manifest_path, &mut errors);
+    validate_selected_task_plan_state(
+        &paths.workdir,
+        &paths.run_root,
+        &execution_manifest_path,
+        &mut errors,
+    );
     validate_receipt(&paths.run_root.join("receipt.md"), &mut errors);
     validate_planning_manifest(&planning_manifest_path, &mut errors);
     validate_steward_promotion_decisions(&paths.run_root, &mut errors);
@@ -1797,6 +1804,86 @@ fn validate_execution_manifest(path: &Path, errors: &mut Vec<String>) {
                 "execution manifest missing telegram summary `{key}`"
             ));
         }
+    }
+}
+
+fn validate_selected_task_plan_state(
+    workdir: &Path,
+    run_root: &Path,
+    execution_manifest_path: &Path,
+    errors: &mut Vec<String>,
+) {
+    let Some(manifest) = read_json_artifact(execution_manifest_path) else {
+        return;
+    };
+    let status = string_at(&manifest, &["status"]);
+    if !matches!(status, "executed" | "degraded") {
+        return;
+    }
+
+    let task_id = string_at(&manifest, &["selected_task", "id"]);
+    if task_id.is_empty() {
+        return;
+    }
+
+    let Some(plan_path) = selected_task_plan_path(workdir, run_root, &manifest) else {
+        errors.push(format!(
+            "execution selected task `{task_id}` is marked `{status}` but no source plan or IMPLEMENTATION_PLAN.md exists for task-state validation"
+        ));
+        return;
+    };
+    let Ok(plan_text) = fs::read_to_string(&plan_path) else {
+        errors.push(format!(
+            "execution selected task `{task_id}` source plan is unreadable: {}",
+            plan_path.display()
+        ));
+        return;
+    };
+    let plan = parse_loop_plan(&plan_text);
+    let Some(task) = plan.task(task_id) else {
+        errors.push(format!(
+            "execution selected task `{task_id}` is missing from source plan {}",
+            plan_path.display()
+        ));
+        return;
+    };
+    match task.status {
+        LoopTaskStatus::Pending | LoopTaskStatus::Blocked => {
+            errors.push(format!(
+                "execution selected task `{task_id}` is still {} in {}; mark the task `[~]`/`[x]` or classify the run as blocked",
+                loop_task_status_label(task.status),
+                plan_path.display()
+            ));
+        }
+        LoopTaskStatus::Partial | LoopTaskStatus::Done => {}
+    }
+}
+
+fn selected_task_plan_path(workdir: &Path, run_root: &Path, manifest: &Value) -> Option<PathBuf> {
+    let source_plan = string_at(manifest, &["selected_task", "source_plan"]);
+    if !source_plan.is_empty() {
+        let source_path = Path::new(source_plan);
+        if source_path.is_absolute() && source_path.exists() {
+            return Some(source_path.to_path_buf());
+        }
+        for base in [run_root, workdir] {
+            let candidate = base.join(source_path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let root_plan = workdir.join("IMPLEMENTATION_PLAN.md");
+    root_plan.exists().then_some(root_plan)
+}
+
+fn loop_task_status_label(status: LoopTaskStatus) -> &'static str {
+    match status {
+        LoopTaskStatus::Pending => "pending",
+        LoopTaskStatus::Blocked => "blocked",
+        LoopTaskStatus::Partial => "partial",
+        LoopTaskStatus::Done => "done",
     }
 }
 
@@ -2415,6 +2502,36 @@ mod tests {
     }
 
     #[test]
+    fn closeout_validation_rejects_executed_task_still_pending_in_plan() {
+        let root = unique_temp_dir("closeout-task-still-pending");
+        write_complete_closeout_artifacts(&root, false);
+        std::fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "\
+# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [ ] `TASK-001` Fixture slice
+  Verification:
+    - `cargo test pilot_command`
+  Dependencies: none
+",
+        )
+        .expect("plan");
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        let err = validate_closeout(&args, &paths).expect_err("invalid closeout");
+
+        assert!(err.to_string().contains("pilot closeout validation failed"));
+        let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
+            .expect("failure artifact");
+        assert!(failure.contains("execution selected task `TASK-001` is still pending"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn execution_manifest_writer_creates_pending_contract() {
         let root = unique_temp_dir("execution-contract");
         let args = test_pilot_args(root.clone());
@@ -2741,9 +2858,9 @@ mod tests {
                 "schema_version": 1,
                 "status": "executed",
                 "selected_task": {
-                    "id": "pilot-fixture",
+                    "id": "TASK-001",
                     "title": "Fixture slice",
-                    "source_plan": "pilot-planning.json",
+                    "source_plan": "IMPLEMENTATION_PLAN.md",
                     "no_task_reason": ""
                 },
                 "executor": {
@@ -2784,6 +2901,20 @@ mod tests {
             .expect("execution json"),
         )
         .expect("execution manifest");
+        std::fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "\
+# IMPLEMENTATION_PLAN
+
+## Priority Work
+
+- [x] `TASK-001` Fixture slice
+  Verification:
+    - `cargo test pilot_command`
+  Dependencies: none
+",
+        )
+        .expect("plan");
         std::fs::write(
             root.join("receipt.md"),
             "\
