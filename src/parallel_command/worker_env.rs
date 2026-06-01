@@ -1,5 +1,9 @@
 use super::*;
 
+const WORKER_GIT_GUARD_DIR: &str = "worker-bin";
+const WORKER_GIT_GUARD_BLOCKED_VERBS: [&str; 4] = ["push", "pull", "fetch", "rebase"];
+const WORKER_GIT_GUARD_PROTOCOLS: [&str; 4] = ["ssh", "https", "http", "git"];
+
 pub(crate) fn parallel_run_root(repo_root: &Path, args: &ParallelArgs) -> PathBuf {
     match args.run_root.as_deref() {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -27,7 +31,7 @@ pub(crate) fn build_loop_worker_env(
     let parallelism = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4);
-    resolve_loop_worker_env(
+    let mut worker_env = resolve_loop_worker_env(
         args.cargo_build_jobs,
         args.cargo_target,
         inherited.as_deref(),
@@ -36,7 +40,9 @@ pub(crate) fn build_loop_worker_env(
         args.max_concurrent_workers,
         repo_uses_cargo(repo_root),
         run_root,
-    )
+    )?;
+    install_parallel_worker_git_guard(&mut worker_env.extra_env, run_root)?;
+    Ok(worker_env)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,6 +222,151 @@ pub(crate) fn repo_uses_cargo(repo_root: &Path) -> bool {
     repo_root.join("Cargo.toml").exists()
 }
 
+pub(crate) fn install_parallel_worker_git_guard(
+    extra_env: &mut Vec<(String, String)>,
+    run_root: &Path,
+) -> Result<()> {
+    let guard_dir = run_root.join(WORKER_GIT_GUARD_DIR);
+    fs::create_dir_all(&guard_dir)
+        .with_context(|| format!("failed to create {}", guard_dir.display()))?;
+    let guard_path = guard_dir.join("git");
+    atomic_write(&guard_path, worker_git_guard_script().as_bytes())
+        .with_context(|| format!("failed to write {}", guard_path.display()))?;
+    make_executable(&guard_path)?;
+
+    let real_git = resolve_real_git_for_worker_guard(run_root)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+    upsert_env(extra_env, "AUTO_PARALLEL_GIT_GUARD", "remote-git-disabled");
+    upsert_env(extra_env, "AUTO_REAL_GIT", &real_git.to_string_lossy());
+    upsert_env(extra_env, "GIT_TERMINAL_PROMPT", "0");
+    upsert_env(extra_env, "GIT_ASKPASS", "/bin/false");
+    upsert_env(extra_env, "SSH_ASKPASS", "/bin/false");
+    install_git_protocol_block_config(extra_env);
+
+    let current_path = extra_env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| env::var("PATH").ok())
+        .unwrap_or_default();
+    let guarded_path = if current_path.trim().is_empty() {
+        guard_dir.to_string_lossy().into_owned()
+    } else {
+        format!("{}:{current_path}", guard_dir.display())
+    };
+    upsert_env(extra_env, "PATH", &guarded_path);
+    Ok(())
+}
+
+fn install_git_protocol_block_config(extra_env: &mut Vec<(String, String)>) {
+    upsert_env(
+        extra_env,
+        "GIT_CONFIG_COUNT",
+        &WORKER_GIT_GUARD_PROTOCOLS.len().to_string(),
+    );
+    for (index, protocol) in WORKER_GIT_GUARD_PROTOCOLS.iter().enumerate() {
+        upsert_env(
+            extra_env,
+            &format!("GIT_CONFIG_KEY_{index}"),
+            &format!("protocol.{protocol}.allow"),
+        );
+        upsert_env(extra_env, &format!("GIT_CONFIG_VALUE_{index}"), "never");
+    }
+}
+
+fn worker_git_guard_script() -> String {
+    let blocked_pattern = WORKER_GIT_GUARD_BLOCKED_VERBS.join("|");
+    format!(
+        r#"#!/bin/sh
+verb=""
+expect_value=0
+for arg in "$@"; do
+  if [ "$expect_value" = "1" ]; then
+    expect_value=0
+    continue
+  fi
+  case "$arg" in
+    -C|-c|--git-dir|--work-tree|--namespace)
+      expect_value=1
+      continue
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*)
+      continue
+      ;;
+    -*)
+      continue
+      ;;
+    *)
+      verb="$arg"
+      break
+      ;;
+  esac
+done
+
+case "$verb" in
+  {blocked_pattern})
+    echo "AUTO_ENV_BLOCKER: auto parallel worker git guard blocked 'git $verb'; host owns remote sync and branch reconciliation" >&2
+    exit 126
+    ;;
+esac
+
+if [ -n "${{AUTO_REAL_GIT:-}}" ]; then
+  exec "$AUTO_REAL_GIT" "$@"
+fi
+exec git "$@"
+"#
+    )
+}
+
+fn upsert_env(extra_env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = extra_env
+        .iter_mut()
+        .rev()
+        .find(|(existing, _)| existing == key)
+    {
+        *existing = value.to_string();
+    } else {
+        extra_env.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn resolve_real_git_for_worker_guard(run_root: &Path) -> Option<PathBuf> {
+    if let Some(path) = env::var_os("AUTO_REAL_GIT")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path.exists())
+    {
+        return Some(path);
+    }
+
+    let path_env = env::var_os("PATH")?;
+    for path_dir in env::split_paths(&path_env) {
+        let candidate = path_dir.join("git");
+        if candidate.starts_with(run_root) {
+            continue;
+        }
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn effective_parallel_claude_max_turns(args: &ParallelArgs) -> Option<usize> {
     args.max_turns
 }
@@ -231,6 +382,7 @@ pub(crate) fn default_cargo_build_jobs_for(
 
 #[cfg(test)]
 mod tests {
+    use super::{make_executable, worker_git_guard_script, WORKER_GIT_GUARD_DIR};
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -382,6 +534,127 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("--cargo-build-jobs"));
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn build_loop_worker_env_installs_git_guard() {
+        let repo_root = unique_temp_dir("loop-worker-env-git-guard-repo");
+        let run_root = unique_temp_dir("loop-worker-env-git-guard-run");
+        fs::create_dir_all(&repo_root).expect("failed to create repo root");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let args = ParallelArgs {
+            action: None,
+            apply_receipt_backfill_handoffs: false,
+            max_iterations: None,
+            max_concurrent_workers: 2,
+            cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::None,
+            prompt_file: None,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: None,
+            reference_repos: Vec::new(),
+            include_siblings: false,
+            run_root: None,
+            codex_bin: PathBuf::from("codex"),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        };
+
+        let env = build_loop_worker_env(&args, &repo_root, &run_root)
+            .expect("worker env should include git guard");
+        let guard_dir = run_root.join(WORKER_GIT_GUARD_DIR);
+        let guard_path = guard_dir.join("git");
+        assert!(guard_path.exists(), "missing {}", guard_path.display());
+        assert_eq!(
+            env.extra_env
+                .iter()
+                .find(|(key, _)| key == "AUTO_PARALLEL_GIT_GUARD")
+                .map(|(_, value)| value.as_str()),
+            Some("remote-git-disabled")
+        );
+        assert!(env
+            .extra_env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .is_some_and(|(_, value)| value.starts_with(&format!("{}:", guard_dir.display()))));
+        assert_eq!(
+            env.extra_env
+                .iter()
+                .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+                .map(|(_, value)| value.as_str()),
+            Some("4")
+        );
+        assert!(env
+            .extra_env
+            .iter()
+            .any(|(key, value)| { key == "GIT_CONFIG_KEY_0" && value == "protocol.ssh.allow" }));
+
+        fs::remove_dir_all(&repo_root).expect("failed to remove repo root");
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn git_guard_script_blocks_remote_sync_verbs_before_real_git() {
+        let run_root = unique_temp_dir("loop-worker-env-git-guard-script");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("git");
+        atomic_write(&guard_path, worker_git_guard_script().as_bytes())
+            .expect("failed to write guard");
+        make_executable(&guard_path).expect("failed to chmod guard");
+
+        let blocked = Command::new(&guard_path)
+            .arg("-C")
+            .arg("/tmp/repo")
+            .arg("push")
+            .arg("origin")
+            .arg("main")
+            .env("AUTO_REAL_GIT", "/bin/echo")
+            .output()
+            .expect("guard should run");
+        assert_eq!(blocked.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("AUTO_ENV_BLOCKER"));
+
+        let allowed = Command::new(&guard_path)
+            .arg("status")
+            .env("AUTO_REAL_GIT", "/bin/echo")
+            .output()
+            .expect("guard should delegate");
+        assert!(allowed.status.success());
+        assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "status");
+
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn git_guard_env_blocks_absolute_git_network_transport() {
+        let run_root = unique_temp_dir("loop-worker-env-git-guard-protocol");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let mut extra_env = Vec::new();
+        install_parallel_worker_git_guard(&mut extra_env, &run_root)
+            .expect("git guard should install");
+        let real_git = extra_env
+            .iter()
+            .find(|(key, _)| key == "AUTO_REAL_GIT")
+            .map(|(_, value)| value.clone())
+            .expect("guard should record real git");
+
+        let blocked = Command::new(real_git)
+            .arg("ls-remote")
+            .arg("https://example.com/repo.git")
+            .envs(extra_env.iter().map(|(key, value)| (key, value)))
+            .output()
+            .expect("absolute git should run");
+        assert!(!blocked.status.success());
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(
+            stderr.contains("transport 'https' not allowed")
+                || stderr.contains("transport 'https' is not allowed"),
+            "{stderr}"
+        );
+
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
 
