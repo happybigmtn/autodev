@@ -30,9 +30,9 @@ pub(crate) use crate::task_parser::{
     PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root,
-    git_status_short_filtered, git_stdout, push_branch_with_remote_sync, repo_name, run_git,
-    sync_branch_with_remote, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_cherry_pick_empty_arg,
+    git_repo_root, git_status_short_filtered, git_stdout, push_branch_with_remote_sync, repo_name,
+    run_git, sync_branch_with_remote, timestamp_slug,
 };
 pub(crate) use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 

@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::audit_everything::manifest::EverythingManifest;
 use crate::audit_everything::run_paths::RunPaths;
-use crate::util::{git_stdout, run_git};
+use crate::util::{git_cherry_pick_empty_arg, git_stdout, run_git};
 
 pub(crate) fn commit_worktree_changes(
     paths: &RunPaths,
@@ -168,7 +168,7 @@ pub(crate) fn cherry_pick_lane_range(
         .arg("-C")
         .arg(repo_root)
         .arg("cherry-pick")
-        .arg("--empty=drop")
+        .arg(git_cherry_pick_empty_arg())
         .arg(&range)
         .output()
         .with_context(|| format!("failed to cherry-pick {range} in {}", repo_root.display()))?;

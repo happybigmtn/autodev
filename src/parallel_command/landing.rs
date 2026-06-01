@@ -995,7 +995,7 @@ pub(crate) fn cherry_pick_lane_range(
         .arg("-C")
         .arg(repo_root)
         .arg("cherry-pick")
-        .arg("--empty=drop")
+        .arg(git_cherry_pick_empty_arg())
         .arg(&range)
         .output()
         .with_context(|| format!("failed to cherry-pick {range} in {}", repo_root.display()))?;

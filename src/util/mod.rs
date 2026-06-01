@@ -12,9 +12,9 @@ pub(crate) use fsutil::{
     opencode_agent_dir, prune_pi_runtime_state, truncate_file_to_max_bytes, write_0o600_if_unix,
 };
 pub(crate) use git::{
-    auto_checkpoint_if_needed, git_branch_exists, git_repo_root, git_status_short_filtered,
-    git_stdout, parse_origin_head_branch, push_branch_with_remote_sync, run_git,
-    sync_branch_with_remote, KNOWN_PRIMARY_BRANCHES,
+    auto_checkpoint_if_needed, git_branch_exists, git_cherry_pick_empty_arg, git_repo_root,
+    git_status_short_filtered, git_stdout, parse_origin_head_branch, push_branch_with_remote_sync,
+    run_git, sync_branch_with_remote, KNOWN_PRIMARY_BRANCHES,
 };
 
 pub(crate) const CLI_LONG_VERSION: &str = concat!(

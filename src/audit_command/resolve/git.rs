@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::audit_command::resolve::lanes::{FindingResolutionLane, FindingResolutionLaneOutcome};
-use crate::util::{git_stdout, push_branch_with_remote_sync, run_git};
+use crate::util::{git_cherry_pick_empty_arg, git_stdout, push_branch_with_remote_sync, run_git};
 
 pub(crate) fn clone_finding_resolution_lane_repo(
     repo_root: &Path,
@@ -197,7 +197,8 @@ fn cherry_pick_finding_resolution_lane_range(
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["cherry-pick", "--empty=drop"])
+        .arg("cherry-pick")
+        .arg(git_cherry_pick_empty_arg())
         .arg(&range)
         .output()
         .with_context(|| format!("failed to cherry-pick {range} into {}", repo_root.display()))?;

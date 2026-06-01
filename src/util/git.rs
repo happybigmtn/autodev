@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 
@@ -108,6 +109,30 @@ pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a s
         repo_root.display(),
         git_failure_message(&output)
     );
+}
+
+pub(crate) fn git_cherry_pick_empty_arg() -> &'static str {
+    static ARG: OnceLock<&'static str> = OnceLock::new();
+    ARG.get_or_init(|| {
+        let output = Command::new("git").args(["cherry-pick", "-h"]).output();
+        let Ok(output) = output else {
+            return "--keep-redundant-commits";
+        };
+        let help = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git_cherry_pick_empty_arg_from_help(&help)
+    })
+}
+
+fn git_cherry_pick_empty_arg_from_help(help: &str) -> &'static str {
+    if help.contains("--empty=") || help.contains("--empty <") || help.contains("--empty (") {
+        "--empty=drop"
+    } else {
+        "--keep-redundant-commits"
+    }
 }
 
 fn checkpoint_status(repo_root: &Path) -> Result<String> {
@@ -429,9 +454,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        auto_checkpoint_if_needed, checkpoint_status, is_checkpoint_excluded_path,
-        parse_origin_head_branch, push_branch_with_remote_sync, stage_checkpoint_changes,
-        sync_branch_with_remote,
+        auto_checkpoint_if_needed, checkpoint_status, git_cherry_pick_empty_arg_from_help,
+        is_checkpoint_excluded_path, parse_origin_head_branch, push_branch_with_remote_sync,
+        stage_checkpoint_changes, sync_branch_with_remote,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -467,6 +492,21 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git stdout should be utf-8")
+    }
+
+    #[test]
+    fn cherry_pick_empty_arg_prefers_drop_when_supported() {
+        let help = "usage: git cherry-pick [--empty <stop|drop|keep>] <commit>...";
+        assert_eq!(git_cherry_pick_empty_arg_from_help(help), "--empty=drop");
+    }
+
+    #[test]
+    fn cherry_pick_empty_arg_falls_back_for_git_243_help() {
+        let help = "--[no-]keep-redundant-commits keep redundant, empty commits";
+        assert_eq!(
+            git_cherry_pick_empty_arg_from_help(help),
+            "--keep-redundant-commits"
+        );
     }
 
     fn write_repo_file(repo: &Path, path: &str, contents: &str) {
