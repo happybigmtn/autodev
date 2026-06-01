@@ -554,6 +554,9 @@ wrapper exits with an orchestration failure.
 Required typed preflight artifacts:
 
 - `run.env`
+- `phase.env`
+- `phase-heartbeat.json`
+- `phase-history.jsonl`
 - `pilot-preflight.json`
 - `pilot-landing.json`
 - `orchestrator-doctor.log`
@@ -568,6 +571,10 @@ Required typed preflight artifacts:
 - `pilot-execution.json` when `--execution-manifest-only` runs
 - `gbrain/*.md`
 - optional `plan-input.md`
+
+Hermes status reporters must read `phase-heartbeat.json` before inferring state
+from process names. `phase-history.jsonl` is the audit trail for teaching
+reports and post-run diagnosis.
 
 No-Codex smoke proof:
 

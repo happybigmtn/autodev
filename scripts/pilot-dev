@@ -143,9 +143,57 @@ send_telegram() {
   fi
 }
 
+
+write_phase() {
+  local phase="$1"
+  local status="${2:-running}"
+  local detail="${3:-}"
+  local artifact="${4:-}"
+  local updated_at
+  updated_at="$(date -u +%FT%TZ)"
+  {
+    echo "current_phase=$phase"
+    echo "current_phase_status=$status"
+    echo "current_phase_updated_at=$updated_at"
+    if [[ -n "$artifact" ]]; then
+      echo "current_phase_artifact=$artifact"
+    fi
+  } > "$RUN_ROOT/phase.env"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$RUN_ROOT/phase-heartbeat.json" "$RUN_ROOT/phase-history.jsonl" "$RUN_ID" "$REPO_SLUG" "$WORKDIR" "$phase" "$status" "$detail" "$artifact" "$updated_at" <<'PY_PHASE' || true
+import json
+import os
+import sys
+from pathlib import Path
+
+heartbeat_path = Path(sys.argv[1])
+history_path = Path(sys.argv[2])
+entry = {
+    "schema_version": 1,
+    "run_id": sys.argv[3],
+    "repo": sys.argv[4],
+    "workdir": sys.argv[5],
+    "phase": sys.argv[6],
+    "status": sys.argv[7],
+    "detail": sys.argv[8],
+    "artifact": sys.argv[9],
+    "updated_at": sys.argv[10],
+    "pid": os.getpid(),
+}
+heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+tmp = heartbeat_path.with_suffix(heartbeat_path.suffix + ".tmp")
+tmp.write_text(json.dumps(entry, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+tmp.replace(heartbeat_path)
+with history_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(entry, sort_keys=True) + "\n")
+PY_PHASE
+  fi
+}
+
 fail_orchestration() {
   local code="$1"
   shift
+  write_phase "failed" "failed" "exit $code" "$RUN_ROOT/orchestration-failure.md"
   {
     echo "# Orchestration Failure"
     echo
@@ -205,6 +253,7 @@ auto_version_commit() {
   echo "AUTO_SKIP_REMOTE_SYNC=${AUTO_SKIP_REMOTE_SYNC:-}"
   echo "created=$(date -u +%FT%TZ)"
 } > "$RUN_ROOT/run.env"
+write_phase "initialized" "running" "pilot-dev initialized" "$RUN_ROOT/run.env"
 
 AUTODEV_SOURCE_HEAD=""
 if [[ -d "$AUTODEV_SOURCE/.git" && -f "$AUTODEV_SOURCE/Cargo.toml" ]]; then
@@ -225,6 +274,7 @@ if [[ -n "$AUTODEV_SOURCE_HEAD" && "${AUTODEV_INSTALLED_BEFORE:-}" != "$AUTODEV_
       "Installed auto commit: \`${AUTODEV_INSTALLED_BEFORE:-missing}\`" \
       "Source: \`$AUTODEV_SOURCE\`"
   fi
+  write_phase "autodev-install" "running" "install current autodev source" "$RUN_ROOT/logs/autodev-install.log"
   (
     cd "$AUTODEV_SOURCE"
     PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/home/dev/.cargo/bin:/home/dev/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH" \
@@ -235,6 +285,7 @@ if [[ -n "$AUTODEV_SOURCE_HEAD" && "${AUTODEV_INSTALLED_BEFORE:-}" != "$AUTODEV_
       "Source: \`$AUTODEV_SOURCE\`" \
       "Log: \`$RUN_ROOT/logs/autodev-install.log\`"
   hash -r || true
+  write_phase "autodev-install" "ok" "installed current autodev source" "$RUN_ROOT/logs/autodev-install.log"
 fi
 
 AUTODEV_INSTALLED_AFTER="$(auto_version_commit || true)"
@@ -294,6 +345,7 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
   fi
   TYPED_PREFLIGHT_ARGS+=("${REFERENCE_ARGS[@]}")
 
+  write_phase "$TYPED_PILOT_PHASE" "running" "auto pilot $TYPED_PILOT_MODE_FLAG" "$TYPED_PILOT_LOG"
   if (
     cd "$WORKDIR"
     auto "${TYPED_PREFLIGHT_ARGS[@]}"
@@ -302,6 +354,7 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
     if [[ "$TYPED_PILOT_PHASE" == "planning" ]]; then
       TYPED_PLANNING_RAN=1
     fi
+    write_phase "$TYPED_PILOT_PHASE" "ok" "auto pilot $TYPED_PILOT_MODE_FLAG" "$TYPED_PILOT_LOG"
     {
       echo "autodev_source_head=${AUTODEV_SOURCE_HEAD:-unknown}"
       echo "autodev_installed_commit_before=${AUTODEV_INSTALLED_BEFORE:-missing}"
@@ -312,6 +365,7 @@ if [[ "$TYPED_PREFLIGHT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pi
       echo "typed_pilot_log=$TYPED_PILOT_LOG"
     } >> "$RUN_ROOT/run.env"
   else
+    write_phase "$TYPED_PILOT_PHASE" "failed" "auto pilot $TYPED_PILOT_MODE_FLAG" "$TYPED_PILOT_LOG"
     {
       echo "typed_preflight_ran=0"
       echo "typed_planning_ran=0"
@@ -359,17 +413,20 @@ if [[ "$TYPED_EXECUTION_MANIFEST" == "1" ]] && command -v auto >/dev/null 2>&1 &
   fi
   TYPED_EXECUTION_MANIFEST_ARGS+=("${REFERENCE_ARGS[@]}")
 
+  write_phase "execution-manifest" "running" "auto pilot --execution-manifest-only" "$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
   if (
     cd "$WORKDIR"
     auto "${TYPED_EXECUTION_MANIFEST_ARGS[@]}"
   ) > "$RUN_ROOT/logs/auto-pilot-execution-manifest.log" 2>&1; then
     TYPED_EXECUTION_MANIFEST_RAN=1
+    write_phase "execution-manifest" "ok" "auto pilot --execution-manifest-only" "$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
     {
       echo "typed_execution_manifest_ran=1"
       echo "typed_execution_manifest_status=ok"
       echo "typed_execution_manifest_log=$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
     } >> "$RUN_ROOT/run.env"
   else
+    write_phase "execution-manifest" "failed" "auto pilot --execution-manifest-only" "$RUN_ROOT/logs/auto-pilot-execution-manifest.log"
     {
       echo "typed_execution_manifest_ran=0"
       echo "typed_execution_manifest_status=failed"
@@ -392,6 +449,7 @@ workdir: $WORKDIR
 intent: $PROMPT"
 
 if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v auto >/dev/null 2>&1; then
+  write_phase "command-surface" "running" "inventory auto command surface" "$RUN_ROOT/autodev-command-selection.md"
   auto --version > "$RUN_ROOT/logs/auto-version.log" 2>&1 || true
   auto --help > "$RUN_ROOT/logs/auto-help.log" 2>&1 || true
   if auto command-surface --json > "$RUN_ROOT/logs/auto-command-surface.json" 2>/dev/null && command -v jq >/dev/null 2>&1; then
@@ -504,6 +562,7 @@ if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v auto >/dev/null 2>&1; then
       fi
     } > "$RUN_ROOT/autodev-command-selection.md"
   fi
+  write_phase "command-surface" "ok" "inventoried auto command surface" "$RUN_ROOT/autodev-command-selection.md"
 fi
 
 run_logged() {
@@ -514,6 +573,22 @@ run_logged() {
     set -o pipefail
     "$@" 2>&1 | tee "$log_path"
   )
+}
+
+run_phase_logged() {
+  local phase="$1"
+  local detail="$2"
+  local log_path="$3"
+  shift 3
+  write_phase "$phase" "running" "$detail" "$log_path"
+  if run_logged "$log_path" "$@"; then
+    write_phase "$phase" "ok" "$detail" "$log_path"
+    return 0
+  else
+    local status="$?"
+    write_phase "$phase" "failed" "exit $status: $detail" "$log_path"
+    return "$status"
+  fi
 }
 
 EFFECTIVE_PLANNING_MODE="$PLANNING_MODE"
@@ -533,13 +608,13 @@ if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
     ORCHESTRATOR_DOCTOR_ARGS+=(--allow-local-only)
   fi
   if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]]; then
-    run_logged "$RUN_ROOT/orchestrator-doctor.log" auto "${ORCHESTRATOR_DOCTOR_ARGS[@]}"
-    run_logged "$RUN_ROOT/doctor.log" auto doctor
+    run_phase_logged "orchestrator-doctor" "auto doctor --orchestrator" "$RUN_ROOT/orchestrator-doctor.log" auto "${ORCHESTRATOR_DOCTOR_ARGS[@]}"
+    run_phase_logged "doctor" "auto doctor" "$RUN_ROOT/doctor.log" auto doctor
   fi
 
   if [[ "$TYPED_PLANNING_RAN" != "1" ]]; then
     if [[ "$REQUIRE_PLANNING_SPINE" == "1" && "$EFFECTIVE_PLANNING_MODE" != "none" ]]; then
-      run_logged "$RUN_ROOT/corpus.log" \
+      run_phase_logged "corpus" "auto corpus planning spine" "$RUN_ROOT/corpus.log" \
         auto corpus \
           --idea "$PROMPT" \
           --focus "$FOCUS" \
@@ -549,7 +624,7 @@ if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
           --review-effort "$PLAN_EFFORT" \
           "${REFERENCE_ARGS[@]}"
 
-      run_logged "$RUN_ROOT/gen.log" \
+      run_phase_logged "gen" "auto gen --snapshot-only planning spine" "$RUN_ROOT/gen.log" \
         auto gen \
           --snapshot-only \
           --model "$MODEL" \
@@ -562,7 +637,7 @@ if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
       greenfield)
         ;;
       steward|full)
-        run_logged "$RUN_ROOT/steward-preflight.log" \
+        run_phase_logged "steward-preflight" "auto steward --report-only" "$RUN_ROOT/steward-preflight.log" \
           auto steward \
             --report-only \
             --output-dir "$RUN_ROOT/steward-preflight" \
@@ -583,6 +658,7 @@ if command -v auto >/dev/null 2>&1 && [[ -d "$WORKDIR/.git" ]]; then
 fi
 
 if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v gbrain >/dev/null 2>&1; then
+  write_phase "gbrain-context" "running" "copy gbrain context pages" "$RUN_ROOT/gbrain"
   for slug in \
     manuals/canonical-development-operating-manual \
     manuals/hermes-codex-supervisor-workflow \
@@ -594,6 +670,7 @@ if [[ "$TYPED_PREFLIGHT_RAN" != "1" ]] && command -v gbrain >/dev/null 2>&1; the
     safe_slug="${slug//\//__}"
     gbrain get "$slug" > "$RUN_ROOT/gbrain/$safe_slug.md" 2> "$RUN_ROOT/gbrain/$safe_slug.err" || true
   done
+  write_phase "gbrain-context" "ok" "copied gbrain context pages" "$RUN_ROOT/gbrain"
 fi
 
 if [[ -n "$PLAN_PATH" && -f "$PLAN_PATH" ]]; then
@@ -603,6 +680,7 @@ fi
 
 if [[ "$WRAPPER_PREFLIGHT_ONLY" == "1" ]]; then
   echo "wrapper_preflight_only_exit=1" >> "$RUN_ROOT/run.env"
+  write_phase "preflight-complete" "ok" "wrapper preflight-only exit" "$RUN_ROOT/run.env"
 send_telegram "[pilot-dev]" "preflight complete $REPO_SLUG
 run: $RUN_ID
 run_root: $RUN_ROOT
@@ -611,6 +689,7 @@ typed_planning: $TYPED_PLANNING_RAN"
   exit 0
 fi
 
+write_phase "worker-prompt" "running" "render Codex worker prompt" "$RUN_ROOT/codex/worker-prompt.md"
 cat > "$RUN_ROOT/codex/worker-prompt.md" <<EOF
 You are a Codex worker supervised by Hermes through the pilot-dev command.
 
@@ -694,6 +773,7 @@ if ! grep -F "\`$RUN_ROOT/steward-preflight/PROMOTIONS.md\`" "$RUN_ROOT/codex/wo
    ! grep -F "$RUN_ROOT/pilot-landing.json" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "$RUN_ROOT/pilot-execution.json" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "\`auto parallel status\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null; then
+  write_phase "failed" "failed" "exit 78" "$RUN_ROOT/orchestration-failure.md"
   {
     echo "# Orchestration Failure"
     echo
@@ -706,9 +786,12 @@ if ! grep -F "\`$RUN_ROOT/steward-preflight/PROMOTIONS.md\`" "$RUN_ROOT/codex/wo
   exit 78
 fi
 
+write_phase "worker-prompt" "ok" "rendered Codex worker prompt" "$RUN_ROOT/codex/worker-prompt.md"
+
 CODEX_LOG="$RUN_ROOT/codex/codex-exec.jsonl"
 CODEX_FINAL="$RUN_ROOT/codex/final.md"
 
+write_phase "codex-exec" "running" "codex execution worker" "$CODEX_LOG"
 set +e
 codex exec \
   --cd "$WORKDIR" \
@@ -722,6 +805,11 @@ codex exec \
   > "$CODEX_LOG" 2>&1
 CODEX_STATUS=$?
 set -e
+if [[ "$CODEX_STATUS" -eq 0 ]]; then
+  write_phase "codex-exec" "ok" "codex execution worker" "$CODEX_LOG"
+else
+  write_phase "codex-exec" "failed" "codex exit $CODEX_STATUS" "$CODEX_LOG"
+fi
 
 CONTRACT_STATUS=0
 if [[ "$TYPED_TASK_FINALIZE" == "1" && "$CODEX_STATUS" -eq 0 ]]; then
@@ -773,6 +861,7 @@ if [[ "$TYPED_TASK_FINALIZE" == "1" && "$CODEX_STATUS" -eq 0 ]]; then
         *)
           TASK_FINALIZE_STATUS="failed-invalid-status"
           CONTRACT_STATUS=72
+          write_phase "task-finalize" "failed" "auto pilot --task-finalize-only" "$RUN_ROOT/logs/auto-pilot-task-finalize.log"
           {
             echo "typed_task_finalize_ran=0"
             echo "task_finalize_status=$TASK_FINALIZE_STATUS"
@@ -882,12 +971,14 @@ if [[ "$TYPED_TASK_FINALIZE" == "1" && "$CODEX_STATUS" -eq 0 ]]; then
         fi
         TYPED_TASK_FINALIZE_ARGS+=("${REFERENCE_ARGS[@]}")
 
+        write_phase "task-finalize" "running" "auto pilot --task-finalize-only" "$RUN_ROOT/logs/auto-pilot-task-finalize.log"
         if (
           cd "$WORKDIR"
           auto "${TYPED_TASK_FINALIZE_ARGS[@]}"
         ) > "$RUN_ROOT/logs/auto-pilot-task-finalize.log" 2>&1; then
           TYPED_TASK_FINALIZE_RAN=1
           TASK_FINALIZE_STATUS="ok"
+          write_phase "task-finalize" "ok" "auto pilot --task-finalize-only" "$RUN_ROOT/logs/auto-pilot-task-finalize.log"
           {
             echo "typed_task_finalize_ran=1"
             echo "task_finalize_status=ok"
@@ -956,11 +1047,13 @@ if [[ "$TYPED_CLOSEOUT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pil
   fi
   TYPED_CLOSEOUT_ARGS+=("${REFERENCE_ARGS[@]}")
 
+  write_phase "closeout" "running" "auto pilot --closeout-only" "$RUN_ROOT/logs/auto-pilot-closeout.log"
   if (
     cd "$WORKDIR"
     auto "${TYPED_CLOSEOUT_ARGS[@]}"
   ) > "$RUN_ROOT/logs/auto-pilot-closeout.log" 2>&1; then
     TYPED_CLOSEOUT_RAN=1
+    write_phase "closeout" "ok" "auto pilot --closeout-only" "$RUN_ROOT/logs/auto-pilot-closeout.log"
     {
       echo "typed_closeout_ran=1"
       echo "typed_closeout_status=ok"
@@ -969,6 +1062,7 @@ if [[ "$TYPED_CLOSEOUT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pil
   else
     TYPED_CLOSEOUT_RAN=1
     CONTRACT_STATUS=72
+    write_phase "closeout" "failed" "auto pilot --closeout-only" "$RUN_ROOT/logs/auto-pilot-closeout.log"
     {
       echo "typed_closeout_ran=1"
       echo "typed_closeout_status=failed"
@@ -1034,6 +1128,7 @@ fi
 
 if [[ "$CONTRACT_STATUS" -eq 0 && ! -s "$RUN_ROOT/receipt.md" ]]; then
   CONTRACT_STATUS=73
+  write_phase "failed" "failed" "exit 73" "$RUN_ROOT/orchestration-failure.md"
   {
     echo "# Orchestration Failure"
     echo
@@ -1112,11 +1207,13 @@ if [[ "$PROJECT_ROLLUP" == "1" && "$CONTRACT_STATUS" -eq 0 ]] && command -v auto
   fi
   PROJECT_ROLLUP_ARGS+=("${REFERENCE_ARGS[@]}")
 
+  write_phase "project-rollup" "running" "auto pilot --project-rollup-only" "$RUN_ROOT/logs/auto-pilot-project-rollup.log"
   if (
     cd "$WORKDIR"
     auto "${PROJECT_ROLLUP_ARGS[@]}"
   ) > "$RUN_ROOT/logs/auto-pilot-project-rollup.log" 2>&1; then
     PROJECT_ROLLUP_STATUS="artifact-ok"
+    write_phase "project-rollup" "ok" "auto pilot --project-rollup-only" "$RUN_ROOT/project-rollup.md"
     {
       echo "project_rollup_ran=1"
       echo "project_rollup_status=artifact-ok"
@@ -1166,6 +1263,7 @@ if [[ "$PROJECT_ROLLUP" == "1" && "$CONTRACT_STATUS" -eq 0 ]] && command -v auto
     fi
   else
     PROJECT_ROLLUP_STATUS="artifact-failed"
+    write_phase "project-rollup" "failed" "auto pilot --project-rollup-only" "$RUN_ROOT/logs/auto-pilot-project-rollup.log"
     {
       echo "# Project Rollup Warning"
       echo
@@ -1184,6 +1282,12 @@ fi
 
 if [[ "$CODEX_STATUS" -eq 0 && "$CONTRACT_STATUS" -ne 0 ]]; then
   CODEX_STATUS="$CONTRACT_STATUS"
+fi
+
+if [[ "$CODEX_STATUS" -eq 0 ]]; then
+  write_phase "finished" "ok" "pilot-dev complete" "$RUN_ROOT/run.env"
+else
+  write_phase "finished" "failed" "pilot-dev exit $CODEX_STATUS" "$RUN_ROOT/run.env"
 fi
 
 {

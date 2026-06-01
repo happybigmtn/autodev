@@ -168,9 +168,33 @@ fn pilot_dev_auto_finalizes_selected_task_before_closeout() {
     assert!(run_root.join("task-finalize.json").exists());
     assert!(run_root.join("pilot-closeout.json").exists());
     assert!(run_root.join("project-rollup.md").exists());
+    assert!(run_root.join("phase-heartbeat.json").exists());
+    assert!(run_root.join("phase-history.jsonl").exists());
 
     let closeout = fs::read_to_string(run_root.join("pilot-closeout.json")).expect("closeout");
     assert!(closeout.contains("\"status\": \"ok\""));
+    let heartbeat: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(run_root.join("phase-heartbeat.json")).expect("heartbeat"),
+    )
+    .expect("heartbeat json");
+    assert_eq!(heartbeat["phase"].as_str(), Some("finished"));
+    assert_eq!(heartbeat["status"].as_str(), Some("ok"));
+    let phase_history =
+        fs::read_to_string(run_root.join("phase-history.jsonl")).expect("phase history");
+    for expected in [
+        "\"phase\": \"initialized\"",
+        "\"phase\": \"worker-prompt\"",
+        "\"phase\": \"codex-exec\"",
+        "\"phase\": \"task-finalize\"",
+        "\"phase\": \"closeout\"",
+        "\"phase\": \"project-rollup\"",
+        "\"phase\": \"finished\"",
+    ] {
+        assert!(
+            phase_history.contains(expected),
+            "missing phase history entry {expected}"
+        );
+    }
     let finalize = fs::read_to_string(run_root.join("task-finalize.json")).expect("finalize");
     assert!(finalize.contains("\"before_status\": \"pending\""));
     assert!(finalize.contains("\"after_status\": \"done\""));
