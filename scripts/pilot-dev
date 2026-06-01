@@ -629,35 +629,37 @@ Required process:
 1. Read the gbrain context copied under $RUN_ROOT/gbrain and the optional plan input.
 2. Inspect the real repo/workspace. For Autonomy Bitino, clone or inspect happybigmtn/autonomy and happybigmtn/bitino if they are missing and needed. Do not accept an empty skeleton as sufficient source context.
 3. Fill $RUN_ROOT/autodev-command-selection.json if it exists, and fill $RUN_ROOT/autodev-command-selection.md before execution. Every command, action, and subcommand from the live command surface must be selected, deferred, or skipped with a reason. Include phase-specific options discovered in $RUN_ROOT/logs/auto-command-surface.json and $RUN_ROOT/logs/auto-help-<command>.log. Do not leave any UNDECIDED rows.
-4. Update $RUN_ROOT/pilot-execution.json with \`auto pilot "$REPO_SLUG" "$PROMPT" --execution-update-only --run-id "$RUN_ID" --run-root "$RUN_ROOT" ...\` before execution. Record the selected task or no-task reason, executor kind/command/reason, expected verification path, git branch, runtime restart expectation, and Telegram summary placeholders. Run the same update helper again after validation with final status, tests, commit or no-commit reason, push ref when applicable, restart evidence when required, and next command. Do not hand-edit the JSON unless the helper itself is the blocker, and then record that degraded path.
-5. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
+4. Read $RUN_ROOT/pilot-landing.json before execution. Treat it as the authoritative git landing contract: normal repos require a successful remote dry-run, while local-no-origin repos are explicitly local-only and must not attempt remote git commands. Reflect this in the execution summary instead of guessing from prose.
+5. Update $RUN_ROOT/pilot-execution.json with \`auto pilot "$REPO_SLUG" "$PROMPT" --execution-update-only --run-id "$RUN_ID" --run-root "$RUN_ROOT" ...\` before execution. Record the selected task or no-task reason, executor kind/command/reason, expected verification path, git branch, runtime restart expectation, and Telegram summary placeholders. Run the same update helper again after validation with final status, tests, commit or no-commit reason, push ref when applicable, restart evidence when required, and next command. Do not hand-edit the JSON unless the helper itself is the blocker, and then record that degraded path.
+6. Inspect the wrapper preflight logs. The wrapper already runs auto doctor and then either greenfield planning or mid-flight stewardship:
    $RUN_ROOT/orchestrator-doctor.log
    $RUN_ROOT/doctor.log
    $RUN_ROOT/corpus.log
    $RUN_ROOT/gen.log
    $RUN_ROOT/steward-preflight.log for mid-flight stewardship when present
-6. Run and capture any additional appropriate autodev commands selected from the live inventory. Every normal pilot run starts with this planning spine:
+7. Run and capture any additional appropriate autodev commands selected from the live inventory. Every normal pilot run starts with this planning spine:
    auto doctor
    auto corpus --idea "$PROMPT" --focus "$FOCUS"
    auto gen --snapshot-only
    Use --reference-repo for sibling source repos when relevant.
-7. If the repo already has active planning surfaces, use auto steward in addition to corpus/gen unless the operator explicitly disables planning with PILOT_PLANNING_MODE=none and records why. When \`$RUN_ROOT/steward-preflight/PROMOTIONS.md\` exists, write \`$RUN_ROOT/steward-promotion-decisions.md\` before execution with one row per ready/proposed promotion and a decision of \`accepted\`, \`rejected\`, or \`deferred\`, plus evidence. If an accepted ready promotion changes the active frontier, update the root plan first, rerun \`auto parallel status\`, and execute the corrected frontier. Do not run \`auto parallel\` against a stale queue while a ready steward promotion is undecided.
-8. If the generated plan touches a product/design/TUI/operator surface, run the design gate and save the design artifact. Use Claude only for design/product-plan critique when explicitly needed.
-9. Before accepting a task with executable Verification commands, make sure the repo has the autodev verification receipt wrapper \`scripts/run-task-verification.sh\` plus its recorder \`scripts/verification_receipt.py\`. If the wrapper is missing, treat installing or generating it as a prerequisite slice; do not claim \`[x]\` from prose logs alone.
-10. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
-11. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
-12. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
-13. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
+8. If the repo already has active planning surfaces, use auto steward in addition to corpus/gen unless the operator explicitly disables planning with PILOT_PLANNING_MODE=none and records why. When \`$RUN_ROOT/steward-preflight/PROMOTIONS.md\` exists, write \`$RUN_ROOT/steward-promotion-decisions.md\` before execution with one row per ready/proposed promotion and a decision of \`accepted\`, \`rejected\`, or \`deferred\`, plus evidence. If an accepted ready promotion changes the active frontier, update the root plan first, rerun \`auto parallel status\`, and execute the corrected frontier. Do not run \`auto parallel\` against a stale queue while a ready steward promotion is undecided.
+9. If the generated plan touches a product/design/TUI/operator surface, run the design gate and save the design artifact. Use Claude only for design/product-plan critique when explicitly needed.
+10. Before accepting a task with executable Verification commands, make sure the repo has the autodev verification receipt wrapper \`scripts/run-task-verification.sh\` plus its recorder \`scripts/verification_receipt.py\`. If the wrapper is missing, treat installing or generating it as a prerequisite slice; do not claim \`[x]\` from prose logs alone.
+11. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
+12. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
+13. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
+14. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
 
 Evidence discipline:
 - Do not claim success without command output and file paths.
 - Every skipped autodev command, and every relevant skipped subcommand/action discovered from per-command help, needs a reason.
-- Typed closeout will fail unless $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary. Prefer \`auto pilot --execution-update-only\` for every manifest update.
+- Typed closeout will fail unless $RUN_ROOT/pilot-landing.json proves either successful remote dry-run or explicit local-only no-origin mode, and $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary. Prefer \`auto pilot --execution-update-only\` for every manifest update.
 - If Telegram is needed, verify with hermes send before claiming it is unavailable.
 EOF
 
 if ! grep -F "\`$RUN_ROOT/steward-preflight/PROMOTIONS.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "\`$RUN_ROOT/steward-promotion-decisions.md\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
+   ! grep -F "$RUN_ROOT/pilot-landing.json" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "$RUN_ROOT/pilot-execution.json" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null ||
    ! grep -F "\`auto parallel status\`" "$RUN_ROOT/codex/worker-prompt.md" >/dev/null; then
   {

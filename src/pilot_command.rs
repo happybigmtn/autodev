@@ -2,10 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Args;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::util::atomic_write;
 
@@ -233,7 +233,9 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
     .filter(|selected| **selected)
     .count();
     if selected_modes > 1 {
-        bail!("--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, and --closeout-only are mutually exclusive");
+        bail!(
+            "--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, and --closeout-only are mutually exclusive"
+        );
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
@@ -287,6 +289,7 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
     let current_branch = current_branch(&paths.workdir);
 
     write_run_env(&args, &paths, &intent, &remote_sync_mode, &current_branch)?;
+    write_landing_manifest(&args, &paths, &remote_sync_mode, &current_branch)?;
     capture_auto_surface(&paths, &args.repo_slug)?;
     run_doctor_preflights(&args, &paths, &remote_sync_mode)?;
     capture_gbrain_context(&args, &paths)?;
@@ -417,6 +420,104 @@ created={created}
         created = Utc::now().format("%FT%TZ"),
     );
     atomic_write(&paths.run_root.join("run.env"), body.as_bytes())
+}
+
+fn write_landing_manifest(
+    args: &PilotArgs,
+    paths: &PilotPaths,
+    remote_sync_mode: &str,
+    current_branch: &str,
+) -> Result<()> {
+    let origin = Command::new("git")
+        .arg("-C")
+        .arg(&paths.workdir)
+        .args(["remote", "get-url", "origin"])
+        .output();
+    let (origin_present, origin_url) = match origin {
+        Ok(output) if output.status.success() => (
+            true,
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ),
+        _ => (false, String::new()),
+    };
+
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&paths.workdir)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let local_only = remote_sync_mode == "local-no-origin";
+    let probe_log = paths.run_root.join("logs/git-push-dry-run.log");
+    let (push_policy, permission_probe) = if local_only {
+        (
+            "local-only-no-origin",
+            json!({
+                "skipped": true,
+                "reason": "no origin remote configured; local-only pilot mode",
+                "command": ""
+            }),
+        )
+    } else if !origin_present {
+        (
+            "missing-origin",
+            json!({
+                "skipped": true,
+                "reason": "origin remote is missing but local-only mode was not active",
+                "command": "git push --dry-run origin HEAD"
+            }),
+        )
+    } else {
+        let output = Command::new("git")
+            .arg("push")
+            .arg("--dry-run")
+            .arg("origin")
+            .arg("HEAD")
+            .current_dir(&paths.workdir)
+            .output()
+            .context("failed to run git push --dry-run origin HEAD")?;
+        atomic_write(&probe_log, render_output(&output).as_bytes())?;
+        (
+            "remote-dry-run",
+            json!({
+                "skipped": false,
+                "command": "git push --dry-run origin HEAD",
+                "success": output.status.success(),
+                "code": output.status.code(),
+                "log": probe_log
+            }),
+        )
+    };
+
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "remote_sync_mode": remote_sync_mode,
+        "local_only": local_only,
+        "current_branch": current_branch,
+        "current_head": head,
+        "origin_present": origin_present,
+        "origin_url": origin_url,
+        "push_policy": push_policy,
+        "permission_probe": permission_probe,
+        "artifacts": {
+            "run_env": paths.run_root.join("run.env"),
+            "probe_log": probe_log
+        }
+    });
+    atomic_write(
+        &paths.run_root.join("pilot-landing.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )
 }
 
 fn capture_auto_surface(paths: &PilotPaths, repo_slug: &str) -> Result<()> {
@@ -796,6 +897,7 @@ fn write_preflight_manifest(
         "created": Utc::now().format("%FT%TZ").to_string(),
         "artifacts": {
             "run_env": paths.run_root.join("run.env"),
+            "landing_manifest": paths.run_root.join("pilot-landing.json"),
             "orchestrator_doctor": paths.run_root.join("orchestrator-doctor.log"),
             "doctor": paths.run_root.join("doctor.log"),
             "command_surface": paths.run_root.join("logs/auto-command-surface.json"),
@@ -859,6 +961,7 @@ fn write_execution_manifest(
         "artifacts": {
             "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
             "planning_manifest": paths.run_root.join("pilot-planning.json"),
+            "landing_manifest": paths.run_root.join("pilot-landing.json"),
             "execution_manifest": paths.run_root.join("pilot-execution.json"),
             "closeout_manifest": paths.run_root.join("pilot-closeout.json"),
             "command_selection_json": paths.run_root.join("autodev-command-selection.json"),
@@ -1086,6 +1189,8 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
         "preflight manifest",
         &mut errors,
     );
+    let landing_manifest_path = paths.run_root.join("pilot-landing.json");
+    require_nonempty_artifact(&landing_manifest_path, "landing manifest", &mut errors);
     let planning_manifest_path = paths.run_root.join("pilot-planning.json");
     require_nonempty_artifact(&planning_manifest_path, "planning manifest", &mut errors);
     require_nonempty_artifact(
@@ -1103,6 +1208,7 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     require_nonempty_artifact(&paths.run_root.join("receipt.md"), "receipt", &mut errors);
 
     validate_command_selection(&paths.run_root, &mut errors);
+    validate_landing_manifest(&landing_manifest_path, &mut errors);
     validate_execution_manifest(&execution_manifest_path, &mut errors);
     validate_receipt(&paths.run_root.join("receipt.md"), &mut errors);
     validate_planning_manifest(&planning_manifest_path, &mut errors);
@@ -1121,6 +1227,7 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
         "errors": errors,
         "artifacts": {
             "preflight_manifest": paths.run_root.join("pilot-preflight.json"),
+            "landing_manifest": landing_manifest_path,
             "planning_manifest": planning_manifest_path,
             "execution_manifest": execution_manifest_path,
             "closeout_manifest": paths.run_root.join("pilot-closeout.json"),
@@ -1214,6 +1321,69 @@ fn validate_decision_node(node: &Value, path: &str, errors: &mut Vec<String>) {
                 validate_decision_node(child, command, errors);
             }
         }
+    }
+}
+
+fn validate_landing_manifest(path: &Path, errors: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&text) else {
+        errors.push(format!("invalid landing manifest json: {}", path.display()));
+        return;
+    };
+
+    let remote_sync_mode = string_at(&manifest, &["remote_sync_mode"]);
+    let current_branch = string_at(&manifest, &["current_branch"]);
+    let push_policy = string_at(&manifest, &["push_policy"]);
+    let origin_present = bool_at(&manifest, &["origin_present"]);
+    let local_only = bool_at(&manifest, &["local_only"]);
+    let probe_skipped = bool_at(&manifest, &["permission_probe", "skipped"]);
+    let probe_success = bool_at(&manifest, &["permission_probe", "success"]);
+
+    if remote_sync_mode.is_empty() {
+        errors.push("landing manifest missing remote_sync_mode".to_string());
+    }
+    if current_branch.is_empty() {
+        errors.push("landing manifest missing current_branch".to_string());
+    }
+
+    match remote_sync_mode {
+        "local-no-origin" => {
+            if !local_only {
+                errors.push(
+                    "landing manifest local-no-origin mode is not marked local_only".to_string(),
+                );
+            }
+            if origin_present {
+                errors.push("landing manifest local-no-origin mode still has origin".to_string());
+            }
+            if push_policy != "local-only-no-origin" {
+                errors.push("landing manifest local-only push policy is not explicit".to_string());
+            }
+            if !probe_skipped {
+                errors.push(
+                    "landing manifest local-only mode should skip remote push probe".to_string(),
+                );
+            }
+        }
+        "normal" => {
+            if !origin_present {
+                errors.push("landing manifest normal mode missing origin remote".to_string());
+            }
+            if push_policy != "remote-dry-run" {
+                errors
+                    .push("landing manifest normal mode missing remote dry-run policy".to_string());
+            }
+            if probe_skipped || !probe_success {
+                errors.push(
+                    "landing manifest normal mode lacks successful git push dry-run".to_string(),
+                );
+            }
+        }
+        other => errors.push(format!(
+            "landing manifest has unsupported remote_sync_mode `{other}`"
+        )),
     }
 }
 
@@ -1657,9 +1827,10 @@ mod tests {
     use crate::cli::{Cli, Command};
 
     use super::{
-        command_selection_from_surface, effective_planning_mode, render_command_selection_markdown,
-        safe_artifact_slug, update_execution_manifest, validate_closeout, write_execution_manifest,
-        PilotPaths,
+        PilotPaths, command_selection_from_surface, effective_planning_mode,
+        render_command_selection_markdown, safe_artifact_slug, update_execution_manifest,
+        validate_closeout, validate_landing_manifest, write_execution_manifest,
+        write_landing_manifest,
     };
 
     #[test]
@@ -1917,6 +2088,33 @@ mod tests {
     }
 
     #[test]
+    fn landing_manifest_writer_records_local_only_no_origin() {
+        let root = unique_temp_dir("landing-local-only");
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .output()
+            .expect("git init");
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        write_landing_manifest(&args, &paths, "local-no-origin", "main").expect("landing manifest");
+
+        let mut errors = Vec::new();
+        validate_landing_manifest(&root.join("pilot-landing.json"), &mut errors);
+        assert!(errors.is_empty(), "landing errors: {errors:?}");
+        let text = std::fs::read_to_string(root.join("pilot-landing.json"))
+            .expect("landing manifest text");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("landing json");
+        assert_eq!(manifest["remote_sync_mode"], "local-no-origin");
+        assert_eq!(manifest["local_only"], true);
+        assert_eq!(manifest["origin_present"], false);
+        assert_eq!(manifest["push_policy"], "local-only-no-origin");
+        assert_eq!(manifest["permission_probe"]["skipped"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn execution_update_helper_fills_closeout_valid_manifest() {
         let root = unique_temp_dir("execution-update");
         write_complete_closeout_artifacts(&root, false);
@@ -1970,6 +2168,23 @@ mod tests {
         let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
             .expect("failure artifact");
         assert!(failure.contains("missing required execution manifest"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closeout_validation_rejects_missing_landing_manifest() {
+        let root = unique_temp_dir("closeout-missing-landing");
+        write_complete_closeout_artifacts(&root, false);
+        std::fs::remove_file(root.join("pilot-landing.json")).expect("remove landing manifest");
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        let err = validate_closeout(&args, &paths).expect_err("invalid closeout");
+
+        assert!(err.to_string().contains("pilot closeout validation failed"));
+        let failure = std::fs::read_to_string(root.join("orchestration-failure.md"))
+            .expect("failure artifact");
+        assert!(failure.contains("missing required landing manifest"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2087,6 +2302,26 @@ mod tests {
 
     fn write_complete_closeout_artifacts(root: &Path, undecided: bool) {
         std::fs::write(root.join("pilot-preflight.json"), "{}\n").expect("preflight");
+        std::fs::write(
+            root.join("pilot-landing.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "remote_sync_mode": "local-no-origin",
+                "local_only": true,
+                "current_branch": "main",
+                "current_head": "fixture",
+                "origin_present": false,
+                "origin_url": "",
+                "push_policy": "local-only-no-origin",
+                "permission_probe": {
+                    "skipped": true,
+                    "reason": "fixture local-only run",
+                    "command": ""
+                }
+            }))
+            .expect("landing json"),
+        )
+        .expect("landing");
         std::fs::write(
             root.join("pilot-planning.json"),
             serde_json::to_string_pretty(&json!({

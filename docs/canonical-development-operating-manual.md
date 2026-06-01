@@ -555,6 +555,7 @@ Required typed preflight artifacts:
 
 - `run.env`
 - `pilot-preflight.json`
+- `pilot-landing.json`
 - `orchestrator-doctor.log`
 - `doctor.log`
 - `logs/auto-version.log`
@@ -580,9 +581,9 @@ PILOT_TYPED_PLANNING_REQUIRED=1 \
 pilot-dev <repo-slug> "<operator intent>"
 ```
 
-The smoke proof must create `pilot-preflight.json`, `pilot-planning.json`,
-`pilot-execution.json`, typed command-surface logs, and gbrain context, then exit without
-`codex/codex-exec.jsonl`.
+The smoke proof must create `pilot-preflight.json`, `pilot-landing.json`,
+`pilot-planning.json`, `pilot-execution.json`, typed command-surface logs, and
+gbrain context, then exit without `codex/codex-exec.jsonl`.
 
 Default policy for `pilot-dev`: run typed planning first, then launch Codex only
 after the planning artifact exists. Normal production pilots use:
@@ -610,6 +611,10 @@ auto pilot <repo-slug> "<operator intent>" \
 `PILOT_TYPED_EXECUTION_MANIFEST=1` before launching Codex. The command writes
 `pilot-execution.json` with pending fields for selected task, executor,
 verification, git, runtime restart policy, artifacts, and Telegram summary.
+Codex must read `pilot-landing.json` before execution and treat it as the git
+landing contract: normal repos require a successful `git push --dry-run origin
+HEAD` probe, while no-origin repos must be explicitly marked local-only and must
+not attempt remote git commands.
 Codex must update the file before and after execution with the deterministic
 helper, not by hand-editing JSON:
 
@@ -680,6 +685,7 @@ auto pilot <repo-slug> "<operator intent>" \
 or incomplete:
 
 - `pilot-preflight.json`
+- `pilot-landing.json`
 - `pilot-planning.json`
 - `pilot-execution.json`
 - `autodev-command-selection.json`
@@ -688,6 +694,8 @@ or incomplete:
 - non-pending execution status, executor path, selected task/no-task reason,
   verification summary, commit/no-commit evidence, runtime restart/no-restart
   evidence, and Telegram summary fields in `pilot-execution.json`
+- successful remote dry-run or explicit local-only no-origin policy in
+  `pilot-landing.json`
 - selected/deferred/skipped decisions and reasons for every discovered command
 - no `UNDECIDED` entries in the markdown companion
 - required planning phases recorded as successful in `pilot-planning.json`
