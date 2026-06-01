@@ -45,13 +45,30 @@ const OPTIONAL_TOOLS: &[OptionalTool] = &[
 ];
 
 #[derive(Args, Clone)]
-pub(crate) struct DoctorArgs {}
+pub(crate) struct DoctorArgs {
+    /// Include primary-dev-machine orchestration checks: landing path, Hermes,
+    /// gbrain, GitHub auth, installed auto/source consistency, and disk budget.
+    #[arg(long)]
+    pub(crate) orchestrator: bool,
 
-pub(crate) async fn run_doctor(_args: DoctorArgs) -> Result<()> {
+    /// Local autodev source checkout that should match the installed auto binary.
+    #[arg(long, default_value = "/srv/dev/repos/autodev")]
+    pub(crate) autodev_source: PathBuf,
+
+    /// Permit repositories without origin to pass the landing-path check as local-only pilots.
+    #[arg(long)]
+    pub(crate) allow_local_only: bool,
+
+    /// Minimum available disk, in KiB, required for orchestrator runs.
+    #[arg(long, default_value_t = 10_000_000)]
+    pub(crate) min_disk_kb: u64,
+}
+
+pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
     let current_exe = env::current_exe().context("failed to resolve current auto executable")?;
-    let report = build_doctor_report(&current_exe);
+    let report = build_doctor_report(&current_exe, &args);
     print_doctor_report(&report);
-    if report.required_failed() {
+    if report.required_failed(args.orchestrator) {
         return Err(anyhow!("doctor failed"));
     }
     Ok(())
@@ -62,11 +79,13 @@ struct DoctorReport {
     baseline: Vec<RequiredCheck>,
     execution: Vec<RequiredCheck>,
     capabilities: Vec<CapabilityCheck>,
+    orchestrator: Vec<RequiredCheck>,
 }
 
 impl DoctorReport {
-    fn required_failed(&self) -> bool {
+    fn required_failed(&self, include_orchestrator: bool) -> bool {
         self.baseline.iter().any(|check| !check.passed)
+            || (include_orchestrator && self.orchestrator.iter().any(|check| !check.passed))
     }
 }
 
@@ -99,14 +118,16 @@ struct CommandProbe {
     launch_error: Option<String>,
 }
 
-fn build_doctor_report(current_exe: &Path) -> DoctorReport {
+fn build_doctor_report(current_exe: &Path, args: &DoctorArgs) -> DoctorReport {
     let mut report = DoctorReport {
         baseline: Vec::new(),
         execution: Vec::new(),
         capabilities: build_optional_tool_checks(find_on_path),
+        orchestrator: Vec::new(),
     };
 
-    match git_repo_root() {
+    let repo_root = git_repo_root();
+    match &repo_root {
         Ok(repo_root) => {
             report.baseline.push(RequiredCheck {
                 name: "repo root".to_string(),
@@ -125,6 +146,15 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
         }),
     }
 
+    if args.orchestrator {
+        report.orchestrator = build_orchestrator_checks(
+            repo_root.as_deref().ok(),
+            &args.autodev_source,
+            args.allow_local_only,
+            args.min_disk_kb,
+        );
+    }
+
     report.baseline.push(check_version_probe(&run_auto_probe(
         current_exe,
         &["--version"],
@@ -134,6 +164,42 @@ fn build_doctor_report(current_exe: &Path) -> DoctorReport {
     }));
 
     report
+}
+
+fn build_orchestrator_checks(
+    repo_root: Option<&Path>,
+    autodev_source: &Path,
+    allow_local_only: bool,
+    min_disk_kb: u64,
+) -> Vec<RequiredCheck> {
+    let mut checks = Vec::new();
+    checks.push(check_installed_auto_matches_source(autodev_source));
+    checks.push(check_required_command("codex", &["--version"]));
+    checks.push(check_required_command("claude", &["--version"]));
+    checks.push(check_required_command("gbrain", &["list", "-n", "1"]));
+    checks.push(check_required_command("gh", &["auth", "status"]));
+    checks.push(check_hermes_gateway());
+
+    if let Some(repo_root) = repo_root {
+        checks.push(check_git_landing_path(repo_root, allow_local_only));
+        checks.push(check_github_repo_permission(repo_root, allow_local_only));
+        checks.push(check_disk_budget(repo_root, min_disk_kb));
+    } else {
+        checks.push(RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: false,
+            detail: "repo root unavailable".to_string(),
+            action: Some("rerun from inside the repository checkout".to_string()),
+        });
+        checks.push(RequiredCheck {
+            name: "disk budget".to_string(),
+            passed: false,
+            detail: "repo root unavailable".to_string(),
+            action: Some("rerun from inside the repository checkout".to_string()),
+        });
+    }
+
+    checks
 }
 
 fn check_repo_checkout(repo_root: &Path) -> Vec<RequiredCheck> {
@@ -146,6 +212,295 @@ fn check_repo_checkout(repo_root: &Path) -> Vec<RequiredCheck> {
         Ok(Some(_)) => vec![check_project_checkout_layout(repo_root)],
         Ok(None) => vec![check_project_checkout_layout(repo_root)],
         Err(check) => vec![check],
+    }
+}
+
+fn check_installed_auto_matches_source(autodev_source: &Path) -> RequiredCheck {
+    if !autodev_source.join(".git").exists() {
+        return RequiredCheck {
+            name: "autodev source match".to_string(),
+            passed: false,
+            detail: format!("missing git checkout at {}", autodev_source.display()),
+            action: Some(
+                "clone or mount the canonical autodev source before orchestrator runs".to_string(),
+            ),
+        };
+    }
+
+    let source_head =
+        match command_stdout_in(autodev_source, "git", &["rev-parse", "--short", "HEAD"]) {
+            Ok(source_head) => source_head,
+            Err(err) => {
+                return RequiredCheck {
+                    name: "autodev source match".to_string(),
+                    passed: false,
+                    detail: err,
+                    action: Some("repair the autodev source checkout".to_string()),
+                };
+            }
+        };
+    let installed = env!("AUTODEV_GIT_SHA");
+    if source_head.trim() == installed {
+        return RequiredCheck {
+            name: "autodev source match".to_string(),
+            passed: true,
+            detail: format!(
+                "installed auto commit {installed} matches {}",
+                autodev_source.display()
+            ),
+            action: None,
+        };
+    } else {
+        RequiredCheck {
+            name: "autodev source match".to_string(),
+            passed: false,
+            detail: format!(
+                "installed auto commit {installed} does not match source commit {} at {}",
+                source_head.trim(),
+                autodev_source.display()
+            ),
+            action: Some(format!(
+                "run cargo install --path {} --locked --root $HOME/.local",
+                autodev_source.display()
+            )),
+        }
+    }
+}
+
+fn check_required_command(command: &'static str, args: &[&str]) -> RequiredCheck {
+    let output = Command::new(command).args(args).output();
+    match output {
+        Ok(output) if output.status.success() => RequiredCheck {
+            name: format!("{command} availability"),
+            passed: true,
+            detail: format!("{command} {}", args.join(" ")),
+            action: None,
+        },
+        Ok(output) => RequiredCheck {
+            name: format!("{command} availability"),
+            passed: false,
+            detail: compact_command_output(&output),
+            action: Some(format!(
+                "install or authenticate `{command}` before orchestrator runs"
+            )),
+        },
+        Err(err) => RequiredCheck {
+            name: format!("{command} availability"),
+            passed: false,
+            detail: err.to_string(),
+            action: Some(format!(
+                "install `{command}` on PATH before orchestrator runs"
+            )),
+        },
+    }
+}
+
+fn check_hermes_gateway() -> RequiredCheck {
+    let hermes_help = Command::new("hermes").arg("--help").output();
+    match hermes_help {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            return RequiredCheck {
+                name: "Hermes gateway".to_string(),
+                passed: false,
+                detail: format!("hermes CLI failed: {}", compact_command_output(&output)),
+                action: Some("repair the hermes CLI before orchestrator runs".to_string()),
+            };
+        }
+        Err(err) => {
+            return RequiredCheck {
+                name: "Hermes gateway".to_string(),
+                passed: false,
+                detail: err.to_string(),
+                action: Some("install `hermes` on PATH before orchestrator runs".to_string()),
+            };
+        }
+    }
+
+    let status = Command::new("systemctl")
+        .args(["--user", "is-active", "hermes-gateway.service"])
+        .output();
+    match status {
+        Ok(output) if output.status.success() => RequiredCheck {
+            name: "Hermes gateway".to_string(),
+            passed: true,
+            detail: "user service hermes-gateway.service is active".to_string(),
+            action: None,
+        },
+        Ok(output) => RequiredCheck {
+            name: "Hermes gateway".to_string(),
+            passed: false,
+            detail: compact_command_output(&output),
+            action: Some("start with systemctl --user start hermes-gateway.service".to_string()),
+        },
+        Err(err) => RequiredCheck {
+            name: "Hermes gateway".to_string(),
+            passed: false,
+            detail: err.to_string(),
+            action: Some("install or repair user systemd for hermes-gateway.service".to_string()),
+        },
+    }
+}
+
+fn check_git_landing_path(repo_root: &Path, allow_local_only: bool) -> RequiredCheck {
+    let branch = command_stdout_in(repo_root, "git", &["branch", "--show-current"])
+        .unwrap_or_else(|_| "detached".to_string());
+    let branch = branch.trim();
+    let origin = command_stdout_in(repo_root, "git", &["remote", "get-url", "origin"]);
+    let Ok(origin) = origin else {
+        return RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: allow_local_only,
+            detail: "no origin remote configured".to_string(),
+            action: if allow_local_only {
+                None
+            } else {
+                Some(
+                    "configure origin or rerun with --allow-local-only for a local pilot"
+                        .to_string(),
+                )
+            },
+        };
+    };
+
+    if branch.is_empty() || branch == "detached" {
+        return RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: false,
+            detail: format!("detached HEAD with origin {}", origin.trim()),
+            action: Some("checkout a named campaign branch before orchestration".to_string()),
+        };
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["push", "--dry-run", "origin"])
+        .arg(format!("HEAD:{branch}"))
+        .output();
+    match output {
+        Ok(output) if output.status.success() => RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: true,
+            detail: format!("dry-run push to origin/{branch} succeeded"),
+            action: None,
+        },
+        Ok(output) => RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: false,
+            detail: compact_command_output(&output),
+            action: Some(
+                "fix push credentials, set a fork PR path, or mark the run local-only".to_string(),
+            ),
+        },
+        Err(err) => RequiredCheck {
+            name: "git landing path".to_string(),
+            passed: false,
+            detail: err.to_string(),
+            action: Some("repair git before orchestrator runs".to_string()),
+        },
+    }
+}
+
+fn check_github_repo_permission(repo_root: &Path, allow_local_only: bool) -> RequiredCheck {
+    let origin = command_stdout_in(repo_root, "git", &["remote", "get-url", "origin"]);
+    let Ok(origin) = origin else {
+        return RequiredCheck {
+            name: "GitHub repo permission".to_string(),
+            passed: allow_local_only,
+            detail: "no origin remote configured".to_string(),
+            action: if allow_local_only {
+                None
+            } else {
+                Some("configure a GitHub origin or mark the run local-only".to_string())
+            },
+        };
+    };
+    let Some(repo) = parse_github_repo_from_remote_url(origin.trim()) else {
+        return RequiredCheck {
+            name: "GitHub repo permission".to_string(),
+            passed: false,
+            detail: format!("origin is not a parseable GitHub repo: {}", origin.trim()),
+            action: Some(
+                "configure a GitHub origin or document the alternate landing path".to_string(),
+            ),
+        };
+    };
+
+    let output = Command::new("gh")
+        .args(["repo", "view", &repo, "--json", "viewerPermission"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let permission = extract_json_string_field(&text, "viewerPermission")
+                .unwrap_or_else(|| "unknown".to_string());
+            let passed = matches!(permission.as_str(), "WRITE" | "MAINTAIN" | "ADMIN");
+            RequiredCheck {
+                name: "GitHub repo permission".to_string(),
+                passed,
+                detail: format!("{repo} viewerPermission={permission}"),
+                action: (!passed).then(|| {
+                    "use an owned fork plus PR, or run with a repo where the orchestrator can write"
+                        .to_string()
+                }),
+            }
+        }
+        Ok(output) => RequiredCheck {
+            name: "GitHub repo permission".to_string(),
+            passed: false,
+            detail: compact_command_output(&output),
+            action: Some(
+                "authenticate gh or verify repo visibility before orchestration".to_string(),
+            ),
+        },
+        Err(err) => RequiredCheck {
+            name: "GitHub repo permission".to_string(),
+            passed: false,
+            detail: err.to_string(),
+            action: Some("install `gh` and authenticate before orchestration".to_string()),
+        },
+    }
+}
+
+fn check_disk_budget(path: &Path, min_disk_kb: u64) -> RequiredCheck {
+    let output = Command::new("df").arg("-Pk").arg(path).output();
+    let Ok(output) = output else {
+        return RequiredCheck {
+            name: "disk budget".to_string(),
+            passed: false,
+            detail: "failed to run df".to_string(),
+            action: Some("repair coreutils/df before orchestrator runs".to_string()),
+        };
+    };
+    if !output.status.success() {
+        return RequiredCheck {
+            name: "disk budget".to_string(),
+            passed: false,
+            detail: compact_command_output(&output),
+            action: Some("repair filesystem visibility before orchestrator runs".to_string()),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let available_kb = stdout
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|value| value.parse::<u64>().ok());
+    let Some(available_kb) = available_kb else {
+        return RequiredCheck {
+            name: "disk budget".to_string(),
+            passed: false,
+            detail: format!("could not parse df output: {}", stdout.trim()),
+            action: Some("inspect disk capacity manually before orchestrator runs".to_string()),
+        };
+    };
+    RequiredCheck {
+        name: "disk budget".to_string(),
+        passed: available_kb >= min_disk_kb,
+        detail: format!("{available_kb} KiB available; required {min_disk_kb} KiB"),
+        action: (available_kb < min_disk_kb)
+            .then(|| "prune .auto/artifacts or expand disk before orchestrator runs".to_string()),
     }
 }
 
@@ -481,6 +836,78 @@ fn find_on_path(tool: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn command_stdout_in(
+    cwd: &Path,
+    command: &str,
+    args: &[&str],
+) -> std::result::Result<String, String> {
+    let output = Command::new(command)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(compact_command_output(&output))
+    }
+}
+
+fn compact_command_output(output: &std::process::Output) -> String {
+    let mut text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    if text.len() > 240 {
+        text.truncate(240);
+        text.push_str("...");
+    }
+    if text.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        text
+    }
+}
+
+fn parse_github_repo_from_remote_url(remote_url: &str) -> Option<String> {
+    let remote_url = remote_url.trim().trim_end_matches(".git");
+    if let Some(path) = remote_url.strip_prefix("git@github.com:") {
+        return normalize_github_repo_path(path);
+    }
+    if let Some(path) = remote_url.strip_prefix("ssh://git@github.com/") {
+        return normalize_github_repo_path(path);
+    }
+    if let Some(path) = remote_url.strip_prefix("https://github.com/") {
+        return normalize_github_repo_path(path);
+    }
+    if let Some(path) = remote_url.strip_prefix("http://github.com/") {
+        return normalize_github_repo_path(path);
+    }
+    None
+}
+
+fn normalize_github_repo_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 fn print_doctor_report(report: &DoctorReport) {
     print!("{}", render_doctor_report(report));
 }
@@ -521,13 +948,29 @@ fn render_doctor_report(report: &DoctorReport) -> String {
 
     output.push('\n');
     output.push_str("model/network:\n");
-    output.push_str("- [ok] no model providers, network APIs, Linear, GitHub, Symphony, Docker, browser automation, or tmux sessions were invoked\n");
+    if report.orchestrator.is_empty() {
+        output.push_str("- [ok] no model providers, network APIs, Linear, GitHub, Symphony, Docker, browser automation, or tmux sessions were invoked\n");
+    } else {
+        output.push_str("- [ok] no model providers, Linear, Symphony, Docker, browser automation, or tmux sessions were invoked\n");
+        output.push_str("- [warn] orchestrator readiness may invoke GitHub, gbrain, Hermes, systemd, git dry-run push, and disk probes\n");
+    }
+
+    if !report.orchestrator.is_empty() {
+        output.push('\n');
+        output.push_str("orchestrator readiness:\n");
+        for check in &report.orchestrator {
+            output.push_str(&render_required_check(check));
+        }
+    }
 
     output.push('\n');
     output.push_str("next steps:\n");
-    if report.required_failed() {
+    if report.baseline.iter().any(|check| !check.passed) {
         output
             .push_str("- fix the failed baseline readiness checks above, then rerun auto doctor\n");
+        output.push_str("doctor failed\n");
+    } else if report.orchestrator.iter().any(|check| !check.passed) {
+        output.push_str("- fix failed orchestrator readiness checks before running pilot-dev or auto parallel campaigns\n");
         output.push_str("doctor failed\n");
     } else if report.execution.iter().any(|check| !check.passed) {
         output.push_str("- baseline is ready for no-model commands\n");
@@ -596,8 +1039,9 @@ mod tests {
 
     use super::{
         build_optional_tool_checks, check_help_surfaces_with, check_planning_health,
-        check_repo_checkout, check_version_probe, format_auto_args, render_doctor_report,
-        CapabilityCheck, CommandProbe, DoctorReport, RequiredCheck, HELP_SURFACES,
+        check_repo_checkout, check_version_probe, extract_json_string_field, format_auto_args,
+        parse_github_repo_from_remote_url, render_doctor_report, CapabilityCheck, CommandProbe,
+        DoctorReport, RequiredCheck, HELP_SURFACES,
     };
 
     #[test]
@@ -723,6 +1167,7 @@ mod tests {
                 found: None,
                 workflows: "model-backed flows",
             }],
+            orchestrator: Vec::new(),
         };
 
         let rendered = render_doctor_report(&report);
@@ -755,6 +1200,7 @@ mod tests {
                 found: None,
                 workflows: "model-backed flows",
             }],
+            orchestrator: Vec::new(),
         };
 
         let rendered = render_doctor_report(&report);
@@ -785,13 +1231,74 @@ mod tests {
                 found: None,
                 workflows: "Claude-backed corpus and generation flows",
             }],
+            orchestrator: Vec::new(),
         };
         let rendered = render_doctor_report(&execution_blocked);
 
-        assert!(!execution_blocked.required_failed());
+        assert!(!execution_blocked.required_failed(false));
         assert!(rendered.contains("- [fail] planning root: missing genesis"));
         assert!(rendered.contains("baseline is ready for no-model commands"));
         assert!(rendered.contains("doctor ok"));
+    }
+
+    #[test]
+    fn doctor_renders_orchestrator_readiness_as_hard_gate() {
+        let report = DoctorReport {
+            baseline: vec![RequiredCheck {
+                name: "repo layout".to_string(),
+                passed: true,
+                detail: "found AGENTS.md".to_string(),
+                action: None,
+            }],
+            execution: Vec::new(),
+            capabilities: Vec::new(),
+            orchestrator: vec![RequiredCheck {
+                name: "git landing path".to_string(),
+                passed: false,
+                detail: "no origin remote configured".to_string(),
+                action: Some("configure origin".to_string()),
+            }],
+        };
+
+        let rendered = render_doctor_report(&report);
+
+        assert!(report.required_failed(true));
+        assert!(!report.required_failed(false));
+        assert!(rendered.contains("orchestrator readiness:\n- [fail] git landing path:"));
+        assert!(rendered.contains("fix failed orchestrator readiness checks"));
+        assert!(rendered.contains("doctor failed"));
+    }
+
+    #[test]
+    fn doctor_parses_common_github_remote_urls() {
+        assert_eq!(
+            parse_github_repo_from_remote_url("git@github.com:happybigmtn/autodev.git"),
+            Some("happybigmtn/autodev".to_string())
+        );
+        assert_eq!(
+            parse_github_repo_from_remote_url("https://github.com/NousResearch/hermes-agent.git"),
+            Some("NousResearch/hermes-agent".to_string())
+        );
+        assert_eq!(
+            parse_github_repo_from_remote_url("ssh://git@github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            parse_github_repo_from_remote_url("git@example.com:owner/repo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_extracts_viewer_permission_from_gh_json() {
+        assert_eq!(
+            extract_json_string_field(r#"{"viewerPermission":"WRITE"}"#, "viewerPermission"),
+            Some("WRITE".to_string())
+        );
+        assert_eq!(
+            extract_json_string_field(r#"{"name":"repo"}"#, "viewerPermission"),
+            None
+        );
     }
 
     #[test]
