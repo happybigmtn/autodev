@@ -9,15 +9,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
+use crate::StewardArgs;
 use crate::codex_exec::run_codex_exec;
 use crate::task_parser::validate_execution_rows;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
-use crate::StewardArgs;
 
 const STEWARD_DELIVERABLES: [&str; 6] = [
     "DRIFT.md",
@@ -217,6 +217,7 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
             finalizer_stderr.display()
         );
     }
+    verify_steward_finalizer_review(&repo_root, &output_dir)?;
 
     if !args.report_only && !current_branch.is_empty() {
         if let Some(commit) = auto_checkpoint_if_needed(
@@ -301,6 +302,30 @@ fn verify_steward_deliverables(output_dir: &Path) -> Result<()> {
             "steward deliverables missing or empty in {}: {}",
             output_dir.display(),
             missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn verify_steward_finalizer_review(repo_root: &Path, output_dir: &Path) -> Result<()> {
+    let output_dir = if output_dir.is_absolute() {
+        output_dir.to_path_buf()
+    } else {
+        repo_root.join(output_dir)
+    };
+    let expected = output_dir.join("final-review.md");
+    let content = fs::read_to_string(&expected)
+        .with_context(|| format!("missing steward finalizer review {}", expected.display()))?;
+    if content.trim().is_empty() {
+        bail!("steward finalizer review {} is empty", expected.display());
+    }
+
+    let default_review = repo_root.join("steward").join("final-review.md");
+    if output_dir != repo_root.join("steward") && default_review.exists() {
+        bail!(
+            "steward finalizer wrote default artifact {}; expected {}",
+            default_review.display(),
+            expected.display()
         );
     }
     Ok(())
@@ -531,32 +556,38 @@ fn build_finalizer_prompt(
         .unwrap_or(output_dir)
         .display()
         .to_string();
+    let final_review_path = format!("{steward_dir}/final-review.md");
     let apply_clause = if report_only {
-        "The first pass ran in report-only mode; you are also in report-only \
-         mode. Review the deliverables and promotions for plausibility, write \
-         your verdict, and stop. Do NOT edit any planning surface."
+        format!(
+            "The first pass ran in report-only mode; you are also in report-only \
+             mode. Review the deliverables and promotions for plausibility, write \
+             your verdict to `{final_review_path}`, and stop. Do NOT edit any \
+             planning surface."
+        )
     } else {
-        "The first Codex pass has either (a) written active spec/plan \
-         promotions directly into `specs/`, `IMPLEMENTATION_PLAN.md`, \
-         `SECURITY_PLAN.md`, `WORKLIST.md`, or `LEARNINGS.md`, or (b) staged \
-         them inside `PROMOTIONS.md` and the `## Proposed plan/spec promotions` \
-         section of `STEWARDSHIP-REPORT.md`. Your job: verify and reconcile:\n\n\
-         - Read the cited files in the repo to confirm each claim holds.\n\
-         - If the first pass wrote directly into a planning surface or `specs/` \
-           and the claim holds, leave it. If the entry shape is not \
-           auto-parallel-ready, fix it or remove it.\n\
-         - Reject or remove any newly added unchecked `- [ ]` item whose title \
-           says `DEFERRED` or `not shipped`; convert it to a blocked `- [!]` \
-           row only when it must remain on the active dependency graph.\n\
-         - If the first pass staged promotions in `PROMOTIONS.md` and they \
-           hold, apply them in-place to the planning surface and/or `specs/`.\n\
-         - Never delete or rewrite existing plan items during this pass; only \
-           append, trim invalid additions, or make narrow verified status/prose \
-           corrections needed to prevent false completion.\n\n\
-         Write your verdict to `steward/final-review.md` with sections \
-         `## Accepted`, `## Rejected`, `## Deferred`, `## Plan-surface diff \
-         summary`. End with a `PASS | CONCERNS | FAIL` verdict.\n\n\
-         Commit any edits with message `steward: finalizer applied`."
+        format!(
+            "The first Codex pass has either (a) written active spec/plan \
+             promotions directly into `specs/`, `IMPLEMENTATION_PLAN.md`, \
+             `SECURITY_PLAN.md`, `WORKLIST.md`, or `LEARNINGS.md`, or (b) staged \
+             them inside `PROMOTIONS.md` and the `## Proposed plan/spec promotions` \
+             section of `STEWARDSHIP-REPORT.md`. Your job: verify and reconcile:\n\n\
+             - Read the cited files in the repo to confirm each claim holds.\n\
+             - If the first pass wrote directly into a planning surface or `specs/` \
+               and the claim holds, leave it. If the entry shape is not \
+               auto-parallel-ready, fix it or remove it.\n\
+             - Reject or remove any newly added unchecked `- [ ]` item whose title \
+               says `DEFERRED` or `not shipped`; convert it to a blocked `- [!]` \
+               row only when it must remain on the active dependency graph.\n\
+             - If the first pass staged promotions in `PROMOTIONS.md` and they \
+               hold, apply them in-place to the planning surface and/or `specs/`.\n\
+             - Never delete or rewrite existing plan items during this pass; only \
+               append, trim invalid additions, or make narrow verified status/prose \
+               corrections needed to prevent false completion.\n\n\
+             Write your verdict to `{final_review_path}` with sections \
+             `## Accepted`, `## Rejected`, `## Deferred`, `## Plan-surface diff \
+             summary`. End with a `PASS | CONCERNS | FAIL` verdict.\n\n\
+             Commit any edits with message `steward: finalizer applied`."
+        )
     };
     format!(
         r#"You are the finalizer for an `auto steward` pass. Both passes run under Codex gpt-5.5 by default; you are the second, independent look.
@@ -588,11 +619,12 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 
 ## Hard rules
 
-- Do NOT rewrite the first pass's deliverable files. Your verdict goes in `steward/final-review.md`.
+- Do NOT rewrite the first pass's deliverable files. Your verdict goes in `{final_review_path}`.
 - Do NOT invent new items. If you think the first pass missed something, record it under `## Finalizer addenda` in `final-review.md` as a follow-up.
 - Stay on branch `{branch}`.
 "#,
         steward_dir = steward_dir,
+        final_review_path = final_review_path,
         branch = if branch.is_empty() {
             "(detached)"
         } else {
@@ -825,12 +857,47 @@ mod tests {
     fn finalizer_prompt_forbids_rewriting_steward_artifacts() {
         let temp = unique_temp_dir();
         fs::create_dir_all(&temp).expect("create temp");
-        let prompt = build_finalizer_prompt(&temp, &temp.join("steward"), "trunk", false);
+        let output_dir = temp
+            .join(".auto")
+            .join("orchestrator")
+            .join("run")
+            .join("steward");
+        let prompt = build_finalizer_prompt(&temp, &output_dir, "trunk", false);
         assert!(prompt.contains("Do NOT rewrite"));
-        assert!(prompt.contains("final-review.md"));
+        assert!(prompt.contains(".auto/orchestrator/run/steward/final-review.md"));
+        assert!(!prompt.contains("`steward/final-review.md`"));
         assert!(prompt.contains("Accepted"));
         assert!(prompt.contains("PROMOTIONS.md"));
         assert!(prompt.contains("auto-parallel-ready"));
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn finalizer_review_verification_requires_requested_output_dir() {
+        let temp = unique_temp_dir();
+        let output_dir = temp
+            .join(".auto")
+            .join("orchestrator")
+            .join("run")
+            .join("steward");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::create_dir_all(temp.join("steward")).expect("create default steward dir");
+        fs::write(
+            temp.join("steward").join("final-review.md"),
+            "wrong place\n",
+        )
+        .expect("write misplaced review");
+
+        let err = super::verify_steward_finalizer_review(&temp, &output_dir)
+            .expect_err("misplaced final review should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("missing steward finalizer review"));
+
+        fs::write(output_dir.join("final-review.md"), "PASS\n").expect("write review");
+        let err = super::verify_steward_finalizer_review(&temp, &output_dir)
+            .expect_err("default review should be rejected when custom output is used");
+        let message = format!("{err:#}");
+        assert!(message.contains("wrote default artifact"));
         fs::remove_dir_all(temp).expect("cleanup");
     }
 }

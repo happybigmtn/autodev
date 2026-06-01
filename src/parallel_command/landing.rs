@@ -1761,6 +1761,35 @@ mod tests {
     }
 
     #[test]
+    fn repair_parallel_canonical_before_dispatch_ignores_run_artifact_roots() {
+        let repo = unique_temp_dir("parallel-ignore-run-artifacts");
+        let run_root = unique_temp_dir("parallel-ignore-run-artifacts-run");
+        init_git_repo(&repo);
+        fs::create_dir_all(&run_root).expect("failed to create run dir");
+        run_git_in(&repo, ["branch", "-M", "trunk"]);
+        fs::write(repo.join("README.md"), "# repo\n").expect("failed to write README");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "init"]);
+        fs::create_dir_all(repo.join("steward")).expect("failed to create steward dir");
+        fs::write(repo.join("steward").join("final-review.md"), "PASS\n")
+            .expect("failed to write final review");
+        fs::create_dir_all(repo.join("genesis")).expect("failed to create genesis dir");
+        fs::write(repo.join("genesis").join("GBRAIN-CONTEXT.md"), "context\n")
+            .expect("failed to write gbrain context");
+        let before = git_output(&repo, ["rev-parse", "HEAD"]);
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        repair_parallel_canonical_before_dispatch(&repo, "trunk", &logger)
+            .expect("run artifact roots should not force a checkpoint");
+
+        let after = git_output(&repo, ["rev-parse", "HEAD"]);
+        assert_eq!(after, before);
+        let status = git_output(&repo, ["status", "--short", "--untracked-files=all"]);
+        assert!(status.contains("steward/final-review.md"));
+        assert!(status.contains("genesis/GBRAIN-CONTEXT.md"));
+    }
+
+    #[test]
     fn audit_parallel_completion_drift_reports_closeout_candidates_without_promoting_plan() {
         let repo = unique_temp_dir("parallel-closeout-audit");
         let run_root = unique_temp_dir("parallel-closeout-audit-run");

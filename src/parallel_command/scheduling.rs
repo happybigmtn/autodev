@@ -347,7 +347,9 @@ pub(crate) fn parallel_dispatch_path_is_ignored(path: &str) -> bool {
     first_segment == ".auto"
         || first_segment == "auto"
         || first_segment == "bug"
+        || first_segment == "genesis"
         || first_segment == "nemesis"
+        || first_segment == "steward"
         || first_segment.starts_with("gen-")
 }
 
@@ -743,6 +745,26 @@ mod tests {
     }
 
     #[test]
+    fn parallel_dispatch_ignores_run_artifact_roots() {
+        for path in [
+            ".auto/orchestrator/run/receipt.md",
+            "auto/symphony/verification-receipts/TASK-1.json",
+            "bug/report.md",
+            "genesis/GBRAIN-CONTEXT.md",
+            "gen-20260601-125649/IMPLEMENTATION_PLAN.md",
+            "nemesis/report.md",
+            "steward/final-review.md",
+        ] {
+            assert!(
+                parallel_dispatch_path_is_ignored(path),
+                "{path} should be treated as run evidence, not dispatch source"
+            );
+        }
+        assert!(!parallel_dispatch_path_is_ignored("IMPLEMENTATION_PLAN.md"));
+        assert!(!parallel_dispatch_path_is_ignored("src/lib.rs"));
+    }
+
+    #[test]
     fn no_dependency_ready_stop_message_calls_out_shelved_tasks() {
         let plan = parse_loop_plan(
             r#"
@@ -896,16 +918,18 @@ mod tests {
         );
 
         attempts.insert("TASK-P".to_string(), 4);
-        assert!(next_parallel_unblock_candidate(
-            &plan,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            &deferred,
-            &BTreeMap::new(),
-            &attempts,
-            4,
-        )
-        .is_none());
+        assert!(
+            next_parallel_unblock_candidate(
+                &plan,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &deferred,
+                &BTreeMap::new(),
+                &attempts,
+                4,
+            )
+            .is_none()
+        );
     }
 
     #[test]
