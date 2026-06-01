@@ -27,6 +27,15 @@ Environment:
                                       for doctor/corpus/gen/steward planning.
   PILOT_TYPED_EXECUTION_MANIFEST=1    Use typed `auto pilot --execution-manifest-only`
                                       before Codex execution.
+  PILOT_TYPED_TASK_FINALIZE=1          Run typed `auto pilot --task-finalize-only`
+                                      after successful Codex execution when
+                                      the execution manifest selected a task.
+  PILOT_TASK_FINALIZE_STATUS=auto      auto, done, or partial. auto maps
+                                      executed->done and degraded->partial.
+  PILOT_TASK_FINALIZE_COMMIT=1         Commit source-plan task-state changes.
+  PILOT_TASK_FINALIZE_PUSH=auto        auto, 1, or 0. auto pushes only when the
+                                      execution manifest says the implementation
+                                      was pushed on a normal-origin repo.
   PILOT_TYPED_CLOSEOUT=1              Use typed `auto pilot --closeout-only`
                                       after Codex execution.
   PILOT_PROJECT_ROLLUP=1              Write `project-rollup.json/md` after
@@ -85,6 +94,11 @@ TYPED_PLANNING="${PILOT_TYPED_PLANNING:-1}"
 TYPED_PLANNING_REQUIRED="${PILOT_TYPED_PLANNING_REQUIRED:-0}"
 TYPED_EXECUTION_MANIFEST="${PILOT_TYPED_EXECUTION_MANIFEST:-1}"
 TYPED_EXECUTION_MANIFEST_REQUIRED="${PILOT_TYPED_EXECUTION_MANIFEST_REQUIRED:-0}"
+TYPED_TASK_FINALIZE="${PILOT_TYPED_TASK_FINALIZE:-1}"
+TYPED_TASK_FINALIZE_REQUIRED="${PILOT_TYPED_TASK_FINALIZE_REQUIRED:-0}"
+TASK_FINALIZE_STATUS_REQUEST="${PILOT_TASK_FINALIZE_STATUS:-auto}"
+TASK_FINALIZE_COMMIT="${PILOT_TASK_FINALIZE_COMMIT:-1}"
+TASK_FINALIZE_PUSH="${PILOT_TASK_FINALIZE_PUSH:-auto}"
 TYPED_CLOSEOUT="${PILOT_TYPED_CLOSEOUT:-1}"
 TYPED_CLOSEOUT_REQUIRED="${PILOT_TYPED_CLOSEOUT_REQUIRED:-0}"
 PROJECT_ROLLUP="${PILOT_PROJECT_ROLLUP:-1}"
@@ -95,7 +109,9 @@ MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
 TYPED_PREFLIGHT_RAN=0
 TYPED_PLANNING_RAN=0
 TYPED_EXECUTION_MANIFEST_RAN=0
+TYPED_TASK_FINALIZE_RAN=0
 TYPED_CLOSEOUT_RAN=0
+TASK_FINALIZE_STATUS="skipped"
 REMOTE_SYNC_MODE="normal"
 CURRENT_BRANCH="unknown"
 
@@ -172,6 +188,11 @@ auto_version_commit() {
   echo "typed_planning_required=$TYPED_PLANNING_REQUIRED"
   echo "typed_execution_manifest_requested=$TYPED_EXECUTION_MANIFEST"
   echo "typed_execution_manifest_required=$TYPED_EXECUTION_MANIFEST_REQUIRED"
+  echo "typed_task_finalize_requested=$TYPED_TASK_FINALIZE"
+  echo "typed_task_finalize_required=$TYPED_TASK_FINALIZE_REQUIRED"
+  echo "task_finalize_status_request=$TASK_FINALIZE_STATUS_REQUEST"
+  echo "task_finalize_commit=$TASK_FINALIZE_COMMIT"
+  echo "task_finalize_push=$TASK_FINALIZE_PUSH"
   echo "typed_closeout_requested=$TYPED_CLOSEOUT"
   echo "typed_closeout_required=$TYPED_CLOSEOUT_REQUIRED"
   echo "project_rollup_requested=$PROJECT_ROLLUP"
@@ -658,12 +679,13 @@ Required process:
 11. Execute at most one smallest safe implementation slice. Prefer auto parallel --max-iterations 1 for dependency-ready queue work. When using auto parallel, pass \`--branch "$CURRENT_BRANCH"\` unless you have explicitly changed branches and recorded why; the live default may be master even when the pilot branch is the correct campaign branch. If this run is in local-no-origin mode, the wrapper has exported AUTO_SKIP_REMOTE_SYNC=1 so auto parallel can run locally without pushing. If auto parallel still fails before worker execution, write the exact blocker and classify any focused Codex fallback as a degraded path, not a full autodev execution proof.
 12. Run focused validation. When a task has executable Verification commands, run those commands through \`scripts/run-task-verification.sh <TASK-ID> -- <command>\` so \`.auto/symphony/verification-receipts/<TASK-ID>.json\` is produced.
 13. Write $RUN_ROOT/receipt.md with inputs read, commands, artifacts, tests, commit/no-commit reason, risks, and next command.
-14. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
+14. Keep selected_task.source_plan accurate in $RUN_ROOT/pilot-execution.json. After Codex exits successfully, the wrapper runs auto pilot --task-finalize-only for executed/degraded selected tasks before closeout, so do not hand-edit task checklist state unless that helper is the blocker and you record the degraded path.
+15. Write or update a gbrain closeout page when enough evidence exists. If blocked, write a blocker page and classify it as repo-blocker, credential-blocker, planning-blocker, execution-blocker, or orchestration-failure.
 
 Evidence discipline:
 - Do not claim success without command output and file paths.
 - Every skipped autodev command, and every relevant skipped subcommand/action discovered from per-command help, needs a reason.
-- Typed closeout will fail unless $RUN_ROOT/pilot-landing.json proves either successful remote dry-run or explicit local-only no-origin mode, and $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary. Prefer \`auto pilot --execution-update-only\` for every manifest update.
+- Typed closeout will fail unless $RUN_ROOT/pilot-landing.json proves either successful remote dry-run or explicit local-only no-origin mode, $RUN_ROOT/pilot-execution.json has non-pending status, executor proof, verification summary, commit/no-commit evidence, runtime restart/no-restart evidence, and a complete Telegram summary, and any executed/degraded selected task is no longer pending in its source plan. Prefer \`auto pilot --execution-update-only\` for every manifest update; the wrapper then uses \`auto pilot --task-finalize-only\` for the source-plan checklist update.
 - If Telegram is needed, verify with hermes send before claiming it is unavailable.
 EOF
 
@@ -702,6 +724,214 @@ CODEX_STATUS=$?
 set -e
 
 CONTRACT_STATUS=0
+if [[ "$TYPED_TASK_FINALIZE" == "1" && "$CODEX_STATUS" -eq 0 ]]; then
+  EXECUTION_MANIFEST="$RUN_ROOT/pilot-execution.json"
+  if [[ ! -s "$EXECUTION_MANIFEST" ]]; then
+    TASK_FINALIZE_STATUS="skipped-missing-execution-manifest"
+    echo "typed_task_finalize_ran=0" >> "$RUN_ROOT/run.env"
+    echo "task_finalize_status=$TASK_FINALIZE_STATUS" >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_TASK_FINALIZE_REQUIRED" == "1" ]]; then
+      CONTRACT_STATUS=72
+    fi
+  elif ! command -v jq >/dev/null 2>&1; then
+    TASK_FINALIZE_STATUS="skipped-missing-jq"
+    echo "typed_task_finalize_ran=0" >> "$RUN_ROOT/run.env"
+    echo "task_finalize_status=$TASK_FINALIZE_STATUS" >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_TASK_FINALIZE_REQUIRED" == "1" ]]; then
+      CONTRACT_STATUS=72
+    fi
+  elif ! command -v auto >/dev/null 2>&1 || ! auto pilot --help 2>/dev/null | grep -q -- '--task-finalize-only'; then
+    TASK_FINALIZE_STATUS="skipped-unsupported-auto"
+    echo "typed_task_finalize_ran=0" >> "$RUN_ROOT/run.env"
+    echo "task_finalize_status=$TASK_FINALIZE_STATUS" >> "$RUN_ROOT/run.env"
+    if [[ "$TYPED_TASK_FINALIZE_REQUIRED" == "1" ]]; then
+      CONTRACT_STATUS=72
+    fi
+  else
+    EXECUTION_STATUS="$(jq -r '.status // ""' "$EXECUTION_MANIFEST")"
+    EXECUTION_TASK_ID="$(jq -r '.selected_task.id // ""' "$EXECUTION_MANIFEST")"
+    EXECUTION_PUSHED="$(jq -r '.git.pushed // false' "$EXECUTION_MANIFEST")"
+    if [[ ! "$EXECUTION_STATUS" =~ ^(executed|degraded)$ || -z "$EXECUTION_TASK_ID" ]]; then
+      TASK_FINALIZE_STATUS="skipped-not-eligible"
+      {
+        echo "typed_task_finalize_ran=0"
+        echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+        echo "task_finalize_skip_reason=execution_status=${EXECUTION_STATUS:-missing}; selected_task=${EXECUTION_TASK_ID:-missing}"
+      } >> "$RUN_ROOT/run.env"
+    else
+      case "$TASK_FINALIZE_STATUS_REQUEST" in
+        auto|"")
+          if [[ "$EXECUTION_STATUS" == "executed" ]]; then
+            TASK_FINALIZE_TARGET_STATUS="done"
+          else
+            TASK_FINALIZE_TARGET_STATUS="partial"
+          fi
+          ;;
+        done|partial)
+          TASK_FINALIZE_TARGET_STATUS="$TASK_FINALIZE_STATUS_REQUEST"
+          ;;
+        *)
+          TASK_FINALIZE_STATUS="failed-invalid-status"
+          CONTRACT_STATUS=72
+          {
+            echo "typed_task_finalize_ran=0"
+            echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+            echo "task_finalize_error=unsupported PILOT_TASK_FINALIZE_STATUS: $TASK_FINALIZE_STATUS_REQUEST"
+          } >> "$RUN_ROOT/run.env"
+          ;;
+      esac
+
+      if [[ "$CONTRACT_STATUS" -eq 0 ]]; then
+        case "$TASK_FINALIZE_COMMIT" in
+          1|true|TRUE|yes|YES)
+            TASK_FINALIZE_COMMIT_FLAG=1
+            ;;
+          0|false|FALSE|no|NO)
+            TASK_FINALIZE_COMMIT_FLAG=0
+            ;;
+          *)
+            TASK_FINALIZE_STATUS="failed-invalid-commit-policy"
+            CONTRACT_STATUS=72
+            {
+              echo "typed_task_finalize_ran=0"
+              echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+              echo "task_finalize_error=unsupported PILOT_TASK_FINALIZE_COMMIT: $TASK_FINALIZE_COMMIT"
+            } >> "$RUN_ROOT/run.env"
+            ;;
+        esac
+      fi
+
+      if [[ "$CONTRACT_STATUS" -eq 0 ]]; then
+        case "$TASK_FINALIZE_PUSH" in
+          auto|"")
+            if [[ "$TASK_FINALIZE_COMMIT_FLAG" -eq 1 && "$REMOTE_SYNC_MODE" == "normal" && "$EXECUTION_PUSHED" == "true" ]]; then
+              TASK_FINALIZE_PUSH_FLAG=1
+            else
+              TASK_FINALIZE_PUSH_FLAG=0
+            fi
+            ;;
+          1|true|TRUE|yes|YES)
+            TASK_FINALIZE_PUSH_FLAG=1
+            ;;
+          0|false|FALSE|no|NO)
+            TASK_FINALIZE_PUSH_FLAG=0
+            ;;
+          *)
+            TASK_FINALIZE_STATUS="failed-invalid-push-policy"
+            CONTRACT_STATUS=72
+            {
+              echo "typed_task_finalize_ran=0"
+              echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+              echo "task_finalize_error=unsupported PILOT_TASK_FINALIZE_PUSH: $TASK_FINALIZE_PUSH"
+            } >> "$RUN_ROOT/run.env"
+            ;;
+        esac
+      fi
+
+      if [[ "$CONTRACT_STATUS" -eq 0 && "$TASK_FINALIZE_PUSH_FLAG" -eq 1 && "$TASK_FINALIZE_COMMIT_FLAG" -ne 1 ]]; then
+        TASK_FINALIZE_STATUS="failed-push-without-commit"
+        CONTRACT_STATUS=72
+        {
+          echo "typed_task_finalize_ran=0"
+          echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+          echo "task_finalize_error=PILOT_TASK_FINALIZE_PUSH requires PILOT_TASK_FINALIZE_COMMIT=1"
+        } >> "$RUN_ROOT/run.env"
+      fi
+
+      if [[ "$CONTRACT_STATUS" -eq 0 && "$TASK_FINALIZE_PUSH_FLAG" -eq 1 && "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+        TASK_FINALIZE_STATUS="failed-local-only-push-requested"
+        CONTRACT_STATUS=72
+        {
+          echo "typed_task_finalize_ran=0"
+          echo "task_finalize_status=$TASK_FINALIZE_STATUS"
+          echo "task_finalize_error=refusing to push task-finalize state from local-no-origin repo"
+        } >> "$RUN_ROOT/run.env"
+      fi
+
+      if [[ "$CONTRACT_STATUS" -eq 0 ]]; then
+        TYPED_TASK_FINALIZE_ARGS=(
+          pilot
+          "$REPO_SLUG"
+          "$PROMPT"
+          --base-dir "$BASE_DIR"
+          --run-id "$RUN_ID"
+          --run-root "$RUN_ROOT"
+          --autodev-source "$AUTODEV_SOURCE"
+          --min-disk-kb "$MIN_DISK_KB"
+          --planning-mode "$PLANNING_MODE"
+          --task-finalize-only
+          --task-finalize-status "$TASK_FINALIZE_TARGET_STATUS"
+        )
+        if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+          TYPED_TASK_FINALIZE_ARGS+=(--allow-local-only)
+        fi
+        if [[ "$REQUIRE_PLANNING_SPINE" == "0" ]]; then
+          TYPED_TASK_FINALIZE_ARGS+=(--require-planning-spine false)
+        fi
+        if [[ "$TASK_FINALIZE_COMMIT_FLAG" -eq 1 ]]; then
+          TYPED_TASK_FINALIZE_ARGS+=(
+            --task-finalize-commit
+            --task-finalize-message "$REPO_SLUG: finalize $EXECUTION_TASK_ID plan state"
+          )
+        fi
+        if [[ "$TASK_FINALIZE_PUSH_FLAG" -eq 1 ]]; then
+          TYPED_TASK_FINALIZE_ARGS+=(--task-finalize-push)
+        fi
+        if [[ -n "$PLAN_PATH" ]]; then
+          TYPED_TASK_FINALIZE_ARGS+=(--plan "$PLAN_PATH")
+        fi
+        TYPED_TASK_FINALIZE_ARGS+=("${REFERENCE_ARGS[@]}")
+
+        if (
+          cd "$WORKDIR"
+          auto "${TYPED_TASK_FINALIZE_ARGS[@]}"
+        ) > "$RUN_ROOT/logs/auto-pilot-task-finalize.log" 2>&1; then
+          TYPED_TASK_FINALIZE_RAN=1
+          TASK_FINALIZE_STATUS="ok"
+          {
+            echo "typed_task_finalize_ran=1"
+            echo "task_finalize_status=ok"
+            echo "task_finalize_target_status=$TASK_FINALIZE_TARGET_STATUS"
+            echo "task_finalize_commit_requested=$TASK_FINALIZE_COMMIT_FLAG"
+            echo "task_finalize_push_requested=$TASK_FINALIZE_PUSH_FLAG"
+            echo "task_finalize_log=$RUN_ROOT/logs/auto-pilot-task-finalize.log"
+            echo "task_finalize_json=$RUN_ROOT/task-finalize.json"
+          } >> "$RUN_ROOT/run.env"
+        else
+          TYPED_TASK_FINALIZE_RAN=1
+          TASK_FINALIZE_STATUS="failed"
+          CONTRACT_STATUS=72
+          {
+            echo "typed_task_finalize_ran=1"
+            echo "task_finalize_status=failed"
+            echo "task_finalize_target_status=$TASK_FINALIZE_TARGET_STATUS"
+            echo "task_finalize_log=$RUN_ROOT/logs/auto-pilot-task-finalize.log"
+            echo "task_finalize_json=$RUN_ROOT/task-finalize.json"
+          } >> "$RUN_ROOT/run.env"
+          {
+            echo "# Task Finalize Warning"
+            echo
+            echo "Typed task finalization failed before closeout."
+            echo
+            echo "Selected task: \`$EXECUTION_TASK_ID\`"
+            echo "Execution status: \`$EXECUTION_STATUS\`"
+            echo "Target status: \`$TASK_FINALIZE_TARGET_STATUS\`"
+            echo "Log: \`$RUN_ROOT/logs/auto-pilot-task-finalize.log\`"
+          } > "$RUN_ROOT/task-finalize-warning.md"
+        fi
+      fi
+    fi
+  fi
+else
+  echo "typed_task_finalize_ran=0" >> "$RUN_ROOT/run.env"
+  if [[ "$TYPED_TASK_FINALIZE" != "1" ]]; then
+    TASK_FINALIZE_STATUS="disabled"
+  elif [[ "$CODEX_STATUS" -ne 0 ]]; then
+    TASK_FINALIZE_STATUS="skipped-codex-failed"
+  fi
+  echo "task_finalize_status=$TASK_FINALIZE_STATUS" >> "$RUN_ROOT/run.env"
+fi
+
 if [[ "$TYPED_CLOSEOUT" == "1" ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
   TYPED_CLOSEOUT_ARGS=(
     pilot
@@ -958,6 +1188,7 @@ fi
 
 {
   echo "codex_status=$CODEX_STATUS"
+  echo "task_finalize_status=$TASK_FINALIZE_STATUS"
   echo "project_rollup_status=$PROJECT_ROLLUP_STATUS"
   echo "completed=$(date -u +%FT%TZ)"
 } >> "$RUN_ROOT/run.env"
@@ -971,6 +1202,7 @@ fi
 send_telegram "[pilot-dev]" "finished $REPO_SLUG
 run: $RUN_ID
 codex_status: $CODEX_STATUS
+task_finalize: $TASK_FINALIZE_STATUS
 receipt: $RUN_ROOT/receipt.md
 project_rollup: $PROJECT_ROLLUP_STATUS
 next: ${NEXT_LINE:-inspect receipt}"
@@ -980,6 +1212,7 @@ echo "workdir: $WORKDIR"
 echo "run: $RUN_ID"
 echo "run_root: $RUN_ROOT"
 echo "codex_status: $CODEX_STATUS"
+echo "task_finalize: $TASK_FINALIZE_STATUS"
 echo "codex_log: $CODEX_LOG"
 echo "codex_final: $CODEX_FINAL"
 echo "receipt: $RUN_ROOT/receipt.md"

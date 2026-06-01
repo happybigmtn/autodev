@@ -647,6 +647,41 @@ status as `pending`, executor as `UNDECIDED`, verification empty,
 commit/no-commit evidence absent, runtime restart/no-restart evidence absent,
 or Telegram summary fields blank.
 
+Task-state finalization:
+
+```bash
+auto pilot <repo-slug> "<operator intent>" \
+  --task-finalize-only \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT" \
+  --task-finalize-status done \
+  --task-finalize-commit \
+  --task-finalize-push
+```
+
+`pilot-dev` runs this automatically after Codex exits successfully and
+`pilot-execution.json` says `executed` or `degraded` with a concrete
+`selected_task.id`. The default policy is:
+
+- `executed` finalizes the source-plan task as `done`
+- `degraded` finalizes the source-plan task as `partial`
+- commit the source-plan checklist change
+- push the finalization commit only when the execution manifest already says
+  the implementation commit was pushed and the repo has a normal origin
+
+Use these environment controls only when a campaign has an explicit reason to
+deviate:
+
+- `PILOT_TYPED_TASK_FINALIZE=0` disables the wrapper-owned finalizer
+- `PILOT_TASK_FINALIZE_STATUS=done|partial|auto` overrides status mapping
+- `PILOT_TASK_FINALIZE_COMMIT=0` avoids the plan-state commit
+- `PILOT_TASK_FINALIZE_PUSH=0|1|auto` controls the push policy
+
+The worker should not hand-edit checklist state for a selected task after
+execution. It must keep `selected_task.source_plan` accurate, and then let the
+wrapper write `task-finalize.json` before closeout. If task finalization fails,
+the run is an orchestration failure, not a successful closeout.
+
 Promotion policy: promote the generated snapshot automatically only when
 `auto gen --snapshot-only` exits 0, the newest `gen-*` directory contains
 `IMPLEMENTATION_PLAN.md`, and the design gate is either not applicable or
@@ -696,6 +731,9 @@ or incomplete:
   evidence, and Telegram summary fields in `pilot-execution.json`
 - successful remote dry-run or explicit local-only no-origin policy in
   `pilot-landing.json`
+- selected executed/degraded tasks are marked `[~]` or `[x]` in the resolved
+  source plan; `pilot-dev` should have already done this through
+  `auto pilot --task-finalize-only`
 - selected/deferred/skipped decisions and reasons for every discovered command
 - no `UNDECIDED` entries in the markdown companion
 - required planning phases recorded as successful in `pilot-planning.json`
