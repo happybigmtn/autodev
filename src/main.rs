@@ -20,6 +20,7 @@ mod loop_command;
 mod nemesis;
 mod parallel_command;
 mod pi_backend;
+mod pilot_command;
 mod prompt_ethos;
 mod qa_command;
 mod qa_only_command;
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
         Command::AuditHarvest(args) => super_command::run_audit_harvest_standalone(args).await,
         Command::Ship(args) => ship_command::run_ship(args).await,
         Command::Nemesis(args) => nemesis::run_nemesis(args).await,
+        Command::Pilot(args) => pilot_command::run_pilot(args).await,
         Command::Quota(args) => match args.command {
             QuotaSubcommand::Status => quota_status::run_status().await,
             QuotaSubcommand::Select(args) => {
@@ -137,6 +139,7 @@ mod tests {
             "audit",
             "ship",
             "nemesis",
+            "pilot",
             "quota",
             "audit-harvest",
             "symphony",

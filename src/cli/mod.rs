@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::util::CLI_LONG_VERSION;
 
+pub(crate) use crate::pilot_command::PilotArgs;
 pub(crate) use args_exec::{
     BugArgs, HardeningProfile, LoopArgs, NemesisArgs, ParallelAction, ParallelArgs,
     ParallelCargoTarget, ReviewArgs,
@@ -93,6 +94,8 @@ pub(crate) enum Command {
     Ship(ShipArgs),
     /// Run a disposable Nemesis audit and append its outputs into root specs and plan
     Nemesis(NemesisArgs),
+    /// Create a typed Hermes/Codex pilot run preflight and artifact spine
+    Pilot(PilotArgs),
     /// Manage quota-aware account multiplexing for Claude and Codex
     Quota(QuotaArgs),
     /// Harvest findings from a completed `auto audit --everything` run into
