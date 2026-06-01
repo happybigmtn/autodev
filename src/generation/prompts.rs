@@ -359,7 +359,7 @@ Section requirements for numbered priority plans:
 - `## User / Operator Outcome` explains what a user or operator gains and how they can see it working.
 - `## Evidence` names repository-relative code, tests, logs, commands, or docs that prove this priority is real.
 - `## Scope Boundary` states what the plan intentionally does not change, especially docs/audits/artifacts that are not needed now.
-- `## Implementation Slice` names the goal, dependencies, files to create or modify, tests to add or modify, and the approach. For research/checkpoint plans, name the decision artifact and write `Test expectation: none -- <reason>` only when no code behavior changes.
+- `## Implementation Slice` names the goal, dependencies, files to create or modify, tests to add or modify, and the approach. For code or UX/runtime implementation slices, include literal lines or labels containing `Goal`, `Files`, and `Tests` inside `## Implementation Slice`; commands in `## Verification` do not satisfy the slice contract by themselves. For research/checkpoint plans, name the decision artifact and write `Test expectation: none -- <reason>` only when no code behavior changes. For a master/index plan whose deliverable is the generated plan set rather than code, write an explicit dispatch phrase inside `## Implementation Slice`, such as `Plan dispatch`, `Dispatch index`, or `The master plan delivers`.
 - `## Verification` gives exact commands or checks from the repository root and the expected observation.
 - `## Deferred` lists follow-on work that is intentionally not part of this slice.
 
@@ -495,7 +495,7 @@ Corpus-specific validation:
 - Numbered priority plans must be self-contained, novice-readable, vertically sliced where possible, and grounded in repository-relative files and commands.
 - Reject or rewrite any absolute repo-root path that appears in the corpus. Use repository-relative references, "the repository root" in prose, or `cd "$(git rev-parse --show-toplevel)"` in shell examples instead.
 - Every numbered priority plan must include non-empty sections for `Priority Decision`, `User / Operator Outcome`, `Evidence`, `Scope Boundary`, `Implementation Slice`, `Verification`, and `Deferred`.
-- `Priority Decision` must state P0/P1/P2 and why the slice outranks plausible docs/audit/artifact work. `Implementation Slice` must name goal, dependencies, files to create or modify, tests to add or modify, and approach. For research-only or checkpoint work, name the decision artifact and explain why no code test is expected.
+- `Priority Decision` must state P0/P1/P2 and why the slice outranks plausible docs/audit/artifact work. `Implementation Slice` must name goal, dependencies, files to create or modify, tests to add or modify, and approach. For code or UX/runtime implementation slices, include literal lines or labels containing `Goal`, `Files`, and `Tests` inside `## Implementation Slice`; commands in `## Verification` do not satisfy the slice contract by themselves. For research-only or checkpoint work, name the decision artifact and explain why no code test is expected. For a master/index plan whose deliverable is the generated plan set rather than code, write an explicit dispatch phrase inside `## Implementation Slice`, such as `Plan dispatch`, `Dispatch index`, or `The master plan delivers`.
 - `Priority Decision` must state which autodev lever the plan feeds and why that lever is the right next control point.
 - Add checkpoint or decision-gate plans only when later work depends on unresolved evidence.
 
@@ -969,6 +969,11 @@ mod tests {
         assert!(prompt.contains("## Priority Decision"));
         assert!(prompt.contains("## User / Operator Outcome"));
         assert!(prompt.contains("## Implementation Slice"));
+        assert!(prompt.contains("literal lines or labels containing `Goal`, `Files`, and `Tests`"));
+        assert!(prompt.contains("commands in `## Verification` do not satisfy the slice contract"));
+        assert!(
+            prompt.contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`")
+        );
         assert!(prompt.contains("Do not use the short `## Objective`"));
         assert!(prompt.contains("current gstack `/autoplan` review discipline"));
         assert!(prompt.contains("Priority focus lens"));
@@ -977,8 +982,11 @@ mod tests {
         assert!(prompt.contains("Next Autodev Lever"));
         assert!(prompt.contains("Delete Or Demote"));
         assert!(prompt.contains("whether the operator should run `auto design`"));
-        assert!(prompt
-            .contains("product leverage, user-visible clarity, and engineering feasibility/tests"));
+        assert!(
+            prompt.contains(
+                "product leverage, user-visible clarity, and engineering feasibility/tests"
+            )
+        );
         assert!(prompt.contains("Never emit the absolute repository-root path"));
         assert!(prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(prompt.contains(
@@ -1032,6 +1040,18 @@ mod tests {
         assert!(corpus_prompt.contains(
             "Every numbered plan under `/tmp/repo/genesis/plans/` must use the compact priority-plan shape"
         ));
+        assert!(
+            corpus_prompt
+                .contains("literal lines or labels containing `Goal`, `Files`, and `Tests`")
+        );
+        assert!(
+            corpus_prompt
+                .contains("commands in `## Verification` do not satisfy the slice contract")
+        );
+        assert!(
+            corpus_prompt
+                .contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`")
+        );
         assert!(corpus_prompt.contains("Reject or rewrite any absolute repo-root path"));
         assert!(corpus_prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(corpus_prompt.contains("# Codex Corpus Review"));
@@ -1047,8 +1067,10 @@ mod tests {
         assert!(generation_prompt.contains("outside-voice review step for `auto gen`"));
         assert!(generation_prompt.contains("Do NOT read or execute any SKILL.md files"));
         assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
-        assert!(generation_prompt
-            .contains("The generator will sync reviewed outputs to the root after your pass"));
+        assert!(
+            generation_prompt
+                .contains("The generator will sync reviewed outputs to the root after your pass")
+        );
         assert!(generation_prompt.contains("Priority focus lens"));
         assert!(generation_prompt.contains("active production blockers"));
         assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
@@ -1155,7 +1177,9 @@ mod tests {
         assert!(prompt.contains("rank candidate tasks through the priority focus lens"));
         assert!(prompt.contains("Production orchestration discipline"));
         assert!(prompt.contains("Evidence, receipts, checkpoints, and report generation"));
-        assert!(prompt.contains("Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work`"));
+        assert!(prompt.contains(
+            "Put docs-only, audit-only, report-only, and artifact-only tasks in `## Follow-On Work`"
+        ));
         assert!(prompt.contains("Generated artifacts:` must name bindings, schemas, docs, snapshots, or `none`; this is proof metadata"));
     }
 
