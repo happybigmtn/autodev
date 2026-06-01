@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::corpus::PlanningCorpus;
-use crate::generation::{ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode};
+use crate::generation::{
+    ActivePlanSurface, CorpusPromptInputs, GeneratedSpecDocument, GenerationMode,
+};
 use crate::prompt_ethos::PRODUCTION_ORCHESTRATION_DISCIPLINE;
 
 pub(crate) const IMPLEMENTATION_PLAN_HEADER: &str = "# IMPLEMENTATION_PLAN";
@@ -111,6 +113,7 @@ pub(crate) fn build_corpus_prompt(
         focus,
         reference_repos,
         active_plan_surface,
+        gbrain_context_path,
     } = inputs;
     let planning_root = planning_root
         .strip_prefix(repo_root)
@@ -147,6 +150,7 @@ pub(crate) fn build_corpus_prompt(
             "Reference repositories to inspect as required input:\n{listing}\n\nWhen reference repos are listed:\n- Inspect them directly; do not treat them as optional background.\n- Use them to distinguish reusable code, architectural inspiration, and non-reusable coupling.\n- Be explicit about which conclusions came from the target repo vs the reference repos.\n\n"
         )
     };
+    let gbrain_context_clause = gbrain_context_clause(repo_root, gbrain_context_path);
     let active_plan_clause = if active_plan_surface.root_plan_standard_path.is_none()
         && !active_plan_surface.has_active_plans()
     {
@@ -240,6 +244,7 @@ Use up to {parallelism} parallel subagents when helpful for code review, repo-hi
 
 Additional operator-provided context:
 {previous_snapshot_clause}
+{gbrain_context_clause}
 {reference_repo_clause}
 {active_plan_clause}
 
@@ -618,6 +623,7 @@ pub(crate) fn build_spec_generation_prompt(
     output_dir: &Path,
     corpus: &PlanningCorpus,
     parallelism: usize,
+    gbrain_context_path: Option<&Path>,
 ) -> String {
     let mode_clause = match mode {
         GenerationMode::Gen => {
@@ -657,6 +663,7 @@ pub(crate) fn build_spec_generation_prompt(
             )
         })
         .unwrap_or_else(|| "No FOCUS.md steering brief is present for this corpus.".to_string());
+    let gbrain_context_clause = gbrain_context_clause(repo_root, gbrain_context_path);
     format!(
         r#"You are generating a new spec snapshot for `{repo_root}`.
 
@@ -678,6 +685,8 @@ Idea-seed context:
 
 Focus context:
 {focus_clause}
+
+{gbrain_context_clause}
 
 {priority_focus_lens}
 
@@ -756,6 +765,7 @@ pub(crate) fn build_implementation_plan_prompt(
     output_dir: &Path,
     generated_specs: &[GeneratedSpecDocument],
     parallelism: usize,
+    gbrain_context_path: Option<&Path>,
 ) -> String {
     let mode_clause = match mode {
         GenerationMode::Gen => {
@@ -778,6 +788,7 @@ pub(crate) fn build_implementation_plan_prompt(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let gbrain_context_clause = gbrain_context_clause(repo_root, gbrain_context_path);
     format!(
         r#"You are writing `{output_dir}/IMPLEMENTATION_PLAN.md` for `{repo_root}`.
 
@@ -787,6 +798,8 @@ Use up to {parallelism} parallel subagents where helpful.
 
 Generated specs for this run:
 {spec_listing}
+
+{gbrain_context_clause}
 
 {priority_focus_lens}
 
@@ -896,8 +909,28 @@ The goal is a truthful, execution-ready implementation queue."#,
         } else {
             spec_listing
         },
+        gbrain_context_clause = gbrain_context_clause,
         priority_focus_lens = PRIORITY_FOCUS_LENS,
         production_orchestration_discipline = PRODUCTION_ORCHESTRATION_DISCIPLINE,
+    )
+}
+
+fn gbrain_context_clause(repo_root: &Path, gbrain_context_path: Option<&Path>) -> String {
+    let Some(path) = gbrain_context_path else {
+        return String::new();
+    };
+    let display_path = path
+        .strip_prefix(repo_root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    format!(
+        r#"Shared gbrain context:
+- Auto-collected file: `{display_path}`
+- Read it as durable operator and project memory before ranking priorities.
+- Treat it as advisory memory only; verify current code facts against the live checkout.
+- Use it to avoid recreating stale branch-memory work and to preserve recent strategic decisions.
+"#
     )
 }
 
@@ -909,7 +942,7 @@ mod tests {
     };
     use crate::generation::tests::generated_spec;
     use crate::generation::{ActivePlanSurface, CorpusPromptInputs, GenerationMode};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn corpus_prompt_requires_assumption_validation_and_checkpoint_plans() {
@@ -923,6 +956,7 @@ mod tests {
                 focus: None,
                 reference_repos: &[],
                 active_plan_surface: &ActivePlanSurface::default(),
+                gbrain_context_path: None,
             },
         );
 
@@ -964,6 +998,7 @@ mod tests {
                 focus: Some("wire reconnects, TLS failures, session-token handling"),
                 reference_repos: &[],
                 active_plan_surface: &ActivePlanSurface::default(),
+                gbrain_context_path: None,
             },
         );
 
@@ -1036,6 +1071,7 @@ mod tests {
                     root_plan_standard_path: Some("PLANS.md".to_string()),
                     active_plan_paths: vec!["plans/001-master-plan.md".to_string()],
                 },
+                gbrain_context_path: None,
             },
         );
 
@@ -1061,6 +1097,7 @@ mod tests {
                     root_plan_standard_path: Some("PLANS.md".to_string()),
                     active_plan_paths: vec![],
                 },
+                gbrain_context_path: None,
             },
         );
 
@@ -1101,6 +1138,7 @@ mod tests {
                 "# Specification: Workspace Build System\n",
             )],
             4,
+            None,
         );
 
         assert!(prompt.contains("checkpoint tasks"));
@@ -1131,6 +1169,7 @@ mod tests {
                 "# Specification: Workspace Build System\n",
             )],
             4,
+            None,
         );
 
         assert!(
@@ -1154,10 +1193,47 @@ mod tests {
                 "# Specification: Workspace Build System\n",
             )],
             4,
+            None,
         );
 
         assert!(prompt.contains("authoritative for current-state facts"));
         assert!(prompt.contains("metric names"));
         assert!(prompt.contains("do not invent alternate dates or filenames"));
+    }
+
+    #[test]
+    fn gbrain_context_path_is_referenced_as_advisory_shared_memory() {
+        let prompt = build_corpus_prompt(
+            Path::new("/tmp/repo"),
+            Path::new("/tmp/repo/genesis"),
+            CorpusPromptInputs {
+                previous_planning_snapshot: None,
+                parallelism: 4,
+                idea: None,
+                focus: None,
+                reference_repos: &[],
+                active_plan_surface: &ActivePlanSurface::default(),
+                gbrain_context_path: Some(Path::new("/tmp/repo/genesis/GBRAIN-CONTEXT.md")),
+            },
+        );
+
+        assert!(prompt.contains("Shared gbrain context"));
+        assert!(prompt.contains("`genesis/GBRAIN-CONTEXT.md`"));
+        assert!(prompt.contains("advisory memory only"));
+
+        let plan_prompt = build_implementation_plan_prompt(
+            GenerationMode::Gen,
+            Path::new("/tmp/repo"),
+            Path::new("/tmp/repo/gen-123"),
+            &[generated_spec(
+                "workspace-build-system",
+                "# Specification: Workspace Build System\n",
+            )],
+            4,
+            Some(Path::new("/tmp/repo/gen-123/GBRAIN-CONTEXT.md")),
+        );
+
+        assert!(plan_prompt.contains("`gen-123/GBRAIN-CONTEXT.md`"));
+        assert!(plan_prompt.contains("durable operator and project memory"));
     }
 }

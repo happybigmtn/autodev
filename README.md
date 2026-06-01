@@ -46,6 +46,8 @@ need to pass directories in the normal case.
 - Planning root defaults to `<repo>/genesis`
 - Generated output defaults to `<repo>/gen-<timestamp>`
 - Internal state and logs live under `<repo>/.auto/`
+- `auto corpus` and `auto gen` automatically collect advisory gbrain shared memory into
+  `GBRAIN-CONTEXT.md` unless `--no-gbrain-context` is supplied
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
 - `auto bug` runs `gpt-5.5` `low` finder and skeptic passes, then `gpt-5.5`
@@ -197,6 +199,37 @@ The production-control promotion artifact is the root ledger:
 evidence such as `SHIP.md`, `QA.md`, and `HEALTH.md`. Generated snapshots stay
 subordinate until explicitly promoted; see
 `docs/decisions/production-control-promotion.md`.
+
+#### Hermes / GBrain Zero-Manual Loop
+
+Hermes should treat `auto` as the workflow driver, not as a pile of manual
+steps. The Telegram command should pass only the target repo and operator
+intent; `auto` handles gbrain lookup, prompt wiring, logs, and artifacts.
+
+Canonical command body for a repo-wide planning run:
+
+```bash
+cd "$REPO"
+auto doctor
+auto corpus \
+  --idea "$PROMPT" \
+  --focus "$FOCUS" \
+  --model "${MODEL:-gpt-5.5}" \
+  --reasoning-effort "${PLAN_EFFORT:-xhigh}" \
+  --review-model "${MODEL:-gpt-5.5}" \
+  --review-effort "${PLAN_EFFORT:-xhigh}"
+auto gen \
+  --snapshot-only \
+  --model "${MODEL:-gpt-5.5}" \
+  --reasoning-effort "${PLAN_EFFORT:-xhigh}" \
+  --review-model "${MODEL:-gpt-5.5}" \
+  --review-effort "${PLAN_EFFORT:-xhigh}"
+```
+
+The Hermes reply should include the generated `gen-*` path, the promotion
+command, `gen-*/GBRAIN-CONTEXT.md`, `gen-*/IMPLEMENTATION_PLAN.md`, and the
+latest prompt/model log paths printed by `auto`. No separate `gbrain search`,
+copy/paste context pack, or manual prompt assembly should be required.
 
 #### 3. Perfect Design And Runtime/UI Contracts
 
@@ -409,6 +442,7 @@ What it reads:
 
 - The live repository
 - Existing `genesis/` only as optional historical context
+- Advisory gbrain shared memory from automatic `gbrain search` / `gbrain list` probes
 - Existing planning standards and control docs such as `PLANS.md`,
   `plans/*.md`, `AGENTS.md`, and `CLAUDE.md`
 
@@ -420,6 +454,7 @@ What it writes:
 - `genesis/SPEC.md`
 - `genesis/PLANS.md`
 - `genesis/GENESIS-REPORT.md`
+- `genesis/GBRAIN-CONTEXT.md`
 - `genesis/DESIGN.md` when the repo has meaningful UI surfaces
 - `genesis/plans/*.md`
 - prompt and model logs under `.auto/logs/`
@@ -429,6 +464,8 @@ What it actually does:
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
 - Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Writes `GBRAIN-CONTEXT.md` before prompt authoring and tells the model to read it as advisory
+  operator/project memory, while still verifying code facts against the live checkout
 - Gives Codex-backed authoring and independent review passes the maximum Codex model context
   window; Kimi and MiniMax model aliases use their provider CLI limits
 - Reviews the repo as the primary truth source
@@ -498,6 +535,8 @@ Useful flags:
   independent review pass
 - `--max-turns <n>` to raise or lower the planning budget
 - `--parallelism <n>` to encourage more or less parallel planning work
+- `--gbrain-bin <path>` to use a non-default gbrain executable
+- `--no-gbrain-context` to disable automatic gbrain shared-memory capture
 - `--dry-run` to preview without invoking the model
 
 ### `auto gen`
@@ -509,11 +548,13 @@ Purpose:
 What it reads:
 
 - `genesis/`
+- Advisory gbrain shared memory from automatic `gbrain search` / `gbrain list` probes
 
 What it writes:
 
 - `gen-<timestamp>/specs/*.md`
 - `gen-<timestamp>/IMPLEMENTATION_PLAN.md`
+- `gen-<timestamp>/GBRAIN-CONTEXT.md`
 - root `specs/*.md` snapshot files
 - root `IMPLEMENTATION_PLAN.md`
 - prompt and model logs under `.auto/logs/`
@@ -522,6 +563,8 @@ What it actually does:
 
 - Generates fresh specs from the planning corpus
 - Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Writes `GBRAIN-CONTEXT.md` into the `gen-*` snapshot and threads it into both spec and plan
+  prompts as advisory shared memory
 - Gives Codex-backed authoring and independent review passes the maximum Codex model context
   window; Kimi and MiniMax model aliases use their provider CLI limits
 - Uses the planning corpus for intended future direction, but treats the live codebase as
@@ -591,6 +634,8 @@ Useful flags:
 - `--plan-only` to reuse an existing `gen-*` output and only regenerate the plan
 - `--snapshot-only` to write and verify a reviewable `gen-*` snapshot without syncing root specs or
   the root `IMPLEMENTATION_PLAN.md`; promote it later with `--sync-only --output-dir <gen-dir>`
+- `--gbrain-bin <path>` to use a non-default gbrain executable
+- `--no-gbrain-context` to disable automatic gbrain shared-memory capture
 - `--model`, `--reasoning-effort`, `--max-turns`, and `--parallelism` to tune the generation pass
 
 Binary provenance:

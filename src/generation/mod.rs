@@ -7,10 +7,11 @@
 //! hold output validation and root synchronization.
 
 mod corpus_verify;
+mod gbrain_context;
 pub(crate) mod markdown;
 mod phase_runner;
-mod planning_root;
 mod plan_verify;
+mod planning_root;
 mod prompts;
 mod root_sync;
 mod spec_verify;
@@ -30,23 +31,25 @@ use crate::generation::corpus_verify::{
     sanitize_and_verify_corpus_outputs, verify_corpus_outputs, verify_corpus_outputs_read_only,
     CorpusOutputSummary,
 };
+use crate::generation::gbrain_context::{collect_gbrain_context, GBRAIN_CONTEXT_FILENAME};
 use crate::generation::phase_runner::{
     codex_review_report_path, run_logged_author_phase, run_logged_codex_review,
 };
+use crate::generation::plan_verify::verify_generated_implementation_plan;
 use crate::generation::planning_root::{
     discover_active_plan_surface, ensure_planning_root_exists,
     ensure_planning_root_ready_for_corpus, prepare_generation_output_dir,
-    prepare_planning_root_for_corpus, promote_staged_planning_root, resolve_generation_planning_root,
-    resolve_reference_repos,
+    prepare_planning_root_for_corpus, promote_staged_planning_root,
+    resolve_generation_planning_root, resolve_reference_repos,
 };
-use crate::generation::plan_verify::verify_generated_implementation_plan;
 use crate::generation::prompts::{
     build_corpus_codex_review_prompt, build_corpus_prompt, build_generation_codex_review_prompt,
     build_implementation_plan_prompt, build_spec_generation_prompt,
 };
 use crate::generation::root_sync::{
-    rewrite_generated_plan_spec_refs, scrub_root_generated_outputs, sync_generated_specs_to_root,
-    sync_generated_plan_to_root_preserving_open_tasks, SpecSyncSummary,
+    rewrite_generated_plan_spec_refs, scrub_root_generated_outputs,
+    sync_generated_plan_to_root_preserving_open_tasks, sync_generated_specs_to_root,
+    SpecSyncSummary,
 };
 use crate::generation::spec_verify::verify_generated_specs;
 
@@ -100,6 +103,7 @@ struct CorpusPromptInputs<'a> {
     focus: Option<&'a str>,
     reference_repos: &'a [PathBuf],
     active_plan_surface: &'a ActivePlanSurface,
+    gbrain_context_path: Option<&'a Path>,
 }
 
 pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
@@ -155,6 +159,14 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
+    println!(
+        "gbrain ctx:  {}",
+        if args.no_gbrain_context {
+            "disabled"
+        } else {
+            "enabled"
+        }
+    );
     if args.verify_only {
         println!("mode:        verify-only");
     }
@@ -203,6 +215,22 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         )
     })?;
 
+    let gbrain_context_path = if args.no_gbrain_context {
+        None
+    } else {
+        print_stage("collect gbrain context", run_started_at);
+        match collect_gbrain_context(&repo_root, &authoring_root, "auto corpus", &args.gbrain_bin) {
+            Ok(path) => {
+                println!("gbrain ctx:  {}", path.display());
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!("warning: failed to collect gbrain context: {error:#}");
+                None
+            }
+        }
+    };
+
     let prompt = build_corpus_prompt(
         &repo_root,
         &authoring_root,
@@ -213,6 +241,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
             focus: args.focus.as_deref(),
             reference_repos: &reference_repos,
             active_plan_surface: &active_plan_surface,
+            gbrain_context_path: gbrain_context_path.as_deref(),
         },
     );
     print_stage("run corpus model", run_started_at);
@@ -288,6 +317,12 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     }
     if let Some(previous) = preparation.previous_snapshot {
         println!("prior input: {}", previous.display());
+    }
+    if gbrain_context_path.is_some() {
+        println!(
+            "gbrain ctx:  {}",
+            planning_root.join(GBRAIN_CONTEXT_FILENAME).display()
+        );
     }
     println!("plan files:  {}", summary.plan_count);
     println!("prompt log:  {}", author_phase.prompt_path.display());
@@ -383,6 +418,14 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     );
     println!("max turns:   {}", args.max_turns);
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
+    println!(
+        "gbrain ctx:  {}",
+        if args.no_gbrain_context {
+            "disabled"
+        } else {
+            "enabled"
+        }
+    );
     println!("planning source: {}", resolved_planning_root.source.label());
     println!("plan only:   {}", if args.plan_only { "yes" } else { "no" });
     println!(
@@ -453,6 +496,26 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             output_dir.join("corpus").display()
         )
     })?;
+    let gbrain_context_path = if args.no_gbrain_context {
+        None
+    } else {
+        print_stage("collect gbrain context", run_started_at);
+        match collect_gbrain_context(
+            &repo_root,
+            &output_dir,
+            mode.command_label(),
+            &args.gbrain_bin,
+        ) {
+            Ok(path) => {
+                println!("gbrain ctx:  {}", path.display());
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!("warning: failed to collect gbrain context: {error:#}");
+                None
+            }
+        }
+    };
 
     let mut generated_specs = if args.plan_only {
         print_stage("reuse existing generated specs", run_started_at);
@@ -466,6 +529,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             &output_dir,
             &corpus,
             args.parallelism.clamp(1, 10),
+            gbrain_context_path.as_deref(),
         );
         let phase = run_logged_author_phase(
             &repo_root,
@@ -493,6 +557,7 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             &output_dir,
             &generated_specs,
             args.parallelism.clamp(1, 10),
+            gbrain_context_path.as_deref(),
         );
         let plan_phase = run_logged_author_phase(
             &repo_root,
@@ -570,6 +635,9 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     println!("parallelism: {}", args.parallelism.clamp(1, 10));
     println!("specs:       {}", generated_specs.len());
     println!("plan:        {}", implementation_plan.display());
+    if let Some(path) = &gbrain_context_path {
+        println!("gbrain ctx:  {}", path.display());
+    }
     if let Some(sync_summary) = sync_summary {
         println!(
             "root specs:  {} appended, {} skipped",
@@ -725,8 +793,8 @@ pub(crate) mod tests {
         finalize_verified_generation_outputs, GeneratedSpecDocument, GenerationMode,
         SyncVerifiedGenerationOutputs,
     };
-    use crate::generation::spec_verify::verify_generated_specs;
     use crate::generation::plan_verify::verify_generated_implementation_plan;
+    use crate::generation::spec_verify::verify_generated_specs;
     use crate::state::{load_state, AutoState};
     use std::fs;
     use std::path::{Path, PathBuf};

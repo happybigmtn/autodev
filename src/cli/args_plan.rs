@@ -40,6 +40,14 @@ pub(crate) struct CorpusArgs {
     #[arg(long, default_value = "codex")]
     pub(crate) codex_bin: PathBuf,
 
+    /// gbrain executable used for automatic shared-memory context collection
+    #[arg(long, default_value = "gbrain")]
+    pub(crate) gbrain_bin: PathBuf,
+
+    /// Do not auto-load gbrain shared-memory context into the corpus prompt
+    #[arg(long)]
+    pub(crate) no_gbrain_context: bool,
+
     /// Skip the independent review pass
     #[arg(long)]
     pub(crate) skip_codex_review: bool,
@@ -90,6 +98,14 @@ pub(crate) struct GenerationArgs {
     /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
     #[arg(long, default_value = "codex")]
     pub(crate) codex_bin: PathBuf,
+
+    /// gbrain executable used for automatic shared-memory context collection
+    #[arg(long, default_value = "gbrain")]
+    pub(crate) gbrain_bin: PathBuf,
+
+    /// Do not auto-load gbrain shared-memory context into the spec and plan prompts
+    #[arg(long)]
+    pub(crate) no_gbrain_context: bool,
 
     /// Skip the independent review pass
     #[arg(long)]

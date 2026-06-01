@@ -159,6 +159,8 @@ pub(crate) fn build_super_generation_args(
         codex_review_model: args.model.clone(),
         codex_review_effort: args.reasoning_effort.clone(),
         codex_bin: args.codex_bin.clone(),
+        gbrain_bin: std::path::PathBuf::from("gbrain"),
+        no_gbrain_context: false,
         skip_codex_review: false,
         max_turns: args.max_turns,
         parallelism: args.planning_parallelism,

@@ -120,6 +120,8 @@ pub(crate) async fn run_super(args: SuperArgs) -> Result<()> {
             codex_review_model: args.model.clone(),
             codex_review_effort: args.reasoning_effort.clone(),
             codex_bin: args.codex_bin.clone(),
+            gbrain_bin: std::path::PathBuf::from("gbrain"),
+            no_gbrain_context: false,
             skip_codex_review: false,
             verify_only: false,
             max_turns: args.max_turns,
