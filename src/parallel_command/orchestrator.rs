@@ -130,6 +130,9 @@ pub(crate) async fn run_serial_loop(
     worker_env: &LoopWorkerEnv,
 ) -> Result<()> {
     let stderr_log_path = run_root.join("stderr.log");
+    let stdout_log_path = run_root.join("stdout.log");
+    fs::write(&stdout_log_path, b"")
+        .with_context(|| format!("failed to initialize {}", stdout_log_path.display()))?;
     let harness = if args.claude { "Claude" } else { "Codex" };
     let mut iteration = 0usize;
     let mut consecutive_failures = 0usize;
@@ -204,7 +207,7 @@ pub(crate) async fn run_serial_loop(
                 &args.reasoning_effort,
                 args.max_turns,
                 &stderr_log_path,
-                None,
+                Some(&stdout_log_path),
                 "auto parallel",
                 &worker_env.extra_env,
                 None,
@@ -219,7 +222,7 @@ pub(crate) async fn run_serial_loop(
                 &args.reasoning_effort,
                 &args.codex_bin,
                 &stderr_log_path,
-                None,
+                Some(&stdout_log_path),
                 "auto parallel",
                 &worker_env.extra_env,
                 None,
@@ -227,6 +230,13 @@ pub(crate) async fn run_serial_loop(
             )
             .await?
         };
+        if let Some(violation) = detect_forbidden_worker_remote_git_command(&stdout_log_path)? {
+            bail!(
+                "{harness} worker attempted forbidden remote git command `{}` in {}; lanes must leave remote sync to the host",
+                violation.command,
+                stdout_log_path.display()
+            );
+        }
         if !exit_status.success() {
             let exit_code = exit_status.code().unwrap_or(-1);
             let is_futility = exit_code == FUTILITY_EXIT_MARKER;
@@ -866,6 +876,29 @@ pub(crate) async fn run_parallel_loop(
             continue;
         };
         active_tasks.remove(&assignment.task.id);
+
+        if let Some(violation) =
+            detect_forbidden_worker_remote_git_command(&assignment.stdout_log_path)?
+        {
+            parallel_logger.warn(format!(
+                "policy:      lane-{} `{}` attempted forbidden remote git command `{}`; shelving for the rest of this run. see {}",
+                assignment.lane_index,
+                assignment.task.id,
+                violation.command,
+                assignment.stdout_log_path.display()
+            ));
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!(
+                    "shelved: worker attempted forbidden remote git command `{}`; host owns remote sync",
+                    violation.command
+                ),
+            );
+            shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+            continue;
+        }
 
         if let Some(error) = lane_result.error {
             eprintln!(
@@ -1586,6 +1619,236 @@ pub(crate) fn redact_parallel_live_log_message(message: &str) -> String {
         .into_owned()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForbiddenWorkerRemoteGitCommand {
+    command: String,
+    verb: String,
+}
+
+fn detect_forbidden_worker_remote_git_command(
+    rendered_stdout_log_path: &Path,
+) -> Result<Option<ForbiddenWorkerRemoteGitCommand>> {
+    if !rendered_stdout_log_path.exists() {
+        return Ok(None);
+    }
+    let log_text = fs::read_to_string(rendered_stdout_log_path)
+        .with_context(|| format!("failed to read {}", rendered_stdout_log_path.display()))?;
+    Ok(detect_forbidden_worker_remote_git_command_in_rendered_log(
+        &log_text,
+    ))
+}
+
+fn detect_forbidden_worker_remote_git_command_in_rendered_log(
+    log_text: &str,
+) -> Option<ForbiddenWorkerRemoteGitCommand> {
+    let mut in_command = false;
+    let mut command_lines = Vec::new();
+
+    for raw_line in log_text.lines() {
+        let sanitized = strip_ansi_codes(raw_line);
+        let line = strip_auto_stream_prefix(&sanitized);
+        let trimmed = line.trim();
+
+        if trimmed == "command:" {
+            if let Some(violation) =
+                detect_forbidden_worker_remote_git_command_lines(&command_lines)
+            {
+                return Some(violation);
+            }
+            command_lines.clear();
+            in_command = true;
+            continue;
+        }
+
+        if !in_command {
+            continue;
+        }
+
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            command_lines.push(line.trim().to_string());
+            continue;
+        }
+
+        if let Some(violation) = detect_forbidden_worker_remote_git_command_lines(&command_lines) {
+            return Some(violation);
+        }
+        command_lines.clear();
+        in_command = false;
+    }
+
+    detect_forbidden_worker_remote_git_command_lines(&command_lines)
+}
+
+fn detect_forbidden_worker_remote_git_command_lines(
+    command_lines: &[String],
+) -> Option<ForbiddenWorkerRemoteGitCommand> {
+    let command = command_lines.join(" ");
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    forbidden_remote_git_verb(command).map(|verb| ForbiddenWorkerRemoteGitCommand {
+        command: command.to_string(),
+        verb,
+    })
+}
+
+fn forbidden_remote_git_verb(command: &str) -> Option<String> {
+    forbidden_remote_git_verb_with_depth(command, 0)
+}
+
+fn forbidden_remote_git_verb_with_depth(command: &str, depth: usize) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    let tokens = shell_tokens(command);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        if !is_shell_invocation(token) {
+            continue;
+        }
+        let mut cursor = index + 1;
+        while cursor < tokens.len() {
+            let token = tokens[cursor].as_str();
+            if matches!(token, "-c" | "-lc") {
+                if let Some(script) = tokens.get(cursor + 1) {
+                    if let Some(verb) = forbidden_remote_git_verb_with_depth(script, depth + 1) {
+                        return Some(verb);
+                    }
+                }
+                break;
+            }
+            cursor += 1;
+        }
+    }
+
+    let mut start = 0usize;
+    while start < tokens.len() {
+        while start < tokens.len() && is_shell_separator(&tokens[start]) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < tokens.len() && !is_shell_separator(&tokens[end]) {
+            end += 1;
+        }
+        if start < end {
+            if let Some(verb) = forbidden_remote_git_verb_in_segment(&tokens[start..end]) {
+                return Some(verb);
+            }
+        }
+        start = end + 1;
+    }
+
+    None
+}
+
+fn forbidden_remote_git_verb_in_segment(tokens: &[String]) -> Option<String> {
+    let mut cursor = 0usize;
+    while cursor < tokens.len() {
+        match tokens[cursor].as_str() {
+            "sudo" | "command" | "time" => cursor += 1,
+            "env" | "/usr/bin/env" => {
+                cursor += 1;
+                while cursor < tokens.len() && looks_like_env_assignment(&tokens[cursor]) {
+                    cursor += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    if cursor >= tokens.len() || !is_git_invocation(&tokens[cursor]) {
+        return None;
+    }
+
+    cursor += 1;
+    while cursor < tokens.len() {
+        let token = tokens[cursor].as_str();
+        if matches!(
+            token,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            cursor += 2;
+            continue;
+        }
+        if token.starts_with("--git-dir=")
+            || token.starts_with("--work-tree=")
+            || token.starts_with("--namespace=")
+        {
+            cursor += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+
+    tokens.get(cursor).and_then(|verb| {
+        let verb = verb.as_str();
+        if matches!(verb, "push" | "pull" | "fetch" | "rebase") {
+            Some(verb.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn shell_tokens(command: &str) -> Vec<String> {
+    shlex::split(command).unwrap_or_else(|| {
+        command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    })
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(key, _)| {
+        !key.is_empty()
+            && key
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    })
+}
+
+fn is_shell_separator(token: &str) -> bool {
+    matches!(token, "&&" | "||" | ";" | "|")
+}
+
+fn is_shell_invocation(token: &str) -> bool {
+    command_basename(token).is_some_and(|name| matches!(name, "sh" | "bash" | "zsh" | "dash"))
+}
+
+fn is_git_invocation(token: &str) -> bool {
+    command_basename(token).is_some_and(|name| name == "git")
+}
+
+fn command_basename(token: &str) -> Option<&str> {
+    token.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+fn strip_auto_stream_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((_, after)) = rest.split_once("] ") {
+            return after;
+        }
+    }
+    line
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    ANSI_RE
+        .get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("valid ansi regex"))
+        .replace_all(input, "")
+        .into_owned()
+}
+
 pub(crate) fn spawn_parallel_lane_attempt(
     join_set: &mut JoinSet<LaneAttemptResult>,
     lane_config: &LaneRunConfig,
@@ -1816,7 +2079,7 @@ pub(crate) fn clean_commit_harvest_ready(
 
 #[cfg(test)]
 mod tests {
-    use crate::parallel_command::*;
+    use super::*;
     use anyhow::anyhow;
     use std::time::UNIX_EPOCH;
 
@@ -1873,5 +2136,36 @@ mod tests {
         );
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn rendered_worker_log_detects_forbidden_remote_git_command() {
+        let violation = detect_forbidden_worker_remote_git_command_in_rendered_log(
+            "[auto parallel] command:\n[auto parallel]   /bin/bash -lc 'git push origin pilot'\n[auto parallel] exit: code 128\n",
+        )
+        .expect("expected forbidden command");
+
+        assert_eq!(violation.verb, "push");
+        assert_eq!(violation.command, "/bin/bash -lc 'git push origin pilot'");
+    }
+
+    #[test]
+    fn rendered_worker_log_ignores_searches_for_forbidden_git_text() {
+        let violation = detect_forbidden_worker_remote_git_command_in_rendered_log(
+            "command:\n  /bin/bash -lc 'rg -n \"git push|git fetch\" src README.md'\nresult: no matches\n",
+        );
+
+        assert_eq!(violation, None);
+    }
+
+    #[test]
+    fn rendered_worker_log_detects_git_global_option_remote_command() {
+        let violation = detect_forbidden_worker_remote_git_command_in_rendered_log(
+            "command:\n  /usr/bin/git -C ../repo fetch origin\nresult: fetched\n",
+        )
+        .expect("expected forbidden command");
+
+        assert_eq!(violation.verb, "fetch");
+        assert_eq!(violation.command, "/usr/bin/git -C ../repo fetch origin");
     }
 }
