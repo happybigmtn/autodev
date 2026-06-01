@@ -29,6 +29,10 @@ Environment:
                                       before Codex execution.
   PILOT_TYPED_CLOSEOUT=1              Use typed `auto pilot --closeout-only`
                                       after Codex execution.
+  PILOT_PROJECT_ROLLUP=1              Write `project-rollup.json/md` after
+                                      successful typed closeout.
+  PILOT_GBRAIN_PROJECT_ROLLUP=1       Publish `project-rollup.md` to
+                                      `projects/<repo-slug>` in gbrain.
   PILOT_WRAPPER_PREFLIGHT_ONLY=0      Stop after wrapper preflight/planning
                                       gates; useful for no-Codex smoke tests.
 
@@ -83,6 +87,9 @@ TYPED_EXECUTION_MANIFEST="${PILOT_TYPED_EXECUTION_MANIFEST:-1}"
 TYPED_EXECUTION_MANIFEST_REQUIRED="${PILOT_TYPED_EXECUTION_MANIFEST_REQUIRED:-0}"
 TYPED_CLOSEOUT="${PILOT_TYPED_CLOSEOUT:-1}"
 TYPED_CLOSEOUT_REQUIRED="${PILOT_TYPED_CLOSEOUT_REQUIRED:-0}"
+PROJECT_ROLLUP="${PILOT_PROJECT_ROLLUP:-1}"
+PROJECT_ROLLUP_REQUIRED="${PILOT_PROJECT_ROLLUP_REQUIRED:-0}"
+GBRAIN_PROJECT_ROLLUP="${PILOT_GBRAIN_PROJECT_ROLLUP:-1}"
 WRAPPER_PREFLIGHT_ONLY="${PILOT_WRAPPER_PREFLIGHT_ONLY:-0}"
 MIN_DISK_KB="${PILOT_MIN_DISK_KB:-10000000}"
 TYPED_PREFLIGHT_RAN=0
@@ -167,6 +174,9 @@ auto_version_commit() {
   echo "typed_execution_manifest_required=$TYPED_EXECUTION_MANIFEST_REQUIRED"
   echo "typed_closeout_requested=$TYPED_CLOSEOUT"
   echo "typed_closeout_required=$TYPED_CLOSEOUT_REQUIRED"
+  echo "project_rollup_requested=$PROJECT_ROLLUP"
+  echo "project_rollup_required=$PROJECT_ROLLUP_REQUIRED"
+  echo "gbrain_project_rollup=$GBRAIN_PROJECT_ROLLUP"
   echo "wrapper_preflight_only=$WRAPPER_PREFLIGHT_ONLY"
   echo "min_disk_kb=$MIN_DISK_KB"
   echo "remote_sync_mode=$REMOTE_SYNC_MODE"
@@ -847,12 +857,108 @@ if [[ "$CONTRACT_STATUS" -eq 0 && -s "$RUN_ROOT/steward-preflight/PROMOTIONS.md"
 fi
 fi
 
+PROJECT_ROLLUP_STATUS="skipped"
+if [[ "$PROJECT_ROLLUP" == "1" && "$CONTRACT_STATUS" -eq 0 ]] && command -v auto >/dev/null 2>&1 && auto pilot --help >/dev/null 2>&1; then
+  PROJECT_ROLLUP_ARGS=(
+    pilot
+    "$REPO_SLUG"
+    "$PROMPT"
+    --base-dir "$BASE_DIR"
+    --run-id "$RUN_ID"
+    --run-root "$RUN_ROOT"
+    --autodev-source "$AUTODEV_SOURCE"
+    --min-disk-kb "$MIN_DISK_KB"
+    --planning-mode "$PLANNING_MODE"
+    --project-rollup-only
+  )
+  if [[ "$REMOTE_SYNC_MODE" == "local-no-origin" ]]; then
+    PROJECT_ROLLUP_ARGS+=(--allow-local-only)
+  fi
+  if [[ "$REQUIRE_PLANNING_SPINE" == "0" ]]; then
+    PROJECT_ROLLUP_ARGS+=(--require-planning-spine false)
+  fi
+  if [[ -n "$PLAN_PATH" ]]; then
+    PROJECT_ROLLUP_ARGS+=(--plan "$PLAN_PATH")
+  fi
+  PROJECT_ROLLUP_ARGS+=("${REFERENCE_ARGS[@]}")
+
+  if (
+    cd "$WORKDIR"
+    auto "${PROJECT_ROLLUP_ARGS[@]}"
+  ) > "$RUN_ROOT/logs/auto-pilot-project-rollup.log" 2>&1; then
+    PROJECT_ROLLUP_STATUS="artifact-ok"
+    {
+      echo "project_rollup_ran=1"
+      echo "project_rollup_status=artifact-ok"
+      echo "project_rollup_log=$RUN_ROOT/logs/auto-pilot-project-rollup.log"
+      echo "project_rollup_json=$RUN_ROOT/project-rollup.json"
+      echo "project_rollup_markdown=$RUN_ROOT/project-rollup.md"
+    } >> "$RUN_ROOT/run.env"
+    if [[ "$GBRAIN_PROJECT_ROLLUP" == "1" ]]; then
+      if command -v gbrain >/dev/null 2>&1 && [[ -s "$RUN_ROOT/project-rollup.md" ]]; then
+        if gbrain put "projects/$REPO_SLUG" --content "$(cat "$RUN_ROOT/project-rollup.md")" > "$RUN_ROOT/logs/gbrain-project-rollup.log" 2>&1; then
+          PROJECT_ROLLUP_STATUS="gbrain-ok"
+          {
+            echo "project_rollup_status=gbrain-ok"
+            echo "project_rollup_gbrain_slug=projects/$REPO_SLUG"
+            echo "project_rollup_gbrain_log=$RUN_ROOT/logs/gbrain-project-rollup.log"
+          } >> "$RUN_ROOT/run.env"
+        else
+          PROJECT_ROLLUP_STATUS="gbrain-failed"
+          {
+            echo "# Project Rollup Warning"
+            echo
+            echo "Generated project rollup artifacts but failed to publish them to gbrain."
+            echo
+            echo "Slug: \`projects/$REPO_SLUG\`"
+            echo "Markdown: \`$RUN_ROOT/project-rollup.md\`"
+            echo "Log: \`$RUN_ROOT/logs/gbrain-project-rollup.log\`"
+          } > "$RUN_ROOT/project-rollup-warning.md"
+          echo "project_rollup_status=gbrain-failed" >> "$RUN_ROOT/run.env"
+          if [[ "$PROJECT_ROLLUP_REQUIRED" == "1" ]]; then
+            CONTRACT_STATUS=77
+          fi
+        fi
+      else
+        PROJECT_ROLLUP_STATUS="gbrain-unavailable"
+        {
+          echo "# Project Rollup Warning"
+          echo
+          echo "Generated project rollup artifacts but gbrain was unavailable or the markdown artifact was missing."
+          echo
+          echo "Markdown: \`$RUN_ROOT/project-rollup.md\`"
+        } > "$RUN_ROOT/project-rollup-warning.md"
+        echo "project_rollup_status=gbrain-unavailable" >> "$RUN_ROOT/run.env"
+        if [[ "$PROJECT_ROLLUP_REQUIRED" == "1" ]]; then
+          CONTRACT_STATUS=77
+        fi
+      fi
+    fi
+  else
+    PROJECT_ROLLUP_STATUS="artifact-failed"
+    {
+      echo "# Project Rollup Warning"
+      echo
+      echo "Failed to generate typed project rollup artifacts."
+      echo
+      echo "Log: \`$RUN_ROOT/logs/auto-pilot-project-rollup.log\`"
+    } > "$RUN_ROOT/project-rollup-warning.md"
+    echo "project_rollup_status=artifact-failed" >> "$RUN_ROOT/run.env"
+    if [[ "$PROJECT_ROLLUP_REQUIRED" == "1" ]]; then
+      CONTRACT_STATUS=77
+    fi
+  fi
+else
+  echo "project_rollup_ran=0" >> "$RUN_ROOT/run.env"
+fi
+
 if [[ "$CODEX_STATUS" -eq 0 && "$CONTRACT_STATUS" -ne 0 ]]; then
   CODEX_STATUS="$CONTRACT_STATUS"
 fi
 
 {
   echo "codex_status=$CODEX_STATUS"
+  echo "project_rollup_status=$PROJECT_ROLLUP_STATUS"
   echo "completed=$(date -u +%FT%TZ)"
 } >> "$RUN_ROOT/run.env"
 
@@ -866,6 +972,7 @@ send_telegram "[pilot-dev]" "finished $REPO_SLUG
 run: $RUN_ID
 codex_status: $CODEX_STATUS
 receipt: $RUN_ROOT/receipt.md
+project_rollup: $PROJECT_ROLLUP_STATUS
 next: ${NEXT_LINE:-inspect receipt}"
 
 echo "repo: $REPO_SLUG"
@@ -876,5 +983,7 @@ echo "codex_status: $CODEX_STATUS"
 echo "codex_log: $CODEX_LOG"
 echo "codex_final: $CODEX_FINAL"
 echo "receipt: $RUN_ROOT/receipt.md"
+echo "project_rollup: $PROJECT_ROLLUP_STATUS"
+echo "project_rollup_md: $RUN_ROOT/project-rollup.md"
 
 exit "$CODEX_STATUS"

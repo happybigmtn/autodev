@@ -705,6 +705,27 @@ Hermes may send a successful Telegram summary only after the typed closeout
 gate passes. If it fails, the wrapper reports the run as an orchestration
 failure and links `pilot-closeout.json` plus `orchestration-failure.md`.
 
+Project rollup:
+
+```bash
+auto pilot <repo-slug> "<operator intent>" \
+  --project-rollup-only \
+  --run-id "$RUN_ID" \
+  --run-root "$RUN_ROOT"
+```
+
+`pilot-dev` runs this after a successful typed closeout by default through
+`PILOT_PROJECT_ROLLUP=1`. The command writes:
+
+- `project-rollup.json`
+- `project-rollup.md`
+
+When `PILOT_GBRAIN_PROJECT_ROLLUP=1`, the wrapper publishes
+`project-rollup.md` to `projects/<repo-slug>` with `gbrain put`. If publication
+fails, the wrapper writes `project-rollup-warning.md`; set
+`PILOT_PROJECT_ROLLUP_REQUIRED=1` when stale gbrain project memory should fail
+the run.
+
 Hermes returns this Telegram summary shape:
 
 ```text

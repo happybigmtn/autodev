@@ -219,6 +219,10 @@ pub(crate) struct PilotArgs {
     /// Validate a completed pilot run's closeout artifacts, then stop.
     #[arg(long)]
     pub(crate) closeout_only: bool,
+
+    /// Write project rollup artifacts from the completed pilot run, then stop.
+    #[arg(long)]
+    pub(crate) project_rollup_only: bool,
 }
 
 pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
@@ -228,17 +232,31 @@ pub(crate) async fn run_pilot(args: PilotArgs) -> Result<()> {
         args.execution_manifest_only,
         args.execution_update_only,
         args.closeout_only,
+        args.project_rollup_only,
     ]
     .iter()
     .filter(|selected| **selected)
     .count();
     if selected_modes > 1 {
         bail!(
-            "--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, and --closeout-only are mutually exclusive"
+            "--preflight-only, --planning-only, --execution-manifest-only, --execution-update-only, --closeout-only, and --project-rollup-only are mutually exclusive"
         );
     }
     let intent = args.intent.join(" ");
     let paths = PilotPaths::resolve(&args)?;
+    if args.project_rollup_only {
+        write_project_rollup(&args, &paths)?;
+        println!("repo: {}", args.repo_slug);
+        println!("workdir: {}", paths.workdir.display());
+        println!("run: {}", paths.run_id);
+        println!("run_root: {}", paths.run_root.display());
+        println!(
+            "project_rollup: {}",
+            paths.run_root.join("project-rollup.md").display()
+        );
+        println!("pilot project rollup ok");
+        return Ok(());
+    }
     if args.closeout_only {
         validate_closeout(&args, &paths)?;
         println!("repo: {}", args.repo_slug);
@@ -1264,6 +1282,314 @@ fn validate_closeout(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
     Ok(())
 }
 
+fn write_project_rollup(args: &PilotArgs, paths: &PilotPaths) -> Result<()> {
+    fs::create_dir_all(&paths.run_root)?;
+    let landing = read_json_artifact(&paths.run_root.join("pilot-landing.json"));
+    let planning = read_json_artifact(&paths.run_root.join("pilot-planning.json"));
+    let execution = read_json_artifact(&paths.run_root.join("pilot-execution.json"));
+    let closeout = read_json_artifact(&paths.run_root.join("pilot-closeout.json"));
+    let branch = current_branch(&paths.workdir);
+    let head = git_output(&paths.workdir, &["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|| "unknown".to_string());
+    let head_subject =
+        git_output(&paths.workdir, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
+    let origin = git_output(&paths.workdir, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let status_short = git_output(&paths.workdir, &["status", "--short"]).unwrap_or_default();
+    let latest_generated_snapshot = latest_generated_snapshot(&paths.workdir)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    let landing_mode = landing
+        .as_ref()
+        .map(|value| string_at(value, &["remote_sync_mode"]).to_string())
+        .unwrap_or_default();
+    let landing_policy = landing
+        .as_ref()
+        .map(|value| string_at(value, &["push_policy"]).to_string())
+        .unwrap_or_default();
+    let execution_status = execution
+        .as_ref()
+        .map(|value| string_at(value, &["status"]).to_string())
+        .unwrap_or_default();
+    let selected_task = execution
+        .as_ref()
+        .map(|value| string_at(value, &["selected_task", "id"]).to_string())
+        .unwrap_or_default();
+    let selected_task_title = execution
+        .as_ref()
+        .map(|value| string_at(value, &["selected_task", "title"]).to_string())
+        .unwrap_or_default();
+    let verification_summary = execution
+        .as_ref()
+        .map(|value| string_at(value, &["verification", "summary"]).to_string())
+        .unwrap_or_default();
+    let execution_commit = execution
+        .as_ref()
+        .map(|value| string_at(value, &["git", "commit"]).to_string())
+        .unwrap_or_default();
+    let no_commit_reason = execution
+        .as_ref()
+        .map(|value| string_at(value, &["git", "no_commit_reason"]).to_string())
+        .unwrap_or_default();
+    let pushed = execution
+        .as_ref()
+        .is_some_and(|value| bool_at(value, &["git", "pushed"]));
+    let closeout_status = closeout
+        .as_ref()
+        .map(|value| string_at(value, &["status"]).to_string())
+        .unwrap_or_default();
+    let planning_mode = planning
+        .as_ref()
+        .map(|value| string_at(value, &["effective_planning_mode"]).to_string())
+        .unwrap_or_default();
+    let summary_plan = execution
+        .as_ref()
+        .map(|value| string_at(value, &["telegram_summary", "plan"]).to_string())
+        .unwrap_or_default();
+    let summary_tests = execution
+        .as_ref()
+        .map(|value| string_at(value, &["telegram_summary", "tests"]).to_string())
+        .unwrap_or_default();
+    let summary_next = execution
+        .as_ref()
+        .map(|value| string_at(value, &["telegram_summary", "next"]).to_string())
+        .unwrap_or_default();
+
+    let manifest = json!({
+        "schema_version": 1,
+        "repo_slug": args.repo_slug,
+        "project_slug": format!("projects/{}", args.repo_slug),
+        "repo": paths.repo,
+        "workdir": paths.workdir,
+        "run_id": paths.run_id,
+        "run_root": paths.run_root,
+        "created": Utc::now().format("%FT%TZ").to_string(),
+        "branch": branch,
+        "head": head,
+        "head_subject": head_subject,
+        "origin": origin,
+        "status_short": status_short,
+        "latest_generated_snapshot": latest_generated_snapshot,
+        "planning": {
+            "effective_mode": planning_mode,
+            "manifest": paths.run_root.join("pilot-planning.json")
+        },
+        "landing": {
+            "remote_sync_mode": landing_mode,
+            "push_policy": landing_policy,
+            "manifest": paths.run_root.join("pilot-landing.json")
+        },
+        "execution": {
+            "status": execution_status,
+            "selected_task": selected_task,
+            "selected_task_title": selected_task_title,
+            "verification_summary": verification_summary,
+            "commit": execution_commit,
+            "pushed": pushed,
+            "no_commit_reason": no_commit_reason,
+            "manifest": paths.run_root.join("pilot-execution.json")
+        },
+        "closeout": {
+            "status": closeout_status,
+            "manifest": paths.run_root.join("pilot-closeout.json")
+        },
+        "summary": {
+            "plan": summary_plan,
+            "tests": summary_tests,
+            "next": summary_next
+        },
+        "artifacts": {
+            "preflight": paths.run_root.join("pilot-preflight.json"),
+            "landing": paths.run_root.join("pilot-landing.json"),
+            "planning": paths.run_root.join("pilot-planning.json"),
+            "execution": paths.run_root.join("pilot-execution.json"),
+            "closeout": paths.run_root.join("pilot-closeout.json"),
+            "receipt": paths.run_root.join("receipt.md"),
+            "project_rollup_json": paths.run_root.join("project-rollup.json"),
+            "project_rollup_markdown": paths.run_root.join("project-rollup.md")
+        }
+    });
+
+    let markdown = render_project_rollup_markdown(args, paths, &manifest);
+    atomic_write(
+        &paths.run_root.join("project-rollup.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
+    atomic_write(
+        &paths.run_root.join("project-rollup.md"),
+        markdown.as_bytes(),
+    )
+}
+
+fn render_project_rollup_markdown(
+    args: &PilotArgs,
+    paths: &PilotPaths,
+    manifest: &Value,
+) -> String {
+    let project_title = human_project_title(&args.repo_slug);
+    let repo_slug = &args.repo_slug;
+    let branch = string_at(manifest, &["branch"]);
+    let head = string_at(manifest, &["head"]);
+    let head_subject = string_at(manifest, &["head_subject"]);
+    let origin = string_at(manifest, &["origin"]);
+    let latest_generated_snapshot = string_at(manifest, &["latest_generated_snapshot"]);
+    let planning_mode = string_at(manifest, &["planning", "effective_mode"]);
+    let landing_mode = string_at(manifest, &["landing", "remote_sync_mode"]);
+    let landing_policy = string_at(manifest, &["landing", "push_policy"]);
+    let execution_status = string_at(manifest, &["execution", "status"]);
+    let selected_task = string_at(manifest, &["execution", "selected_task"]);
+    let selected_task_title = string_at(manifest, &["execution", "selected_task_title"]);
+    let verification_summary = string_at(manifest, &["execution", "verification_summary"]);
+    let execution_commit = string_at(manifest, &["execution", "commit"]);
+    let no_commit_reason = string_at(manifest, &["execution", "no_commit_reason"]);
+    let pushed = bool_at(manifest, &["execution", "pushed"]);
+    let closeout_status = string_at(manifest, &["closeout", "status"]);
+    let summary_plan = string_at(manifest, &["summary", "plan"]);
+    let summary_tests = string_at(manifest, &["summary", "tests"]);
+    let summary_next = string_at(manifest, &["summary", "next"]);
+
+    format!(
+        "\
+---
+type: project
+title: {project_title}
+tags:
+  - {repo_slug}
+  - orchestrator
+---
+
+# {project_title}
+
+## Current State
+
+- Repo: `{}`
+- Branch: `{branch}`
+- Head: `{head}` `{head_subject}`
+- Origin: `{}`
+- Latest generated snapshot: `{}`
+- Planning mode: `{}`
+- Latest run: `{}`
+
+## Landing
+
+- Remote sync mode: `{}`
+- Push policy: `{}`
+- Pushed: `{}`
+- Commit evidence: `{}`
+- No-commit reason: `{}`
+
+## Execution
+
+- Closeout status: `{}`
+- Execution status: `{}`
+- Selected task: `{}` `{}`
+- Verification: `{}`
+- Plan: `{}`
+- Tests: `{}`
+
+## Artifact Index
+
+- Preflight: `{}`
+- Landing: `{}`
+- Planning: `{}`
+- Execution: `{}`
+- Closeout: `{}`
+- Receipt: `{}`
+- Project rollup JSON: `{}`
+
+## Next Command
+
+```bash
+{}
+```
+",
+        paths.workdir.display(),
+        empty_label(origin, "none"),
+        empty_label(latest_generated_snapshot, "none"),
+        empty_label(planning_mode, "unknown"),
+        paths.run_id,
+        empty_label(landing_mode, "unknown"),
+        empty_label(landing_policy, "unknown"),
+        pushed,
+        empty_label(execution_commit, "none"),
+        empty_label(no_commit_reason, "none"),
+        empty_label(closeout_status, "unknown"),
+        empty_label(execution_status, "unknown"),
+        empty_label(selected_task, "none"),
+        empty_label(selected_task_title, ""),
+        empty_label(verification_summary, "none"),
+        empty_label(summary_plan, "none"),
+        empty_label(summary_tests, "none"),
+        paths.run_root.join("pilot-preflight.json").display(),
+        paths.run_root.join("pilot-landing.json").display(),
+        paths.run_root.join("pilot-planning.json").display(),
+        paths.run_root.join("pilot-execution.json").display(),
+        paths.run_root.join("pilot-closeout.json").display(),
+        paths.run_root.join("receipt.md").display(),
+        paths.run_root.join("project-rollup.json").display(),
+        empty_label(
+            summary_next,
+            "inspect the latest closeout and choose the next safe slice"
+        ),
+    )
+}
+
+fn read_json_artifact(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn git_output(workdir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn latest_generated_snapshot(workdir: &Path) -> Option<PathBuf> {
+    let mut dirs = fs::read_dir(workdir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("gen-"))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.pop()
+}
+
+fn human_project_title(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn empty_label<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
 fn require_nonempty_artifact(path: &Path, label: &str, errors: &mut Vec<String>) {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
@@ -1830,7 +2156,7 @@ mod tests {
         PilotPaths, command_selection_from_surface, effective_planning_mode,
         render_command_selection_markdown, safe_artifact_slug, update_execution_manifest,
         validate_closeout, validate_landing_manifest, write_execution_manifest,
-        write_landing_manifest,
+        write_landing_manifest, write_project_rollup,
     };
 
     #[test]
@@ -1894,6 +2220,26 @@ mod tests {
             panic!("expected pilot command");
         };
         assert!(args.closeout_only);
+        assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
+    }
+
+    #[test]
+    fn pilot_args_parse_project_rollup_only() {
+        let cli = Cli::try_parse_from([
+            "auto",
+            "pilot",
+            "autonomy-bitino",
+            "intent",
+            "--run-root",
+            "/tmp/pilot-run",
+            "--project-rollup-only",
+        ])
+        .expect("pilot args parse");
+
+        let Command::Pilot(args) = cli.command else {
+            panic!("expected pilot command");
+        };
+        assert!(args.project_rollup_only);
         assert_eq!(args.run_root.as_deref(), Some(Path::new("/tmp/pilot-run")));
     }
 
@@ -2223,6 +2569,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn project_rollup_writer_creates_project_artifacts() {
+        let root = unique_temp_dir("project-rollup");
+        write_complete_closeout_artifacts(&root, false);
+        let args = test_pilot_args(root.clone());
+        let paths = test_pilot_paths(root.clone());
+
+        write_project_rollup(&args, &paths).expect("project rollup");
+
+        let text =
+            std::fs::read_to_string(root.join("project-rollup.json")).expect("project rollup json");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("rollup json");
+        assert_eq!(manifest["repo_slug"], "repo");
+        assert_eq!(manifest["project_slug"], "projects/repo");
+        assert_eq!(manifest["landing"]["push_policy"], "local-only-no-origin");
+        assert_eq!(manifest["execution"]["status"], "executed");
+        assert_eq!(manifest["closeout"]["status"], "");
+
+        let markdown = std::fs::read_to_string(root.join("project-rollup.md"))
+            .expect("project rollup markdown");
+        assert!(markdown.contains("type: project"));
+        assert!(markdown.contains("# Repo"));
+        assert!(markdown.contains("pilot-execution.json"));
+        assert!(markdown.contains("auto pilot --closeout-only"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "autodev-pilot-{name}-{}-{}",
@@ -2288,6 +2661,7 @@ mod tests {
             summary_closeout: None,
             summary_next: None,
             closeout_only: true,
+            project_rollup_only: false,
         }
     }
 
