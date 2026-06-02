@@ -350,10 +350,10 @@ pub(crate) fn sanitize_quota_error_message(err: &anyhow::Error) -> String {
     if quota_error_contains_secret_payload(&chain) {
         return "sensitive auth details redacted".to_string();
     }
-    sanitize_quota_error_text(&err.to_string())
+    sanitize_provider_error_text(&err.to_string())
 }
 
-fn sanitize_quota_error_text(message: &str) -> String {
+pub(crate) fn sanitize_provider_error_text(message: &str) -> String {
     if quota_error_contains_secret_payload(message) {
         "sensitive auth details redacted".to_string()
     } else {

@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::quota_usage::sanitize_provider_error_text;
+
 /// Default Kimi model id passed to `kimi-cli -m`. `kimi-cli` 1.22 expects
 /// the full provider-qualified name from its `~/.kimi/config.toml` — the
 /// short ids like `k2.6` that we use in CLI flags and logs must be mapped
@@ -169,12 +171,12 @@ pub(crate) fn parse_kimi_error(stdout: &str) -> Option<String> {
         if event.get("type").and_then(Value::as_str) == Some("error") {
             if let Some(message) = event.get("message").and_then(Value::as_str) {
                 if !message.trim().is_empty() {
-                    return Some(message.trim().to_string());
+                    return Some(sanitize_provider_error_text(message.trim()));
                 }
             }
             if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
                 if !message.trim().is_empty() {
-                    return Some(message.trim().to_string());
+                    return Some(sanitize_provider_error_text(message.trim()));
                 }
             }
         }
@@ -326,6 +328,15 @@ mod tests {
     fn parse_kimi_error_reads_nested_api_error() {
         let stdout = r#"{"type":"error","error":{"message":"invalid api key"}}"#;
         assert_eq!(parse_kimi_error(stdout).as_deref(), Some("invalid api key"));
+    }
+
+    #[test]
+    fn parse_kimi_error_redacts_secret_payloads() {
+        let stdout = r#"{"type":"error","error":{"message":"provider rejected {\"access_token\":\"eyJ.secret\",\"refresh_token\":\"refresh\"}"}}"#;
+        let error = parse_kimi_error(stdout).expect("secret-bearing provider error should surface");
+        assert_eq!(error, "sensitive auth details redacted");
+        assert!(!error.contains("access_token"));
+        assert!(!error.contains("eyJ"));
     }
 
     #[test]

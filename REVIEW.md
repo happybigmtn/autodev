@@ -1,5 +1,13 @@
 # REVIEW
 
+## Quota Provider Error Sanitization
+- Source: Hermes velocity steward pass from `specs/300426-quota-backend-and-credential-safety.md`; root queue had no dependency-ready tasks, so this picked the smallest remaining quota-safety slice.
+- Files: `src/kimi_backend.rs`, `src/pi_backend.rs`, `src/quota_usage.rs`.
+- Changed during this pass: shared the quota provider-error text sanitizer and routed Kimi/PI parsed provider errors through it, while preserving existing non-secret parse behavior. Added Kimi and PI regression tests for token-bearing provider payload redaction.
+- Validation: `cargo test kimi_backend::tests -- --nocapture`; `cargo test pi_backend::tests -- --nocapture`; `cargo test quota_usage::tests -- --nocapture`; `git diff --check -- src/kimi_backend.rs src/pi_backend.rs src/quota_usage.rs REVIEW.md`.
+- Validation caveat: broad `cargo fmt --check` still reports pre-existing unrelated formatting drift outside this slice.
+- Remaining blockers: none for this provider-error sanitizer slice.
+
 ## `AUTODEV-HARDENING-20260430`
 - Source: manual completion batch for the remaining autodev auto-super/auto-parallel/no-go hardening rows.
 - Rows completed: `QSEC-001`, `QSEC-002`, `QSEC-003`, `CHECK-001`, `CSTATE-001`, `CSTATE-002`, `CSTATE-003`, `CHECK-002`, `ROW-001`, `ROW-002`, `CHECK-003A`, `EVID-001`, `EVID-002`, `EVID-003`, `CHECK-003`, `SCHED-001`, `SCHED-002`, `SCHED-003`, `CHECK-004`, `REL-001`, `REL-002`, `LIFE-001`, `LIFE-002`, `DX-001`, `CTRL-001`, `PROMO-001`, `QSEC-004`, `EVID-004`, `DX-002`, `CTRL-002`.

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::quota_usage::sanitize_provider_error_text;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiProvider {
     Kimi,
@@ -112,13 +114,13 @@ fn parse_pi_error_event(event: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|message| !message.is_empty())
-                .map(str::to_string)
+                .map(sanitize_provider_error_text)
         }) {
             return Some(message);
         }
         return serde_json::to_string(event)
             .ok()
-            .map(|text| text.trim().to_string())
+            .map(|text| sanitize_provider_error_text(text.trim()))
             .filter(|text| !text.is_empty());
     }
 
@@ -128,13 +130,13 @@ fn parse_pi_error_event(event: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|message| !message.is_empty())
-            .map(str::to_string)
+            .map(sanitize_provider_error_text)
         {
             return Some(message);
         }
         return serde_json::to_string(event)
             .ok()
-            .map(|text| text.trim().to_string())
+            .map(|text| sanitize_provider_error_text(text.trim()))
             .filter(|text| !text.is_empty());
     }
 
@@ -153,7 +155,7 @@ fn json_string_field(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .map(str::to_string)
+        .map(sanitize_provider_error_text)
 }
 
 fn map_minimax_model_name(model: &str) -> String {
@@ -234,5 +236,14 @@ mod tests {
     fn parse_pi_error_reads_api_error_payload() {
         let stdout = r#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid params"}}"#;
         assert_eq!(parse_pi_error(stdout).as_deref(), Some("invalid params"));
+    }
+
+    #[test]
+    fn parse_pi_error_redacts_secret_payloads() {
+        let stdout = r#"{"type":"error","error":{"message":"provider rejected access_token=eyJ.secret refresh_token=refresh"}}"#;
+        let error = parse_pi_error(stdout).expect("secret-bearing provider error should surface");
+        assert_eq!(error, "sensitive auth details redacted");
+        assert!(!error.contains("access_token"));
+        assert!(!error.contains("eyJ"));
     }
 }
