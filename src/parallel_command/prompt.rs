@@ -92,7 +92,7 @@ fn remote_git_policy_clause(skip_remote_sync: bool, branch: &str) -> String {
 
 pub(crate) fn render_default_parallel_prompt(branch: &str, reference_repos: &[PathBuf]) -> String {
     let base = crate::loop_command::DEFAULT_LOOP_PROMPT_TEMPLATE.replace("{branch}", branch);
-    let parallel_guard = "\n\nParallel execution guard:\n- This lane implements exactly the assigned task. Do not maintain planning ledgers, write audits, or create report artifacts unless the assigned task explicitly owns them.\n- Preserve completion evidence in code, tests, generated receipts, and final stdout. The host owns queue updates, review handoff, and status reconciliation.\n- Prefer the smallest truthful source/test/runtime/UX proof that closes the task over bonus documentation or artifact volume.\n";
+    let parallel_guard = "\n\nParallel execution guard:\n- This lane implements exactly the assigned task. Do not maintain planning ledgers, write audits, or create report artifacts unless the assigned task explicitly owns them.\n- Done means an observable product or behavior change covered by a passing test. Receipts, ledgers, evidence rollups, and closeout notes are automatic side-effects of that change, never the deliverable; a task closed by writing a guard, audit, receipt, or doc without changing product behavior is NOT done -- find the behavior it was meant to change. Preserve completion evidence in code, tests, generated receipts, and final stdout. The host owns queue updates, review handoff, and status reconciliation.\n- Prefer the smallest truthful source/test/runtime/UX proof that closes the task over bonus documentation or artifact volume.\n";
     append_reference_repo_clause(format!("{base}{parallel_guard}"), reference_repos)
 }
 

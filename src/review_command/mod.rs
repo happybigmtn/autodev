@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_REVIEW_PROMPT: &str = r#"You are running one iteration 
 
 ## If you find problems
 - Fix the finding directly when the root cause is clear and bounded.
-- Append severity-tagged follow-ups to `WORKLIST.md` (create if missing).
+- Append severity-tagged follow-ups to `WORKLIST.md` (create if missing). Only file a follow-up that names a specific observable user-facing gap or a reproducible bug (file:line or a failing command). Do NOT file process, guard, receipt, audit, ledger, snapshot, or "evidence" rows. Max 3 follow-ups per pass. Never write `## Next wave`, `## Why the wave...`, or any meta-justification of the review itself into `IMPLEMENTATION_PLAN.md` or `REVIEW.md` -- plan files hold only actionable unchecked tasks, never diary or rationale sections. A follow-up that duplicates an existing checked-or-unchecked row is forbidden; re-promotion is a no-op.
 - Record durable engineering lessons in `LEARNINGS.md`.
 - Leave unfinished items in `REVIEW.md`.
 

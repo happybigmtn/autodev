@@ -244,8 +244,9 @@ pub(crate) fn build_live_tree_annotation(repo_root: &Path, batch: &[String]) -> 
     out.push_str(
         "The queue entries below name one or more file paths. Before archiving any item, \
          refuse items whose cited paths no longer exist in the current tree and either \
-         (a) convert them into fresh IMPLEMENTATION_PLAN.md tasks that re-land the surface, \
-         or (b) rewrite the queue entry truthfully.\n\n",
+         (a) rewrite the queue entry truthfully to state the surface is gone, or (b) only if an \
+         end user or operator observably lost a capability, create ONE fresh task naming that \
+         exact lost capability. Do not re-create a task merely to rebuild a deleted path.\n\n",
     );
     for (index, item) in batch.iter().enumerate() {
         let label_source = item_identity(item);
