@@ -852,7 +852,7 @@ Output requirements:
   - `Owns:`
   - `Acceptance criteria:`
   - `Verification:`
-  - `Required tests:`
+  - `Required tests:` (name AT MOST 5 concrete test names or commands; if a task needs more than five, split it into separate tasks)
   - `Completion artifacts:`
   - `Dependencies:`
   - `Estimated scope:`
