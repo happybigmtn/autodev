@@ -412,6 +412,7 @@ pub(crate) async fn run_parallel_loop(
     .await?;
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
+    let review_config = LaneReviewConfig::from_run_config(&args.model, &args.codex_bin);
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
     let mut resumable_lanes = discover_resume_candidates(
         repo_root,
@@ -429,6 +430,7 @@ pub(crate) async fn run_parallel_loop(
         &mut deferred_partial_tasks,
         linear_tracker,
         parallel_logger,
+        &review_config,
     )
     .await?;
     plan = refresh_parallel_plan_or_last_good(
@@ -936,7 +938,7 @@ pub(crate) async fn run_parallel_loop(
             };
             match progress {
                 LaneRepoProgress::NewCommits => {
-                    match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+                    match land_parallel_lane_result(repo_root, target_branch, &mut assignment, &review_config).await {
                         Ok(LaneLandingOutcome::Landed {
                             auto_repaired,
                             completion_status,
@@ -1313,7 +1315,7 @@ pub(crate) async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::NewCommits => {
-                match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+                match land_parallel_lane_result(repo_root, target_branch, &mut assignment, &review_config).await {
                     Ok(LaneLandingOutcome::Landed {
                         auto_repaired,
                         completion_status,

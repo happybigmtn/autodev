@@ -519,6 +519,7 @@ pub(crate) fn discover_resume_candidates(
     Ok(candidates)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn harvest_resumable_lane_results(
     repo_root: &Path,
     target_branch: &str,
@@ -527,6 +528,7 @@ pub(crate) async fn harvest_resumable_lane_results(
     deferred_partial_tasks: &mut BTreeSet<String>,
     linear_tracker: &mut Option<LinearTracker>,
     parallel_logger: &ParallelEventLogger,
+    review_config: &LaneReviewConfig,
 ) -> Result<usize> {
     let mut landed = 0usize;
     let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
@@ -573,7 +575,7 @@ pub(crate) async fn harvest_resumable_lane_results(
             terminate_requested_at: None,
             host_recovery_note: candidate.host_recovery_note,
         };
-        match land_parallel_lane_result(repo_root, target_branch, &mut assignment) {
+        match land_parallel_lane_result(repo_root, target_branch, &mut assignment, review_config).await {
             Ok(LaneLandingOutcome::Landed {
                 auto_repaired,
                 completion_status,

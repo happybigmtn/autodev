@@ -470,10 +470,11 @@ pub(crate) fn render_receipts_drift_entry(entry: &ReceiptDriftTriageEntry) -> St
     rendered
 }
 
-pub(crate) fn land_parallel_lane_result(
+pub(crate) async fn land_parallel_lane_result(
     repo_root: &Path,
     target_branch: &str,
     assignment: &mut ActiveLaneAssignment,
+    review_config: &LaneReviewConfig,
 ) -> Result<LaneLandingOutcome> {
     let mut auto_repaired = false;
     let mut canonical_checkpointed = false;
@@ -567,6 +568,22 @@ pub(crate) fn land_parallel_lane_result(
     } else if completion_status == LoopTaskStatus::Partial {
         assignment.task.status = LoopTaskStatus::Partial;
     }
+    // Independent diff-review gate (openclaw "autoreview" contract): before
+    // the host marks this task [x], run an independent Codex review of the
+    // lane's diff. The gate runs on every lane (unless AUTO_PARALLEL_REVIEW=0),
+    // is bounded by AUTO_PARALLEL_REVIEW_TIMEOUT_SECS, and is FAIL-OPEN: any
+    // error degrades to "land as today + review_skipped". `apply_lane_review_gate`
+    // catches every error path internally so a bug in the gate can never wedge
+    // the orchestrator or change the committed work that already landed.
+    let completion_status = apply_lane_review_gate(
+        repo_root,
+        target_branch,
+        assignment,
+        &changed_files,
+        completion_status,
+        review_config,
+    )
+    .await;
     if repo_has_staged_queue_updates(repo_root)? {
         let message = format!(
             "{}: {} queue sync",
@@ -582,6 +599,128 @@ pub(crate) fn land_parallel_lane_result(
         auto_repaired,
         completion_status,
     })
+}
+
+/// Orchestrator-side glue for the independent diff-review gate.
+///
+/// Runs the bounded, fail-open review (see [`run_lane_review_gate`]) and maps
+/// its outcome onto the lane's landing status WITHOUT touching the committed
+/// work that already landed:
+///
+/// - Gate disabled (`AUTO_PARALLEL_REVIEW=0`) -> return `incoming_status`
+///   unchanged (legacy behavior).
+/// - `Clean` -> return `incoming_status` unchanged; the lane lands `[x]`.
+/// - `FindingsKeepPartial` -> append the structured findings to `REVIEW.md`
+///   (staged for the closeout commit), demote a `Done` task to `Partial` in the
+///   plan, stamp the lane closeout log, and return `Partial`. An already-Partial
+///   task stays Partial; findings are still recorded.
+/// - `SkippedFailOpen` -> stamp `review_skipped: <reason>` into the lane's
+///   closeout log, log a warning, and return `incoming_status` unchanged.
+///
+/// Every fallible step here is itself fail-open: a write or git error is logged
+/// and degrades to "land as today", so a bug in the gate can never block, hang,
+/// or change a landing decision in a way that loses the worker's committed work.
+async fn apply_lane_review_gate(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &mut ActiveLaneAssignment,
+    changed_files: &[String],
+    incoming_status: LoopTaskStatus,
+    review_config: &LaneReviewConfig,
+) -> LoopTaskStatus {
+    if !review_gate_enabled() {
+        return incoming_status;
+    }
+    let outcome =
+        run_lane_review_gate(repo_root, target_branch, assignment, changed_files, review_config)
+            .await;
+    apply_lane_review_outcome(repo_root, assignment, incoming_status, outcome)
+}
+
+/// Apply a [`LaneReviewOutcome`] to the lane's landing status. Synchronous and
+/// side-effecting (writes `REVIEW.md`, demotes the plan row, stamps the lane
+/// closeout log) but fail-open at every step. Split out of
+/// [`apply_lane_review_gate`] so tests can drive the demote/append/stamp wiring
+/// with a stubbed outcome instead of calling real codex.
+pub(crate) fn apply_lane_review_outcome(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    outcome: LaneReviewOutcome,
+) -> LoopTaskStatus {
+    match outcome {
+        LaneReviewOutcome::Clean => {
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                "independent-review: clean (no actionable findings)",
+            );
+            incoming_status
+        }
+        LaneReviewOutcome::FindingsKeepPartial { findings_summary } => {
+            // Record findings for the next pass. Best-effort: a failure here
+            // must not block landing the committed work.
+            if let Err(err) =
+                append_lane_review_findings(repo_root, &assignment.task.id, &findings_summary)
+            {
+                eprintln!(
+                    "warning: failed appending independent-review findings for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                eprintln!(
+                    "warning: failed staging REVIEW.md after independent-review findings for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+            // Hold the task at [~] so it re-dispatches until a clean-review diff.
+            assignment.task.status = LoopTaskStatus::Partial;
+            if incoming_status == LoopTaskStatus::Done {
+                match update_reconciled_task_completion_in_plan(
+                    repo_root,
+                    &assignment.task,
+                    LoopTaskStatus::Partial,
+                ) {
+                    Ok(true) => {
+                        if let Err(err) = run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]) {
+                            eprintln!(
+                                "warning: failed staging IMPLEMENTATION_PLAN.md after independent-review demote for `{}`: {err:#}",
+                                assignment.task.id
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed demoting `{}` to [~] after independent-review findings: {err:#}",
+                            assignment.task.id
+                        );
+                    }
+                }
+            }
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                "independent-review: actionable findings recorded to REVIEW.md; task held [~] for re-dispatch",
+            );
+            LoopTaskStatus::Partial
+        }
+        LaneReviewOutcome::SkippedFailOpen { reason } => {
+            eprintln!(
+                "warning: independent-review gate skipped (fail-open) for `{}`: {reason}",
+                assignment.task.id
+            );
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!("review_skipped: {reason}"),
+            );
+            incoming_status
+        }
+    }
 }
 
 /// Copy a lane worker's `.auto/symphony/verification-receipts/<task>.json` and
@@ -1822,4 +1961,125 @@ mod tests {
             fs::read_to_string(run_root.join("live.log")).expect("closeout should write host log");
         assert!(live_log.contains("receipt-closeout: closed 1 partial task(s)"));
     }
+    fn review_gate_assignment(root: &std::path::Path, task_id: &str, title: &str) -> ActiveLaneAssignment {
+        ActiveLaneAssignment {
+            lane_index: 3,
+            attempts: 1,
+            task: LoopTask {
+                id: task_id.to_string(),
+                title: title.to_string(),
+                status: LoopTaskStatus::Done,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: format!("- [ ] `{task_id}` {title}\n"),
+            },
+            resumed: false,
+            lane_root: root.join("lane-review-root"),
+            lane_repo_root: root.join("lane-review-repo"),
+            base_commit: "0000000000000000000000000000000000000000".to_string(),
+            stdout_log_path: root.join("lane-review.stdout.log"),
+            stderr_log_path: root.join("lane-review.stderr.log"),
+            worker_pid_path: root.join("lane-review.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        }
+    }
+
+    #[test]
+    fn review_clean_outcome_keeps_done_and_stamps_clean() {
+        let root = unique_temp_dir("review-gate-clean");
+        init_git_repo(&root);
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-CLEAN-1", "clean diff lands as done");
+        let status = apply_lane_review_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            LaneReviewOutcome::Clean,
+        );
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log written");
+        assert!(log.contains("independent-review: clean"));
+        // Clean review must not create or touch REVIEW.md.
+        assert!(!root.join("REVIEW.md").exists());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn review_findings_outcome_demotes_done_and_appends_review_md() {
+        let root = unique_temp_dir("review-gate-findings");
+        init_git_repo(&root);
+        // Seed a committed plan marking the task [x] so the demote has a row to flip.
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-FND-1` findings should demote this\n",
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed plan"]);
+
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-FND-1", "findings should demote this");
+        let status = apply_lane_review_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            LaneReviewOutcome::FindingsKeepPartial {
+                findings_summary: "1. `src/x.rs`: real bug introduced by this diff.".to_string(),
+            },
+        );
+        // Status downgraded.
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        // Plan row demoted [x] -> [~].
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("plan readable");
+        assert!(
+            plan.contains("- [~] `TASK-FND-1` findings should demote this"),
+            "plan should demote done row: {plan}"
+        );
+        // REVIEW.md got the findings under a marked block.
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("review written");
+        assert!(review.contains("## `TASK-FND-1`: independent review findings"));
+        assert!(review.contains("real bug introduced by this diff"));
+        // REVIEW.md + plan staged for the closeout commit.
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
+        // Closeout log stamped.
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
+        assert!(log.contains("independent-review: actionable findings recorded"));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn review_skipped_outcome_fails_open_and_stamps_review_skipped() {
+        let root = unique_temp_dir("review-gate-skipped");
+        init_git_repo(&root);
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-SKIP-1", "review error lands as today");
+        let status = apply_lane_review_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            LaneReviewOutcome::SkippedFailOpen {
+                reason: "review timed out after 900s".to_string(),
+            },
+        );
+        // Fail-open: status unchanged from what landed today.
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
+        assert!(log.contains("review_skipped: review timed out after 900s"));
+        // Fail-open must not append findings.
+        assert!(!root.join("REVIEW.md").exists());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
 }
