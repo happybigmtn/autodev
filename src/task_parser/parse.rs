@@ -242,24 +242,21 @@ fn parse_lane_kind(markdown: &str) -> Option<LaneKind> {
 }
 
 pub(crate) const PLAN_TASK_REQUIRED_FIELDS: &[&str] = &[
+    // Core contract: every task carries these regardless of which surface it
+    // touches. The surface-specific fields (Source of truth, Runtime owner,
+    // UI consumers, Generated artifacts, Fixture boundary, Retired surfaces,
+    // Integration touchpoints, Scope boundary, Contract generation,
+    // Cross-surface tests, Review/closeout) are CONDITIONAL: validated only
+    // when present (PLAN_TASK_PROCESS_FIELDS + validate_execution_row_process_fields).
+    // Requiring all of them on every row was the structural pressure that made
+    // generators fabricate guard/contract/closeout ceremony just to fill fields.
     "Spec:",
     "Why now:",
     "Codebase evidence:",
-    "Source of truth:",
-    "Runtime owner:",
-    "UI consumers:",
-    "Generated artifacts:",
-    "Fixture boundary:",
-    "Retired surfaces:",
     "Owns:",
-    "Integration touchpoints:",
-    "Scope boundary:",
     "Acceptance criteria:",
     "Verification:",
     "Required tests:",
-    "Contract generation:",
-    "Cross-surface tests:",
-    "Review/closeout:",
     "Completion artifacts:",
     // `Lane kind:` is optional. When absent, parallel dispatch defaults to
     // the code lane and validate_execution_row_lane_kind accepts the missing

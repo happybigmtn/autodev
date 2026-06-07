@@ -264,6 +264,10 @@ fn validate_execution_row_completion_artifacts(task: &PlanTask) -> Result<()> {
 
 fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
+        // Conditional: only validate the surface field when the task declares it.
+        if !task.markdown.contains(field) {
+            continue;
+        }
         let value = execution_row_first_field_line(task, field)?;
         let lowercase = value.to_ascii_lowercase();
         for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
@@ -281,8 +285,6 @@ fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
     // test, because the task is purely a copy fix and the surface itself is
     // covered by a separate test row. The required-field listing still
     // mandates non-vague content, so authors can't elide the field entirely.
-    let _ = execution_row_first_field_line(task, "UI consumers:")?;
-    let _ = execution_row_first_field_line(task, "Cross-surface tests:")?;
 
     // We used to require `Contract generation:` whenever `Generated artifacts:`
     // was populated. That's correct for codegen-shaped tasks (TS bindings,
@@ -293,10 +295,12 @@ fn validate_execution_row_process_fields(task: &PlanTask) -> Result<()> {
     // The required-field listing above already enforces non-vague content via
     // the TBD/TODO/unspecified/unknown checks; this coupling check punished
     // valid evidence-shaped tasks too aggressively.
-    let _ = execution_row_first_field_line(task, "Generated artifacts:")?;
-    let _ = execution_row_first_field_line(task, "Contract generation:")?;
 
-    let review_closeout = execution_row_first_field_line(task, "Review/closeout:")?;
+    let review_closeout = if task.markdown.contains("Review/closeout:") {
+        execution_row_first_field_line(task, "Review/closeout:")?
+    } else {
+        String::new()
+    };
     let review_lower = review_closeout.to_ascii_lowercase();
     if review_lower == "cargo check" || review_lower.contains("cargo check only") {
         bail!(
@@ -403,7 +407,7 @@ mod tests {
 
     #[test]
     fn plan_task_field_catalog_covers_rich_contract_boundaries() {
-        for required in [
+        for conditional in [
             "Source of truth:",
             "Runtime owner:",
             "UI consumers:",
@@ -415,15 +419,19 @@ mod tests {
             "Review/closeout:",
         ] {
             assert!(
-                PLAN_TASK_REQUIRED_FIELDS.contains(&required),
-                "{required} must stay in the shared required-field catalog"
+                !PLAN_TASK_REQUIRED_FIELDS.contains(&conditional),
+                "{conditional} must be conditional, not required"
+            );
+            assert!(
+                TASK_FIELD_BOUNDARIES.contains(&conditional),
+                "{conditional} must still bound multiline task-field parsing"
             );
         }
 
         for process_field in PLAN_TASK_PROCESS_FIELDS {
             assert!(
-                PLAN_TASK_REQUIRED_FIELDS.contains(process_field),
-                "{process_field} must be required before process validation can read it"
+                !PLAN_TASK_REQUIRED_FIELDS.contains(process_field),
+                "{process_field} is conditional and must not be required"
             );
         }
 
@@ -475,12 +483,13 @@ mod tests {
 
     #[test]
     fn execution_row_validator_rejects_missing_required_field_with_task_id() {
-        let plan = rich_execution_row_plan().replace("  Runtime owner: `src/runtime.rs`\n", "");
+        let plan = rich_execution_row_plan()
+            .replace("  Verification: `cargo test runtime_ui_readback`\n", "");
         let tasks = parse_tasks(&plan);
         let ids = tasks.iter().map(|task| task.id.as_str()).collect();
         let err = validate_execution_row(&tasks[0], &ids).expect_err("missing field rejected");
         assert!(format!("{err:#}").contains("TASK-001"));
-        assert!(format!("{err:#}").contains("Runtime owner:"));
+        assert!(format!("{err:#}").contains("Verification:"));
     }
 
     #[test]

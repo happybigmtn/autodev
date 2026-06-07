@@ -843,29 +843,26 @@ Output requirements:
     Why now: ...
     Estimated scope: S
   ```
-- Every unfinished task in `## Priority Work` and `## Follow-On Work` must include these exact fields, even when it is deferred, gated, research-shaped, or lower priority:
+- Every unfinished task in `## Priority Work` and `## Follow-On Work` must include these CORE fields, even when it is deferred, gated, research-shaped, or lower priority:
   - `Spec:`
   - `Why now:`
   - `Codebase evidence:`
-  - `Source of truth:`
-  - `Runtime owner:`
-  - `UI consumers:`
-  - `Generated artifacts:`
-  - `Fixture boundary:`
-  - `Retired surfaces:`
   - `Owns:`
-  - `Integration touchpoints:`
-  - `Scope boundary:`
   - `Acceptance criteria:`
   - `Verification:`
   - `Required tests:`
-  - `Contract generation:`
-  - `Cross-surface tests:`
-  - `Review/closeout:`
   - `Completion artifacts:`
   - `Dependencies:`
   - `Estimated scope:`
   - `Completion signal:`
+- Include these CONDITIONAL fields ONLY when the task actually touches that surface; omit the line entirely otherwise. Never invent a value to satisfy a contract -- an omitted line is correct when the surface is untouched, and stamping `none` on every row is exactly the ceremony to avoid:
+  - `Source of truth:` / `Runtime owner:` -- only when the task changes runtime/engine/API-owned facts.
+  - `UI consumers:` / `Cross-surface tests:` -- only when the task changes a UI/presentation surface that reads runtime facts.
+  - `Generated artifacts:` / `Contract generation:` -- only when the task changes a codegen/bindings/schema shape.
+  - `Fixture boundary:` -- only when the task touches fixtures/demo/sample data.
+  - `Retired surfaces:` -- only when the task deletes or supersedes an existing surface.
+  - `Integration touchpoints:` / `Scope boundary:` -- only when the task spans multiple crates/services or needs an explicit non-goal.
+  - `Review/closeout:` -- only when the task needs a closeout proof beyond its `Verification:` command.
 - `## Follow-On Work` is not a shorthand backlog. If you list a follow-on item with `- [ ]`, give it the same full task contract as priority work. Do not create compact follow-on rows with only `Spec:`, `Why now:`, and `Dependencies:`.
 - `Spec:` values must point to `specs/*.md`
 - Every `Spec:` reference must exactly match one of the generated spec paths listed for this run; do not invent alternate dates or filenames

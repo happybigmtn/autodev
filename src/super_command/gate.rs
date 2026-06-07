@@ -154,8 +154,10 @@ pub(crate) fn verify_super_task(
 #[allow(dead_code)]
 pub(crate) fn verify_super_task_process_fields(task: &SuperTaskBlock) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
-        let value = first_super_task_field_line(task, field)
-            .with_context(|| format!("task `{}` is missing `{field}`", task.task_id))?;
+        // Conditional: only validate the surface field when the task declares it.
+        let Some(value) = first_super_task_field_line(task, field) else {
+            continue;
+        };
         let lowercase = value.to_ascii_lowercase();
         for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
             if lowercase.contains(forbidden) {
@@ -411,19 +413,49 @@ mod tests {
     }
 
     #[test]
-    fn super_rejects_task_missing_runtime_ui_fields() {
-        let root = temp_dir("super-gate-missing-runtime-ui");
+    fn super_rejects_task_missing_core_field() {
+        let root = temp_dir("super-gate-missing-core-field");
         let plan = root.join(IMPLEMENTATION_PLAN);
+        // Conditional surface fields may be omitted, but the 11 CORE fields are
+        // still mandatory: dropping `Acceptance criteria:` must still be rejected.
         let malformed = valid_plan(
-            "cargo test super_command::tests::super_rejects_task_missing_runtime_ui_fields",
+            "cargo test super_command::tests::super_rejects_task_missing_core_field",
         )
-        .replace("    Runtime owner: `src/super_command.rs`\n", "");
+        .replace("    Acceptance criteria: scoped plan passes.\n", "");
         fs::write(&plan, malformed).unwrap();
 
         let error = verify_parallel_ready_plan(&plan)
-            .expect_err("expected rich runtime/UI task contract rejection");
+            .expect_err("expected missing-core-field rejection");
 
-        assert!(format!("{error:#}").contains("task `TASK-001` missing `Runtime owner:`"));
+        assert!(format!("{error:#}").contains("Acceptance criteria:"));
+    }
+
+    #[test]
+    fn super_accepts_task_omitting_conditional_runtime_ui_fields() {
+        let root = temp_dir("super-gate-omit-conditional");
+        let plan = root.join(IMPLEMENTATION_PLAN);
+        // A pure-logic task touches no runtime/UI/codegen surface; under the new
+        // contract it may omit every conditional field and still pass the gate
+        // on the 11 core fields alone. This is the relaxation that stops
+        // generators from fabricating surface ceremony on every row.
+        let lean = valid_plan(
+            "cargo test super_command::tests::super_accepts_task_omitting_conditional_runtime_ui_fields",
+        )
+        .replace("    Source of truth: `src/super_command.rs`\n", "")
+        .replace("    Runtime owner: `src/super_command.rs`\n", "")
+        .replace("    UI consumers: terminal output\n", "")
+        .replace("    Generated artifacts: `.auto/super/*/DETERMINISTIC-GATE.json`\n", "")
+        .replace("    Fixture boundary: production code parses the live root plan, not fixture rows.\n", "")
+        .replace("    Retired surfaces: legacy active task rows without runtime/UI contract fields.\n", "")
+        .replace("    Integration touchpoints: `src/main.rs`\n", "")
+        .replace("    Scope boundary: do not launch workers.\n", "")
+        .replace("    Contract generation: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`\n", "")
+        .replace("    Cross-surface tests: `cargo test super_command::tests::super_accepts_generated_rich_task_contract`\n", "")
+        .replace("    Review/closeout: reviewer checks super and generation task contracts stay aligned.\n", "");
+        fs::write(&plan, lean).unwrap();
+
+        verify_parallel_ready_plan(&plan)
+            .expect("lean task omitting conditional fields should pass the gate");
     }
 
     #[test]

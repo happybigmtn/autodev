@@ -148,8 +148,10 @@ fn verify_generated_plan_task_is_scoped(block: &PlanTaskBlock) -> Result<()> {
 
 fn verify_generated_plan_process_fields(block: &PlanTaskBlock) -> Result<()> {
     for &field in PLAN_TASK_PROCESS_FIELDS {
-        let value = plan_task_field_line_value(block, field)
-            .with_context(|| format!("task `{}` missing `{field}`", block.task_id))?;
+        // Conditional: only validate the surface field when the task declares it.
+        let Some(value) = plan_task_field_line_value(block, field) else {
+            continue;
+        };
         let lowercase = value.to_ascii_lowercase();
         for forbidden in ["tbd", "todo", "unspecified", "unknown"] {
             if lowercase.contains(forbidden) {
