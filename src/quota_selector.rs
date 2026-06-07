@@ -45,11 +45,21 @@ pub(crate) async fn score_accounts(
                 if quota_usage::is_auth_failure(&e) {
                     // Revoked/terminated credentials: exclude entirely so the
                     // router never swaps in a dead profile (which clobbers the
-                    // live ~/.codex login). Recover with `codex login` then
-                    // `auto quota accounts capture <name>`.
+                    // live provider login).
+                    let recovery = match provider {
+                        Provider::Codex => {
+                            format!("run `auto quota accounts login {}`", entry.name)
+                        }
+                        Provider::Claude => {
+                            format!(
+                                "run `claude login` then `auto quota accounts capture {}`",
+                                entry.name
+                            )
+                        }
+                    };
                     eprintln!(
-                        "[quota-router] excluding '{}': credentials invalid; run `codex login` then `auto quota accounts capture {}`",
-                        entry.name, entry.name
+                        "[quota-router] excluding '{}': credentials invalid; {recovery}",
+                        entry.name
                     );
                     continue;
                 }

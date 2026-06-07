@@ -1049,7 +1049,11 @@ What it writes:
 What it actually does:
 
 - stores multiple named account profiles per provider
-- captures credentials from the currently logged-in Codex or Claude session
+- logs Codex profiles in through an isolated per-profile `CODEX_HOME` so
+  logging into another Codex account does not revoke the profile's refresh token
+- captures credentials from the currently logged-in Codex or Claude session.
+  For multiple Codex accounts, prefer `auto quota accounts login <name>` over
+  repeatedly logging into the shared `~/.codex` home and then capturing it.
 - shows live session and weekly usage where the upstream provider API allows it
 - lets you manually choose the primary account for `codex` or `claude` with
   `auto quota select <provider>`
@@ -1067,6 +1071,7 @@ Useful subcommands:
 - `auto quota reset [account-name]`
 - `auto quota accounts add <name> <codex|claude>`
 - `auto quota accounts list`
+- `auto quota accounts login <name> -- --device-auth`
 - `auto quota accounts capture <name>`
 - `auto quota accounts remove <name>`
 

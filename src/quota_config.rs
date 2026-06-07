@@ -229,6 +229,25 @@ pub(crate) fn codex_profile_uses_isolated_home(profile_dir: &Path) -> bool {
     profile_dir.join("codex-home").join("auth.json").exists()
 }
 
+pub(crate) fn prepare_codex_profile_login_home(profile_dir: &Path) -> Result<PathBuf> {
+    ensure_profile_path_contained(&QuotaConfig::profiles_dir(), profile_dir)?;
+    ensure_plain_directory(profile_dir)?;
+
+    let codex_home = profile_dir.join("codex-home");
+    ensure_plain_directory(&codex_home)?;
+
+    let active_config = dirs::home_dir()
+        .expect("cannot resolve home directory")
+        .join(".codex")
+        .join("config.toml");
+    let profile_config = codex_home.join("config.toml");
+    if missing_path(&profile_config)? {
+        copy_optional_credential_path(&active_config, &profile_config)?;
+    }
+
+    Ok(codex_home)
+}
+
 pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Result<()> {
     ensure_profile_path_contained(&QuotaConfig::profiles_dir(), profile_dir)?;
     let staged_profile_dir = staged_profile_dir(profile_dir)?;
@@ -248,7 +267,7 @@ pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Re
                         source.display()
                     );
                 }
-                copy_credential_file(&source, &staged_profile_dir.join("auth.json"))
+                copy_codex_credentials_to_isolated_home(&source, &staged_profile_dir)
             }
             Provider::Claude => {
                 if missing_path(&source)? {
@@ -278,6 +297,23 @@ pub(crate) fn copy_auth_to_profile(provider: Provider, profile_dir: &Path) -> Re
     }
 
     replace_profile_dir(profile_dir, &staged_profile_dir)
+}
+
+fn copy_codex_credentials_to_isolated_home(source_auth: &Path, profile_dir: &Path) -> Result<()> {
+    let codex_home = profile_dir.join("codex-home");
+    fs::create_dir_all(&codex_home)
+        .with_context(|| format!("failed to create {}", codex_home.display()))?;
+    copy_credential_file(source_auth, &codex_home.join("auth.json"))?;
+
+    let source_dir = source_auth
+        .parent()
+        .with_context(|| format!("{} has no parent directory", source_auth.display()))?;
+    for filename in &["config.toml"] {
+        let src = source_dir.join(filename);
+        copy_optional_credential_path(&src, &codex_home.join(filename))?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn validate_account_name(name: &str) -> Result<()> {
@@ -396,6 +432,30 @@ fn remove_profile_dir(path: &Path) -> Result<()> {
         );
     }
     fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+fn ensure_plain_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "refusing to use symlinked profile directory {}",
+                    path.display()
+                );
+            }
+            if !meta.is_dir() {
+                bail!(
+                    "refusing to use non-directory profile path {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
 }
 
 fn missing_path(path: &Path) -> Result<bool> {
@@ -814,12 +874,16 @@ provider = "codex"
 
     #[cfg(unix)]
     #[test]
-    fn capture_writes_codex_auth_owner_only() {
+    fn capture_writes_codex_isolated_home_owner_only() {
         let home = TempQuotaHome::new("quota-config-codex-capture");
         let codex_dir = home.home().join(".codex");
         fs::create_dir_all(&codex_dir).expect("failed to create codex auth dir");
         fs::write(codex_dir.join("auth.json"), br#"{"account":"active"}"#)
             .expect("failed to write codex auth");
+        fs::write(codex_dir.join("installation_id"), b"active-installation\n")
+            .expect("failed to write codex installation id");
+        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.5\"\n")
+            .expect("failed to write codex config");
 
         let profile_dir = home.profile_dir(Provider::Codex, "work");
         fs::create_dir_all(&profile_dir).expect("failed to create stale profile dir");
@@ -832,13 +896,46 @@ provider = "codex"
             .expect("failed to read profile dir")
             .map(|entry| entry.expect("failed to read profile entry").file_name())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![OsString::from("auth.json")]);
+        assert_eq!(entries, vec![OsString::from("codex-home")]);
 
-        let profile_auth = profile_dir.join("auth.json");
+        let codex_home = profile_dir.join("codex-home");
+        let profile_auth = codex_home.join("auth.json");
         let meta = fs::symlink_metadata(&profile_auth).expect("failed to stat profile auth");
         assert!(meta.is_file());
         assert!(!meta.file_type().is_symlink());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let config_meta =
+            fs::symlink_metadata(codex_home.join("config.toml")).expect("failed to stat config");
+        assert!(config_meta.is_file());
+        assert_eq!(config_meta.permissions().mode() & 0o777, 0o600);
+
+        assert!(
+            !codex_home.join("installation_id").exists(),
+            "capture must not copy the shared Codex installation id"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_codex_login_home_creates_profile_home_without_auth_or_installation() {
+        let home = TempQuotaHome::new("quota-config-codex-login-home");
+        let codex_dir = home.home().join(".codex");
+        fs::create_dir_all(&codex_dir).expect("failed to create active codex dir");
+        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.5\"\n")
+            .expect("failed to write active codex config");
+        fs::write(codex_dir.join("installation_id"), b"shared-installation\n")
+            .expect("failed to write active codex installation id");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "work");
+        let codex_home = prepare_codex_profile_login_home(&profile_dir)
+            .expect("login home preparation should succeed");
+
+        assert_eq!(codex_home, profile_dir.join("codex-home"));
+        assert!(codex_home.is_dir());
+        assert!(codex_home.join("config.toml").exists());
+        assert!(!codex_home.join("auth.json").exists());
+        assert!(!codex_home.join("installation_id").exists());
     }
 
     #[cfg(unix)]

@@ -53,6 +53,8 @@ pub(crate) enum AccountsCommand {
     Add(AccountsAddArgs),
     /// List all configured accounts
     List,
+    /// Log in to a Codex account inside this profile's isolated CODEX_HOME
+    Login(AccountsLoginArgs),
     /// Remove an account profile
     Remove(AccountsRemoveArgs),
     /// Re-capture credentials from the current session into a profile
@@ -80,4 +82,16 @@ pub(crate) struct AccountsRemoveArgs {
 pub(crate) struct AccountsCaptureArgs {
     /// Account name to update credentials for
     pub(crate) name: String,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct AccountsLoginArgs {
+    /// Account name to log in
+    pub(crate) name: String,
+    /// Codex binary to run
+    #[arg(long, default_value = "codex")]
+    pub(crate) codex_bin: String,
+    /// Arguments passed through to `codex login`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) args: Vec<String>,
 }
