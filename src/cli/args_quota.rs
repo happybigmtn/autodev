@@ -51,6 +51,8 @@ pub(crate) struct AccountsSubcommand {
 pub(crate) enum AccountsCommand {
     /// Add a new account profile
     Add(AccountsAddArgs),
+    /// Add a Codex account that uses the live ~/.codex login
+    AddLive(AccountsAddLiveArgs),
     /// List all configured accounts
     List,
     /// Log in to a Codex account inside this profile's isolated CODEX_HOME
@@ -67,6 +69,12 @@ pub(crate) struct AccountsAddArgs {
     pub(crate) name: String,
     /// Provider: "claude" or "codex"
     pub(crate) provider: String,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct AccountsAddLiveArgs {
+    /// Account name (e.g., "live-codex")
+    pub(crate) name: String,
 }
 
 #[derive(Args, Clone)]

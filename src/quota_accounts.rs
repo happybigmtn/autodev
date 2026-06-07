@@ -17,6 +17,7 @@ pub(crate) fn run_accounts_add(name: &str, provider: &str) -> Result<()> {
     let entry = AccountEntry {
         name: name.to_owned(),
         provider,
+        live: false,
     };
 
     config.add_account(entry)?;
@@ -30,6 +31,25 @@ pub(crate) fn run_accounts_add(name: &str, provider: &str) -> Result<()> {
 
     config.save()?;
     eprintln!("Account '{name}' ({provider}) added.");
+    Ok(())
+}
+
+pub(crate) fn run_accounts_add_live(name: &str) -> Result<()> {
+    let provider = Provider::Codex;
+    QuotaConfig::profile_dir(provider, name)?;
+    let mut config = QuotaConfig::load()?;
+
+    if config.find_account(name).is_some() {
+        anyhow::bail!("account '{name}' already exists");
+    }
+
+    config.add_account(AccountEntry {
+        name: name.to_owned(),
+        provider,
+        live: true,
+    })?;
+    config.save()?;
+    eprintln!("Live Codex account '{name}' added.");
     Ok(())
 }
 
@@ -102,6 +122,11 @@ pub(crate) fn run_accounts_capture(name: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("account '{name}' not found"))?;
 
     let profile_dir = QuotaConfig::profile_dir(account.provider, name)?;
+    if account.provider == Provider::Codex {
+        eprintln!(
+            "Note: captured Codex snapshots are transient; use `auto quota accounts add-live <name>` or `auto quota accounts login <name>` for durable credentials."
+        );
+    }
     eprintln!(
         "Capturing current {} credentials into profile '{name}'...",
         account.provider.label()
@@ -156,4 +181,81 @@ pub(crate) fn run_accounts_login(name: &str, codex_bin: &str, args: &[String]) -
 
     eprintln!("Codex credentials updated for '{name}'.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    struct TempConfigHome {
+        root: PathBuf,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempConfigHome {
+        fn new(label: &str) -> Self {
+            let lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("autodev-{label}-{}-{stamp}", std::process::id()));
+            fs::create_dir_all(&root).expect("failed to create temp config root");
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &root);
+            Self {
+                root,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempConfigHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_live_adds_codex_live_account_and_rejects_duplicate() {
+        let _home = TempConfigHome::new("quota-accounts-add-live");
+
+        run_accounts_add_live("live").expect("add-live should save account");
+        let config = QuotaConfig::load().expect("saved config should load");
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "live");
+        assert_eq!(config.accounts[0].provider, Provider::Codex);
+        assert!(config.accounts[0].live);
+        assert_eq!(config.selected_codex_account.as_deref(), Some("live"));
+
+        let error = run_accounts_add_live("live")
+            .expect_err("duplicate add-live should fail")
+            .to_string();
+        assert!(error.contains("account 'live' already exists"));
+    }
 }

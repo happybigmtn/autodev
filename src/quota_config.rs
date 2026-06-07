@@ -56,6 +56,8 @@ impl std::str::FromStr for Provider {
 pub(crate) struct AccountEntry {
     pub(crate) name: String,
     pub(crate) provider: Provider,
+    #[serde(default)]
+    pub(crate) live: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -220,6 +222,15 @@ pub(crate) fn codex_home_for_profile(profile_dir: &Path) -> PathBuf {
     } else {
         profile_dir.to_path_buf()
     }
+}
+
+/// Resolve the user's live CODEX_HOME. Live accounts reference the real
+/// `~/.codex` login directly, so they keep using the token Codex refreshes
+/// during normal operation instead of going stale after token rotation.
+pub(crate) fn codex_live_home() -> PathBuf {
+    dirs::home_dir()
+        .expect("cannot resolve home directory")
+        .join(".codex")
 }
 
 /// True iff this Codex profile uses the isolated `codex-home/` layout.
@@ -691,10 +702,12 @@ mod tests {
                 AccountEntry {
                     name: "work-codex".into(),
                     provider: Provider::Codex,
+                    live: false,
                 },
                 AccountEntry {
                     name: "personal-claude".into(),
                     provider: Provider::Claude,
+                    live: false,
                 },
             ],
             selected_codex_account: Some("work-codex".into()),
@@ -705,6 +718,29 @@ mod tests {
         assert_eq!(parsed.accounts.len(), 2);
         assert_eq!(parsed.accounts[0].name, "work-codex");
         assert_eq!(parsed.accounts[1].provider, Provider::Claude);
+    }
+
+    #[test]
+    fn account_entry_live_round_trips_and_defaults_false() {
+        let text = r#"
+[[accounts]]
+name = "live-codex"
+provider = "codex"
+live = true
+
+[[accounts]]
+name = "captured-codex"
+provider = "codex"
+"#;
+        let parsed: QuotaConfig = toml::from_str(text).unwrap();
+
+        assert!(parsed.accounts[0].live);
+        assert!(!parsed.accounts[1].live);
+
+        let serialized = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: QuotaConfig = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.accounts[0].live);
+        assert!(!reparsed.accounts[1].live);
     }
 
     #[cfg(unix)]
@@ -755,12 +791,14 @@ provider = "codex"
         let entry = AccountEntry {
             name: "test".into(),
             provider: Provider::Codex,
+            live: false,
         };
         config.add_account(entry.clone()).unwrap();
         assert!(config
             .add_account(AccountEntry {
                 name: "test".into(),
                 provider: Provider::Codex,
+                live: false,
             })
             .is_err());
     }
@@ -778,14 +816,17 @@ provider = "codex"
                 AccountEntry {
                     name: "c1".into(),
                     provider: Provider::Codex,
+                    live: false,
                 },
                 AccountEntry {
                     name: "cl1".into(),
                     provider: Provider::Claude,
+                    live: false,
                 },
                 AccountEntry {
                     name: "c2".into(),
                     provider: Provider::Codex,
+                    live: false,
                 },
             ],
             selected_codex_account: Some("c1".into()),
@@ -827,6 +868,7 @@ provider = "codex"
             let entry = AccountEntry {
                 name: name.to_owned(),
                 provider: Provider::Codex,
+                live: false,
             };
             assert!(
                 config.add_account(entry).is_err(),
@@ -1004,6 +1046,7 @@ provider = "codex"
             accounts: vec![AccountEntry {
                 name: "work-codex".into(),
                 provider: Provider::Codex,
+                live: false,
             }],
             selected_codex_account: Some("work-codex".into()),
             selected_claude_account: None,
@@ -1072,6 +1115,7 @@ provider = "codex"
             accounts: vec![AccountEntry {
                 name: "work-codex".into(),
                 provider: Provider::Codex,
+                live: false,
             }],
             selected_codex_account: Some("work-codex".into()),
             selected_claude_account: None,

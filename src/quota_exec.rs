@@ -6,7 +6,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::quota_config::{
-    codex_home_for_profile, codex_profile_uses_isolated_home, Provider, QuotaConfig,
+    codex_home_for_profile, codex_live_home, codex_profile_uses_isolated_home, Provider,
+    QuotaConfig,
 };
 use crate::quota_patterns::{self, QuotaVerdict};
 use crate::quota_selector;
@@ -21,6 +22,7 @@ pub(crate) struct SelectedAccount {
     pub(crate) name: String,
     pub(crate) provider: Provider,
     pub(crate) profile_dir: PathBuf,
+    pub(crate) live: bool,
 }
 
 impl SelectedAccount {
@@ -34,9 +36,15 @@ impl SelectedAccount {
     }
 
     /// Env vars to inject into the provider CLI process. Currently
-    /// emits `CODEX_HOME` for Codex profiles with an isolated home.
+    /// emits `CODEX_HOME` for live Codex accounts and Codex profiles
+    /// with an isolated home.
     pub(crate) fn extra_env(&self) -> Vec<(String, String)> {
-        if self.uses_isolated_codex_home() {
+        if self.live {
+            vec![(
+                "CODEX_HOME".to_string(),
+                codex_live_home().to_string_lossy().into_owned(),
+            )]
+        } else if self.uses_isolated_codex_home() {
             let home = codex_home_for_profile(&self.profile_dir);
             vec![(
                 "CODEX_HOME".to_string(),
@@ -310,6 +318,10 @@ fn copy_profile_to_active_auth(provider: Provider, profile_dir: &Path) -> Result
 }
 
 fn swap_credentials(account: &SelectedAccount) -> Result<AuthRestoreGuard> {
+    if account.live {
+        return Ok(AuthRestoreGuard::new(Vec::new()));
+    }
+
     // Isolated Codex profiles use CODEX_HOME=<profile_dir>/codex-home at
     // spawn time, so we don't need to swap `~/.codex/auth.json` at all.
     // The empty guard makes restore a no-op.
@@ -383,6 +395,7 @@ fn swap_credentials_legacy(provider: Provider, profile_dir: &Path) -> Result<Aut
         name: "test".to_string(),
         provider,
         profile_dir: profile_dir.to_path_buf(),
+        live: false,
     };
     swap_credentials(&account)
 }
@@ -425,9 +438,13 @@ fn reserve_account_and_swap<'a>(
 
     let selected = quota_selector::select_account_from_scores(config, &state, provider, scored)?;
     let account_name = selected.entry.name.clone();
-    let profile_dir = QuotaConfig::profile_dir(provider, &account_name)?;
+    let profile_dir = if selected.entry.live {
+        codex_live_home()
+    } else {
+        QuotaConfig::profile_dir(provider, &account_name)?
+    };
 
-    if !profile_dir.exists() {
+    if !selected.entry.live && !profile_dir.exists() {
         anyhow::bail!(
             "profile directory for account '{account_name}' not found at {}. \
              Run `auto quota accounts capture {account_name}` to fix.",
@@ -439,6 +456,7 @@ fn reserve_account_and_swap<'a>(
         name: account_name.clone(),
         provider,
         profile_dir,
+        live: selected.entry.live,
     };
 
     state.mark_selected(&account_name, Utc::now())?;
@@ -929,12 +947,14 @@ mod tests {
             .add_account(AccountEntry {
                 name: "primary".to_string(),
                 provider: Provider::Codex,
+                live: false,
             })
             .expect("failed to add primary");
         config
             .add_account(AccountEntry {
                 name: "secondary".to_string(),
                 provider: Provider::Codex,
+                live: false,
             })
             .expect("failed to add secondary");
         config.save().expect("failed to save quota config");
@@ -980,12 +1000,14 @@ mod tests {
             .add_account(AccountEntry {
                 name: "primary".to_string(),
                 provider: Provider::Codex,
+                live: false,
             })
             .expect("failed to add primary");
         config
             .add_account(AccountEntry {
                 name: "secondary".to_string(),
                 provider: Provider::Codex,
+                live: false,
             })
             .expect("failed to add secondary");
         config.save().expect("failed to save quota config");
@@ -1230,6 +1252,7 @@ mod tests {
             name: "isolated".to_string(),
             provider: Provider::Codex,
             profile_dir: profile_dir.clone(),
+            live: false,
         };
         assert!(account.uses_isolated_codex_home());
         let env = account.extra_env();
@@ -1240,6 +1263,42 @@ mod tests {
         let guard = super::swap_credentials(&account).expect("isolated swap should succeed");
         // Active auth was NOT replaced — the worker is expected to read from
         // CODEX_HOME=<profile_dir>/codex-home instead.
+        let active = fs::read(&active_auth).expect("active auth should remain");
+        assert_eq!(active, br#"{"account":"untouched"}"#);
+        drop(guard);
+        let active_after = fs::read(&active_auth).expect("active auth should still be present");
+        assert_eq!(active_after, br#"{"account":"untouched"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_codex_home_skips_active_auth_swap() {
+        use crate::quota_config::codex_live_home;
+        use crate::quota_exec::SelectedAccount;
+
+        let home = TempQuotaHome::new("quota-exec-live-codex");
+        let live_home = codex_live_home();
+        let active_auth = live_home.join("auth.json");
+        fs::create_dir_all(&live_home).expect("failed to create live codex dir");
+        fs::write(&active_auth, br#"{"account":"untouched"}"#).expect("failed to seed active auth");
+
+        let profile_dir = home.profile_dir(Provider::Codex, "live");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        fs::write(profile_dir.join("auth.json"), br#"{"account":"profile"}"#)
+            .expect("failed to seed profile auth");
+
+        let account = SelectedAccount {
+            name: "live".to_string(),
+            provider: Provider::Codex,
+            profile_dir,
+            live: true,
+        };
+        let env = account.extra_env();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "CODEX_HOME");
+        assert_eq!(PathBuf::from(&env[0].1), live_home);
+
+        let guard = super::swap_credentials(&account).expect("live swap should be a no-op");
         let active = fs::read(&active_auth).expect("active auth should remain");
         assert_eq!(active, br#"{"account":"untouched"}"#);
         drop(guard);

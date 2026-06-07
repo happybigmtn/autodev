@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
+use crate::quota_config::{codex_live_home, AccountEntry, Provider, QuotaConfig};
 use crate::quota_state::QuotaState;
 use crate::quota_usage::{self, AccountUsage};
 
@@ -33,7 +33,7 @@ pub(crate) async fn score_accounts(
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
         Vec::with_capacity(candidates.len());
     for entry in candidates {
-        let profile_dir = QuotaConfig::profile_dir(provider, &entry.name)?;
+        let profile_dir = usage_profile_dir(provider, entry)?;
         match quota_usage::fetch_usage(provider, &profile_dir).await {
             Ok(usage) => scored.push((entry, Some(usage))),
             Err(e) => {
@@ -76,6 +76,14 @@ pub(crate) async fn score_accounts(
     }
 
     Ok(scored)
+}
+
+fn usage_profile_dir(provider: Provider, entry: &AccountEntry) -> Result<std::path::PathBuf> {
+    if matches!(provider, Provider::Codex) && entry.live {
+        Ok(codex_live_home())
+    } else {
+        QuotaConfig::profile_dir(provider, &entry.name)
+    }
 }
 
 /// Select the best account from pre-fetched quota scores.
@@ -414,6 +422,7 @@ mod tests {
         AccountEntry {
             name: name.into(),
             provider,
+            live: false,
         }
     }
 
@@ -487,6 +496,51 @@ mod tests {
         let selected =
             select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap();
         assert_eq!(selected.entry.name, "healthy");
+    }
+
+    #[test]
+    fn live_codex_usage_reads_from_live_home() {
+        let live = AccountEntry {
+            name: "live".into(),
+            provider: Provider::Codex,
+            live: true,
+        };
+        let captured = make_account("captured", Provider::Codex);
+
+        assert_eq!(
+            usage_profile_dir(Provider::Codex, &live).unwrap(),
+            codex_live_home()
+        );
+        assert_eq!(
+            usage_profile_dir(Provider::Codex, &captured).unwrap(),
+            QuotaConfig::profile_dir(Provider::Codex, "captured").unwrap()
+        );
+    }
+
+    #[test]
+    fn live_account_can_be_selected_as_candidate() {
+        let config = QuotaConfig {
+            accounts: vec![
+                make_account("captured", Provider::Codex),
+                AccountEntry {
+                    name: "live".into(),
+                    provider: Provider::Codex,
+                    live: true,
+                },
+            ],
+            selected_codex_account: Some("live".into()),
+            selected_claude_account: None,
+        };
+        let state = QuotaState::default();
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&config.accounts[0], Some(make_usage(50, 600, 50, 3600))),
+            (&config.accounts[1], Some(make_usage(50, 600, 50, 3600))),
+        ];
+
+        let selected =
+            select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap();
+        assert_eq!(selected.entry.name, "live");
+        assert!(selected.entry.live);
     }
 
     #[test]

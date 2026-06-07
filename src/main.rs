@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
                 AccountsCommand::Add(args) => {
                     quota_accounts::run_accounts_add(&args.name, &args.provider)
                 }
+                AccountsCommand::AddLive(args) => quota_accounts::run_accounts_add_live(&args.name),
                 AccountsCommand::List => quota_accounts::run_accounts_list(),
                 AccountsCommand::Login(args) => {
                     quota_accounts::run_accounts_login(&args.name, &args.codex_bin, &args.args)
