@@ -353,6 +353,20 @@ pub(crate) fn sanitize_quota_error_message(err: &anyhow::Error) -> String {
     sanitize_provider_error_text(&err.to_string())
 }
 
+/// True when a quota/usage error means the account's credentials are revoked or
+/// its session ended (HTTP 401, "session has ended", app_session_terminated,
+/// "refresh token was revoked"). Such accounts must be EXCLUDED from selection so
+/// the router never swaps in a dead profile, which clobbers the live ~/.codex login.
+pub(crate) fn is_auth_failure(err: &anyhow::Error) -> bool {
+    let chain = format!("{err:#}").to_lowercase();
+    chain.contains("401")
+        || chain.contains("unauthorized")
+        || chain.contains("session has ended")
+        || chain.contains("app_session_terminated")
+        || chain.contains("refresh token was revoked")
+        || chain.contains("could not be refreshed")
+}
+
 pub(crate) fn sanitize_provider_error_text(message: &str) -> String {
     if quota_error_contains_secret_payload(message) {
         "sensitive auth details redacted".to_string()

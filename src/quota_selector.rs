@@ -42,9 +42,27 @@ pub(crate) async fn score_accounts(
                     entry.name,
                     quota_usage::sanitize_quota_error_message(&e),
                 );
+                if quota_usage::is_auth_failure(&e) {
+                    // Revoked/terminated credentials: exclude entirely so the
+                    // router never swaps in a dead profile (which clobbers the
+                    // live ~/.codex login). Recover with `codex login` then
+                    // `auto quota accounts capture <name>`.
+                    eprintln!(
+                        "[quota-router] excluding '{}': credentials invalid; run `codex login` then `auto quota accounts capture {}`",
+                        entry.name, entry.name
+                    );
+                    continue;
+                }
                 scored.push((entry, None));
             }
         }
+    }
+
+    if scored.is_empty() {
+        bail!(
+            "all {provider} accounts have invalid credentials (revoked/expired). \
+             Run `codex login` then `auto quota accounts capture <name>` for at least one."
+        );
     }
 
     Ok(scored)
