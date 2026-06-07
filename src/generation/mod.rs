@@ -9,7 +9,7 @@
 mod corpus_verify;
 mod gbrain_context;
 pub(crate) mod markdown;
-mod phase_runner;
+pub(crate) mod phase_runner;
 mod plan_verify;
 mod planning_root;
 mod prompts;
