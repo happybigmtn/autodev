@@ -222,11 +222,41 @@ fn plan_task_field_body(block: &PlanTaskBlock, field: &str, next_field: &str) ->
         if collecting && plan_field_line_value(line, next_field).is_some() {
             break;
         }
+        // Stop at ANY other structured field header, not just the
+        // expected `next_field`. Task rows vary in which optional
+        // fields they carry; without this, a row missing `next_field`
+        // silently swallows every later field (Completion signal,
+        // Review/closeout, ...) into this body — e.g. inflating the
+        // `Required tests:` entry count with backticked commands that
+        // belong to other fields.
+        if collecting && looks_like_plan_field_header(line) {
+            break;
+        }
         if collecting {
             body.push(line.to_string());
         }
     }
     collecting.then(|| body.join("\n"))
+}
+
+fn looks_like_plan_field_header(line: &str) -> bool {
+    // Bulleted lines are list items inside a field body (e.g. a test
+    // list), never field headers.
+    let trimmed = line.trim_start();
+    if ["- ", "* ", "+ "].iter().any(|b| trimmed.starts_with(b)) {
+        return false;
+    }
+    let stripped = trimmed.strip_prefix("**").unwrap_or(trimmed);
+    let Some(colon) = stripped.find(':') else {
+        return false;
+    };
+    let name = stripped[..colon].trim_end_matches("**");
+    !name.is_empty()
+        && name.len() <= 40
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '/' | '-' | '+'))
 }
 
 fn verify_required_tests_are_scoped(block: &PlanTaskBlock, body: &str) -> Result<()> {
@@ -742,13 +772,46 @@ fn extract_spec_refs_from_line(line: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_generated_implementation_plan, verify_generated_implementation_plan};
+    use super::{
+        normalize_generated_implementation_plan, plan_task_field_body, PlanSection,
+        PlanTaskBlock, verify_generated_implementation_plan,
+    };
     use crate::generation::prompts::IMPLEMENTATION_PLAN_HEADER;
     use crate::generation::root_sync::merge_generated_plan_with_existing_open_tasks;
     use crate::generation::tests::{
         temp_dir, valid_generated_plan_task, write_generated_plan, write_real_spec,
     };
     use std::fs;
+
+    #[test]
+    fn field_body_stops_at_other_field_headers_when_next_field_absent() {
+        // Regression: a row with no `Contract generation:` field must not
+        // swallow `Completion signal:` / `Review/closeout:` backticked
+        // commands into its `Required tests:` body (that inflated the
+        // entry count past the 5-test limit and failed valid plans).
+        let block = PlanTaskBlock {
+            section: PlanSection::Priority,
+            task_id: "TASK-301".to_string(),
+            checked: false,
+            markdown: [
+                "- [ ] `TASK-301` Green tree",
+                "",
+                "  Required tests: `cargo test -p a x`; `cargo test -p b y`",
+                "  Completion artifacts: none",
+                "  Dependencies: none",
+                "  Completion signal: `git diff --stat` lists only owned files",
+                "  Review/closeout: `cargo fmt --check`; `cargo clippy`; `cargo test --workspace`",
+            ]
+            .join("\n"),
+        };
+        let body = plan_task_field_body(&block, "Required tests:", "Contract generation:")
+            .expect("field body");
+        assert!(
+            !body.contains("Review/closeout") && !body.contains("git diff"),
+            "Required tests body leaked later fields: {body:?}"
+        );
+        assert_eq!(super::count_required_test_entries(&body), 2);
+    }
 
     #[test]
     fn normalizes_noncanonical_plan_heading() {
