@@ -52,6 +52,11 @@ pub(crate) struct CorpusArgs {
     #[arg(long)]
     pub(crate) skip_codex_review: bool,
 
+    /// Resume from an existing .auto/corpus-staging/<dir> whose authoring completed but whose
+    /// review/promotion failed: skips the authoring model and re-runs review -> verify -> promote
+    #[arg(long, value_name = "STAGING_DIR")]
+    pub(crate) resume_staging: Option<PathBuf>,
+
     /// Sanitize and verify the existing planning corpus without invoking authoring or review models
     #[arg(long)]
     pub(crate) verify_only: bool,

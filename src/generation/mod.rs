@@ -170,6 +170,9 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     if args.verify_only {
         println!("mode:        verify-only");
     }
+    if let Some(staging) = args.resume_staging.as_ref() {
+        println!("mode:        resume-staging ({})", staging.display());
+    }
     if args.dry_run {
         println!("mode:        dry-run");
         return Ok(());
@@ -203,59 +206,107 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         return Ok(());
     }
 
-    print_stage("prepare planning root", run_started_at);
-    let preparation = prepare_planning_root_for_corpus(&repo_root, &planning_root)?;
-    let authoring_root = preparation.authoring_root;
-
-    print_stage("create corpus skeleton", run_started_at);
-    fs::create_dir_all(authoring_root.join("plans")).with_context(|| {
-        format!(
-            "failed to create corpus plan directory {}",
-            authoring_root.join("plans").display()
-        )
-    })?;
-
-    let gbrain_context_path = if args.no_gbrain_context {
-        None
-    } else {
-        print_stage("collect gbrain context", run_started_at);
-        match collect_gbrain_context(&repo_root, &authoring_root, "auto corpus", &args.gbrain_bin) {
-            Ok(path) => {
-                println!("gbrain ctx:  {}", path.display());
-                Some(path)
+    let (authoring_root, author_phase, previous_snapshot, gbrain_context_path) =
+        if let Some(staging) = args.resume_staging.as_ref() {
+            // Salvage a run whose authoring completed but whose review or
+            // promotion failed (dead review credentials, validation crash,
+            // operator interrupt): skip the authoring model entirely and
+            // re-enter the pipeline at the review stage against the
+            // already-authored staging dir.
+            let staging = if staging.is_absolute() {
+                staging.clone()
+            } else {
+                repo_root.join(staging)
+            };
+            for required in ["ASSESSMENT.md", "SPEC.md", "PLANS.md"] {
+                if !staging.join(required).exists() {
+                    bail!(
+                        "--resume-staging {} is not a completed corpus staging dir (missing {required}); \
+                         expected a .auto/corpus-staging/genesis-* dir whose authoring phase finished",
+                        staging.display()
+                    );
+                }
             }
-            Err(error) => {
-                eprintln!("warning: failed to collect gbrain context: {error:#}");
+            print_stage("resume staged corpus (authoring skipped)", run_started_at);
+            println!("staging:     {}", staging.display());
+            let gbrain_context_path = staging
+                .join(GBRAIN_CONTEXT_FILENAME)
+                .exists()
+                .then(|| staging.join(GBRAIN_CONTEXT_FILENAME));
+            (staging, None, None, gbrain_context_path)
+        } else {
+            print_stage("prepare planning root", run_started_at);
+            let preparation = prepare_planning_root_for_corpus(&repo_root, &planning_root)?;
+            let authoring_root = preparation.authoring_root;
+
+            print_stage("create corpus skeleton", run_started_at);
+            fs::create_dir_all(authoring_root.join("plans")).with_context(|| {
+                format!(
+                    "failed to create corpus plan directory {}",
+                    authoring_root.join("plans").display()
+                )
+            })?;
+
+            let gbrain_context_path = if args.no_gbrain_context {
                 None
-            }
-        }
-    };
+            } else {
+                print_stage("collect gbrain context", run_started_at);
+                match collect_gbrain_context(
+                    &repo_root,
+                    &authoring_root,
+                    "auto corpus",
+                    &args.gbrain_bin,
+                ) {
+                    Ok(path) => {
+                        println!("gbrain ctx:  {}", path.display());
+                        Some(path)
+                    }
+                    Err(error) => {
+                        eprintln!("warning: failed to collect gbrain context: {error:#}");
+                        None
+                    }
+                }
+            };
 
-    let prompt = build_corpus_prompt(
-        &repo_root,
-        &authoring_root,
-        CorpusPromptInputs {
-            previous_planning_snapshot: preparation.previous_snapshot.as_deref(),
-            parallelism: args.parallelism.clamp(1, 10),
-            idea: args.idea.as_deref(),
-            focus: args.focus.as_deref(),
-            reference_repos: &reference_repos,
-            active_plan_surface: &active_plan_surface,
-            gbrain_context_path: gbrain_context_path.as_deref(),
-        },
+            let prompt = build_corpus_prompt(
+                &repo_root,
+                &authoring_root,
+                CorpusPromptInputs {
+                    previous_planning_snapshot: preparation.previous_snapshot.as_deref(),
+                    parallelism: args.parallelism.clamp(1, 10),
+                    idea: args.idea.as_deref(),
+                    focus: args.focus.as_deref(),
+                    reference_repos: &reference_repos,
+                    active_plan_surface: &active_plan_surface,
+                    gbrain_context_path: gbrain_context_path.as_deref(),
+                },
+            );
+            print_stage("run corpus model", run_started_at);
+            let author_phase = run_logged_author_phase(
+                &repo_root,
+                "corpus",
+                &prompt,
+                &args.model,
+                &args.reasoning_effort,
+                args.max_turns,
+                &args.codex_bin,
+            )
+            .await
+            .context("corpus generation failed")?;
+            (
+                authoring_root,
+                Some(author_phase),
+                preparation.previous_snapshot,
+                gbrain_context_path,
+            )
+        };
+    // On any post-authoring failure below, the staging dir survives on
+    // disk; tell the operator how to resume without re-authoring.
+    let resume_hint = format!(
+        "corpus staging preserved; resume without re-authoring via \
+         `auto corpus --resume-staging {}`",
+        authoring_root.display()
     );
-    print_stage("run corpus model", run_started_at);
-    let author_phase = run_logged_author_phase(
-        &repo_root,
-        "corpus",
-        &prompt,
-        &args.model,
-        &args.reasoning_effort,
-        args.max_turns,
-        &args.codex_bin,
-    )
-    .await
-    .context("corpus generation failed")?;
 
     let codex_review = if args.skip_codex_review {
         None
@@ -279,7 +330,8 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
                 &args.codex_bin,
                 &report_path,
             )
-            .await?,
+            .await
+            .with_context(|| resume_hint.clone())?,
         )
     };
 
@@ -289,7 +341,8 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         args.focus.is_some(),
         &active_plan_surface,
         run_started_at,
-    )?;
+    )
+    .with_context(|| resume_hint.clone())?;
     print_stage("promote staged corpus", run_started_at);
     promote_staged_planning_root(&authoring_root, &planning_root)?;
     let summary = save_verified_corpus_state(
@@ -315,7 +368,7 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
     if let Some(idea) = summary.idea_path {
         println!("idea brief:  {}", idea.display());
     }
-    if let Some(previous) = preparation.previous_snapshot {
+    if let Some(previous) = previous_snapshot {
         println!("prior input: {}", previous.display());
     }
     if gbrain_context_path.is_some() {
@@ -325,10 +378,12 @@ pub(crate) async fn run_corpus(args: CorpusArgs) -> Result<()> {
         );
     }
     println!("plan files:  {}", summary.plan_count);
-    println!("prompt log:  {}", author_phase.prompt_path.display());
-    if let Some(response_path) = &author_phase.response_path {
-        if response_path.exists() {
-            println!("model log:   {}", response_path.display());
+    if let Some(author_phase) = &author_phase {
+        println!("prompt log:  {}", author_phase.prompt_path.display());
+        if let Some(response_path) = &author_phase.response_path {
+            if response_path.exists() {
+                println!("model log:   {}", response_path.display());
+            }
         }
     }
     if let Some(review) = codex_review {
