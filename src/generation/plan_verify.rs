@@ -56,6 +56,9 @@ pub(crate) fn verify_generated_implementation_plan(output_dir: &Path) -> Result<
             ));
         }
     }
+    // Collect every block's failure instead of bailing on the first so a
+    // single rerun fixes the whole plan (mirrors validate_execution_rows).
+    let mut block_errors: Vec<String> = Vec::new();
     for block in &blocks {
         if block.checked {
             continue;
@@ -78,8 +81,16 @@ pub(crate) fn verify_generated_implementation_plan(output_dir: &Path) -> Result<
                 eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
                 continue;
             }
-            return Err(err);
+            block_errors.push(format!("{err:#}"));
         }
+    }
+    match block_errors.len() {
+        0 => {}
+        1 => bail!("{}", block_errors.remove(0)),
+        n => bail!(
+            "{n} generated-plan task validation errors:\n  - {}",
+            block_errors.join("\n  - ")
+        ),
     }
     let available_specs = collect_available_spec_refs(&output_dir.join("specs"))?;
     validate_plan_spec_refs(
@@ -1159,8 +1170,11 @@ Spec: specs/010426-observability.md
     }
 
     #[test]
-    fn generated_plan_rejects_bin_only_cargo_lib_verification() {
-        let root = temp_dir("bin-only-cargo-lib-verification");
+    fn generated_plan_accepts_cargo_lib_verification_with_concrete_filter() {
+        // `--lib <filter>` is a tighter scope than no target flag; the old
+        // blanket ban rejected valid plans on lib crates with a misleading
+        // "bin-only crate" message.
+        let root = temp_dir("cargo-lib-with-filter-verification");
         write_real_spec(&root);
         let task = valid_generated_plan_task().replace(
             "    cargo test -p docs exact_docs_test",
@@ -1168,10 +1182,24 @@ Spec: specs/010426-observability.md
         );
         write_generated_plan(&root, &task);
 
-        let error = verify_generated_implementation_plan(&root)
-            .expect_err("expected cargo --lib verification failure");
+        verify_generated_implementation_plan(&root)
+            .expect("cargo test --lib with a concrete filter is a valid scoped command");
+    }
 
-        assert!(error.to_string().contains("cargo test --lib"));
+    #[test]
+    fn generated_plan_rejects_cargo_lib_verification_without_filter() {
+        let root = temp_dir("cargo-lib-without-filter-verification");
+        write_real_spec(&root);
+        let task = valid_generated_plan_task().replace(
+            "    cargo test -p docs exact_docs_test",
+            "    cargo test -p docs --lib",
+        );
+        write_generated_plan(&root, &task);
+
+        let error = verify_generated_implementation_plan(&root)
+            .expect_err("expected package-wide cargo test failure");
+
+        assert!(error.to_string().contains("package-wide"));
     }
 
     #[test]

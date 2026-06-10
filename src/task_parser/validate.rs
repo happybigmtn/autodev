@@ -48,6 +48,10 @@ pub(crate) fn validate_execution_rows(plan: &str) -> Result<Vec<PlanTask>> {
         .collect::<BTreeSet<_>>();
     let lenient = std::env::var("AUTO_LENIENT_GATE").ok().as_deref() == Some("1")
         || std::env::var("AUTO_LENIENT_DEPS").ok().as_deref() == Some("1");
+    // Collect every row's failure instead of bailing on the first: a
+    // generated plan with several bad rows should cost one fix-and-rerun
+    // cycle, not one cycle per row.
+    let mut errors: Vec<String> = Vec::new();
     for task in tasks
         .iter()
         .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Partial))
@@ -57,10 +61,17 @@ pub(crate) fn validate_execution_rows(plan: &str) -> Result<Vec<PlanTask>> {
                 eprintln!("warning: {err:#} (continuing under AUTO_LENIENT_GATE=1)");
                 continue;
             }
-            return Err(err);
+            errors.push(format!("{err:#}"));
         }
     }
-    Ok(tasks)
+    match errors.len() {
+        0 => Ok(tasks),
+        1 => bail!("{}", errors.remove(0)),
+        n => bail!(
+            "{n} execution-row validation errors:\n  - {}",
+            errors.join("\n  - ")
+        ),
+    }
 }
 
 pub(crate) fn execution_row_field_body(task: &PlanTask, field: &str) -> Result<String> {

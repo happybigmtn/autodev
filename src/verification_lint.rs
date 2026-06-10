@@ -47,11 +47,11 @@ fn verify_cargo_test_command(
             "task `{task_id}` `{field}` uses broad verification command `{command}`; use one concrete affected test filter"
         );
     }
-    if cargo_test_has_lib_target_flag(argv) {
-        bail!(
-            "task `{task_id}` `{field}` uses stale `cargo test --lib` verification command `{command}` for this bin-only crate; use `cargo test <test-filter>` or `cargo clippy --bins`"
-        );
-    }
+    // NOTE: `--lib` with a concrete filter is deliberately allowed. It is a
+    // *tighter* scope than no target flag, and most workspace crates are lib
+    // crates — the old blanket ban rejected valid plans with a misleading
+    // "bin-only crate" message. A `--lib` command with NO filter still fails
+    // the package-wide check below.
 
     let filters = cargo_test_filter_tokens(argv);
     if filters.is_empty() {
@@ -73,10 +73,6 @@ fn cargo_test_has_broad_scope_flag(argv: &[String]) -> bool {
     argv.iter()
         .skip(2)
         .any(|token| matches!(token.as_str(), "--workspace" | "--all"))
-}
-
-fn cargo_test_has_lib_target_flag(argv: &[String]) -> bool {
-    argv.iter().skip(2).any(|token| token == "--lib")
 }
 
 fn verify_grep_command(task_id: &str, field: &str, command: &str, argv: &[String]) -> Result<()> {
