@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 
-use crate::claude_exec::run_claude_exec;
+use crate::claude_exec::{looks_like_claude_model, run_claude_exec};
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::task_parser::{
     execution_row_first_field_line, parse_task_header, parse_tasks, validate_execution_row,
@@ -162,15 +162,7 @@ fn default_spec_filename(prompt: &str) -> String {
 }
 
 fn spec_author_uses_claude_model(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized.is_empty()
-        || normalized == "opus"
-        || normalized == "sonnet"
-        || normalized == "haiku"
-        || normalized.contains("claude")
-        || normalized.contains("opus")
-        || normalized.contains("sonnet")
-        || normalized.contains("haiku")
+    model.trim().is_empty() || looks_like_claude_model(model)
 }
 
 fn build_spec_prompt(repo_root: &Path, prompt: &str, spec_path: &Path, plan_path: &Path) -> String {
@@ -666,6 +658,8 @@ mod tests {
     fn auto_spec_routes_opus_defaults_to_claude_author() {
         assert!(spec_author_uses_claude_model("opus"));
         assert!(spec_author_uses_claude_model("claude-opus-4-8"));
+        assert!(spec_author_uses_claude_model("fable 5"));
+        assert!(spec_author_uses_claude_model("fable-5"));
         assert!(!spec_author_uses_claude_model("gpt-5.5"));
     }
 

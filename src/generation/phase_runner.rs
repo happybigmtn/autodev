@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
+use crate::claude_exec::looks_like_claude_model;
 use crate::codex_exec::run_codex_exec_max_context;
 use crate::generation::format_duration;
 use crate::util::{atomic_write, timestamp_slug};
@@ -266,15 +267,7 @@ async fn run_logged_codex_author_phase(
 }
 
 pub(crate) fn author_phase_uses_claude_model(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized.is_empty()
-        || normalized == "opus"
-        || normalized == "sonnet"
-        || normalized == "haiku"
-        || normalized.contains("claude")
-        || normalized.contains("opus")
-        || normalized.contains("sonnet")
-        || normalized.contains("haiku")
+    model.trim().is_empty() || looks_like_claude_model(model)
 }
 
 fn run_logged_claude_phase(
@@ -400,6 +393,8 @@ mod tests {
     fn generation_author_backend_uses_codex_for_non_claude_models() {
         assert!(author_phase_uses_claude_model("claude-sonnet-4-6"));
         assert!(author_phase_uses_claude_model("sonnet"));
+        assert!(author_phase_uses_claude_model("fable 5"));
+        assert!(author_phase_uses_claude_model("fable-5"));
         assert!(!author_phase_uses_claude_model("gpt-5.5"));
         assert!(!author_phase_uses_claude_model("o3"));
     }

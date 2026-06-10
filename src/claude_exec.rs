@@ -250,6 +250,10 @@ pub(crate) fn resolve_claude_model(model: &str) -> String {
     if trimmed.is_empty() {
         return DEFAULT_CLAUDE_MODEL_ALIAS.to_string();
     }
+    let normalized = trimmed.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "fable 5" | "fable-5") {
+        return "claude-fable-5".to_string();
+    }
     if looks_like_claude_model(trimmed) {
         return trimmed.to_string();
     }
@@ -274,7 +278,12 @@ pub(crate) fn describe_claude_harness(model: &str, effort: &str) -> String {
 
 pub(crate) fn looks_like_claude_model(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
-    normalized.starts_with("claude") || matches!(normalized.as_str(), "opus" | "sonnet" | "haiku")
+    normalized.starts_with("claude")
+        || matches!(
+            normalized.as_str(),
+            "opus" | "sonnet" | "haiku" | "fable" | "fable-5" | "fable 5"
+        )
+        || normalized.contains("fable")
 }
 
 #[cfg(test)]
@@ -290,6 +299,9 @@ mod tests {
     #[test]
     fn explicit_claude_settings_are_preserved() {
         assert_eq!(resolve_claude_model("opus"), "opus");
+        assert_eq!(resolve_claude_model("fable 5"), "claude-fable-5");
+        assert_eq!(resolve_claude_model("fable-5"), "claude-fable-5");
+        assert_eq!(resolve_claude_model("fable"), "fable");
         assert_eq!(
             resolve_claude_model("claude-sonnet-4-6"),
             "claude-sonnet-4-6"
