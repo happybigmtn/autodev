@@ -99,6 +99,16 @@ pub(crate) async fn run_codex_exec_with_env(
                 let context_label = context_label.to_owned();
                 let extra_env = extra_env.to_vec();
                 let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
+                // Keep owned copies for the all-accounts-dead fallback:
+                // the originals below are moved into the quota closure.
+                let fb_repo_root = repo_root.clone();
+                let fb_full_prompt = full_prompt.clone();
+                let fb_model = model.clone();
+                let fb_reasoning_effort = reasoning_effort.clone();
+                let fb_codex_bin = codex_bin.clone();
+                let fb_context_label = context_label.clone();
+                let fb_extra_env = extra_env.clone();
+                let fb_stdout_log_path = stdout_log_path.clone();
                 let result = quota_exec::run_with_quota(Provider::Codex, move |account| {
                     let repo_root = repo_root.clone();
                     let full_prompt = full_prompt.clone();
@@ -125,8 +135,30 @@ pub(crate) async fn run_codex_exec_with_env(
                         .await
                     }
                 })
-                .await?;
-                (result.exit_status, result.stderr_text)
+                .await;
+                match result {
+                    Ok(result) => (result.exit_status, result.stderr_text),
+                    Err(err) if quota_exec::error_is_all_accounts_invalid(&err) => {
+                        eprintln!("[quota-router] {err:#}");
+                        eprintln!(
+                            "[quota-router] falling back to the default codex login (~/.codex)"
+                        );
+                        spawn_codex(
+                            &fb_repo_root,
+                            &fb_full_prompt,
+                            &fb_model,
+                            &fb_reasoning_effort,
+                            &fb_codex_bin,
+                            fb_stdout_log_path.as_deref(),
+                            &fb_context_label,
+                            &fb_extra_env,
+                            worker_pid_path,
+                            model_context_window,
+                        )
+                        .await?
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 spawn_codex(
                     repo_root,

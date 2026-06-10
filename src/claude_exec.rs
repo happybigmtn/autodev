@@ -93,6 +93,15 @@ pub(crate) async fn run_claude_exec_with_env(
         let context_label = context_label.to_owned();
         let extra_env = extra_env.to_vec();
         let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
+        // Keep owned copies for the all-accounts-dead fallback: the
+        // originals below are moved into the quota closure.
+        let fb_repo_root = repo_root.clone();
+        let fb_full_prompt = full_prompt.clone();
+        let fb_resolved_model = resolved_model.clone();
+        let fb_resolved_effort = resolved_effort.clone();
+        let fb_context_label = context_label.clone();
+        let fb_extra_env = extra_env.clone();
+        let fb_stdout_log_path = stdout_log_path.clone();
         let result = quota_exec::run_with_quota(Provider::Claude, move |_account| {
             let repo_root = repo_root.clone();
             let full_prompt = full_prompt.clone();
@@ -117,8 +126,28 @@ pub(crate) async fn run_claude_exec_with_env(
                 .await
             }
         })
-        .await?;
-        (result.exit_status, result.stderr_text)
+        .await;
+        match result {
+            Ok(result) => (result.exit_status, result.stderr_text),
+            Err(err) if quota_exec::error_is_all_accounts_invalid(&err) => {
+                eprintln!("[quota-router] {err:#}");
+                eprintln!("[quota-router] falling back to the default claude login");
+                spawn_claude(
+                    &fb_repo_root,
+                    &fb_full_prompt,
+                    &fb_resolved_model,
+                    &fb_resolved_effort,
+                    max_turns,
+                    fb_stdout_log_path.as_deref(),
+                    &fb_context_label,
+                    &fb_extra_env,
+                    worker_pid_path,
+                    futility_threshold,
+                )
+                .await?
+            }
+            Err(err) => return Err(err),
+        }
     } else {
         spawn_claude(
             repo_root,

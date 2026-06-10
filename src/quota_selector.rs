@@ -9,6 +9,28 @@ const WEEKLY_FLOOR_PCT: u32 = 10;
 /// Accounts with less than this session remaining are avoided when possible.
 const SESSION_FLOOR_PCT: u32 = 25;
 
+/// Every configured account for the provider was excluded because its
+/// credentials are revoked/expired. Typed so exec seams can distinguish
+/// "the router has nothing usable" (fall back to the provider's default
+/// login) from a transient routing failure (propagate).
+#[derive(Debug)]
+pub(crate) struct AllAccountsInvalid {
+    pub(crate) provider: Provider,
+}
+
+impl std::fmt::Display for AllAccountsInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "all {} accounts have invalid credentials (revoked/expired). \
+             Run `codex login` then `auto quota accounts capture <name>` for at least one.",
+            self.provider
+        )
+    }
+}
+
+impl std::error::Error for AllAccountsInvalid {}
+
 #[derive(Debug)]
 pub(crate) struct SelectedAccount<'a> {
     pub(crate) entry: &'a AccountEntry,
@@ -69,10 +91,7 @@ pub(crate) async fn score_accounts(
     }
 
     if scored.is_empty() {
-        bail!(
-            "all {provider} accounts have invalid credentials (revoked/expired). \
-             Run `codex login` then `auto quota accounts capture <name>` for at least one."
-        );
+        return Err(anyhow::Error::new(AllAccountsInvalid { provider }));
     }
 
     Ok(scored)

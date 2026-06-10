@@ -657,6 +657,16 @@ pub(crate) fn is_quota_available(provider: Provider) -> bool {
         .is_some_and(|c| !c.accounts_for_provider(provider).is_empty())
 }
 
+/// True when `err` (anywhere in its chain) says every configured account
+/// for the provider has dead credentials. Exec seams use this to fall
+/// back to the provider's default login instead of failing the whole
+/// run — a model phase should not die because the router's account pool
+/// went stale while the default `~/.codex` / `claude` login still works.
+pub(crate) fn error_is_all_accounts_invalid(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<crate::quota_selector::AllAccountsInvalid>())
+}
+
 /// Select the best account, swap credentials, launch the provider CLI
 /// with the given args, wait for exit, and restore credentials.
 pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Result<i32> {
