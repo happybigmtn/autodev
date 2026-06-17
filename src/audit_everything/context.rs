@@ -42,8 +42,7 @@ pub(crate) fn read_context_bundle(paths: &RunPaths) -> Result<String> {
             .with_context(|| format!("failed to read {}", bundle.display()));
     }
     write_context_bundle(paths)?;
-    std::fs::read_to_string(&bundle)
-        .with_context(|| format!("failed to read {}", bundle.display()))
+    std::fs::read_to_string(&bundle).with_context(|| format!("failed to read {}", bundle.display()))
 }
 
 pub(crate) fn write_context_bundle(paths: &RunPaths) -> Result<()> {

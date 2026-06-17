@@ -13,10 +13,10 @@ use anyhow::{bail, Context, Result};
 use crate::claude_exec::{describe_claude_harness, run_claude_exec, FUTILITY_EXIT_MARKER};
 use crate::codex_exec::run_codex_exec;
 use crate::loop_command::branch::resolve_loop_branch;
+pub(crate) use crate::loop_command::prompt::DEFAULT_LOOP_PROMPT_TEMPLATE;
 use crate::loop_command::prompt::{
     append_reference_repo_clause, build_iteration_prompt, render_default_loop_prompt,
 };
-pub(crate) use crate::loop_command::prompt::DEFAULT_LOOP_PROMPT_TEMPLATE;
 use crate::loop_command::queue::{inspect_loop_queue, reconcile_loop_task_completion_evidence};
 use crate::loop_command::refs::resolve_reference_repos;
 use crate::util::{

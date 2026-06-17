@@ -57,10 +57,7 @@ impl ActivePlanSurface {
     }
 }
 
-pub(crate) fn resolve_reference_repos(
-    repo_root: &Path,
-    paths: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
+pub(crate) fn resolve_reference_repos(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
     for path in paths {
         let absolute = if path.is_absolute() {

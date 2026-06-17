@@ -9,15 +9,15 @@ use anyhow::{bail, Context, Result};
 use tokio::task::JoinSet;
 
 use crate::audit_everything::git::{
-    audit_lane_changed_files, cherry_pick_lane_range, clone_audit_lane_repo, commit_worktree_changes,
-    fetch_lane_commit, git_ref_is_ancestor,
+    audit_lane_changed_files, cherry_pick_lane_range, clone_audit_lane_repo,
+    commit_worktree_changes, fetch_lane_commit, git_ref_is_ancestor,
 };
 use crate::audit_everything::manifest::write_manifest;
 use crate::audit_everything::manifest::{EverythingManifest, RemediationTaskState, StageStatus};
 use crate::audit_everything::prompts::selected_skill_names_for_file;
 use crate::audit_everything::prompts::{
-    is_docs_or_devex_path, is_release_or_deploy_path, is_rust_or_backend_path, is_test_or_perf_path,
-    push_unique, render_skill_policy,
+    is_docs_or_devex_path, is_release_or_deploy_path, is_rust_or_backend_path,
+    is_test_or_perf_path, push_unique, render_skill_policy,
 };
 use crate::audit_everything::run_paths::{
     remediation_plan_json_path, remediation_plan_markdown_path, PhaseConfig, RunPaths,
@@ -257,10 +257,7 @@ async fn run_remediation_lanes(
     Ok(())
 }
 
-fn persist_remediation_progress(
-    paths: &RunPaths,
-    manifest: &EverythingManifest,
-) -> Result<()> {
+fn persist_remediation_progress(paths: &RunPaths, manifest: &EverythingManifest) -> Result<()> {
     write_remediation_plan_files(paths, manifest)?;
     write_manifest(paths, manifest)?;
     commit_worktree_changes(paths, manifest)
@@ -618,10 +615,7 @@ pub(crate) fn complete_remediation_task_ids(manifest: &EverythingManifest) -> BT
     complete
 }
 
-fn is_schedulable_remediation_task(
-    task: &RemediationTaskState,
-    active: &BTreeSet<String>,
-) -> bool {
+fn is_schedulable_remediation_task(task: &RemediationTaskState, active: &BTreeSet<String>) -> bool {
     !active.contains(&task.id)
         && !matches!(
             task.status,
@@ -643,9 +637,7 @@ pub(crate) fn unmet_remediation_dependencies(
         .collect()
 }
 
-fn first_blocked_remediation_task(
-    manifest: &EverythingManifest,
-) -> Option<&RemediationTaskState> {
+fn first_blocked_remediation_task(manifest: &EverythingManifest) -> Option<&RemediationTaskState> {
     manifest
         .remediation_tasks
         .iter()
@@ -737,10 +729,7 @@ async fn run_one_remediation_lane(
     Ok(())
 }
 
-fn prepare_remediation_lane_repo(
-    paths: &RunPaths,
-    task: &mut RemediationTaskState,
-) -> Result<()> {
+fn prepare_remediation_lane_repo(paths: &RunPaths, task: &mut RemediationTaskState) -> Result<()> {
     let lane_root = PathBuf::from(&task.lane_root);
     let lane_repo_root = PathBuf::from(&task.lane_repo_root);
     if lane_repo_root.join(".git").exists() {
@@ -881,10 +870,7 @@ fn render_skill_policy_for_paths(paths: &[String]) -> String {
     render_skill_policy(&selected)
 }
 
-fn land_remediation_lane(
-    paths: &RunPaths,
-    task: &RemediationTaskState,
-) -> Result<Vec<String>> {
+fn land_remediation_lane(paths: &RunPaths, task: &RemediationTaskState) -> Result<Vec<String>> {
     let lane_repo_root = PathBuf::from(&task.lane_repo_root);
     let base_commit = task
         .base_commit
@@ -909,10 +895,7 @@ fn land_remediation_lane(
     Ok(changed_files)
 }
 
-fn restore_dirty_generated_reports(
-    paths: &RunPaths,
-    changed_files: &[String],
-) -> Result<()> {
+fn restore_dirty_generated_reports(paths: &RunPaths, changed_files: &[String]) -> Result<()> {
     let report_prefix = format!("audit/everything/{}/reports/", report_run_id(paths));
     let dirty = git_stdout(&paths.worktree_root, ["status", "--porcelain", "--"])?;
     for path in changed_files

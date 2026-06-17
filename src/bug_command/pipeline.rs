@@ -21,8 +21,8 @@ use crate::bug_command::prompts::{
     fix_result_json_schema, review_result_json_schema, skeptic_verdict_json_schema,
 };
 use crate::bug_command::types::{
-    AcceptedFinding, BugFinding, ChunkOutcome, FinalReviewResult, FixResult, PhaseConfig, RepoChunk,
-    ReviewResult, SkepticVerdict,
+    AcceptedFinding, BugFinding, ChunkOutcome, FinalReviewResult, FixResult, PhaseConfig,
+    RepoChunk, ReviewResult, SkepticVerdict,
 };
 use crate::bug_command::validate::{
     derive_accepted_findings, derive_verified_findings, load_json_file,

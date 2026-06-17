@@ -72,8 +72,7 @@ fn spawn_group_worker(
 ) {
     let paths_clone = paths.clone();
     let config_clone = config.clone();
-    join_set
-        .spawn(async move { run_one_group_phase(&paths_clone, &group, &config_clone).await });
+    join_set.spawn(async move { run_one_group_phase(&paths_clone, &group, &config_clone).await });
 }
 
 async fn run_one_file_analysis(

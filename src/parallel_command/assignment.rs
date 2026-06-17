@@ -575,7 +575,9 @@ pub(crate) async fn harvest_resumable_lane_results(
             terminate_requested_at: None,
             host_recovery_note: candidate.host_recovery_note,
         };
-        match land_parallel_lane_result(repo_root, target_branch, &mut assignment, review_config).await {
+        match land_parallel_lane_result(repo_root, target_branch, &mut assignment, review_config)
+            .await
+        {
             Ok(LaneLandingOutcome::Landed {
                 auto_repaired,
                 completion_status,

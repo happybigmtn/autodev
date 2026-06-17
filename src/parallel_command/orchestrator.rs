@@ -938,7 +938,14 @@ pub(crate) async fn run_parallel_loop(
             };
             match progress {
                 LaneRepoProgress::NewCommits => {
-                    match land_parallel_lane_result(repo_root, target_branch, &mut assignment, &review_config).await {
+                    match land_parallel_lane_result(
+                        repo_root,
+                        target_branch,
+                        &mut assignment,
+                        &review_config,
+                    )
+                    .await
+                    {
                         Ok(LaneLandingOutcome::Landed {
                             auto_repaired,
                             completion_status,
@@ -1315,7 +1322,14 @@ pub(crate) async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::NewCommits => {
-                match land_parallel_lane_result(repo_root, target_branch, &mut assignment, &review_config).await {
+                match land_parallel_lane_result(
+                    repo_root,
+                    target_branch,
+                    &mut assignment,
+                    &review_config,
+                )
+                .await
+                {
                     Ok(LaneLandingOutcome::Landed {
                         auto_repaired,
                         completion_status,

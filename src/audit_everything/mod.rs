@@ -22,16 +22,16 @@ mod prompts;
 mod remediation;
 mod run_paths;
 mod status;
-mod worktree;
 mod workers;
+mod worktree;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::audit_everything::manifest::{EverythingManifest, StageStatus};
 use crate::audit_everything::manifest::write_manifest;
+use crate::audit_everything::manifest::{EverythingManifest, StageStatus};
 use crate::audit_everything::phases::{
     attempt_merge, complete_in_place_run, refresh_final_status_after_merge,
     require_context_complete, require_first_pass_complete, require_synthesis_complete,
@@ -43,7 +43,9 @@ use crate::audit_everything::run_paths::{
     load_or_create_run, resolve_primary_branch, resolve_run_root_base, RunPaths,
 };
 use crate::audit_everything::status::{print_status, write_run_status_if_possible};
-use crate::audit_everything::worktree::{clear_pause, ensure_worktree, pause_requested, request_pause};
+use crate::audit_everything::worktree::{
+    clear_pause, ensure_worktree, pause_requested, request_pause,
+};
 use crate::util::{binary_provenance_line, ensure_repo_layout, git_repo_root, git_stdout};
 use crate::{AuditArgs, AuditEverythingPhase};
 
@@ -294,8 +296,7 @@ fn one_line(text: &str) -> String {
 pub(crate) mod tests {
     use super::slugify;
     use crate::audit_everything::manifest::{
-        ContextState, EverythingManifest, GroupState, RemediationTaskState, StageState,
-        StageStatus,
+        ContextState, EverythingManifest, GroupState, RemediationTaskState, StageState, StageStatus,
     };
 
     pub(crate) fn manifest_with_groups(groups: Vec<GroupState>) -> EverythingManifest {

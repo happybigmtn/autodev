@@ -11,7 +11,9 @@ use crate::audit_everything::context::{
     hash_doctrine, hash_file_if_exists, read_context_bundle, write_context_bundle,
     write_skill_policy_reference,
 };
-use crate::audit_everything::file_quality::{require_file_quality_acceptance, run_file_quality_gate_phase};
+use crate::audit_everything::file_quality::{
+    require_file_quality_acceptance, run_file_quality_gate_phase,
+};
 use crate::audit_everything::git::{commit_worktree_changes, remote_branch_exists};
 use crate::audit_everything::inventory::{build_initial_group_reports, reconcile_file_inventory};
 use crate::audit_everything::manifest::write_manifest;

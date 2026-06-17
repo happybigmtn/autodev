@@ -3,9 +3,11 @@
 
 use std::path::Path;
 
-use crate::audit_everything::manifest::{EverythingManifest, FileState, FileQualityRatingState, GroupState};
+use crate::audit_everything::manifest::{
+    EverythingManifest, FileQualityRatingState, FileState, GroupState,
+};
 use crate::audit_everything::run_paths::{
-    final_review_markdown_path, file_quality_file_path, RunPaths,
+    file_quality_file_path, final_review_markdown_path, RunPaths,
 };
 
 pub(crate) const GSTACK_SKILL_POLICY: &str = r#"# GStack Skill Policy
@@ -786,10 +788,10 @@ pub(crate) fn is_release_or_deploy_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_file_prompt, build_final_review_repair_prompt,
-        build_final_review_synthesis_prompt, build_synthesis_prompt,
-        build_file_quality_deliverables_prompt, build_file_quality_rerate_prompt,
-        selected_skill_names_for_file, selected_skill_policy_for_final_review,
+        build_file_prompt, build_file_quality_deliverables_prompt,
+        build_file_quality_rerate_prompt, build_final_review_repair_prompt,
+        build_final_review_synthesis_prompt, build_synthesis_prompt, selected_skill_names_for_file,
+        selected_skill_policy_for_final_review,
     };
     use crate::audit_everything::manifest::{
         FileQualityRatingState, FileState, GroupState, StageStatus,

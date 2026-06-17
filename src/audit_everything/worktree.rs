@@ -7,9 +7,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::audit_everything::git::{git_ref_exists, remote_branch_exists, run_git_dynamic};
 use crate::audit_everything::manifest::EverythingManifest;
+use crate::audit_everything::path_str;
 use crate::audit_everything::run_paths::RunPaths;
 use crate::audit_everything::status::write_run_status_if_possible;
-use crate::audit_everything::path_str;
 use crate::util::{atomic_write, git_stdout, run_git, timestamp_slug};
 
 pub(crate) fn ensure_clean_in_place_start(repo_root: &Path) -> Result<()> {

@@ -19,7 +19,9 @@ use crate::kimi_backend::{
 };
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::prompt_ethos::with_autodev_prompt_ethos;
-use crate::util::{opencode_agent_dir, prune_pi_runtime_state, timestamp_slug, truncate_file_to_max_bytes};
+use crate::util::{
+    opencode_agent_dir, prune_pi_runtime_state, timestamp_slug, truncate_file_to_max_bytes,
+};
 
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
 
@@ -501,7 +503,11 @@ fn configure_pi_env(command: &mut TokioCommand, repo_root: &Path) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn print_phase_header(phase: &str, chunk: &crate::bug_command::types::RepoChunk, backend: &LlmBackend) {
+pub(crate) fn print_phase_header(
+    phase: &str,
+    chunk: &crate::bug_command::types::RepoChunk,
+    backend: &LlmBackend,
+) {
     println!();
     println!("phase:       {phase}");
     println!("chunk:       {}", chunk.id);

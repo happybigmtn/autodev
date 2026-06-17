@@ -2,8 +2,7 @@ use console::Style;
 use serde_json::Value;
 
 use crate::codex_stream::format::{
-    compact_json, extract_content_text, json_string, push_plain_line, push_styled_line,
-    write_block,
+    compact_json, extract_content_text, json_string, push_plain_line, push_styled_line, write_block,
 };
 
 pub(crate) const CLAUDE_FUTILITY_THRESHOLD: usize = 8;

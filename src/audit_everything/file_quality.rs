@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tokio::task::JoinSet;
 
+use crate::audit_everything::git::commit_worktree_changes;
+use crate::audit_everything::inventory::file_artifact_slug;
 use crate::audit_everything::manifest::write_manifest;
 use crate::audit_everything::manifest::{
     EverythingManifest, FileQualityPassState, FileQualityRatingState, FileState, StageStatus,
@@ -14,12 +16,10 @@ use crate::audit_everything::manifest::{
 use crate::audit_everything::prompts::{
     build_file_quality_deliverables_prompt, build_file_quality_rerate_prompt,
 };
+use crate::audit_everything::require_nonempty_file;
 use crate::audit_everything::run_paths::{
     file_quality_file_path, file_quality_pass_path, file_quality_root_path, PhaseConfig, RunPaths,
 };
-use crate::audit_everything::git::commit_worktree_changes;
-use crate::audit_everything::inventory::file_artifact_slug;
-use crate::audit_everything::require_nonempty_file;
 use crate::audit_everything::workers::run_codex_phase_for_artifact;
 use crate::AuditArgs;
 

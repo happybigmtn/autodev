@@ -3,8 +3,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::design_command::prompt::{build_design_parallel_prompt, build_design_prompt, DesignRunKind};
 use crate::design_command::promotion::promote_design_plan_items_to_root_queue;
+use crate::design_command::prompt::{
+    build_design_parallel_prompt, build_design_prompt, DesignRunKind,
+};
 use crate::design_command::verify::{design_report_is_go, verify_design_artifacts};
 use crate::design_command::{run_design_codex_phase, DesignManifest};
 use crate::parallel_command;
@@ -370,7 +372,9 @@ fn write_design_no_go_resolution_status(
 mod tests {
     use std::fs;
 
-    use super::{preserve_final_no_go_design_plan_items, root_queue_has_dependency_ready_repair_tasks};
+    use super::{
+        preserve_final_no_go_design_plan_items, root_queue_has_dependency_ready_repair_tasks,
+    };
     use crate::design_command::testkit::temp_dir;
     use crate::task_parser::{parse_tasks, TaskStatus};
 

@@ -255,7 +255,10 @@ pub(crate) fn append_lane_review_findings(
     if !review_text.ends_with('\n') {
         review_text.push('\n');
     }
-    review_text.push_str(&render_lane_review_findings_entry(task_id, findings_summary));
+    review_text.push_str(&render_lane_review_findings_entry(
+        task_id,
+        findings_summary,
+    ));
     atomic_write(&review_path, review_text.as_bytes())?;
     Ok(())
 }

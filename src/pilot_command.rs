@@ -2,13 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Args;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::parallel_command::{
-    LoopTaskStatus, parse_loop_plan, update_task_completion_in_plan_text,
+    parse_loop_plan, update_task_completion_in_plan_text, LoopTaskStatus,
 };
 use crate::util::atomic_write;
 
@@ -2622,10 +2622,10 @@ mod tests {
     use crate::cli::{Cli, Command};
 
     use super::{
-        PilotPaths, command_selection_from_surface, effective_planning_mode,
-        finalize_selected_task, render_command_selection_markdown, safe_artifact_slug,
-        update_execution_manifest, validate_closeout, validate_landing_manifest,
-        write_execution_manifest, write_landing_manifest, write_project_rollup,
+        command_selection_from_surface, effective_planning_mode, finalize_selected_task,
+        render_command_selection_markdown, safe_artifact_slug, update_execution_manifest,
+        validate_closeout, validate_landing_manifest, write_execution_manifest,
+        write_landing_manifest, write_project_rollup, PilotPaths,
     };
 
     #[test]

@@ -784,8 +784,8 @@ fn extract_spec_refs_from_line(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_generated_implementation_plan, plan_task_field_body, PlanSection,
-        PlanTaskBlock, verify_generated_implementation_plan,
+        normalize_generated_implementation_plan, plan_task_field_body,
+        verify_generated_implementation_plan, PlanSection, PlanTaskBlock,
     };
     use crate::generation::prompts::IMPLEMENTATION_PLAN_HEADER;
     use crate::generation::root_sync::merge_generated_plan_with_existing_open_tasks;

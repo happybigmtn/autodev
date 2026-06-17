@@ -11,7 +11,9 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 use crate::codex_stream::format::push_styled_line;
 use crate::codex_stream::render_claude::{render_claude_stream_line, ClaudeRenderState};
 use crate::codex_stream::render_codex::{render_codex_stream_line, CodexRenderState};
-use crate::codex_stream::render_pi::{render_opencode_stream_line, render_pi_stream_line, PiRenderState};
+use crate::codex_stream::render_pi::{
+    render_opencode_stream_line, render_pi_stream_line, PiRenderState,
+};
 
 pub(crate) async fn capture_codex_output<R>(stream: R) -> Result<String>
 where

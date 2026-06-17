@@ -20,10 +20,7 @@ pub(crate) fn split_markdown_section<'a>(
 
 /// Return the byte offsets `(body_start, section_end)` for the markdown section
 /// that starts at `header`, ending before the next `## ` heading.
-pub(crate) fn markdown_section_body_bounds(
-    markdown: &str,
-    header: &str,
-) -> Option<(usize, usize)> {
+pub(crate) fn markdown_section_body_bounds(markdown: &str, header: &str) -> Option<(usize, usize)> {
     let start = markdown.find(header)?;
     let body_start = start + header.len();
     let after_header = &markdown[body_start..];

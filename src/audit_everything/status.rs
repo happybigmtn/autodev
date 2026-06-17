@@ -7,17 +7,17 @@ use anyhow::{Context, Result};
 
 use crate::audit_everything::git::{git_ahead_behind, git_rev_parse_short};
 use crate::audit_everything::manifest::{EverythingManifest, RemediationTaskState, StageStatus};
+use crate::audit_everything::one_line;
 use crate::audit_everything::phases::final_review_has_actionable_blockers;
 use crate::audit_everything::remediation::{
     complete_remediation_task_ids, unmet_remediation_dependencies,
 };
 use crate::audit_everything::run_paths::{
-    change_summary_markdown_path, codebase_book_root_path, final_review_markdown_path,
-    file_quality_root_path, remediation_plan_json_path, remediation_plan_markdown_path,
+    change_summary_markdown_path, codebase_book_root_path, file_quality_root_path,
+    final_review_markdown_path, remediation_plan_json_path, remediation_plan_markdown_path,
     run_status_markdown_path, RunPaths,
 };
 use crate::audit_everything::worktree::pause_requested;
-use crate::audit_everything::one_line;
 use crate::qa_only_command::format_final_status_block;
 use crate::util::{atomic_write, git_stdout, timestamp_slug};
 
@@ -736,6 +736,7 @@ pub(crate) fn write_change_summary_markdown(
 #[cfg(test)]
 mod tests {
     use super::{render_status_stdout, write_run_status_markdown};
+    use crate::audit_everything::file_quality::require_file_quality_acceptance;
     use crate::audit_everything::file_quality::{
         FILE_QUALITY_ACCEPT_SCORE, FILE_QUALITY_TARGET_SCORE,
     };
@@ -746,7 +747,6 @@ mod tests {
         file_quality_file_path, file_quality_pass_path, run_status_markdown_path, RunPaths,
         LATEST_RUN_FILE, PAUSE_REQUEST_FILE, PROFESSIONAL_AUDIT_DIR,
     };
-    use crate::audit_everything::file_quality::require_file_quality_acceptance;
     use crate::audit_everything::tests::{group_for_test, manifest_with_groups, task_for_test};
     use std::fs;
 

@@ -918,18 +918,16 @@ mod tests {
         );
 
         attempts.insert("TASK-P".to_string(), 4);
-        assert!(
-            next_parallel_unblock_candidate(
-                &plan,
-                &BTreeSet::new(),
-                &BTreeMap::new(),
-                &deferred,
-                &BTreeMap::new(),
-                &attempts,
-                4,
-            )
-            .is_none()
-        );
+        assert!(next_parallel_unblock_candidate(
+            &plan,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &deferred,
+            &BTreeMap::new(),
+            &attempts,
+            4,
+        )
+        .is_none());
     }
 
     #[test]

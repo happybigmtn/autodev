@@ -973,9 +973,7 @@ mod tests {
         assert!(prompt.contains("## Implementation Slice"));
         assert!(prompt.contains("literal lines or labels containing `Goal`, `Files`, and `Tests`"));
         assert!(prompt.contains("commands in `## Verification` do not satisfy the slice contract"));
-        assert!(
-            prompt.contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`")
-        );
+        assert!(prompt.contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`"));
         assert!(prompt.contains("Do not use the short `## Objective`"));
         assert!(prompt.contains("current gstack `/autoplan` review discipline"));
         assert!(prompt.contains("Priority focus lens"));
@@ -984,11 +982,8 @@ mod tests {
         assert!(prompt.contains("Next Autodev Lever"));
         assert!(prompt.contains("Delete Or Demote"));
         assert!(prompt.contains("whether the operator should run `auto design`"));
-        assert!(
-            prompt.contains(
-                "product leverage, user-visible clarity, and engineering feasibility/tests"
-            )
-        );
+        assert!(prompt
+            .contains("product leverage, user-visible clarity, and engineering feasibility/tests"));
         assert!(prompt.contains("Never emit the absolute repository-root path"));
         assert!(prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(prompt.contains(
@@ -1042,18 +1037,12 @@ mod tests {
         assert!(corpus_prompt.contains(
             "Every numbered plan under `/tmp/repo/genesis/plans/` must use the compact priority-plan shape"
         ));
-        assert!(
-            corpus_prompt
-                .contains("literal lines or labels containing `Goal`, `Files`, and `Tests`")
-        );
-        assert!(
-            corpus_prompt
-                .contains("commands in `## Verification` do not satisfy the slice contract")
-        );
-        assert!(
-            corpus_prompt
-                .contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`")
-        );
+        assert!(corpus_prompt
+            .contains("literal lines or labels containing `Goal`, `Files`, and `Tests`"));
+        assert!(corpus_prompt
+            .contains("commands in `## Verification` do not satisfy the slice contract"));
+        assert!(corpus_prompt
+            .contains("`Plan dispatch`, `Dispatch index`, or `The master plan delivers`"));
         assert!(corpus_prompt.contains("Reject or rewrite any absolute repo-root path"));
         assert!(corpus_prompt.contains("cd \"$(git rev-parse --show-toplevel)\""));
         assert!(corpus_prompt.contains("# Codex Corpus Review"));
@@ -1069,20 +1058,16 @@ mod tests {
         assert!(generation_prompt.contains("outside-voice review step for `auto gen`"));
         assert!(generation_prompt.contains("Do NOT read or execute any SKILL.md files"));
         assert!(generation_prompt.contains("You may edit only `/tmp/repo/gen-010203/specs/*.md`"));
-        assert!(
-            generation_prompt
-                .contains("The generator will sync reviewed outputs to the root after your pass")
-        );
+        assert!(generation_prompt
+            .contains("The generator will sync reviewed outputs to the root after your pass"));
         assert!(generation_prompt.contains("Priority focus lens"));
         assert!(generation_prompt.contains("active production blockers"));
         assert!(generation_prompt.contains("Move docs-only, audit-only, report-only"));
         assert!(generation_prompt.contains("`auto design`"));
         assert!(generation_prompt.contains("continuing or supervising an existing run"));
         assert!(generation_prompt.contains("`Dependencies:` is scheduler input, not prose"));
-        assert!(
-            generation_prompt
-                .contains("Put readiness notes, completed-task context, and sequencing explanations")
-        );
+        assert!(generation_prompt
+            .contains("Put readiness notes, completed-task context, and sequencing explanations"));
         assert!(generation_prompt.contains("# Codex Generation Review"));
     }
 

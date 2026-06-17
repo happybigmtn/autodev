@@ -209,10 +209,7 @@ fn find_same_day_topic_snapshots(
     Ok(matches)
 }
 
-pub(crate) fn scrub_root_generated_outputs(
-    repo_root: &Path,
-    mode: GenerationMode,
-) -> Result<()> {
+pub(crate) fn scrub_root_generated_outputs(repo_root: &Path, mode: GenerationMode) -> Result<()> {
     let available_specs = collect_available_spec_refs(&repo_root.join("specs"))?;
     if mode == GenerationMode::Gen {
         let root_plan = repo_root.join("IMPLEMENTATION_PLAN.md");

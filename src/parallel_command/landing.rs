@@ -631,9 +631,14 @@ async fn apply_lane_review_gate(
     if !review_gate_enabled() {
         return incoming_status;
     }
-    let outcome =
-        run_lane_review_gate(repo_root, target_branch, assignment, changed_files, review_config)
-            .await;
+    let outcome = run_lane_review_gate(
+        repo_root,
+        target_branch,
+        assignment,
+        changed_files,
+        review_config,
+    )
+    .await;
     apply_lane_review_outcome(repo_root, assignment, incoming_status, outcome)
 }
 
@@ -1961,7 +1966,11 @@ mod tests {
             fs::read_to_string(run_root.join("live.log")).expect("closeout should write host log");
         assert!(live_log.contains("receipt-closeout: closed 1 partial task(s)"));
     }
-    fn review_gate_assignment(root: &std::path::Path, task_id: &str, title: &str) -> ActiveLaneAssignment {
+    fn review_gate_assignment(
+        root: &std::path::Path,
+        task_id: &str,
+        title: &str,
+    ) -> ActiveLaneAssignment {
         ActiveLaneAssignment {
             lane_index: 3,
             attempts: 1,
@@ -2081,5 +2090,4 @@ mod tests {
         assert!(!root.join("REVIEW.md").exists());
         fs::remove_dir_all(&root).expect("cleanup");
     }
-
 }

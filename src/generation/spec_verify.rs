@@ -178,9 +178,7 @@ fn lint_duplicate_spec_topics(specs: &[GeneratedSpecDocument]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn lint_signature_policy_consistency(
-    specs: &[GeneratedSpecDocument],
-) -> Result<()> {
+pub(crate) fn lint_signature_policy_consistency(specs: &[GeneratedSpecDocument]) -> Result<()> {
     let Some(transcript) = find_generated_spec(specs, "deterministic-transcripts") else {
         return Ok(());
     };
@@ -203,9 +201,7 @@ pub(crate) fn lint_signature_policy_consistency(
     Ok(())
 }
 
-pub(crate) fn lint_session_resume_wire_contract(
-    specs: &[GeneratedSpecDocument],
-) -> Result<()> {
+pub(crate) fn lint_session_resume_wire_contract(specs: &[GeneratedSpecDocument]) -> Result<()> {
     let Some(session) = find_generated_spec(specs, "session-persistence") else {
         return Ok(());
     };

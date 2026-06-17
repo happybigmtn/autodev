@@ -9,15 +9,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
-use crate::StewardArgs;
 use crate::codex_exec::run_codex_exec;
 use crate::task_parser::validate_execution_rows;
 use crate::util::{
     atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_repo_root, git_stdout,
     push_branch_with_remote_sync, sync_branch_with_remote, timestamp_slug,
 };
+use crate::StewardArgs;
 
 const STEWARD_DELIVERABLES: [&str; 6] = [
     "DRIFT.md",

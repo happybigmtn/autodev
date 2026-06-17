@@ -77,13 +77,9 @@ mod tests {
 
     #[test]
     fn worker_pid_round_trips_then_clears() {
-        let path =
-            std::env::temp_dir().join(format!("backend-process-pid-{}", timestamp_slug()));
+        let path = std::env::temp_dir().join(format!("backend-process-pid-{}", timestamp_slug()));
         write_worker_pid(Some(&path), Some(4242)).expect("write worker pid");
-        assert_eq!(
-            fs::read_to_string(&path).expect("read worker pid"),
-            "4242"
-        );
+        assert_eq!(fs::read_to_string(&path).expect("read worker pid"), "4242");
         clear_worker_pid(Some(&path)).expect("clear worker pid");
         assert!(!path.exists());
         clear_worker_pid(Some(&path)).expect("clearing a missing pid file is a no-op");

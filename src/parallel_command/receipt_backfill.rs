@@ -186,7 +186,11 @@ pub(crate) fn render_receipt_backfill_report(
 }
 
 fn present_label(present: bool) -> &'static str {
-    if present { "present" } else { "missing" }
+    if present {
+        "present"
+    } else {
+        "missing"
+    }
 }
 
 fn review_handoff_changed_files(
@@ -236,8 +240,8 @@ fn shell_single_quote(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiptBackfillEntry, normalize_receipt_command, render_receipt_backfill_report,
-        render_receipt_wrapper_command,
+        normalize_receipt_command, render_receipt_backfill_report, render_receipt_wrapper_command,
+        ReceiptBackfillEntry,
     };
 
     #[test]

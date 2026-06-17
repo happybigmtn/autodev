@@ -418,14 +418,13 @@ mod tests {
         let plan = root.join(IMPLEMENTATION_PLAN);
         // Conditional surface fields may be omitted, but the 11 CORE fields are
         // still mandatory: dropping `Acceptance criteria:` must still be rejected.
-        let malformed = valid_plan(
-            "cargo test super_command::tests::super_rejects_task_missing_core_field",
-        )
-        .replace("    Acceptance criteria: scoped plan passes.\n", "");
+        let malformed =
+            valid_plan("cargo test super_command::tests::super_rejects_task_missing_core_field")
+                .replace("    Acceptance criteria: scoped plan passes.\n", "");
         fs::write(&plan, malformed).unwrap();
 
-        let error = verify_parallel_ready_plan(&plan)
-            .expect_err("expected missing-core-field rejection");
+        let error =
+            verify_parallel_ready_plan(&plan).expect_err("expected missing-core-field rejection");
 
         assert!(format!("{error:#}").contains("Acceptance criteria:"));
     }

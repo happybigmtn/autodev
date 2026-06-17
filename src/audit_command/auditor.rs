@@ -21,7 +21,11 @@ use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::AuditArgs;
 
 #[cfg(test)]
-pub(crate) async fn run_auditor(repo_root: &Path, prompt: &str, args: &AuditArgs) -> Result<String> {
+pub(crate) async fn run_auditor(
+    repo_root: &Path,
+    prompt: &str,
+    args: &AuditArgs,
+) -> Result<String> {
     run_auditor_labeled(repo_root, prompt, args, None).await
 }
 
