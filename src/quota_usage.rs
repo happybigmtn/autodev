@@ -9,7 +9,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 
 use crate::quota_config::{codex_home_for_profile, Provider};
-use crate::util::write_0o600_if_unix;
+use crate::util::{spawn_retrying_etxtbsy, write_0o600_if_unix};
 
 // OAuth token endpoints and client IDs
 const CLAUDE_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
@@ -426,7 +426,8 @@ fn make_codex_refresh_workspace() -> Result<PathBuf> {
 
 fn refresh_codex_with_cli(profile_dir: &Path, codex_bin: &Path) -> Result<()> {
     let scratch_dir = make_codex_refresh_workspace()?;
-    let spawn_result = Command::new(codex_bin)
+    let mut command = Command::new(codex_bin);
+    command
         .arg("exec")
         .arg("--json")
         .arg("--ephemeral")
@@ -446,8 +447,8 @@ fn refresh_codex_with_cli(profile_dir: &Path, codex_bin: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(&scratch_dir)
-        .spawn()
+        .current_dir(&scratch_dir);
+    let spawn_result = spawn_retrying_etxtbsy(&mut command)
         .with_context(|| format!("failed to launch Codex at {}", codex_bin.display()));
 
     let output = match spawn_result {

@@ -384,6 +384,7 @@ pub(crate) fn default_cargo_build_jobs_for(
 mod tests {
     use super::{make_executable, worker_git_guard_script, WORKER_GIT_GUARD_DIR};
     use crate::parallel_command::*;
+    use crate::util::output_retrying_etxtbsy;
     use std::time::UNIX_EPOCH;
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -605,23 +606,23 @@ mod tests {
             .expect("failed to write guard");
         make_executable(&guard_path).expect("failed to chmod guard");
 
-        let blocked = Command::new(&guard_path)
+        let mut blocked_command = Command::new(&guard_path);
+        blocked_command
             .arg("-C")
             .arg("/tmp/repo")
             .arg("push")
             .arg("origin")
             .arg("main")
-            .env("AUTO_REAL_GIT", "/bin/echo")
-            .output()
-            .expect("guard should run");
+            .env("AUTO_REAL_GIT", "/bin/echo");
+        let blocked = output_retrying_etxtbsy(&mut blocked_command).expect("guard should run");
         assert_eq!(blocked.status.code(), Some(126));
         assert!(String::from_utf8_lossy(&blocked.stderr).contains("AUTO_ENV_BLOCKER"));
 
-        let allowed = Command::new(&guard_path)
+        let mut allowed_command = Command::new(&guard_path);
+        allowed_command
             .arg("status")
-            .env("AUTO_REAL_GIT", "/bin/echo")
-            .output()
-            .expect("guard should delegate");
+            .env("AUTO_REAL_GIT", "/bin/echo");
+        let allowed = output_retrying_etxtbsy(&mut allowed_command).expect("guard should delegate");
         assert!(allowed.status.success());
         assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "status");
 

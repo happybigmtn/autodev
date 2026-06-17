@@ -1,5 +1,6 @@
 mod fsutil;
 mod git;
+mod spawn;
 
 use std::path::Path;
 
@@ -16,6 +17,9 @@ pub(crate) use git::{
     git_status_short_filtered, git_stdout, parse_origin_head_branch, push_branch_with_remote_sync,
     run_git, sync_branch_with_remote, KNOWN_PRIMARY_BRANCHES,
 };
+#[cfg(test)]
+pub(crate) use spawn::output_retrying_etxtbsy;
+pub(crate) use spawn::{spawn_retrying_etxtbsy, spawn_retrying_etxtbsy_tokio};
 
 pub(crate) const CLI_LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),

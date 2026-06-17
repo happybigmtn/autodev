@@ -20,7 +20,8 @@ use crate::kimi_backend::{
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
 use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::util::{
-    opencode_agent_dir, prune_pi_runtime_state, timestamp_slug, truncate_file_to_max_bytes,
+    opencode_agent_dir, prune_pi_runtime_state, spawn_retrying_etxtbsy_tokio, timestamp_slug,
+    truncate_file_to_max_bytes,
 };
 
 const BUG_STDERR_LOG_MAX_BYTES: usize = 1024 * 1024;
@@ -163,13 +164,15 @@ pub(crate) async fn run_backend_prompt(
                 .stderr(Stdio::piped())
                 .current_dir(repo_root);
 
-            let mut child = command.spawn().with_context(|| {
-                format!(
-                    "failed to launch Codex at {} from {}",
-                    codex_bin.display(),
-                    repo_root.display()
-                )
-            })?;
+            let mut child = spawn_retrying_etxtbsy_tokio(&mut command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to launch Codex at {} from {}",
+                        codex_bin.display(),
+                        repo_root.display()
+                    )
+                })?;
 
             let mut stdin = child
                 .stdin
@@ -249,13 +252,15 @@ pub(crate) async fn run_backend_prompt(
                 .current_dir(repo_root);
             configure_pi_env(&mut command, repo_root)?;
 
-            let mut child = command.spawn().with_context(|| {
-                format!(
-                    "failed to launch PI at {} from {}",
-                    pi_bin.display(),
-                    repo_root.display()
-                )
-            })?;
+            let mut child = spawn_retrying_etxtbsy_tokio(&mut command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to launch PI at {} from {}",
+                        pi_bin.display(),
+                        repo_root.display()
+                    )
+                })?;
 
             let stdout = child
                 .stdout
@@ -322,13 +327,15 @@ pub(crate) async fn run_backend_prompt(
                 .stderr(Stdio::piped())
                 .current_dir(repo_root);
 
-            let mut child = command.spawn().with_context(|| {
-                format!(
-                    "failed to launch kimi-cli at {} from {}",
-                    kimi_bin.display(),
-                    repo_root.display()
-                )
-            })?;
+            let mut child = spawn_retrying_etxtbsy_tokio(&mut command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to launch kimi-cli at {} from {}",
+                        kimi_bin.display(),
+                        repo_root.display()
+                    )
+                })?;
 
             let stdout = child
                 .stdout

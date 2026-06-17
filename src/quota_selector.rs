@@ -519,6 +519,12 @@ mod tests {
 
     #[test]
     fn live_codex_usage_reads_from_live_home() {
+        // `codex_live_home()` reads the process-global `$HOME`, which sibling
+        // quota tests mutate. Serialize against them via the shared env lock so
+        // a concurrent `set_var`/`remove_var("HOME")` cannot race this read.
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("failed to lock process env");
         let live = AccountEntry {
             name: "live".into(),
             provider: Provider::Codex,
