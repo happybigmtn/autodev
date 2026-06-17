@@ -338,6 +338,13 @@ fn is_non_fast_forward_push_failure(output: &Output) -> bool {
         || message.contains("fetch first")
         || message.contains("updates were rejected")
         || message.contains("incorrect old value provided")
+        // A concurrent writer can move the remote ref *during* our push, after
+        // git has already computed its compare-and-swap expectation. The remote
+        // then reports a stale ref lock ("cannot lock ref ...: is at X but
+        // expected Y" / "failed to update ref") rather than a plain
+        // non-fast-forward. This is the same retryable race: re-sync and retry.
+        || message.contains("cannot lock ref")
+        || message.contains("failed to update ref")
 }
 
 fn remote_branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
