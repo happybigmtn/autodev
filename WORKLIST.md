@@ -36,8 +36,25 @@ command-surface --json` (valid JSON, 24 commands; identical with/without the
 flag) all run end-to-end. Full gate green: fmt clean, clippy `-D warnings`
 clean, 688/688 tests pass.
 
-## Open review-receipt hardening (pre-existing)
+## Review-receipt hardening (closed 2026-06-17)
 
-- [Required] Review receipt command synthesis for bin-only Rust crates and shell-sensitive patterns. This batch found stale `cargo --lib` invocations for a crate with only `[[bin]]` targets and a malformed heading grep containing an unescaped backtick; future generated review entries should emit runnable commands such as `cargo test module::tests::` / `cargo clippy --bins` and escape shell metacharacters.
-- [Required] Harden generated review verification commands against false-positive proof. This batch found a non-existent cargo test filter that ran zero tests and a directory `grep` command that failed before searching; review harvesting should reject zero-test cargo filters and prefer recursive `rg` commands for directory searches.
-- [Required] Make task receipts unambiguous when a failed generated command is corrected in the same task. `AD-018` retained an older failed unquoted `rg` pipeline attempt alongside later passing proof, which makes receipt consumers choose between "any failed command fails the task" and "latest corrected proof wins" without an explicit marker.
+- [Done] Review receipt command synthesis for bin-only Rust crates and shell-sensitive patterns
+  AND false-positive-proof hardening. Root cause was scope, not absence: the lint
+  (`verification_lint::verify_commands_are_runnable` — rejects stale `cargo --lib`,
+  package-wide/no-filter/multi-filter `cargo test`, and directory `grep` → steers to `rg -n`)
+  was wired into plan generation (`generation/plan_verify.rs`) and task validation
+  (`task_parser/validate.rs`), but `validate_execution_rows` only checks Pending/Partial rows,
+  so **Done** rows were copied verbatim into the review queue unlinted. Fix:
+  `review_command/harvest::render_completed_plan_review_item` now lints each completed item and
+  annotates the handoff (⚠ not directly runnable + how to derive concrete proof) without
+  blocking harvest — the receipt machinery already gates the real completion proof. Tests:
+  `harvest_review_item_flags_non_runnable_verification_command`,
+  `harvest_review_item_leaves_runnable_command_unannotated`. Verified: fmt clean, clippy
+  `-D warnings` clean, 690/690 `cargo test --bin auto`, 25/25 full-workspace stress (696 tests).
+  Commit: `fix(review): lint completed-task verification commands at review harvest` (58f761a).
+- [Done] Task receipts unambiguous when a failed generated command is corrected in the same task.
+  Already implemented and tested before this cycle via the explicit `supersedes` marker on
+  `VerificationReceiptCommand` (`completion_artifacts/receipt.rs`):
+  `verification_receipt_failed_entry_is_superseded` lets a later passing command supersede an
+  earlier failed attempt, while `inspect_verification_receipt` still rejects *unsuperseded*
+  stray failures. Tests cover accept-superseded, accept-later-pass, and reject-unsuperseded.
