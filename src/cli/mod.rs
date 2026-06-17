@@ -43,6 +43,9 @@ pub(crate) struct CommandSurfaceArgs {
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
+// `CommandSurface` names the command-surface inventory feature; the overlap
+// with the enum name `Command` is incidental, not redundant naming.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum Command {
     /// Review the repo and author a fresh planning corpus under genesis/
     Corpus(CorpusArgs),

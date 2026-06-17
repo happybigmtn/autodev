@@ -319,7 +319,8 @@ fn copy_codex_credentials_to_isolated_home(source_auth: &Path, profile_dir: &Pat
     let source_dir = source_auth
         .parent()
         .with_context(|| format!("{} has no parent directory", source_auth.display()))?;
-    for filename in &["config.toml"] {
+    {
+        let filename = &"config.toml";
         let src = source_dir.join(filename);
         copy_optional_credential_path(&src, &codex_home.join(filename))?;
     }

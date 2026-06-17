@@ -36,14 +36,13 @@ struct SurfaceValue {
     help: Option<String>,
 }
 
-pub(crate) fn run_command_surface(args: CommandSurfaceArgs) -> Result<()> {
+pub(crate) fn run_command_surface(_args: CommandSurfaceArgs) -> Result<()> {
+    // The command surface is only ever emitted as JSON, so `--json` is a
+    // parseable no-op kept for backward compatibility with callers such as
+    // `auto pilot`, which invoke `command-surface --json`.
     let surface = build_command_surface();
     let json = serde_json::to_string_pretty(&surface)?;
-    if args.json {
-        println!("{json}");
-    } else {
-        println!("{json}");
-    }
+    println!("{json}");
     Ok(())
 }
 

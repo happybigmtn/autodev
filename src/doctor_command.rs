@@ -135,8 +135,8 @@ fn build_doctor_report(current_exe: &Path, args: &DoctorArgs) -> DoctorReport {
                 detail: format!("found {}", repo_root.display()),
                 action: None,
             });
-            report.baseline.extend(check_repo_checkout(&repo_root));
-            report.execution.extend(check_planning_health(&repo_root));
+            report.baseline.extend(check_repo_checkout(repo_root));
+            report.execution.extend(check_planning_health(repo_root));
         }
         Err(err) => report.baseline.push(RequiredCheck {
             name: "repo root".to_string(),
@@ -172,13 +172,14 @@ fn build_orchestrator_checks(
     allow_local_only: bool,
     min_disk_kb: u64,
 ) -> Vec<RequiredCheck> {
-    let mut checks = Vec::new();
-    checks.push(check_installed_auto_matches_source(autodev_source));
-    checks.push(check_required_command("codex", &["--version"]));
-    checks.push(check_required_command("claude", &["--version"]));
-    checks.push(check_required_command("gbrain", &["list", "-n", "1"]));
-    checks.push(check_required_command("gh", &["auth", "status"]));
-    checks.push(check_hermes_gateway());
+    let mut checks = vec![
+        check_installed_auto_matches_source(autodev_source),
+        check_required_command("codex", &["--version"]),
+        check_required_command("claude", &["--version"]),
+        check_required_command("gbrain", &["list", "-n", "1"]),
+        check_required_command("gh", &["auth", "status"]),
+        check_hermes_gateway(),
+    ];
 
     if let Some(repo_root) = repo_root {
         checks.push(check_git_landing_path(repo_root, allow_local_only));
@@ -241,7 +242,7 @@ fn check_installed_auto_matches_source(autodev_source: &Path) -> RequiredCheck {
         };
     let installed = env!("AUTODEV_GIT_SHA");
     if source_head.trim() == installed {
-        return RequiredCheck {
+        RequiredCheck {
             name: "autodev source match".to_string(),
             passed: true,
             detail: format!(
@@ -249,7 +250,7 @@ fn check_installed_auto_matches_source(autodev_source: &Path) -> RequiredCheck {
                 autodev_source.display()
             ),
             action: None,
-        };
+        }
     } else {
         RequiredCheck {
             name: "autodev source match".to_string(),
