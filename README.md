@@ -20,6 +20,12 @@ The local CLI command is `auto`.
 - `auto reverse` reverse-engineers specs from code reality using `genesis/` as supporting context.
 - `auto bug` runs a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline.
 - `auto loop` runs the implementation loop on the repo's primary branch.
+- `auto orchestrate` assesses the repo against a Definition-of-Done spec (each criterion carries a
+  `verify` command; exit 0 ⇒ done, `gate: operator` ⇒ excluded from the denominator), emits a
+  dashboard artifact (`.auto/orchestrate/dod.json`) plus a human `DOD-STATUS.md`, and with
+  `--execute` loops `auto loop` against the unmet criteria — re-assessing after each pass — until
+  the DoD holds. Where `auto super` gates the generated *plan*, `auto orchestrate` gates the *repo
+  against a stated DoD*.
 - `auto parallel` runs the experimental multi-lane implementation executor.
 - `auto qa` runs a runtime QA and ship-readiness pass on the current branch.
 - `auto qa-only` runs a report-only runtime QA pass on the current branch.

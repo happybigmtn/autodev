@@ -156,6 +156,45 @@ pub(crate) struct LoopArgs {
 }
 
 #[derive(Args, Clone)]
+pub(crate) struct OrchestrateArgs {
+    /// Path to the Definition-of-Done spec (JSON). Defaults to <repo>/.auto/dod.json
+    #[arg(long)]
+    pub(crate) dod: Option<PathBuf>,
+
+    /// Drive `auto loop` against unmet criteria, re-assessing after each pass, until the DoD is met or limits are hit. Default: assess only.
+    #[arg(long)]
+    pub(crate) execute: bool,
+
+    /// Maximum execution + re-assess passes when --execute is set.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) max_loops: usize,
+
+    /// Per-criterion verification timeout, in seconds.
+    #[arg(long, default_value_t = 600)]
+    pub(crate) verify_timeout_secs: u64,
+
+    /// Also write a per-repo `<name>.dod.json` into this directory for the shared dashboard.
+    #[arg(long)]
+    pub(crate) dashboard: Option<PathBuf>,
+
+    /// Model used by execution workers (passed through to `auto loop`).
+    #[arg(long, default_value = "gpt-5.5")]
+    pub(crate) model: String,
+
+    /// Reasoning effort used by execution workers.
+    #[arg(long, default_value = "high")]
+    pub(crate) reasoning_effort: String,
+
+    /// Branch the execution loop may run on. Defaults to the repo's primary branch.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+
+    /// Codex executable used by execution workers.
+    #[arg(long, default_value = "codex")]
+    pub(crate) codex_bin: PathBuf,
+}
+
+#[derive(Args, Clone)]
 pub(crate) struct ParallelArgs {
     /// Optional action. `auto parallel status` prints the current tmux/lane health.
     #[arg(value_enum)]

@@ -18,6 +18,7 @@ mod kimi_backend;
 mod linear_tracker;
 mod loop_command;
 mod nemesis;
+mod orchestrate_command;
 mod parallel_command;
 mod pi_backend;
 mod pilot_command;
@@ -52,9 +53,9 @@ use clap::Parser;
 pub(crate) use crate::cli::{
     AccountsCommand, AuditArgs, AuditEverythingPhase, AuditHarvestArgs, AuditResumeMode, BookArgs,
     BugArgs, Cli, Command, CommandSurfaceArgs, CorpusArgs, DesignArgs, GenerationArgs,
-    HardeningProfile, HealthArgs, LoopArgs, NemesisArgs, ParallelAction, ParallelArgs,
-    ParallelCargoTarget, QaArgs, QaOnlyArgs, QaTier, QuotaSubcommand, ReviewArgs, ShipArgs,
-    SpecArgs, StewardArgs, SuperArgs, SymphonyArgs, SymphonyRunArgs, SymphonySubcommand,
+    HardeningProfile, HealthArgs, LoopArgs, NemesisArgs, OrchestrateArgs, ParallelAction,
+    ParallelArgs, ParallelCargoTarget, QaArgs, QaOnlyArgs, QaTier, QuotaSubcommand, ReviewArgs,
+    ShipArgs, SpecArgs, StewardArgs, SuperArgs, SymphonyArgs, SymphonyRunArgs, SymphonySubcommand,
     SymphonySyncArgs, SymphonyWorkflowArgs,
 };
 
@@ -69,6 +70,7 @@ async fn main() -> Result<()> {
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
         Command::Loop(args) => loop_command::run_loop(args).await,
+        Command::Orchestrate(args) => orchestrate_command::run_orchestrate(args).await,
         Command::Parallel(args) => parallel_command::run_parallel(args).await,
         Command::Qa(args) => qa_command::run_qa(args).await,
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
@@ -131,6 +133,7 @@ mod tests {
             "reverse",
             "bug",
             "loop",
+            "orchestrate",
             "parallel",
             "qa",
             "qa-only",

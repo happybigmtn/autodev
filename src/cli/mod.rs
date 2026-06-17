@@ -9,8 +9,8 @@ use crate::util::CLI_LONG_VERSION;
 
 pub(crate) use crate::pilot_command::PilotArgs;
 pub(crate) use args_exec::{
-    BugArgs, HardeningProfile, LoopArgs, NemesisArgs, ParallelAction, ParallelArgs,
-    ParallelCargoTarget, ReviewArgs,
+    BugArgs, HardeningProfile, LoopArgs, NemesisArgs, OrchestrateArgs, ParallelAction,
+    ParallelArgs, ParallelCargoTarget, ReviewArgs,
 };
 pub(crate) use args_ops::{
     AuditArgs, AuditEverythingPhase, AuditResumeMode, HealthArgs, QaArgs, QaOnlyArgs, QaTier,
@@ -63,6 +63,8 @@ pub(crate) enum Command {
     Bug(BugArgs),
     /// Run the implementation loop on the repo's primary branch
     Loop(LoopArgs),
+    /// Assess the repo against a Definition-of-Done spec, emit a dashboard artifact, and optionally loop `auto loop` until every criterion is met
+    Orchestrate(OrchestrateArgs),
     /// Run the experimental multi-lane implementation executor
     Parallel(ParallelArgs),
     /// Run a runtime QA and ship-readiness pass on the current branch

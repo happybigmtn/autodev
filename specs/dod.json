@@ -1,0 +1,13 @@
+{
+  "statement": "A user can rely on the `auto` CLI as a production tool: clean fmt/clippy/test gate, a deterministic full-workspace suite, a working binary across its command surface, an honest no-model first-run, and trustworthy review-receipt proof synthesis. Live model-backed runs require the user's own backend credentials (by design).",
+  "criteria": [
+    { "label": "fmt gate green", "verify": "cargo fmt --check" },
+    { "label": "clippy -D warnings green", "verify": "cargo clippy --all-targets --all-features -- -D warnings" },
+    { "label": "unit suite green", "verify": "cargo test --bin auto" },
+    { "label": "full-workspace incl integration green", "verify": "cargo test --no-fail-fast" },
+    { "label": "binary works across command surface", "verify": "test -x target/release/auto && target/release/auto --version >/dev/null && target/release/auto command-surface --json >/dev/null && target/release/auto doctor >/dev/null" },
+    { "label": "no-model first-run contract", "verify": "cargo test --bin auto doctor_renders_no_model_first_run_contract" },
+    { "label": "review-receipt proof synthesis trustworthy", "verify": "cargo test --bin auto review_command::harvest" },
+    { "label": "live model-backed run", "gate": "operator", "note": "requires the user's own backend credentials; auto doctor guides setup" }
+  ]
+}
