@@ -14,6 +14,7 @@ use crate::task_parser::{
     parse_task_header as parse_shared_task_header, validate_execution_rows, TaskStatus,
 };
 use crate::util::{atomic_write, git_stdout};
+use crate::verification_lint::verify_commands_are_runnable;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct PlanReviewHarvestResult {
@@ -179,6 +180,11 @@ pub(crate) fn render_completed_plan_review_item(item: &CompletedPlanItem) -> Str
         rendered.push('\n');
     }
     rendered.push_str("    ```");
+    if let Err(err) = verify_commands_are_runnable(&item.task_id, "Verification:", &item.markdown) {
+        rendered.push_str(&format!(
+            "\n  - ⚠ Verification command not directly runnable: {err:#}. Reviewer: derive a concrete proof (e.g. `cargo test <module>::tests::<name>` or `rg -n <pattern> <path>`) before signing off."
+        ));
+    }
     rendered
 }
 
@@ -231,7 +237,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{extract_completed_plan_items, harvest_completed_plan_items_for_review};
+    use super::{
+        extract_completed_plan_items, harvest_completed_plan_items_for_review,
+        render_completed_plan_review_item, CompletedPlanItem,
+    };
     use crate::review_command::queue::{
         handoff_completed_items_to_review_queue, ARCHIVED_HEADER, EMPTY_COMPLETED_DOC,
         REVIEW_HEADER,
@@ -285,6 +294,30 @@ mod tests {
         assert!(completed[0].markdown.contains("Verification"));
         assert!(!updated.contains("TASK-1"));
         assert!(updated.contains("TASK-2"));
+    }
+
+    #[test]
+    fn harvest_review_item_flags_non_runnable_verification_command() {
+        let item = CompletedPlanItem {
+            task_id: "TASK-1".to_string(),
+            markdown: "- [x] `TASK-1` Done\n  - Verification: `cargo --lib`".to_string(),
+        };
+
+        let rendered = render_completed_plan_review_item(&item);
+
+        assert!(rendered.contains("⚠ Verification command not directly runnable"));
+    }
+
+    #[test]
+    fn harvest_review_item_leaves_runnable_command_unannotated() {
+        let item = CompletedPlanItem {
+            task_id: "TASK-1".to_string(),
+            markdown: "- [x] `TASK-1` Done\n  - Verification: `cargo test review_command::harvest::tests::harvest_review_item_leaves_runnable_command_unannotated`".to_string(),
+        };
+
+        let rendered = render_completed_plan_review_item(&item);
+
+        assert!(!rendered.contains("⚠"));
     }
 
     #[test]
