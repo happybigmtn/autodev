@@ -84,6 +84,13 @@ pub(crate) fn clone_loop_lane_repo(
         .arg("clone")
         .arg("--quiet")
         .arg("--local")
+        // Copy objects instead of hardlinking them. `--local` alone hardlinks
+        // `.git/objects`, which fails with "Invalid cross-device link" when the lane
+        // root lives on a different filesystem than the canonical repo (e.g. lanes
+        // relocated to a roomy attached volume via AUTO_RUN_ROOT while the repo is on
+        // root). Copying is slightly slower but works on the same device and across
+        // devices alike.
+        .arg("--no-hardlinks")
         .arg("--branch")
         .arg(target_branch)
         .arg("--single-branch")
