@@ -944,6 +944,78 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
     Ok(true)
 }
 
+/// Promote a single task to `[x]` from canonical completion evidence alone,
+/// without dispatching a worker, when that evidence is already complete. This is
+/// the shared per-task core of both the end-of-run shelved recovery and the
+/// pre-dispatch self-heal: inspect canonical evidence, and only if it is fully
+/// evidenced (the SAME `is_fully_evidenced()` gate used everywhere) write the
+/// host review handoff, flip the plan checkbox to done, and commit the closeout.
+/// It performs NO push so batch callers can push once; returns whether the task
+/// was promoted.
+pub(crate) fn promote_task_from_canonical_evidence_no_push(
+    repo_root: &Path,
+    task_id: &str,
+    markdown: &str,
+) -> Result<bool> {
+    let evidence = inspect_task_completion_evidence(repo_root, task_id, markdown);
+    if !evidence.is_fully_evidenced() {
+        return Ok(false);
+    }
+    let review_added = ensure_host_review_handoff(repo_root, task_id, &[], &evidence)?;
+    let plan_updated = update_task_completion_in_plan(repo_root, task_id, LoopTaskStatus::Done)?;
+    if review_added {
+        run_git(repo_root, ["add", "REVIEW.md"])?;
+    }
+    if plan_updated {
+        run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+    }
+    let message = format!("{}: {} evidence recovery", repo_name(repo_root), task_id);
+    if repo_has_staged_queue_updates(repo_root)? {
+        commit_task_closeout(repo_root, task_id, &message, false)?;
+    } else {
+        commit_task_closeout(repo_root, task_id, &message, true)?;
+    }
+    Ok(true)
+}
+
+/// Pre-dispatch self-heal: before spending an expensive worker on a `[~]`
+/// (partial) task, check whether its canonical evidence is already complete and,
+/// if so, promote it to `[x]` (and push) instead of dispatching. Returns whether
+/// the task was promoted (and therefore must NOT be dispatched).
+///
+/// This reclaims receipts that became valid only once HEAD advanced past the
+/// receipt's recorded commit: the freshness gate (`receipt.rs`) skips the
+/// plan-hash, dirty-state, and command checks once the receipt commit is an
+/// ancestor of HEAD rather than HEAD itself, so a follow-up that was marked
+/// `[~]` purely for a stale plan-hash self-heals as soon as any other task
+/// lands. Without this check, each such already-done follow-up still burns one
+/// full worker session (which exits clean-no-commit and is shelved) before the
+/// post-exit `reconcile_parallel_clean_no_commit` / end-of-run shelved recovery
+/// reclaims it. The genuine-partial tasks fail `is_fully_evidenced()` here and
+/// fall through to a normal worker dispatch unchanged.
+pub(crate) fn try_promote_partial_before_dispatch(
+    repo_root: &Path,
+    target_branch: &str,
+    task_id: &str,
+    markdown: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<bool> {
+    if !promote_task_from_canonical_evidence_no_push(repo_root, task_id, markdown)? {
+        return Ok(false);
+    }
+    if push_branch_with_remote_sync(repo_root, target_branch)? {
+        parallel_logger.info(format!(
+            "remote sync: rebased onto origin/{} after pre-dispatch evidence promotion",
+            target_branch
+        ));
+    }
+    parallel_logger.info(format!(
+        "self-heal: promoted already-evidenced partial `{}` to done before dispatch (no worker needed)",
+        task_id
+    ));
+    Ok(true)
+}
+
 pub(crate) fn recover_shelved_tasks_from_canonical_evidence(
     repo_root: &Path,
     target_branch: &str,
@@ -952,26 +1024,9 @@ pub(crate) fn recover_shelved_tasks_from_canonical_evidence(
 ) -> Result<usize> {
     let mut recovered = Vec::new();
     for (task_id, markdown) in shelved_tasks.clone() {
-        let evidence = inspect_task_completion_evidence(repo_root, &task_id, &markdown);
-        if !evidence.is_fully_evidenced() {
-            continue;
+        if promote_task_from_canonical_evidence_no_push(repo_root, &task_id, &markdown)? {
+            recovered.push(task_id);
         }
-        let review_added = ensure_host_review_handoff(repo_root, &task_id, &[], &evidence)?;
-        let plan_updated =
-            update_task_completion_in_plan(repo_root, &task_id, LoopTaskStatus::Done)?;
-        if review_added {
-            run_git(repo_root, ["add", "REVIEW.md"])?;
-        }
-        if plan_updated {
-            run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
-        }
-        let message = format!("{}: {} evidence recovery", repo_name(repo_root), task_id);
-        if repo_has_staged_queue_updates(repo_root)? {
-            commit_task_closeout(repo_root, &task_id, &message, false)?;
-        } else {
-            commit_task_closeout(repo_root, &task_id, &message, true)?;
-        }
-        recovered.push(task_id);
     }
 
     if recovered.is_empty() {
@@ -1444,6 +1499,81 @@ mod tests {
         assert_eq!(propagated["commit"].as_str(), Some(head.as_str()));
 
         fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn promote_from_canonical_evidence_flips_fully_evidenced_partial_to_done() {
+        let repo = unique_temp_dir("promote-evidence-done");
+        init_git_repo(&repo);
+
+        // A partial task with NO executable verification commands (so a receipt
+        // is not required) and no declared completion artifacts: the only
+        // remaining evidence requirement is a REVIEW.md handoff, which is
+        // present. This is the already-done follow-up case the pre-dispatch
+        // self-heal must promote without burning a worker.
+        let task_markdown = "- [~] `TASK-1` Already complete follow-up\n\nNo verification commands and no completion artifacts to chase.\n";
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("failed to write plan");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# Review\n\n## `TASK-1`\n- Source: test handoff.\n- Remaining blockers: none.\n",
+        )
+        .expect("failed to write review");
+        git_ok(&repo, ["add", "."]);
+        git_ok(&repo, ["commit", "-m", "seed plan + review"]);
+        let head_before = git_output(&repo, ["rev-parse", "HEAD"]);
+
+        let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
+            .expect("promotion should not error");
+        assert!(promoted, "fully-evidenced partial must be promoted");
+
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(
+            plan.contains("- [x] `TASK-1`"),
+            "plan checkbox must flip [~] -> [x], got:\n{plan}"
+        );
+        let head_after = git_output(&repo, ["rev-parse", "HEAD"]);
+        assert_ne!(
+            head_before, head_after,
+            "promotion must create a closeout commit"
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn promote_from_canonical_evidence_leaves_unevidenced_partial_untouched() {
+        let repo = unique_temp_dir("promote-evidence-skip");
+        init_git_repo(&repo);
+
+        // Same task, but NO REVIEW.md handoff -> not fully evidenced. The host
+        // must NOT promote it; it has to fall through to a real worker dispatch.
+        let task_markdown = "- [~] `TASK-1` Genuinely partial\n\nStill needs work.\n";
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("failed to write plan");
+        git_ok(&repo, ["add", "."]);
+        git_ok(&repo, ["commit", "-m", "seed plan"]);
+        let head_before = git_output(&repo, ["rev-parse", "HEAD"]);
+
+        let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
+            .expect("promotion check should not error");
+        assert!(!promoted, "task without a REVIEW handoff must not be promoted");
+
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(
+            plan.contains("- [~] `TASK-1`"),
+            "plan checkbox must stay [~], got:\n{plan}"
+        );
+        let head_after = git_output(&repo, ["rev-parse", "HEAD"]);
+        assert_eq!(head_before, head_after, "no commit should be created");
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }
 
     #[test]

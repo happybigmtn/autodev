@@ -725,6 +725,48 @@ pub(crate) async fn run_parallel_loop(
             }
 
             let task = executable_ready[0].clone();
+
+            // Pre-dispatch self-heal: a `[~]` (partial) task whose canonical
+            // evidence is already complete does not need a worker. This happens
+            // when its verification receipt became valid only after HEAD
+            // advanced past the receipt commit (the freshness gate skips the
+            // plan-hash / command checks once the receipt is an ancestor of
+            // HEAD). Promote it host-side and re-evaluate the ready set, instead
+            // of burning a full xhigh worker session that would exit
+            // clean-no-commit and be shelved for the post-exit / end-of-run
+            // recovery to reclaim. Genuine-partial tasks fail the same
+            // `is_fully_evidenced()` gate and fall through to normal dispatch.
+            if task.status == LoopTaskStatus::Partial {
+                match try_promote_partial_before_dispatch(
+                    repo_root,
+                    target_branch,
+                    &task.id,
+                    &task.markdown,
+                    parallel_logger,
+                ) {
+                    Ok(true) => {
+                        plan = refresh_parallel_plan_or_last_good(
+                            repo_root,
+                            target_branch,
+                            linear_tracker,
+                            &mut linear_auto_sync_state,
+                            &plan,
+                            parallel_logger,
+                        )
+                        .await?;
+                        last_idle_summary = None;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: pre-dispatch evidence check for `{}` failed; dispatching a worker instead: {err:#}",
+                            task.id
+                        ));
+                    }
+                }
+            }
+
             let (lane_index, resume_candidate) = if let Some((lane_index, candidate)) =
                 take_resume_candidate_for_task(&mut resumable_lanes, &task.id, &active_lanes)
             {
