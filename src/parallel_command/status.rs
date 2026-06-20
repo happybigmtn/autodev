@@ -2,10 +2,7 @@ use super::*;
 
 pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
-    let run_root = args
-        .run_root
-        .clone()
-        .unwrap_or_else(|| repo_root.join(".auto").join("parallel"));
+    let run_root = parallel_run_root(&repo_root, args);
     let session_name = parallel_tmux_session_name(&repo_root);
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])
         .unwrap_or_default()
