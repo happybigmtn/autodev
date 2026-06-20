@@ -109,7 +109,32 @@ pub(crate) fn clone_loop_lane_repo(
     if remotes.lines().any(|remote| remote.trim() == "origin") {
         run_git(lane_repo_root, ["remote", "rename", "origin", "canonical"])?;
     }
+
+    share_lean_dependency_cache(repo_root, lane_repo_root);
     Ok(())
+}
+
+/// Best-effort: let a freshly-cloned Lean lane reuse the canonical repo's prebuilt
+/// dependency cache (`.lake/packages`, which holds Mathlib and other Lake deps).
+/// That directory is gitignored, so `git clone --local` never brings it across and
+/// each lane would otherwise rebuild Mathlib from scratch — many minutes and gigabytes
+/// per lane. We symlink only the read-only package cache; each lane keeps its own
+/// `.lake/build`, so lanes never contend over compiled artifacts. Any failure here is
+/// non-fatal: the lane simply rebuilds, which is slow but correct.
+pub(crate) fn share_lean_dependency_cache(repo_root: &Path, lane_repo_root: &Path) {
+    let canonical_packages = repo_root.join(".lake").join("packages");
+    if !canonical_packages.is_dir() {
+        return; // not a Lean repo with a prebuilt Lake cache
+    }
+    let lane_lake = lane_repo_root.join(".lake");
+    let lane_packages = lane_lake.join("packages");
+    if lane_packages.exists() {
+        return; // lane already has a package cache; leave it untouched
+    }
+    if fs::create_dir_all(&lane_lake).is_err() {
+        return;
+    }
+    let _ = std::os::unix::fs::symlink(&canonical_packages, &lane_packages);
 }
 
 pub(crate) fn path_modified_elapsed(path: &Path) -> Result<Option<Duration>> {
@@ -473,6 +498,51 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn share_lean_dependency_cache_symlinks_prebuilt_packages() {
+        let base = unique_temp_dir("lean-cache");
+        let canonical = base.join("canonical");
+        let lane = base.join("lane");
+        fs::create_dir_all(canonical.join(".lake").join("packages").join("mathlib"))
+            .expect("failed to create canonical .lake/packages");
+        fs::create_dir_all(&lane).expect("failed to create lane dir");
+
+        share_lean_dependency_cache(&canonical, &lane);
+
+        let linked = lane.join(".lake").join("packages");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .expect("lane packages should exist")
+                .file_type()
+                .is_symlink(),
+            "lane .lake/packages should be a symlink, not a copy"
+        );
+        assert!(
+            linked.join("mathlib").exists(),
+            "symlinked cache should expose the shared mathlib package"
+        );
+
+        fs::remove_dir_all(&base).expect("failed to clean temp dir");
+    }
+
+    #[test]
+    fn share_lean_dependency_cache_is_noop_for_non_lean_repo() {
+        let base = unique_temp_dir("non-lean-cache");
+        let canonical = base.join("canonical");
+        let lane = base.join("lane");
+        fs::create_dir_all(&canonical).expect("failed to create canonical dir");
+        fs::create_dir_all(&lane).expect("failed to create lane dir");
+
+        share_lean_dependency_cache(&canonical, &lane);
+
+        assert!(
+            !lane.join(".lake").exists(),
+            "no .lake should be created for a non-Lean repo"
+        );
+
+        fs::remove_dir_all(&base).expect("failed to clean temp dir");
     }
 
     #[test]
