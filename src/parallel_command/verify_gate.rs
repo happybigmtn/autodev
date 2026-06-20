@@ -122,6 +122,19 @@ async fn run_verify_commands(repo_root: PathBuf, commands: Vec<String>) -> LaneV
             .await;
         match result {
             Ok(output) if output.status.success() => {}
+            // 127 = command not found, 126 = found but not executable. These are
+            // host-environment/toolchain problems (e.g. the build tool isn't on
+            // the host's PATH the way it is in the worker), NOT a verification
+            // failure. Fail open so a missing toolchain can never false-demote a
+            // genuinely-complete task.
+            Ok(output) if matches!(output.status.code(), Some(126) | Some(127)) => {
+                return LaneVerifyOutcome::Skipped {
+                    reason: format!(
+                        "`{command}` could not run on the host (exit {}); toolchain likely unavailable (fail-open)",
+                        output.status.code().unwrap_or_default()
+                    ),
+                };
+            }
             Ok(output) => {
                 let status = output
                     .status
@@ -216,6 +229,22 @@ mod tests {
                 assert!(detail.contains("false"), "names the command: {detail}");
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_lane_verify_gate_fails_open_on_missing_toolchain() {
+        let dir = std::env::temp_dir().join(format!("autodev-verify-127-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // A recognized command (`./`-prefixed) whose binary does not exist ->
+        // exit 127. Must fail OPEN (Skipped), never demote, so a missing host
+        // toolchain can't false-fail a complete task.
+        let markdown =
+            "- [ ] `TASK-1` t\n\nVerification:\n- Run `./nonexistent-binary-xyz check`\n";
+        match run_lane_verify_gate(&dir, markdown).await {
+            LaneVerifyOutcome::Skipped { .. } => {}
+            other => panic!("missing toolchain must fail open, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
