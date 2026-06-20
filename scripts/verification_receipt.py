@@ -99,11 +99,26 @@ def dirty_state(root: Path) -> dict | None:
     }
 
 
+def normalize_plan_status_markers(text: str) -> str:
+    # Normalize task-status checkbox glyphs to the empty form so that the host
+    # flipping a checkbox on landing does not drift the plan hash. MUST stay
+    # byte-for-byte identical to `normalize_plan_status_markers` in
+    # src/completion_artifacts/receipt.rs (ASCII tokens => identical for valid
+    # UTF-8 plans), or worker and host plan hashes will never match.
+    return (
+        text.replace("[x]", "[ ]")
+        .replace("[X]", "[ ]")
+        .replace("[~]", "[ ]")
+        .replace("[!]", "[ ]")
+    )
+
+
 def plan_hash(root: Path) -> str | None:
     path = root / "IMPLEMENTATION_PLAN.md"
     if not path.exists():
         return None
-    return file_sha256(path)
+    text = path.read_text(encoding="utf-8")
+    return hashlib.sha256(normalize_plan_status_markers(text).encode("utf-8")).hexdigest()
 
 
 def declared_completion_artifacts(root: Path, task_id: str) -> list[str]:

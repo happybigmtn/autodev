@@ -25,8 +25,8 @@ use crate::completion_artifacts::verification::verification_step_looks_external;
 
 pub(crate) use receipt::{
     git_verification_receipt_footers, legacy_verification_receipt_backfill_footer,
-    shared_footer_receipt_freshness_problem, shared_receipt_freshness_problem,
-    verification_receipt_commit_footer,
+    normalized_plan_hash_bytes, shared_footer_receipt_freshness_problem,
+    shared_receipt_freshness_problem, verification_receipt_commit_footer,
 };
 pub(crate) use verification::verification_plan;
 

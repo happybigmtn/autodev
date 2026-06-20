@@ -805,16 +805,15 @@ pub(crate) fn propagate_lane_receipts(
         // rewrites `commit` to canonical HEAD, which ACTIVATES the receipt
         // freshness gate's plan-hash comparison (it only runs when the receipt
         // commit is current — see `verification_receipt_freshness_problem` in
-        // completion_artifacts/receipt.rs). But the host itself mutates the plan
-        // file (flips task checkboxes) on every landing, so the worker's recorded
-        // full-file plan hash is always stale through no fault of the worker.
-        // Without this rewrite, every propagated receipt is rejected as "plan
-        // hash mismatch" and genuinely-complete tasks land [~] and re-dispatch in
-        // a loop. Spec drift is still caught by the declared-artifact hash checks,
-        // the verification-command checks, and the independent diff-review gate.
+        // completion_artifacts/receipt.rs). The hash is taken over the plan with
+        // task-status checkbox markers normalized out (see
+        // `normalized_plan_hash_bytes`), so a checkbox flip no longer drifts it;
+        // this refresh now only matters when the canonical plan's SPEC content
+        // (not its statuses) changed between worker verification and landing.
+        // Genuine spec drift is still caught by the declared-artifact hash
+        // checks, the verification-command checks, and the diff-review gate.
         if let Ok(plan_bytes) = std::fs::read(canonical_root.join("IMPLEMENTATION_PLAN.md")) {
-            use sha2::{Digest, Sha256};
-            let plan_hash = format!("{:x}", Sha256::digest(&plan_bytes));
+            let plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(&plan_bytes);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("plan_hash".to_string(), serde_json::Value::String(plan_hash));
             }
@@ -1488,10 +1487,14 @@ mod tests {
         )
         .expect("failed to parse canonical receipt");
 
+        // The refreshed hash is taken over the plan with status markers
+        // normalized (`[x]` -> `[ ]`), so it equals the hash of the normalized
+        // canonical plan, not the raw bytes.
+        let normalized_canonical = canonical_plan.replace("[x]", "[ ]");
         assert_eq!(
             propagated["plan_hash"].as_str(),
-            Some(sha256_hex_local(canonical_plan.as_bytes()).as_str()),
-            "plan_hash must be refreshed to canonical's current IMPLEMENTATION_PLAN.md"
+            Some(sha256_hex_local(normalized_canonical.as_bytes()).as_str()),
+            "plan_hash must be refreshed to canonical's normalized IMPLEMENTATION_PLAN.md"
         );
         // The existing commit refresh must still hold (the two must stay in sync,
         // since the plan-hash gate only runs once the commit reads as current).

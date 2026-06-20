@@ -893,10 +893,38 @@ fn current_dirty_state_is_clean(repo_root: &Path) -> bool {
         .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
 }
 
+/// Normalize task-status checkbox markers (`[x]`/`[X]`/`[~]`/`[!]`) to the empty
+/// form `[ ]` before hashing the plan. The host flips a task's checkbox on EVERY
+/// landing, so a whole-file hash of `IMPLEMENTATION_PLAN.md` goes stale the
+/// instant any task's status changes — through no fault of the worker — which is
+/// the root of the spurious `[~]` "plan hash mismatch" bug class. By normalizing
+/// the status glyph out, the hash tracks only genuine SPEC content (titles,
+/// bodies, dependencies, verification commands, declared artifacts); a checkbox
+/// flip never invalidates a receipt, but a real spec edit still does.
+///
+/// The tokens are ASCII, so this string replacement is byte-for-byte identical
+/// to the same normalization in `scripts/verification_receipt.py` for any valid
+/// UTF-8 plan file — the two MUST stay in lockstep or worker and host hashes
+/// will never match.
+pub(crate) fn normalize_plan_status_markers(text: &str) -> String {
+    text.replace("[x]", "[ ]")
+        .replace("[X]", "[ ]")
+        .replace("[~]", "[ ]")
+        .replace("[!]", "[ ]")
+}
+
+/// Hash plan bytes with status markers normalized (see
+/// [`normalize_plan_status_markers`]). Shared by the freshness gate and the
+/// host's lane-receipt propagation so every site agrees on one plan-hash value.
+pub(crate) fn normalized_plan_hash_bytes(plan_bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(plan_bytes);
+    sha256_hex(normalize_plan_status_markers(&text).as_bytes())
+}
+
 fn current_plan_hash(repo_root: &Path) -> Option<String> {
     fs::read(repo_root.join("IMPLEMENTATION_PLAN.md"))
         .ok()
-        .map(|bytes| sha256_hex(&bytes))
+        .map(|bytes| normalized_plan_hash_bytes(&bytes))
 }
 
 fn git_commit_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> bool {
@@ -962,9 +990,32 @@ mod tests {
     use crate::completion_artifacts::artifacts::artifact_hash;
 
     use super::{
-        verification_receipt_freshness_problem, VerificationDirtyState, VerificationReceipt,
-        VerificationReceiptArtifact, VerificationReceiptCommand,
+        normalized_plan_hash_bytes, verification_receipt_freshness_problem, VerificationDirtyState,
+        VerificationReceipt, VerificationReceiptArtifact, VerificationReceiptCommand,
     };
+
+    #[test]
+    fn normalized_plan_hash_is_stable_across_checkbox_flips_but_not_spec_edits() {
+        let pending = b"# Plan\n- [ ] `TASK-1` Do the thing\n- [ ] `TASK-2` Other\n";
+        let partial = b"# Plan\n- [~] `TASK-1` Do the thing\n- [ ] `TASK-2` Other\n";
+        let done = b"# Plan\n- [x] `TASK-1` Do the thing\n- [x] `TASK-2` Other\n";
+        // Flipping any/all checkboxes must NOT change the hash — that was the
+        // root of the spurious "[~] plan hash mismatch" bug.
+        assert_eq!(
+            normalized_plan_hash_bytes(pending),
+            normalized_plan_hash_bytes(partial)
+        );
+        assert_eq!(
+            normalized_plan_hash_bytes(pending),
+            normalized_plan_hash_bytes(done)
+        );
+        // A genuine spec edit (changing a task title) MUST change the hash.
+        let edited = b"# Plan\n- [x] `TASK-1` Do the OTHER thing\n- [x] `TASK-2` Other\n";
+        assert_ne!(
+            normalized_plan_hash_bytes(done),
+            normalized_plan_hash_bytes(edited)
+        );
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
