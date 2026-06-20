@@ -800,6 +800,25 @@ pub(crate) fn propagate_lane_receipts(
                 }
             }
         }
+        // Refresh `plan_hash` to canonical's current IMPLEMENTATION_PLAN.md, the
+        // same way `commit` and `dirty_state` are refreshed above. The host
+        // rewrites `commit` to canonical HEAD, which ACTIVATES the receipt
+        // freshness gate's plan-hash comparison (it only runs when the receipt
+        // commit is current — see `verification_receipt_freshness_problem` in
+        // completion_artifacts/receipt.rs). But the host itself mutates the plan
+        // file (flips task checkboxes) on every landing, so the worker's recorded
+        // full-file plan hash is always stale through no fault of the worker.
+        // Without this rewrite, every propagated receipt is rejected as "plan
+        // hash mismatch" and genuinely-complete tasks land [~] and re-dispatch in
+        // a loop. Spec drift is still caught by the declared-artifact hash checks,
+        // the verification-command checks, and the independent diff-review gate.
+        if let Ok(plan_bytes) = std::fs::read(canonical_root.join("IMPLEMENTATION_PLAN.md")) {
+            use sha2::{Digest, Sha256};
+            let plan_hash = format!("{:x}", Sha256::digest(&plan_bytes));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("plan_hash".to_string(), serde_json::Value::String(plan_hash));
+            }
+        }
         let pretty = serde_json::to_string_pretty(&value)
             .context("failed to re-serialize symphony receipt for canonical write")?;
         std::fs::write(&dst_receipt, pretty + "\n").with_context(|| {
@@ -1363,6 +1382,68 @@ mod tests {
             "git cherry-pick failed in /tmp/repo: error: Your local changes to the following files would be overwritten by merge:\n  src/lib.rs\nPlease commit your changes or stash them before you merge.\nAborting\nfatal: cherry-pick failed"
         );
         assert!(landing_error_suggests_dirty_canonical_worktree(&err));
+    }
+
+    #[test]
+    fn propagate_lane_receipts_refreshes_plan_hash_to_canonical() {
+        fn sha256_hex_local(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        }
+
+        let root = unique_temp_dir("parallel-propagate-plan-hash");
+        let lane = root.join("lane");
+        let canonical = root.join("canonical");
+        init_git_repo(&lane);
+        init_git_repo(&canonical);
+
+        // Canonical carries the plan AFTER the host flipped TASK-1's checkbox on
+        // landing — exactly the mutation that makes a worker's recorded full-file
+        // plan hash stale through no fault of its own.
+        let canonical_plan = "# Plan\n- [x] `TASK-1` done now\n";
+        fs::write(canonical.join("IMPLEMENTATION_PLAN.md"), canonical_plan)
+            .expect("failed to write canonical plan");
+        git_ok(&canonical, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&canonical, ["commit", "-m", "canonical plan"]);
+
+        // The lane recorded its receipt against the OLD plan text, so its
+        // plan_hash can never match canonical's current hash.
+        let receipt_dir = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("failed to create lane receipt dir");
+        let stale = serde_json::json!({
+            "commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "plan_hash": sha256_hex_local(b"# Plan\n- [ ] `TASK-1` not yet\n"),
+            "dirty_state": { "fingerprint": "stale" },
+            "commands": [],
+            "declared_artifacts": [],
+        });
+        fs::write(
+            receipt_dir.join("TASK-1.json"),
+            serde_json::to_string_pretty(&stale).expect("serialize stale receipt"),
+        )
+        .expect("failed to write lane receipt");
+
+        propagate_lane_receipts(&lane, &canonical, "TASK-1").expect("propagate should succeed");
+
+        let propagated: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                canonical.join(".auto/symphony/verification-receipts/TASK-1.json"),
+            )
+            .expect("failed to read canonical receipt"),
+        )
+        .expect("failed to parse canonical receipt");
+
+        assert_eq!(
+            propagated["plan_hash"].as_str(),
+            Some(sha256_hex_local(canonical_plan.as_bytes()).as_str()),
+            "plan_hash must be refreshed to canonical's current IMPLEMENTATION_PLAN.md"
+        );
+        // The existing commit refresh must still hold (the two must stay in sync,
+        // since the plan-hash gate only runs once the commit reads as current).
+        let head = git_output(&canonical, ["rev-parse", "HEAD"]);
+        assert_eq!(propagated["commit"].as_str(), Some(head.as_str()));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
     }
 
     #[test]
