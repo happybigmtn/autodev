@@ -8,7 +8,8 @@ pub(crate) fn parallel_run_root(repo_root: &Path, args: &ParallelArgs) -> PathBu
     match args.run_root.as_deref() {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => repo_root.join(path),
-        None => repo_root.join(".auto").join("parallel"),
+        None => crate::util::auto_run_root_override(repo_root, "parallel")
+            .unwrap_or_else(|| repo_root.join(".auto").join("parallel")),
     }
 }
 

@@ -443,15 +443,16 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
     let planning_root = resolved_planning_root.path;
     ensure_planning_root_exists(&planning_root)?;
 
+    let default_gen_name = format!("gen-{}", timestamp_slug());
+    let default_gen_dir = crate::util::auto_run_root_override(&repo_root, &default_gen_name)
+        .unwrap_or_else(|| repo_root.join(&default_gen_name));
     let output_dir = if args.plan_only || args.sync_only {
         args.output_dir
             .clone()
             .or_else(|| state.latest_output_dir.clone())
-            .unwrap_or_else(|| repo_root.join(format!("gen-{}", timestamp_slug())))
+            .unwrap_or(default_gen_dir)
     } else {
-        args.output_dir
-            .clone()
-            .unwrap_or_else(|| repo_root.join(format!("gen-{}", timestamp_slug())))
+        args.output_dir.clone().unwrap_or(default_gen_dir)
     };
 
     print_command_header(

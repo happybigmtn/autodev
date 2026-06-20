@@ -43,6 +43,22 @@ pub(crate) fn timestamp_slug() -> String {
     Utc::now().format("%Y%m%d-%H%M%S").to_string()
 }
 
+/// Optional override base for auto's heavy, regenerable working directories.
+///
+/// When `$AUTO_RUN_ROOT` is set (non-empty), returns
+/// `<AUTO_RUN_ROOT>/<repo-name>/<subdir>` so big `auto parallel` lane builds, corpus
+/// staging, and gen/design snapshots land on a roomy volume instead of the repo's own
+/// (possibly small) disk. Returns `None` — callers keep their in-repo default — when the
+/// env var is unset or empty.
+pub(crate) fn auto_run_root_override(repo_root: &Path, subdir: &str) -> Option<std::path::PathBuf> {
+    let root = std::env::var("AUTO_RUN_ROOT").ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    Some(Path::new(root).join(repo_name(repo_root)).join(subdir))
+}
+
 pub(crate) fn current_binary_path() -> String {
     std::env::current_exe()
         .ok()

@@ -164,10 +164,40 @@ fn normalize_repo_relative_path(repo_root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// Best-effort removal of the immediate children of `dir` so prior regenerable run
+/// artifacts don't accumulate. No-op if `dir` is absent; never removes `dir` itself.
+/// Callers point this only at regenerable bases (corpus-staging / fresh-input), never at
+/// `.auto/symphony/verification-receipts`.
+fn prune_dir_children(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+    }
+}
+
 pub(crate) fn prepare_planning_root_for_corpus(
     repo_root: &Path,
     planning_root: &Path,
 ) -> Result<CorpusPreparation> {
+    // Heavy, regenerable corpus working dirs honor $AUTO_RUN_ROOT (so they can live on a
+    // roomy volume) and are pruned at the start of each fresh run so prior staging dirs and
+    // prior-genesis snapshots don't accumulate on disk. The promoted corpus lives in
+    // <repo>/genesis under git, and verification receipts under .auto/symphony are never
+    // touched here.
+    let fresh_input_base = crate::util::auto_run_root_override(repo_root, "fresh-input")
+        .unwrap_or_else(|| repo_root.join(".auto").join("fresh-input"));
+    let staging_base = crate::util::auto_run_root_override(repo_root, "corpus-staging")
+        .unwrap_or_else(|| repo_root.join(".auto").join("corpus-staging"));
+    prune_dir_children(&fresh_input_base);
+    prune_dir_children(&staging_base);
+
     let previous_snapshot = if planning_root.exists() {
         let has_contents = fs::read_dir(planning_root)
             .with_context(|| format!("failed to read {}", planning_root.display()))?
@@ -175,7 +205,7 @@ pub(crate) fn prepare_planning_root_for_corpus(
             .transpose()?
             .is_some();
         if has_contents {
-            let snapshot_root = repo_root.join(".auto").join("fresh-input").join(format!(
+            let snapshot_root = fresh_input_base.join(format!(
                 "{}-previous-{}",
                 planning_root
                     .file_name()
@@ -197,7 +227,7 @@ pub(crate) fn prepare_planning_root_for_corpus(
     } else {
         None
     };
-    let staging_root = repo_root.join(".auto").join("corpus-staging").join(format!(
+    let staging_root = staging_base.join(format!(
         "{}-{}",
         planning_root
             .file_name()

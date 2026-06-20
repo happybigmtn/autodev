@@ -48,10 +48,10 @@ pub(crate) async fn run_design(args: DesignArgs) -> Result<()> {
     }
 
     let run_id = timestamp_slug();
-    let output_dir = args
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| repo_root.join(".auto").join("design").join(&run_id));
+    let output_dir = args.output_dir.clone().unwrap_or_else(|| {
+        crate::util::auto_run_root_override(&repo_root, &format!("design/{run_id}"))
+            .unwrap_or_else(|| repo_root.join(".auto").join("design").join(&run_id))
+    });
     let planning_root = args.planning_root.clone().or_else(|| {
         repo_root
             .join("genesis")
