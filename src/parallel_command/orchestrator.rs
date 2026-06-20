@@ -395,10 +395,30 @@ pub(crate) async fn run_parallel_loop(
     let mut join_set = JoinSet::<LaneAttemptResult>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
-    let mut shelved_tasks = BTreeMap::<String, String>::new();
-    let mut attempted_partial_followups = BTreeMap::<String, usize>::new();
-    let mut deferred_partial_tasks = BTreeSet::<String>::new();
-    let mut unblock_attempt_counts = BTreeMap::<String, usize>::new();
+    // Restore per-run scheduling bookkeeping from a prior (possibly crashed)
+    // invocation on the same run_root. Every restored entry is re-pruned against
+    // the freshly-read plan by the `retain` calls at the top of the main loop, so
+    // a stale ledger can never resurrect a Done/spec-changed task; this only
+    // preserves shelve/defer decisions and retry budgets across a restart so the
+    // resumed host doesn't reset them and re-thrash through the same failures.
+    let restored_run_state = load_parallel_run_state(run_root);
+    let mut shelved_tasks = restored_run_state.shelved_tasks;
+    let mut attempted_partial_followups = restored_run_state.attempted_partial_followups;
+    let mut deferred_partial_tasks = restored_run_state.deferred_partial_tasks;
+    let mut unblock_attempt_counts = restored_run_state.unblock_attempt_counts;
+    if !shelved_tasks.is_empty()
+        || !deferred_partial_tasks.is_empty()
+        || !unblock_attempt_counts.is_empty()
+        || !attempted_partial_followups.is_empty()
+    {
+        parallel_logger.info(format!(
+            "resume: restored run-state ledger (shelved: {}, deferred: {}, unblock-counts: {}, followups: {})",
+            shelved_tasks.len(),
+            deferred_partial_tasks.len(),
+            unblock_attempt_counts.len(),
+            attempted_partial_followups.len()
+        ));
+    }
     let max_autonomous_unblock_attempts = autonomous_unblock_attempt_limit(args.max_retries);
     let mut linear_auto_sync_state = LinearAutoSyncState::default();
     let mut landed = 0usize;
@@ -494,6 +514,14 @@ pub(crate) async fn run_parallel_loop(
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.status != LoopTaskStatus::Done)
         });
+        // Persist the just-pruned bookkeeping so a crash/restart resumes it.
+        save_parallel_run_state(
+            run_root,
+            &shelved_tasks,
+            &deferred_partial_tasks,
+            &unblock_attempt_counts,
+            &attempted_partial_followups,
+        );
 
         if args
             .max_iterations
@@ -851,6 +879,9 @@ pub(crate) async fn run_parallel_loop(
             if queue.pending_ids.is_empty() {
                 if queue.blocked_ids.is_empty() {
                     parallel_logger.info("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
+                    // Clean completion: drop the ledger so a later run on this
+                    // run_root starts fresh instead of reloading finished state.
+                    clear_parallel_run_state(run_root);
                 } else {
                     parallel_logger.info(format!(
                         "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
