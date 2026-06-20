@@ -21,7 +21,7 @@ use crate::completion_artifacts::audit::{
 use crate::completion_artifacts::receipt::{
     inspect_verification_receipt, verification_receipt_path,
 };
-use crate::completion_artifacts::verification::verification_step_looks_external;
+pub(crate) use crate::completion_artifacts::verification::verification_step_looks_external;
 
 pub(crate) use receipt::{
     git_verification_receipt_footers, legacy_verification_receipt_backfill_footer,

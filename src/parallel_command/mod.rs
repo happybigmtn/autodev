@@ -49,6 +49,7 @@ mod review_gate;
 mod scheduling;
 mod status;
 mod tmux;
+mod verify_gate;
 mod worker_env;
 
 pub(crate) use assignment::*;
@@ -62,6 +63,7 @@ pub(crate) use receipt_backfill::*;
 pub(crate) use recovery_notes::*;
 pub(crate) use review_gate::*;
 pub(crate) use scheduling::*;
+pub(crate) use verify_gate::*;
 pub(crate) use status::*;
 pub(crate) use tmux::*;
 pub(crate) use worker_env::*;
