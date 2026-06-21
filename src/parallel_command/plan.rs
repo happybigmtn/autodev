@@ -243,8 +243,16 @@ pub(crate) fn finalize_task(task: SharedPlanTask) -> LoopTask {
     }
 }
 
-pub(crate) fn infer_lane_kind(title: &str, markdown: &str) -> LaneKind {
-    let text = format!("{title}\n{markdown}").to_ascii_lowercase();
+pub(crate) fn infer_lane_kind(title: &str, _markdown: &str) -> LaneKind {
+    // Infer a non-code lane ONLY from the task TITLE, never from incidental body
+    // prose. Scanning the full markdown previously misclassified ordinary code
+    // tasks whose descriptive fields merely MENTIONED these phrases — e.g. a
+    // Fixture boundary note that "temporary suite fixtures are operator evidence
+    // only" forced the whole task onto the non-dispatchable evidence lane, which
+    // stalled the entire dependency frontier when such a task was a root. Authors
+    // who genuinely want a non-code lane set the explicit `Lane kind:` field,
+    // which takes precedence over this inference.
+    let text = title.to_ascii_lowercase();
     if text.contains("evidence only")
         || text.contains("evidence-only")
         || text.contains("verification only")
@@ -532,6 +540,23 @@ mod tests {
         );
         assert!(!verdict.contains("code lanes ready: OPS-001"));
         assert!(verdict.contains("evidence queue: EVID-001"));
+    }
+
+    #[test]
+    fn code_task_with_evidence_phrase_in_body_prose_stays_dispatchable_code() {
+        // Regression: a code task whose descriptive prose merely MENTIONS
+        // "evidence only" (here in a Fixture boundary note) must not be inferred
+        // onto the non-dispatchable evidence lane. Lane kind is inferred from the
+        // title only; the body phrase is incidental and must be ignored.
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `GATE-001` Make the local operator gate deterministic
+  Fixture boundary: temporary suite fixtures are operator evidence only; production modules must not parse them.
+  Verification: `bash scripts/ci.sh`
+  Dependencies: none
+"#,
+        );
+        assert_eq!(plan.task("GATE-001").unwrap().lane_kind, LaneKind::Code);
     }
 
     #[test]
