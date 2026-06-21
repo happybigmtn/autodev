@@ -265,14 +265,33 @@ pub(crate) fn promote_staged_planning_root(
         fs::remove_dir_all(planning_root)
             .with_context(|| format!("failed to clear {}", planning_root.display()))?;
     }
-    fs::rename(staging_root, planning_root).with_context(|| {
-        format!(
-            "failed to promote staged corpus {} -> {}",
-            staging_root.display(),
-            planning_root.display()
-        )
-    })?;
-    Ok(())
+    match fs::rename(staging_root, planning_root) {
+        Ok(()) => Ok(()),
+        // EXDEV (raw OS error 18): the staging root and the planning root live on
+        // different filesystems (e.g. AUTO_RUN_ROOT points at a separate mount
+        // while genesis/ stays on the repo's device). rename() cannot cross
+        // devices, so fall back to a recursive copy and then drop the staging copy.
+        Err(err) if err.raw_os_error() == Some(18) => {
+            copy_tree(staging_root, planning_root).with_context(|| {
+                format!(
+                    "failed to promote staged corpus across devices {} -> {}",
+                    staging_root.display(),
+                    planning_root.display()
+                )
+            })?;
+            fs::remove_dir_all(staging_root).with_context(|| {
+                format!("failed to clear staged corpus {}", staging_root.display())
+            })?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to promote staged corpus {} -> {}",
+                staging_root.display(),
+                planning_root.display()
+            )
+        }),
+    }
 }
 
 pub(crate) fn prepare_generation_output_dir(output_dir: &Path) -> Result<()> {
