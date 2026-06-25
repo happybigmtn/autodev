@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand};
 use crate::util::CLI_LONG_VERSION;
 
 pub(crate) use args_exec::{
-    BugArgs, HardeningProfile, LoopArgs, NemesisArgs, ParallelAction, ParallelArgs,
-    ParallelCargoTarget, ReviewArgs,
+    BugArgs, HardeningProfile, NemesisArgs, ParallelAction, ParallelArgs, ParallelCargoTarget,
+    ReviewArgs,
 };
 pub(crate) use args_ops::{
     AuditArgs, AuditEverythingPhase, AuditResumeMode, HealthArgs, QaArgs, QaOnlyArgs, QaTier,
@@ -50,9 +50,7 @@ pub(crate) enum Command {
     Reverse(GenerationArgs),
     /// Run a chunked multi-pass bug-finding, invalidation, verification, and implementation pipeline
     Bug(BugArgs),
-    /// Run the implementation loop on the repo's primary branch
-    Loop(LoopArgs),
-    /// Run the experimental multi-lane implementation executor
+    /// Run the multi-lane implementation executor
     Parallel(ParallelArgs),
     /// Run a runtime QA and ship-readiness pass on the current branch
     Qa(QaArgs),

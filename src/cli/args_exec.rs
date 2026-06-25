@@ -105,57 +105,6 @@ pub(crate) struct BugArgs {
 }
 
 #[derive(Args, Clone)]
-pub(crate) struct LoopArgs {
-    /// Stop after this many successful loop iterations. Default is unlimited.
-    #[arg(long)]
-    pub(crate) max_iterations: Option<usize>,
-
-    /// Optional override for the worker prompt template
-    #[arg(long)]
-    pub(crate) prompt_file: Option<PathBuf>,
-
-    /// Model to use for the implementation worker
-    #[arg(long, default_value = "gpt-5.5")]
-    pub(crate) model: String,
-
-    /// Reasoning effort to pass through to the Codex worker
-    #[arg(long, default_value = "high")]
-    pub(crate) reasoning_effort: String,
-
-    /// Branch that the loop is allowed to run on. Defaults to the repo's primary branch.
-    #[arg(long)]
-    pub(crate) branch: Option<String>,
-
-    /// Additional repository roots the loop worker may inspect or edit
-    #[arg(long = "reference-repo")]
-    pub(crate) reference_repos: Vec<PathBuf>,
-
-    /// Auto-discover sibling git repos in the parent directory as reference repos
-    #[arg(long)]
-    pub(crate) include_siblings: bool,
-
-    /// Directory for loop logs. Defaults to <repo>/.auto/loop
-    #[arg(long)]
-    pub(crate) run_root: Option<PathBuf>,
-
-    /// Codex executable for Codex-backed phases. Kimi/MiniMax model aliases use kimi-cli/pi discovery.
-    #[arg(long, default_value = "codex")]
-    pub(crate) codex_bin: PathBuf,
-
-    /// Use Claude instead of Codex
-    #[arg(long)]
-    pub(crate) claude: bool,
-
-    /// Maximum Claude turns (only used with --claude). Omit for unlimited.
-    #[arg(long)]
-    pub(crate) max_turns: Option<usize>,
-
-    /// Maximum retries when Claude exits non-zero before bailing
-    #[arg(long, default_value_t = 2)]
-    pub(crate) max_retries: usize,
-}
-
-#[derive(Args, Clone)]
 pub(crate) struct ParallelArgs {
     /// Optional action. `auto parallel status` prints the current tmux/lane health.
     #[arg(value_enum)]

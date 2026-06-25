@@ -15,7 +15,6 @@ mod generation;
 mod health_command;
 mod kimi_backend;
 mod linear_tracker;
-mod loop_command;
 mod nemesis;
 mod parallel_command;
 mod pi_backend;
@@ -50,7 +49,7 @@ use clap::Parser;
 pub(crate) use crate::cli::{
     AccountsCommand, AuditArgs, AuditEverythingPhase, AuditHarvestArgs, AuditResumeMode, BookArgs,
     BugArgs, Cli, Command, CorpusArgs, DesignArgs, GenerationArgs, HardeningProfile, HealthArgs,
-    LoopArgs, NemesisArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, QaArgs, QaOnlyArgs,
+    NemesisArgs, ParallelAction, ParallelArgs, ParallelCargoTarget, QaArgs, QaOnlyArgs,
     QaTier, QuotaSubcommand, ReviewArgs, ShipArgs, SpecArgs, StewardArgs, SuperArgs, SymphonyArgs,
     SymphonyRunArgs, SymphonySubcommand, SymphonySyncArgs, SymphonyWorkflowArgs,
 };
@@ -65,7 +64,6 @@ async fn main() -> Result<()> {
         Command::Super(args) => super_command::run_super(args).await,
         Command::Reverse(args) => generation::run_reverse(args).await,
         Command::Bug(args) => bug_command::run_bug(args).await,
-        Command::Loop(args) => loop_command::run_loop(args).await,
         Command::Parallel(args) => parallel_command::run_parallel(args).await,
         Command::Qa(args) => qa_command::run_qa(args).await,
         Command::QaOnly(args) => qa_only_command::run_qa_only(args).await,
@@ -121,7 +119,6 @@ mod tests {
             "super",
             "reverse",
             "bug",
-            "loop",
             "parallel",
             "qa",
             "qa-only",

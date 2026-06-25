@@ -28,7 +28,7 @@ const HELP_SURFACES: &[&[&str]] = &[
 const OPTIONAL_TOOLS: &[OptionalTool] = &[
     OptionalTool {
         name: "codex",
-        workflows: "model-backed health, qa, review, generation, loop, and parallel flows",
+        workflows: "model-backed health, qa, review, generation, and parallel flows",
     },
     OptionalTool {
         name: "claude",

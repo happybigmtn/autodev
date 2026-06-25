@@ -9,7 +9,7 @@ use crate::util::repo_name;
 
 /// Primary branch names auto treats as the repo's integration branch when no
 /// explicit branch is requested. Shared by `auto ship` base-branch resolution
-/// and `auto loop` branch selection.
+/// and `auto parallel` branch selection.
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

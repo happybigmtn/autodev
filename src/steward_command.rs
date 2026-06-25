@@ -408,7 +408,7 @@ fn build_steward_prompt(
     format!(
         r#"You are the **steward** of this repository at `{repo_root}`, branch `{branch}`.
 
-A steward is not a re-planner. This repo already has an active planning surface and a running auto-loop. Your job is to:
+A steward is not a re-planner. This repo already has an active planning surface and a running `auto parallel` executor. Your job is to:
 
 1. Reconcile what the planning surface claims against what the live tree actually shows.
 2. Identify the 3-5 items whose completion would most collapse remaining scope.
