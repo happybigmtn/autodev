@@ -49,20 +49,25 @@ pub(crate) fn setup_parallel_tmux_windows(
     let pane_target = tmux_pane
         .into_string()
         .map_err(|_| anyhow::anyhow!("TMUX_PANE contained invalid UTF-8"))?;
-    let session_name = tmux_stdout([
+    // Target the session by its stable id (e.g. `$0`) rather than its name.
+    // A session whose name is purely numeric (e.g. tmux's default "0") makes a
+    // bare `-t <name>` ambiguous: tmux parses `new-window -t 0` as window index
+    // 0 and fails with "create window failed: index 0 in use". The `$<id>` form
+    // is always unambiguous as a session target, in every position below.
+    let session_target = tmux_stdout([
         "display-message",
         "-p",
         "-t",
         &pane_target,
-        "#{session_name}",
+        "#{session_id}",
     ])?;
 
-    for window_name in tmux_window_names(&session_name)? {
+    for window_name in tmux_window_names(&session_target)? {
         if window_name.starts_with("loop-lane-") || window_name.starts_with("parallel-lane-") {
             run_tmux([
                 "kill-window",
                 "-t",
-                &format!("{session_name}:{window_name}"),
+                &format!("{session_target}:{window_name}"),
             ])?;
         }
     }
@@ -84,7 +89,7 @@ pub(crate) fn setup_parallel_tmux_windows(
         run_tmux([
             "new-window",
             "-t",
-            &session_name,
+            &session_target,
             "-n",
             &window_name,
             &command,
