@@ -118,7 +118,49 @@ pub(crate) fn clone_loop_lane_repo(
     }
 
     share_lean_dependency_cache(repo_root, lane_repo_root);
+    share_configured_lane_paths(repo_root, lane_repo_root);
     Ok(())
+}
+
+/// Best-effort: symlink operator-configured gitignored build artifacts from the
+/// canonical repo into a freshly-cloned lane. Lanes are `git clone --local` of
+/// the canonical repo, so gitignored paths (build oracles, large fixture blobs,
+/// downloaded caches) never come across, and lanes that need them run degraded
+/// or rebuild them. The operator lists one repo-relative path per line in
+/// `<repo>/.auto/lane-shared-paths` (e.g. `target/oracle` for the Ludii oracle
+/// jar that differential lanes verify against). Each listed path that exists in
+/// the canonical repo and is absent in the lane is symlinked in (parent dirs
+/// created). Blank/`#`-comment lines, absolute paths, and `..` escapes are
+/// ignored. Any failure is non-fatal: the lane simply runs without the artifact.
+pub(crate) fn share_configured_lane_paths(repo_root: &Path, lane_repo_root: &Path) {
+    let config = repo_root.join(".auto").join("lane-shared-paths");
+    let Ok(contents) = fs::read_to_string(&config) else {
+        return; // no operator config; nothing to share
+    };
+    for raw in contents.lines() {
+        let rel = raw.trim();
+        if rel.is_empty() || rel.starts_with('#') {
+            continue;
+        }
+        // Only share repo-relative paths; reject absolute paths and parent escapes.
+        if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        let source = repo_root.join(rel);
+        if !source.exists() {
+            continue; // configured but not present in the canonical repo
+        }
+        let dest = lane_repo_root.join(rel);
+        if dest.exists() {
+            continue; // lane already has it; leave it untouched
+        }
+        if let Some(parent) = dest.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        let _ = std::os::unix::fs::symlink(&source, &dest);
+    }
 }
 
 /// Best-effort: let a freshly-cloned Lean lane reuse the canonical repo's prebuilt
@@ -547,6 +589,64 @@ mod tests {
         assert!(
             !lane.join(".lake").exists(),
             "no .lake should be created for a non-Lean repo"
+        );
+
+        fs::remove_dir_all(&base).expect("failed to clean temp dir");
+    }
+
+    #[test]
+    fn share_configured_lane_paths_symlinks_listed_gitignored_paths() {
+        let base = unique_temp_dir("lane-shared-paths");
+        let canonical = base.join("canonical");
+        let lane = base.join("lane");
+        // Canonical has a gitignored build oracle and a config naming it.
+        fs::create_dir_all(canonical.join("target").join("oracle"))
+            .expect("failed to create canonical oracle dir");
+        fs::write(canonical.join("target").join("oracle").join("Ludii.jar"), b"jar")
+            .expect("failed to write oracle jar");
+        fs::create_dir_all(canonical.join(".auto")).expect("failed to create .auto");
+        fs::write(
+            canonical.join(".auto").join("lane-shared-paths"),
+            "# build artifacts to share into lanes\ntarget/oracle\n/etc/passwd\n../escape\nmissing/path\n",
+        )
+        .expect("failed to write lane-shared-paths");
+        fs::create_dir_all(&lane).expect("failed to create lane dir");
+
+        share_configured_lane_paths(&canonical, &lane);
+
+        let linked = lane.join("target").join("oracle");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .expect("lane oracle should exist")
+                .file_type()
+                .is_symlink(),
+            "configured path should be symlinked into the lane"
+        );
+        assert!(
+            linked.join("Ludii.jar").exists(),
+            "symlinked oracle should expose the shared jar"
+        );
+        // The absolute path, the `..` escape, and the missing path must be skipped.
+        assert!(!lane.join("etc").exists(), "absolute paths must be rejected");
+        assert!(!lane.join("escape").exists(), "parent escapes must be rejected");
+        assert!(!lane.join("missing").exists(), "absent sources must be skipped");
+
+        fs::remove_dir_all(&base).expect("failed to clean temp dir");
+    }
+
+    #[test]
+    fn share_configured_lane_paths_is_noop_without_config() {
+        let base = unique_temp_dir("lane-shared-paths-none");
+        let canonical = base.join("canonical");
+        let lane = base.join("lane");
+        fs::create_dir_all(&canonical).expect("failed to create canonical dir");
+        fs::create_dir_all(&lane).expect("failed to create lane dir");
+
+        share_configured_lane_paths(&canonical, &lane);
+
+        assert!(
+            fs::read_dir(&lane).expect("lane should be readable").next().is_none(),
+            "no config means the lane is left untouched"
         );
 
         fs::remove_dir_all(&base).expect("failed to clean temp dir");
