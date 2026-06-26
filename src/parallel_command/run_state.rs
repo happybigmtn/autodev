@@ -47,7 +47,7 @@ fn run_state_path(run_root: &Path) -> PathBuf {
 /// it cannot be parsed. Never fails: a corrupt ledger degrades to "start fresh".
 pub(crate) fn load_parallel_run_state(run_root: &Path) -> ParallelRunState {
     let path = run_state_path(run_root);
-    match std::fs::read_to_string(&path) {
+    let mut state = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
             eprintln!(
                 "warning: ignoring unreadable parallel run-state ledger {}: {err:#}",
@@ -56,7 +56,42 @@ pub(crate) fn load_parallel_run_state(run_root: &Path) -> ParallelRunState {
             ParallelRunState::default()
         }),
         Err(_) => ParallelRunState::default(),
+    };
+    apply_retry_shelved_override(&mut state, retry_shelved_requested());
+    state
+}
+
+/// Whether the operator asked to retry shelved/deferred tasks this run.
+fn retry_shelved_requested() -> bool {
+    std::env::var("AUTO_PARALLEL_RETRY_SHELVED")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// Operator escape hatch. When a task was shelved or deferred during a prior run
+/// (e.g. a transient dirty-tree cherry-pick conflict that the operator has since
+/// fixed) the durable ledger would keep it shelved on every later invocation —
+/// previously only `rm .run-state.json` recovered it. With
+/// `AUTO_PARALLEL_RETRY_SHELVED=1`, re-invoking `auto parallel` gives every
+/// shelved/deferred task a fresh attempt. Attempt counters are reset so the
+/// retry is real, not immediately re-exhausted.
+fn apply_retry_shelved_override(state: &mut ParallelRunState, requested: bool) {
+    if !requested {
+        return;
     }
+    if state.shelved_tasks.is_empty() && state.deferred_partial_tasks.is_empty() {
+        return;
+    }
+    eprintln!(
+        "resume: AUTO_PARALLEL_RETRY_SHELVED=1 -> retrying {} shelved + {} deferred task(s) fresh",
+        state.shelved_tasks.len(),
+        state.deferred_partial_tasks.len()
+    );
+    state.shelved_tasks.clear();
+    state.deferred_partial_tasks.clear();
+    state.unblock_attempt_counts.clear();
+    state.attempted_partial_followups.clear();
 }
 
 /// Persist the current scheduling bookkeeping. Best-effort: a write error is
@@ -154,5 +189,31 @@ mod tests {
         let state = load_parallel_run_state(&dir);
         assert!(state.shelved_tasks.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retry_shelved_override_clears_shelved_and_deferred_when_requested() {
+        let mut state = ParallelRunState::default();
+        state
+            .shelved_tasks
+            .insert("TASK-006".to_string(), "task md".to_string());
+        state.deferred_partial_tasks.insert("TASK-001".to_string());
+        state.unblock_attempt_counts.insert("TASK-006".to_string(), 4);
+        state
+            .attempted_partial_followups
+            .insert("TASK-001".to_string(), 1);
+
+        // Not requested: state is untouched.
+        let mut untouched = state.clone();
+        apply_retry_shelved_override(&mut untouched, false);
+        assert_eq!(untouched.shelved_tasks.len(), 1);
+        assert_eq!(untouched.deferred_partial_tasks.len(), 1);
+
+        // Requested: shelved/deferred + attempt counters are cleared for a fresh retry.
+        apply_retry_shelved_override(&mut state, true);
+        assert!(state.shelved_tasks.is_empty());
+        assert!(state.deferred_partial_tasks.is_empty());
+        assert!(state.unblock_attempt_counts.is_empty());
+        assert!(state.attempted_partial_followups.is_empty());
     }
 }
