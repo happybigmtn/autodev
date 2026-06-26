@@ -1415,6 +1415,26 @@ pub(crate) fn cherry_pick_lane_range(
     }
 
     scrub_parallel_receipt_staging(repo_root)?;
+    // A dirty canonical worktree (e.g. regenerated evidence/report artifacts left
+    // by an out-of-band verification) makes `git cherry-pick` refuse with "local
+    // changes would be overwritten by merge", which shelves the task even though
+    // the lane commit is authoritative for the task range. With
+    // AUTO_PARALLEL_LANDING_AUTOSTASH=1, stash the dirty state before the
+    // cherry-pick; on success drop it (the lane output supersedes), on failure
+    // restore it so nothing is lost.
+    let autostash = landing_autostash_requested() && canonical_worktree_is_dirty(repo_root)?;
+    if autostash {
+        run_git(
+            repo_root,
+            [
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "auto-parallel landing autostash",
+            ],
+        )?;
+    }
     let range = format!("{base_commit}..{head_ref}");
     let output = Command::new("git")
         .arg("-C")
@@ -1425,17 +1445,40 @@ pub(crate) fn cherry_pick_lane_range(
         .output()
         .with_context(|| format!("failed to cherry-pick {range} in {}", repo_root.display()))?;
     if output.status.success() {
+        if autostash {
+            // Lane commit is authoritative for these paths; discard the stashed
+            // pre-landing dirty state rather than re-conflicting on pop.
+            let _ = run_git(repo_root, ["stash", "drop"]);
+        }
         return Ok(());
     }
 
     if failure_policy == CherryPickFailurePolicy::Abort {
         let _ = run_git(repo_root, ["cherry-pick", "--abort"]);
     }
+    if autostash {
+        let _ = run_git(repo_root, ["stash", "pop"]);
+    }
     bail!(
         "git cherry-pick failed in {}: {}",
         repo_root.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
+}
+
+/// Whether `AUTO_PARALLEL_LANDING_AUTOSTASH=1` is set (opt-in dirty-tree landing).
+fn landing_autostash_requested() -> bool {
+    std::env::var("AUTO_PARALLEL_LANDING_AUTOSTASH")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// True when the canonical worktree has uncommitted (tracked or untracked) changes.
+fn canonical_worktree_is_dirty(repo_root: &Path) -> Result<bool> {
+    Ok(!git_stdout(repo_root, ["status", "--porcelain"])?
+        .trim()
+        .is_empty())
 }
 
 pub(crate) fn scrub_parallel_receipt_staging(repo_root: &Path) -> Result<()> {
