@@ -160,7 +160,14 @@ pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
         );
     }
     verify_steward_deliverables(&output_dir)?;
-    verify_steward_promoted_queue(&repo_root)?;
+    verify_or_repair_promoted_queue(
+        &repo_root,
+        &args.model,
+        &args.reasoning_effort,
+        &args.codex_bin,
+        &output_dir,
+    )
+    .await?;
     println!(
         "steward:     {} deliverables under {}",
         STEWARD_DELIVERABLES.len(),
@@ -341,6 +348,78 @@ fn verify_steward_promoted_queue(repo_root: &Path) -> Result<()> {
     validate_execution_rows(&plan)
         .with_context(|| "steward promotion rejected invalid execution row")
         .map(|_| ())
+}
+
+/// Validate the promoted execution rows; on a format violation, re-prompt the
+/// steward model to fix only the offending row(s) in place, then re-validate.
+/// This keeps a single stray field value (e.g. `Estimated scope: L`) from
+/// discarding an otherwise-good steward run.
+async fn verify_or_repair_promoted_queue(
+    repo_root: &Path,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    const MAX_REPAIRS: usize = 2;
+    let mut last_err = match verify_steward_promoted_queue(repo_root) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for attempt in 1..=MAX_REPAIRS {
+        let detail = format!("{last_err:#}");
+        println!(
+            "promotion:   execution-row validation failed (repair {attempt}/{MAX_REPAIRS}): {detail}"
+        );
+        let prompt = build_promotion_repair_prompt(repo_root, &detail);
+        let stderr = output_dir.join(format!("promotion-repair-{attempt}.stderr.log"));
+        let status = run_codex_exec(
+            repo_root,
+            &prompt,
+            model,
+            reasoning_effort,
+            codex_bin,
+            &stderr,
+            None,
+            "auto steward promotion-repair",
+        )
+        .await?;
+        if !status.success() {
+            bail!(
+                "steward promotion-repair pass exited with status {}; see {}",
+                status
+                    .code()
+                    .map(|c: i32| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                stderr.display()
+            );
+        }
+        match verify_steward_promoted_queue(repo_root) {
+            Ok(()) => {
+                println!("promotion:   execution rows valid after repair {attempt}");
+                return Ok(());
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+        .with_context(|| format!("execution rows still invalid after {MAX_REPAIRS} auto-repairs"))
+}
+
+fn build_promotion_repair_prompt(repo_root: &Path, error: &str) -> String {
+    let plan = repo_root.join("IMPLEMENTATION_PLAN.md");
+    format!(
+        "The steward promoted execution rows into `{plan}`, but execution-row validation rejected them:\n\n\
+         {error}\n\n\
+         Fix ONLY the format violation(s) named above by editing `{plan}` in place. Do not add, \
+         remove, reorder, or re-scope tasks, and do not change the meaning of any field. Enforce the \
+         strict field grammar while repairing: `Estimated scope:` must be exactly `XS`, `S`, or `M` \
+         (split larger work into separate rows — never `L`/`XL`); `Dependencies:` must be backticked \
+         task IDs or the literal `none`; `Required tests:` must name concrete commands, never a bare \
+         package-wide test run. After editing, the plan MUST pass execution-row validation.",
+        plan = plan.display(),
+        error = error,
+    )
 }
 
 fn build_steward_prompt(
