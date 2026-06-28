@@ -685,8 +685,14 @@ pub(crate) fn render_parallel_unblock_note(candidate: &ParallelUnblockCandidate)
 }
 
 pub(crate) fn is_verification_only_task(task: &LoopTask) -> bool {
+    // Only treat as verification-only when the scope boundary LEADS with the
+    // directive — not when an ordinary code task merely mentions the phrase
+    // mid-sentence (e.g. "...fail-closed verification only; do not add commands").
+    // This is the same body-prose false-positive class that `infer_lane_kind`
+    // was already fixed for; an incidental mention previously forced a real code
+    // task onto the non-dispatchable evidence lane and stalled the frontier.
     task_field_body(&task.markdown, "Scope boundary:", "Acceptance criteria:")
-        .map(|body| body.to_ascii_lowercase().contains("verification only"))
+        .map(|body| body.trim().to_ascii_lowercase().starts_with("verification only"))
         .unwrap_or(false)
 }
 
