@@ -416,7 +416,11 @@ fn build_steward_prompt(
            Review/closeout / Completion artifacts / Dependencies / Estimated scope / \
            Completion signal. Omitting any (e.g. `Codebase evidence:` or \
            `Completion artifacts:`) makes the promotion fail validation. Cite \
-           concrete file paths / commands from the live tree for evidence fields.\n\
+           concrete file paths / commands from the live tree for evidence fields. \
+           `Dependencies:` MUST contain ONLY backticked task IDs (e.g. \
+           `` `TASK-007`, `TASK-009` ``) or the literal word `none` — never prose, \
+           file paths, or environment notes. `Required tests:` MUST name a concrete \
+           test/command, not a bare package-wide `cargo test -p <crate>` run.\n\
            Only append items that should be eligible for `auto parallel`. \
            Deferred or not-shipped ideas belong in `PROMOTIONS.md`, \
            `STEWARDSHIP-REPORT.md`, or a blocked `- [!]` row with an explicit \
