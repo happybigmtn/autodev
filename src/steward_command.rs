@@ -420,7 +420,9 @@ fn build_steward_prompt(
            `Dependencies:` MUST contain ONLY backticked task IDs (e.g. \
            `` `TASK-007`, `TASK-009` ``) or the literal word `none` — never prose, \
            file paths, or environment notes. `Required tests:` MUST name a concrete \
-           test/command, not a bare package-wide `cargo test -p <crate>` run.\n\
+           test/command, not a bare package-wide `cargo test -p <crate>` run. \
+           `Estimated scope:` MUST be exactly `XS`, `S`, or `M` (split anything \
+           larger into multiple rows — never `L` or `XL`).\n\
            Only append items that should be eligible for `auto parallel`. \
            Deferred or not-shipped ideas belong in `PROMOTIONS.md`, \
            `STEWARDSHIP-REPORT.md`, or a blocked `- [!]` row with an explicit \
