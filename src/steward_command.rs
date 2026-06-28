@@ -407,12 +407,16 @@ fn build_steward_prompt(
          - `IMPLEMENTATION_PLAN.md`: append active plan items for implementation \
            or cleanup work. Use the repo's existing item-id convention \
            (`W2-NS-*`, `NEM-*`, `BIT-NS-*`, `P-*`, etc.) and match the shape of \
-           surrounding items: Spec / Why now / Codebase evidence / Owns / \
-           Integration touchpoints / Scope boundary / Acceptance criteria / \
-           Verification / Required tests / Dependencies / Estimated scope / \
-           Completion signal. The `Codebase evidence:` field is REQUIRED by the \
-           execution-row validator — every appended row must include it (cite \
-           concrete file paths / commands from the live tree).\n\
+           surrounding items. The execution-row validator REQUIRES the COMPLETE \
+           field set on every appended `- [ ]` row — emit ALL of these, in order: \
+           Spec / Why now / Codebase evidence / Source of truth / Runtime owner / \
+           UI consumers / Generated artifacts / Fixture boundary / Retired surfaces / \
+           Owns / Integration touchpoints / Scope boundary / Acceptance criteria / \
+           Verification / Required tests / Contract generation / Cross-surface tests / \
+           Review/closeout / Completion artifacts / Dependencies / Estimated scope / \
+           Completion signal. Omitting any (e.g. `Codebase evidence:` or \
+           `Completion artifacts:`) makes the promotion fail validation. Cite \
+           concrete file paths / commands from the live tree for evidence fields.\n\
            Only append items that should be eligible for `auto parallel`. \
            Deferred or not-shipped ideas belong in `PROMOTIONS.md`, \
            `STEWARDSHIP-REPORT.md`, or a blocked `- [!]` row with an explicit \
