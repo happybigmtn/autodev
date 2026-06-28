@@ -407,9 +407,12 @@ fn build_steward_prompt(
          - `IMPLEMENTATION_PLAN.md`: append active plan items for implementation \
            or cleanup work. Use the repo's existing item-id convention \
            (`W2-NS-*`, `NEM-*`, `BIT-NS-*`, `P-*`, etc.) and match the shape of \
-           surrounding items: Spec / Why now / Owns / Integration touchpoints / \
-           Scope boundary / Acceptance criteria / Verification / Required tests / \
-           Dependencies / Estimated scope / Completion signal.\n\
+           surrounding items: Spec / Why now / Codebase evidence / Owns / \
+           Integration touchpoints / Scope boundary / Acceptance criteria / \
+           Verification / Required tests / Dependencies / Estimated scope / \
+           Completion signal. The `Codebase evidence:` field is REQUIRED by the \
+           execution-row validator — every appended row must include it (cite \
+           concrete file paths / commands from the live tree).\n\
            Only append items that should be eligible for `auto parallel`. \
            Deferred or not-shipped ideas belong in `PROMOTIONS.md`, \
            `STEWARDSHIP-REPORT.md`, or a blocked `- [!]` row with an explicit \
