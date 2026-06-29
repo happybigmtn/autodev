@@ -35,6 +35,7 @@ use crate::generation::gbrain_context::{collect_gbrain_context, GBRAIN_CONTEXT_F
 use crate::generation::phase_runner::{
     codex_review_report_path, run_logged_author_phase, run_logged_codex_review,
 };
+use crate::codex_exec::run_codex_exec;
 use crate::generation::plan_verify::verify_generated_implementation_plan;
 use crate::generation::planning_root::{
     discover_active_plan_surface, ensure_planning_root_exists,
@@ -628,10 +629,15 @@ async fn run_generation(args: GenerationArgs, mode: GenerationMode) -> Result<()
             &args.codex_bin,
         )
         .await?;
-        (
-            verify_generated_implementation_plan(&output_dir)?,
-            Some(plan_phase),
+        let verified_plan = verify_or_repair_generated_implementation_plan(
+            &output_dir,
+            &repo_root,
+            &args.model,
+            &args.reasoning_effort,
+            &args.codex_bin,
         )
+        .await?;
+        (verified_plan, Some(plan_phase))
     };
     let codex_review = if args.skip_codex_review {
         None
@@ -844,6 +850,80 @@ fn format_duration(duration: std::time::Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// Verify the generated `IMPLEMENTATION_PLAN.md`; on execution-row validation
+/// failure, re-prompt the model with the exact error to repair the offending
+/// rows in place (≤2 attempts), then re-verify — instead of aborting the whole
+/// `auto gen` run. Mirrors the steward promotion self-repair (`f49b5f4`).
+async fn verify_or_repair_generated_implementation_plan(
+    output_dir: &Path,
+    repo_root: &Path,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+) -> Result<PathBuf> {
+    const MAX_PLAN_REPAIRS: usize = 2;
+    let mut last_err = match verify_generated_implementation_plan(output_dir) {
+        Ok(path) => return Ok(path),
+        Err(e) => e,
+    };
+    for attempt in 1..=MAX_PLAN_REPAIRS {
+        let detail = format!("{last_err:#}");
+        println!(
+            "plan:        execution-row validation failed (repair {attempt}/{MAX_PLAN_REPAIRS}): {detail}"
+        );
+        let plan_path = output_dir.join("IMPLEMENTATION_PLAN.md");
+        let prompt = build_generated_plan_repair_prompt(&plan_path, &detail);
+        let stderr = output_dir.join(format!("plan-repair-{attempt}.stderr.log"));
+        let status = run_codex_exec(
+            repo_root,
+            &prompt,
+            model,
+            reasoning_effort,
+            codex_bin,
+            &stderr,
+            None,
+            "auto gen plan-repair",
+        )
+        .await?;
+        if !status.success() {
+            bail!(
+                "auto gen plan-repair pass exited with status {}; see {}",
+                status
+                    .code()
+                    .map(|c: i32| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                stderr.display()
+            );
+        }
+        match verify_generated_implementation_plan(output_dir) {
+            Ok(path) => {
+                println!("plan:        execution rows valid after repair {attempt}");
+                return Ok(path);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err).with_context(|| {
+        format!("generated implementation plan still invalid after {MAX_PLAN_REPAIRS} auto-repairs")
+    })
+}
+
+fn build_generated_plan_repair_prompt(plan_path: &Path, error: &str) -> String {
+    let plan = plan_path.display();
+    format!(
+        "`auto gen` wrote execution rows into `{plan}`, but execution-row validation rejected them:\n\n\
+         {error}\n\n\
+         Fix ONLY the format violation(s) named above by editing `{plan}` in place. Do NOT add, \
+         remove, reorder, or re-scope tasks, and do NOT change the meaning of any field. Every \
+         required field MUST have concrete, specific content — never the placeholder `unknown`, \
+         `TBD`, `N/A`, or an empty value. In particular: `Fixture boundary:` must name the real \
+         fixtures/dirs and the production-truth boundary; `Review/closeout:` must state concrete \
+         reviewer steps; `Estimated scope:` must be exactly `XS`, `S`, or `M`; `Dependencies:` must \
+         be backticked task IDs or the literal `none`; `Required tests:` must name concrete commands. \
+         After editing, the plan MUST pass execution-row validation."
+    )
 }
 
 #[cfg(test)]
