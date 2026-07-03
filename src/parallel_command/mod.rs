@@ -20,8 +20,8 @@ pub(crate) use crate::claude_exec::{
 pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
     assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
-    legacy_verification_receipt_backfill_footer, verification_plan,
-    verification_receipt_commit_footer, CompletionGapKind,
+    legacy_verification_receipt_backfill_footer, unresolved_review_findings_for_task,
+    verification_plan, verification_receipt_commit_footer, CompletionGapKind,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
@@ -65,9 +65,9 @@ pub(crate) use recovery_notes::*;
 pub(crate) use review_gate::*;
 pub(crate) use run_state::*;
 pub(crate) use scheduling::*;
-pub(crate) use verify_gate::*;
 pub(crate) use status::*;
 pub(crate) use tmux::*;
+pub(crate) use verify_gate::*;
 pub(crate) use worker_env::*;
 
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];

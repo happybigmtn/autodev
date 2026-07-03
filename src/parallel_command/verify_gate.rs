@@ -17,10 +17,10 @@
 //!   work still lands, but the task is held at `[~]` and the failing command +
 //!   an output tail are appended to `REVIEW.md` so the next pass fixes it.
 //! - No host-reproducible commands, gate disabled, spawn error, or timeout
-//!   -> FAIL-OPEN: land exactly as today and stamp `verify_skipped: <reason>`.
+//!   -> FAIL-CLOSED for finalization: landed work stays, but `[x]` is withheld.
 //!
-//! Bounded by a hard total timeout and fail-open on every error path: a bug or a
-//! slow/flaky verifier can never block, hang, or lose a worker's committed work.
+//! Bounded by a hard total timeout: a bug or slow verifier can never block,
+//! hang, or lose a worker's committed work, but it also cannot produce `[x]`.
 //!
 //! Toggle:  `AUTO_PARALLEL_VERIFY_LANDINGS`      (default "1" = ON; "0" = skip)
 //! Bound:   `AUTO_PARALLEL_VERIFY_TIMEOUT_SECS`  (default 1800; total across all commands)
@@ -30,6 +30,7 @@ use super::*;
 // `verification_plan` and `Duration` arrive via `super::*`; only the external-
 // step classifier needs an explicit import.
 use crate::completion_artifacts::verification_step_looks_external;
+use shlex::split as shell_split;
 
 /// Env toggle. `"0"` skips the gate entirely (legacy behavior: trust the receipt).
 const VERIFY_ENABLED_ENV: &str = "AUTO_PARALLEL_VERIFY_LANDINGS";
@@ -48,8 +49,8 @@ pub(crate) enum LaneVerifyOutcome {
     /// A command ran and returned non-zero. Hold the task at `[~]`; `detail`
     /// names the command and carries a short tail of its output for `REVIEW.md`.
     Failed { detail: String },
-    /// Nothing host-reproducible to run, gate disabled, or an infra error
-    /// (spawn failure / timeout). Fail open: land exactly as today.
+    /// Nothing host-reproducible to run, gate disabled, or an infra error.
+    /// This is not a pass; finalization must keep the task `[~]`.
     Skipped { reason: String },
 }
 
@@ -73,68 +74,82 @@ fn verify_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The commands the host can reproduce: the task's executable verification
-/// commands minus any that look like external/live steps (URLs, ssh, kubectl,
-/// deploy scripts…) which cannot be re-run on the host box and would otherwise
-/// produce false failures.
+/// The task's exact executable verification commands. External/live steps are
+/// rejected by [`run_lane_verify_gate`] rather than silently filtered, because
+/// a task can only be `[x]` after its canonical verification story is complete.
 pub(crate) fn host_reproducible_commands(task_markdown: &str) -> Vec<String> {
     verification_plan(task_markdown)
         .executable_commands
         .into_iter()
-        .filter(|command| !verification_step_looks_external(command))
         .collect()
 }
 
 /// Re-run the task's declared verification commands at canonical HEAD, bounded
 /// by a total timeout. Never returns `Err`; classifies every path into a
 /// [`LaneVerifyOutcome`].
-pub(crate) async fn run_lane_verify_gate(repo_root: &Path, task_markdown: &str) -> LaneVerifyOutcome {
+pub(crate) async fn run_lane_verify_gate(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+) -> LaneVerifyOutcome {
+    let verification = verification_plan(task_markdown);
+    if verification
+        .steps
+        .iter()
+        .any(|step| verification_step_looks_external(step))
+    {
+        return LaneVerifyOutcome::Skipped {
+            reason: "verification includes external/live step(s); host cannot mark [x] until they are cleared explicitly".to_string(),
+        };
+    }
     let commands = host_reproducible_commands(task_markdown);
     if commands.is_empty() {
         return LaneVerifyOutcome::Skipped {
             reason: "no host-reproducible verification commands to re-run".to_string(),
         };
     }
+    if !repo_root.join("scripts/run-task-verification.sh").is_file() {
+        return LaneVerifyOutcome::Failed {
+            detail: "missing `scripts/run-task-verification.sh`; cannot produce current-tree verification receipt".to_string(),
+        };
+    }
     let deadline = verify_timeout();
-    match tokio::time::timeout(deadline, run_verify_commands(repo_root.to_path_buf(), commands)).await
+    match tokio::time::timeout(
+        deadline,
+        run_verify_commands(repo_root.to_path_buf(), task_id.to_string(), commands),
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(_) => LaneVerifyOutcome::Skipped {
-            reason: format!(
-                "host re-execution timed out after {}s (fail-open)",
-                deadline.as_secs()
-            ),
+            reason: format!("host re-execution timed out after {}s", deadline.as_secs()),
         },
     }
 }
 
-/// Run each command in `repo_root` via a login shell, inheriting the host's
-/// environment (toolchain on PATH). `kill_on_drop` ensures a timeout actually
-/// terminates an in-flight build rather than orphaning it.
-async fn run_verify_commands(repo_root: PathBuf, commands: Vec<String>) -> LaneVerifyOutcome {
+/// Run each command through the repo's receipt wrapper. `kill_on_drop` ensures
+/// a timeout terminates an in-flight build rather than orphaning it.
+async fn run_verify_commands(
+    repo_root: PathBuf,
+    task_id: String,
+    commands: Vec<String>,
+) -> LaneVerifyOutcome {
     for command in &commands {
-        let result = tokio::process::Command::new("bash")
-            .arg("-lc")
-            .arg(command)
+        let Some(argv) = shell_split(command) else {
+            return LaneVerifyOutcome::Failed {
+                detail: format!("could not parse verification command `{command}` as shell argv"),
+            };
+        };
+        let result = tokio::process::Command::new("scripts/run-task-verification.sh")
+            .arg(&task_id)
+            .arg("--")
+            .args(&argv)
             .current_dir(&repo_root)
             .kill_on_drop(true)
             .output()
             .await;
         match result {
             Ok(output) if output.status.success() => {}
-            // 127 = command not found, 126 = found but not executable. These are
-            // host-environment/toolchain problems (e.g. the build tool isn't on
-            // the host's PATH the way it is in the worker), NOT a verification
-            // failure. Fail open so a missing toolchain can never false-demote a
-            // genuinely-complete task.
-            Ok(output) if matches!(output.status.code(), Some(126) | Some(127)) => {
-                return LaneVerifyOutcome::Skipped {
-                    reason: format!(
-                        "`{command}` could not run on the host (exit {}); toolchain likely unavailable (fail-open)",
-                        output.status.code().unwrap_or_default()
-                    ),
-                };
-            }
             Ok(output) => {
                 let status = output
                     .status
@@ -149,10 +164,8 @@ async fn run_verify_commands(repo_root: PathBuf, commands: Vec<String>) -> LaneV
                 };
             }
             Err(err) => {
-                // Could not even spawn the command -> infra problem, not a real
-                // verification failure. Fail open.
-                return LaneVerifyOutcome::Skipped {
-                    reason: format!("could not run `{command}`: {err} (fail-open)"),
+                return LaneVerifyOutcome::Failed {
+                    detail: format!("could not run verification wrapper for `{command}`: {err}"),
                 };
             }
         }
@@ -168,14 +181,101 @@ fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
         String::from_utf8_lossy(stdout),
         String::from_utf8_lossy(stderr)
     );
-    let lines: Vec<&str> = merged.lines().filter(|line| !line.trim().is_empty()).collect();
+    let lines: Vec<&str> = merged
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     let start = lines.len().saturating_sub(FAILURE_TAIL_LINES);
     lines[start..].join("\n")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceTestOutcome {
+    Passed,
+    Failed { detail: String },
+    Skipped { reason: String },
+}
+
+const WORKSPACE_TEST_TIMEOUT_ENV: &str = "AUTO_PARALLEL_WORKSPACE_TEST_TIMEOUT_SECS";
+const DEFAULT_WORKSPACE_TEST_TIMEOUT_SECS: u64 = 1800;
+
+fn workspace_test_timeout() -> Duration {
+    let secs = std::env::var(WORKSPACE_TEST_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_WORKSPACE_TEST_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+pub(crate) async fn run_workspace_test_gate(repo_root: &Path) -> WorkspaceTestOutcome {
+    if !repo_root.join("Cargo.toml").is_file() {
+        return WorkspaceTestOutcome::Skipped {
+            reason: "no Cargo.toml found; workspace cargo test gate is not applicable".to_string(),
+        };
+    }
+    let deadline = workspace_test_timeout();
+    match tokio::time::timeout(deadline, run_workspace_test(repo_root.to_path_buf())).await {
+        Ok(outcome) => outcome,
+        Err(_) => WorkspaceTestOutcome::Skipped {
+            reason: format!(
+                "`cargo test --workspace` timed out after {}s",
+                deadline.as_secs()
+            ),
+        },
+    }
+}
+
+async fn run_workspace_test(repo_root: PathBuf) -> WorkspaceTestOutcome {
+    let result = tokio::process::Command::new("cargo")
+        .args(["test", "--workspace"])
+        .current_dir(&repo_root)
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match result {
+        Ok(output) if output.status.success() => WorkspaceTestOutcome::Passed,
+        Ok(output) => {
+            let status = output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            WorkspaceTestOutcome::Failed {
+                detail: format!(
+                    "`cargo test --workspace` exited with status {status}\n{}",
+                    output_tail(&output.stdout, &output.stderr)
+                ),
+            }
+        }
+        Err(err) => WorkspaceTestOutcome::Failed {
+            detail: format!("could not run `cargo test --workspace`: {err}"),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn install_test_wrapper(dir: &Path) {
+        let scripts = dir.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\nset -euo pipefail\ntask_id=$1\nshift\nif [[ ${1:-} == \"--\" ]]; then shift; fi\n\"$@\"\n",
+        )
+        .expect("write wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
+    }
 
     #[test]
     fn verify_gate_disabled_only_on_explicit_zero() {
@@ -194,16 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn host_reproducible_commands_drops_external_steps() {
+    fn host_reproducible_commands_preserves_exact_commands() {
         let markdown = "- [ ] `TASK-1` thing\n\nVerification:\n- Run `cargo test foo`\n- Check `https://example.com/health` is 200\n- Run `ssh host uptime`\n";
         let commands = host_reproducible_commands(markdown);
         assert!(
             commands.iter().any(|c| c.contains("cargo test foo")),
-            "reproducible command kept, got {commands:?}"
+            "cargo command kept, got {commands:?}"
         );
         assert!(
-            commands.iter().all(|c| !c.contains("example.com") && !c.starts_with("ssh")),
-            "external steps dropped, got {commands:?}"
+            commands.iter().any(|c| c.starts_with("ssh")),
+            "external executable command is not silently dropped, got {commands:?}"
         );
     }
 
@@ -211,9 +311,10 @@ mod tests {
     async fn run_lane_verify_gate_passes_when_command_succeeds() {
         let dir = std::env::temp_dir().join(format!("autodev-verify-pass-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
+        install_test_wrapper(&dir);
         let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
         assert_eq!(
-            run_lane_verify_gate(&dir, markdown).await,
+            run_lane_verify_gate(&dir, "TASK-1", markdown).await,
             LaneVerifyOutcome::AllPassed
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -223,8 +324,9 @@ mod tests {
     async fn run_lane_verify_gate_fails_closed_on_nonzero_command() {
         let dir = std::env::temp_dir().join(format!("autodev-verify-fail-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
+        install_test_wrapper(&dir);
         let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c false`\n";
-        match run_lane_verify_gate(&dir, markdown).await {
+        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
             LaneVerifyOutcome::Failed { detail } => {
                 assert!(detail.contains("false"), "names the command: {detail}");
             }
@@ -234,17 +336,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_lane_verify_gate_fails_open_on_missing_toolchain() {
+    async fn run_lane_verify_gate_fails_closed_on_missing_toolchain() {
         let dir = std::env::temp_dir().join(format!("autodev-verify-127-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        // A recognized command (`./`-prefixed) whose binary does not exist ->
-        // exit 127. Must fail OPEN (Skipped), never demote, so a missing host
-        // toolchain can't false-fail a complete task.
+        install_test_wrapper(&dir);
+        // A recognized command (`./`-prefixed) whose binary does not exist exits
+        // 127. That is not a passing canonical verification, so it must fail
+        // closed and keep the task [~].
         let markdown =
             "- [ ] `TASK-1` t\n\nVerification:\n- Run `./nonexistent-binary-xyz check`\n";
-        match run_lane_verify_gate(&dir, markdown).await {
-            LaneVerifyOutcome::Skipped { .. } => {}
-            other => panic!("missing toolchain must fail open, got {other:?}"),
+        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
+            LaneVerifyOutcome::Failed { detail } => {
+                assert!(detail.contains("nonexistent-binary-xyz"), "{detail}");
+            }
+            other => panic!("missing toolchain must fail closed, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -253,10 +358,43 @@ mod tests {
     async fn run_lane_verify_gate_skips_when_no_commands() {
         let dir = std::env::temp_dir().join(format!("autodev-verify-skip-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Manually confirm the layout looks right\n";
-        match run_lane_verify_gate(&dir, markdown).await {
+        let markdown =
+            "- [ ] `TASK-1` t\n\nVerification:\n- Manually confirm the layout looks right\n";
+        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
             LaneVerifyOutcome::Skipped { .. } => {}
             other => panic!("expected Skipped, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_lane_verify_gate_fails_when_wrapper_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("autodev-verify-wrapper-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
+        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
+            LaneVerifyOutcome::Failed { detail } => {
+                assert!(detail.contains("run-task-verification.sh"), "{detail}");
+            }
+            other => panic!("missing wrapper must fail closed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_lane_verify_gate_skips_external_live_steps() {
+        let dir =
+            std::env::temp_dir().join(format!("autodev-verify-external-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        install_test_wrapper(&dir);
+        let markdown =
+            "- [ ] `TASK-1` t\n\nVerification:\n- Check `https://example.com/health` is 200\n";
+        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
+            LaneVerifyOutcome::Skipped { reason } => {
+                assert!(reason.contains("external/live"), "{reason}");
+            }
+            other => panic!("external verification should not pass, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

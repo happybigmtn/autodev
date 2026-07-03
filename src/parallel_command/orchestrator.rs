@@ -1366,7 +1366,7 @@ pub(crate) async fn run_parallel_loop(
                             &assignment.stdout_log_path,
                             assignment.lane_index,
                             &assignment.task.id,
-                            "self-heal: worker exited cleanly without a commit, but canonical review/receipt/artifact evidence is complete; host marked the task done",
+                            "self-heal: worker exited cleanly without a commit, but canonical review/receipt/artifact evidence is complete; host reconciled the task",
                         );
                         last_idle_summary = None;
                         continue;

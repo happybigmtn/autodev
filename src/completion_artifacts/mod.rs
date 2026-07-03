@@ -35,6 +35,7 @@ const REVIEW_HEADER: &str = "# REVIEW\n\nAwaiting auto review:\n";
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TaskCompletionEvidence {
     pub(crate) has_review_handoff: bool,
+    pub(crate) unresolved_review_findings: Vec<String>,
     pub(crate) verification_receipt_path: Option<PathBuf>,
     pub(crate) verification_receipt_present: bool,
     pub(crate) verification_receipt_status: Option<String>,
@@ -61,6 +62,10 @@ pub(crate) struct CompletionGapAssessment {
 
 impl TaskCompletionEvidence {
     pub(crate) fn is_fully_evidenced(&self) -> bool {
+        self.is_ready_for_definition_of_done_gates() && self.unresolved_review_findings.is_empty()
+    }
+
+    pub(crate) fn is_ready_for_definition_of_done_gates(&self) -> bool {
         self.has_review_handoff
             && self.verification_receipt_present
             && self.missing_completion_artifacts.is_empty()
@@ -71,6 +76,12 @@ impl TaskCompletionEvidence {
         let mut reasons = Vec::new();
         if !self.has_review_handoff {
             reasons.push("missing REVIEW.md handoff".to_string());
+        }
+        if !self.unresolved_review_findings.is_empty() {
+            reasons.push(format!(
+                "unresolved REVIEW.md finding(s): {}",
+                summarize_review_findings(&self.unresolved_review_findings)
+            ));
         }
         if !self.verification_receipt_present {
             reasons.push(self.verification_receipt_status.clone().unwrap_or_else(|| {
@@ -166,6 +177,7 @@ pub(crate) fn inspect_task_completion_evidence(
 
     TaskCompletionEvidence {
         has_review_handoff: review_contains_task(&review_text, task_id),
+        unresolved_review_findings: unresolved_review_findings_for_task(&review_text, task_id),
         verification_receipt_path: verification_receipt_required
             .then_some(verification_receipt_path),
         verification_receipt_present,
@@ -210,6 +222,126 @@ pub(crate) fn review_contains_task(review_text: &str, task_id: &str) -> bool {
             || line.contains(&format!("## {needle}"))
             || line.trim() == needle
     })
+}
+
+pub(crate) fn unresolved_review_findings_for_task(review_text: &str, task_id: &str) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for item in extract_review_items(review_text) {
+        if !review_item_mentions_task(&item, task_id) {
+            continue;
+        }
+        if review_item_clears_task(&item, task_id) {
+            unresolved.clear();
+            continue;
+        }
+        if review_item_has_unresolved_finding(&item) {
+            unresolved.push(review_item_summary(&item));
+        }
+    }
+    unresolved
+}
+
+fn extract_review_items(content: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = Vec::new();
+    let mut in_item = false;
+
+    let flush = |items: &mut Vec<String>, current: &mut Vec<String>, in_item: &mut bool| {
+        if !current.is_empty() {
+            items.push(current.join("\n").trim_end().to_string());
+            current.clear();
+        }
+        *in_item = false;
+    };
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end();
+        if line.starts_with("## ") || is_bullet_review_item_start(line) {
+            flush(&mut items, &mut current, &mut in_item);
+            current.push(line.to_string());
+            in_item = true;
+            continue;
+        }
+        if in_item {
+            current.push(line.to_string());
+        }
+    }
+    flush(&mut items, &mut current, &mut in_item);
+    items
+}
+
+fn is_bullet_review_item_start(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("- `") else {
+        return false;
+    };
+    let Some(identity) = rest.split('`').next() else {
+        return false;
+    };
+    !identity.trim().is_empty()
+        && identity
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+        && identity
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '_'))
+}
+
+fn review_item_mentions_task(item: &str, task_id: &str) -> bool {
+    item.contains(&format!("`{task_id}`"))
+}
+
+fn review_item_clears_task(item: &str, task_id: &str) -> bool {
+    review_item_mentions_task(item, task_id)
+        && item
+            .to_ascii_lowercase()
+            .contains("auto parallel standing-review gate cleared")
+}
+
+fn review_item_has_unresolved_finding(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    if lower.contains("independent review findings")
+        || lower.contains("host re-execution verification failed")
+        || lower.contains("workspace cargo test failed")
+        || lower.contains("review gate skipped")
+        || lower.contains("held at `[~]`")
+        || lower.contains("verdict: findings")
+        || lower.contains("[~]")
+    {
+        return true;
+    }
+
+    item.lines().any(|line| {
+        let lower_line = line.to_ascii_lowercase();
+        let Some((_, blockers)) = lower_line.split_once("remaining blockers:") else {
+            return false;
+        };
+        let blockers = blockers.trim();
+        !blockers.is_empty()
+            && !blockers.starts_with("none")
+            && !blockers.starts_with("no ")
+            && blockers != "n/a"
+    })
+}
+
+fn review_item_summary(item: &str) -> String {
+    item.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("REVIEW.md item")
+        .to_string()
+}
+
+fn summarize_review_findings(findings: &[String]) -> String {
+    const MAX_RENDERED: usize = 5;
+    let mut rendered = findings
+        .iter()
+        .take(MAX_RENDERED)
+        .map(|finding| format!("`{finding}`"))
+        .collect::<Vec<_>>();
+    if findings.len() > MAX_RENDERED {
+        rendered.push(format!("... and {} more", findings.len() - MAX_RENDERED));
+    }
+    rendered.join(", ")
 }
 
 fn render_host_review_entry(
@@ -605,6 +737,7 @@ mod tests {
         let root = temp_dir("review");
         let evidence = TaskCompletionEvidence {
             has_review_handoff: false,
+            unresolved_review_findings: Vec::new(),
             verification_receipt_path: None,
             verification_receipt_present: true,
             verification_receipt_status: None,
@@ -634,6 +767,7 @@ mod tests {
     fn assess_task_completion_gap_marks_local_verification_repairs() {
         let evidence = TaskCompletionEvidence {
             has_review_handoff: true,
+            unresolved_review_findings: Vec::new(),
             verification_receipt_path: Some(PathBuf::from(
                 ".auto/symphony/verification-receipts/TASK-3.json",
             )),
@@ -656,6 +790,7 @@ mod tests {
     fn assess_task_completion_gap_marks_external_live_followups() {
         let evidence = TaskCompletionEvidence {
             has_review_handoff: true,
+            unresolved_review_findings: Vec::new(),
             verification_receipt_path: None,
             verification_receipt_present: true,
             verification_receipt_status: None,
@@ -821,6 +956,46 @@ mod tests {
             ..TaskCompletionEvidence::default()
         };
         assert!(evidence.is_fully_evidenced());
+    }
+
+    #[test]
+    fn unresolved_review_findings_block_completion_until_cleared() {
+        let review = r#"# REVIEW
+
+## `TASK-REVIEW`: independent review findings
+- Source: auto parallel independent diff-review gate (held at `[~]`).
+
+1. `src/lib.rs`: real bug.
+
+## `OTHER-TASK`
+- Remaining blockers: missing proof.
+"#;
+        let findings = super::unresolved_review_findings_for_task(review, "TASK-REVIEW");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].contains("TASK-REVIEW"));
+
+        let evidence = TaskCompletionEvidence {
+            has_review_handoff: true,
+            unresolved_review_findings: findings.clone(),
+            verification_receipt_present: true,
+            ..TaskCompletionEvidence::default()
+        };
+        assert!(
+            evidence.is_ready_for_definition_of_done_gates(),
+            "standing review findings should not block entry into the review gate"
+        );
+        assert!(
+            !evidence.is_fully_evidenced(),
+            "standing review findings must block final completion"
+        );
+
+        let cleared = format!(
+            "{review}\n## `TASK-REVIEW`: standing review cleared\n- Source: auto parallel standing-review gate cleared this task after a clean independent review of the current tree.\n- Remaining blockers: none.\n"
+        );
+        assert!(
+            super::unresolved_review_findings_for_task(&cleared, "TASK-REVIEW").is_empty(),
+            "clear marker should supersede earlier standing findings"
+        );
     }
 
     #[test]

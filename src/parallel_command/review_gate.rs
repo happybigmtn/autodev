@@ -11,12 +11,12 @@
 //!   next parallel pass / review-wave picks them up. The task is naturally
 //!   re-dispatched until a pass produces a clean-review diff. No in-lane fix
 //!   loop.
-//! - SKIPPED: any review error, timeout, or unparseable output FAILS OPEN: the
-//!   lane lands exactly as before, but a `review_skipped: <reason>` marker is
-//!   stamped into the lane's closeout log and a warning is logged.
+//! - SKIPPED: any review error, timeout, or unparseable output is not a clean
+//!   review. Landing keeps the task `[~]`, records the reason, and stamps a
+//!   `review_skipped: <reason>` marker into the lane's closeout log.
 //!
-//! The whole gate is bounded (hard subprocess timeout) and fail-open: a bug in
-//! the gate path can never block, hang, or panic the fleet.
+//! The whole gate is bounded by a hard subprocess timeout. A bug in the review
+//! subprocess cannot block or lose landed work, but it also cannot produce `[x]`.
 //!
 //! Toggle:  `AUTO_PARALLEL_REVIEW`               (default "1" = ON; "0" = skip)
 //! Bound:   `AUTO_PARALLEL_REVIEW_TIMEOUT_SECS`  (default 900)
@@ -76,7 +76,8 @@ pub(crate) enum LaneReviewOutcome {
     /// task at `[~]`; the carried summary is appended to `REVIEW.md`.
     FindingsKeepPartial { findings_summary: String },
     /// Review errored, timed out, or produced unparseable output. Fail open:
-    /// land exactly as today and stamp `review_skipped: <reason>`.
+    /// the runner could not produce a clean review, so finalization must hold
+    /// the task `[~]`.
     SkippedFailOpen { reason: String },
 }
 
@@ -109,6 +110,7 @@ pub(crate) fn build_lane_review_prompt(
     target_branch: &str,
     task_id: &str,
     changed_files: &[String],
+    standing_review_findings: &[String],
     report_path: &Path,
 ) -> String {
     let files = if changed_files.is_empty() {
@@ -120,6 +122,22 @@ pub(crate) fn build_lane_review_prompt(
             .map(|path| format!("- `{path}`"))
             .collect::<Vec<_>>()
             .join("\n")
+    };
+    let review_context = if standing_review_findings.is_empty() {
+        "(no unresolved task-specific REVIEW.md findings detected by the host)".to_string()
+    } else {
+        standing_review_findings
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!(
+                    "### Standing finding {}\n{}",
+                    index + 1,
+                    indent_markdown_block(item.trim())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
     format!(
         r#"{skill_boundary}
@@ -133,10 +151,15 @@ Target branch: `{target_branch}`
 Lane diff surface (changed files the host recorded for this task):
 {files}
 
-Inspect the diff for this lane against the target branch (for example: `git diff {target_branch}...HEAD -- <files>`, or `git show` on the landed commits). Review ONLY this lane's changes.
+Task-specific REVIEW.md context from the target repository:
+{review_context}
+
+Inspect the target repository's `REVIEW.md` for this task, then inspect the diff for this lane against the target branch (for example: `git diff {target_branch}...HEAD -- <files>`, or `git show` on the landed commits). Review this lane's changes and any standing REVIEW.md finding for this task.
 
 Your job and its strict boundaries:
 - This is an ADVISORY review. Report ONLY concrete, actionable problems that are clearly attributable to THIS diff: real correctness bugs, real security risks, or clear regressions that the diff introduces.
+- A standing REVIEW.md finding for this task is in scope. Re-run it against the CURRENT tree. If the current tree does not clear it, the verdict is FINDINGS.
+- An empty lane diff is NOT clean when a standing REVIEW.md finding exists for this task.
 - REJECT speculative findings, hypothetical edge cases, "what if" concerns, style nits, and anything you are not confident is a real defect in this diff.
 - Do NOT request refactors, rewrites, broad redesigns, added abstractions, or scope expansion. Those are not findings.
 - Do NOT spawn or request any nested reviewers, sub-agents, or further review passes.
@@ -161,13 +184,22 @@ Use only lightweight local inspection (`git diff`, `git show`, `rg`, targeted fi
         target_branch = target_branch,
         task_id = task_id,
         files = files,
+        review_context = review_context,
         report_path = report_path.display(),
     )
 }
 
+fn indent_markdown_block(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Classify a review report's text into a [`LaneReviewOutcome`]. The first
 /// non-blank line is the authoritative verdict. Unparseable output (no verdict
-/// line, empty report) fails open as `SkippedFailOpen` per the contract.
+/// line, empty report) becomes `SkippedFailOpen`; landing treats that as a
+/// failed definition-of-done gate.
 pub(crate) fn classify_review_report(report_text: &str) -> LaneReviewOutcome {
     let mut verdict_line: Option<&str> = None;
     for line in report_text.lines() {
@@ -263,6 +295,29 @@ pub(crate) fn append_lane_review_findings(
     Ok(())
 }
 
+pub(crate) fn append_lane_review_clearance(repo_root: &Path, task_id: &str) -> Result<bool> {
+    let review_path = repo_root.join("REVIEW.md");
+    let review_text = std::fs::read_to_string(&review_path).unwrap_or_default();
+    if unresolved_review_findings_for_task(&review_text, task_id).is_empty() {
+        return Ok(false);
+    }
+    let mut review_text = if review_text.is_empty() {
+        "# REVIEW\n\nAwaiting auto review:\n".to_string()
+    } else {
+        review_text
+    };
+    if !review_text.ends_with('\n') {
+        review_text.push('\n');
+    }
+    review_text.push_str(&format!(
+        "\n## `{task_id}`: standing review cleared\n\
+- Source: auto parallel standing-review gate cleared this task after a clean independent review of the current tree.\n\
+- Remaining blockers: none.\n"
+    ));
+    atomic_write(&review_path, review_text.as_bytes())?;
+    Ok(true)
+}
+
 fn render_lane_review_findings_entry(task_id: &str, findings_summary: &str) -> String {
     let body = if findings_summary.trim().is_empty() {
         "Independent review reported actionable findings but recorded no detail.".to_string()
@@ -277,7 +332,7 @@ fn render_lane_review_findings_entry(task_id: &str, findings_summary: &str) -> S
     )
 }
 
-/// Run the bounded, fail-open independent review gate for one lane.
+/// Run the bounded independent review gate for one lane.
 ///
 /// This is the public entry wired into the landing seam. It runs a real Codex
 /// review via [`run_logged_codex_review`], bounded by the configured timeout,
@@ -290,12 +345,29 @@ pub(crate) async fn run_lane_review_gate(
     changed_files: &[String],
     config: &LaneReviewConfig,
 ) -> LaneReviewOutcome {
+    let review_text = std::fs::read_to_string(repo_root.join("REVIEW.md")).unwrap_or_default();
+    let standing_review_findings =
+        unresolved_review_findings_for_task(&review_text, &assignment.task.id);
+    if changed_files.is_empty() && !standing_review_findings.is_empty() {
+        return LaneReviewOutcome::FindingsKeepPartial {
+            findings_summary: format!(
+                "Standing REVIEW.md finding remains for `{}` and the landed lane recorded no changed files to clear it:\n\n{}",
+                assignment.task.id,
+                standing_review_findings
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+    }
     let report_path = codex_review_report_path(repo_root, "parallel-lane-review");
     let prompt = build_lane_review_prompt(
         repo_root,
         target_branch,
         &assignment.task.id,
         changed_files,
+        &standing_review_findings,
         &report_path,
     );
     let runner = run_logged_codex_review(
@@ -342,6 +414,33 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("failed to create temp dir");
         path
+    }
+
+    fn test_assignment(root: &Path, task_id: &str) -> ActiveLaneAssignment {
+        ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: task_id.to_string(),
+                title: "standing review".to_string(),
+                status: LoopTaskStatus::Done,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: format!("- [ ] `{task_id}` standing review\n"),
+            },
+            resumed: false,
+            lane_root: root.join("lane-root"),
+            lane_repo_root: root.join("lane-repo"),
+            base_commit: "0000000000000000000000000000000000000000".to_string(),
+            stdout_log_path: root.join("stdout.log"),
+            stderr_log_path: root.join("stderr.log"),
+            worker_pid_path: root.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        }
     }
 
     // --- toggle: AUTO_PARALLEL_REVIEW=0 bypasses the gate -------------------
@@ -427,7 +526,7 @@ mod tests {
     // --- review error / unparseable -> SkippedFailOpen ---------------------
 
     #[test]
-    fn empty_report_fails_open() {
+    fn empty_report_classifies_as_skipped() {
         let outcome = classify_review_report("   \n\n  \n");
         match outcome {
             LaneReviewOutcome::SkippedFailOpen { reason } => {
@@ -438,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_verdict_fails_open() {
+    fn unparseable_verdict_classifies_as_skipped() {
         let outcome = classify_review_report("I think this is fine, no verdict line here.\n");
         match outcome {
             LaneReviewOutcome::SkippedFailOpen { reason } => {
@@ -457,18 +556,45 @@ mod tests {
             "main",
             "TASK-007",
             &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            &["## `TASK-007`: independent review findings\n1. existing blocker".to_string()],
             Path::new("/repo/.auto/logs/report.md"),
         );
         assert!(prompt.contains("INDEPENDENT"));
         assert!(prompt.contains("ADVISORY"));
-        assert!(prompt.contains("THIS lane's diff only") || prompt.contains("THIS lane's changes"));
+        assert!(prompt.contains("standing REVIEW.md finding"));
         assert!(prompt.contains("Do NOT request refactors"));
         assert!(prompt.contains("nested reviewers"));
         assert!(prompt.contains("VERDICT: CLEAN"));
         assert!(prompt.contains("VERDICT: FINDINGS"));
         assert!(prompt.contains("TASK-007"));
         assert!(prompt.contains("src/a.rs"));
+        assert!(prompt.contains("existing blocker"));
         assert!(prompt.contains("prefer CLEAN"));
+    }
+
+    #[tokio::test]
+    async fn empty_diff_with_standing_review_finding_is_not_clean() {
+        let root = temp_dir("standing-empty-diff");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-007`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/x.rs`: still broken.\n",
+        )
+        .expect("write review");
+        let assignment = test_assignment(&root, "TASK-007");
+        let config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: PathBuf::from("/bin/false"),
+        };
+
+        match run_lane_review_gate(&root, "main", &assignment, &[], &config).await {
+            LaneReviewOutcome::FindingsKeepPartial { findings_summary } => {
+                assert!(findings_summary.contains("Standing REVIEW.md finding remains"));
+                assert!(findings_summary.contains("TASK-007"));
+            }
+            other => panic!("empty diff with standing finding must not be clean: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     // --- timeout resolution ------------------------------------------------

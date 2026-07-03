@@ -270,7 +270,7 @@ pub(crate) fn audit_parallel_completion_drift(
     let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
     let mut backfilled_receipts = Vec::new();
-    let mut closed_partial_receipts = Vec::new();
+    let mut manual_closeout_candidates = Vec::new();
 
     for task in snapshot
         .tasks
@@ -291,9 +291,14 @@ pub(crate) fn audit_parallel_completion_drift(
         let entry = ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
-            status: task.status,
+            status: LoopTaskStatus::Partial,
             reasons: evidence.missing_reasons(),
         };
+        updated_plan_text = update_reconciled_task_completion_in_plan_text(
+            &updated_plan_text,
+            task,
+            LoopTaskStatus::Partial,
+        );
         completed_drift.push(entry);
     }
 
@@ -306,9 +311,14 @@ pub(crate) fn audit_parallel_completion_drift(
         if !evidence.is_fully_evidenced() {
             continue;
         }
-        updated_plan_text =
-            update_task_completion_in_plan_text(&updated_plan_text, &task.id, LoopTaskStatus::Done);
-        closed_partial_receipts.push(task.id.clone());
+        manual_closeout_candidates.push(ReceiptDriftTriageEntry {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            status: LoopTaskStatus::Partial,
+            reasons: vec![
+                "repo-local evidence appears complete, but definition-of-done gates must re-run before [x]".to_string(),
+            ],
+        });
     }
 
     if updated_plan_text != plan_text {
@@ -316,12 +326,18 @@ pub(crate) fn audit_parallel_completion_drift(
         atomic_write(&plan_path, updated_plan_text.as_bytes())
             .with_context(|| format!("failed to write {}", plan_path.display()))?;
     }
-    let triage_changed =
-        if !completed_drift.is_empty() || repo_root.join("RECEIPTS-DRIFT.md").exists() {
-            write_receipts_drift_triage(repo_root, completed_drift.as_slice(), &[])?
-        } else {
-            false
-        };
+    let triage_changed = if !completed_drift.is_empty()
+        || !manual_closeout_candidates.is_empty()
+        || repo_root.join("RECEIPTS-DRIFT.md").exists()
+    {
+        write_receipts_drift_triage(
+            repo_root,
+            completed_drift.as_slice(),
+            manual_closeout_candidates.as_slice(),
+        )?
+    } else {
+        false
+    };
     if !backfilled_receipts.is_empty() {
         if push_branch_with_remote_sync(repo_root, target_branch)? {
             parallel_logger.info(format!(
@@ -335,16 +351,20 @@ pub(crate) fn audit_parallel_completion_drift(
             backfilled_receipts.join(", ")
         ));
     }
-    if !closed_partial_receipts.is_empty() {
+    if !manual_closeout_candidates.is_empty() {
         parallel_logger.info(format!(
-            "receipt-closeout: closed {} partial task(s) from canonical repo-local evidence ({})",
-            closed_partial_receipts.len(),
-            closed_partial_receipts.join(", ")
+            "receipt-closeout: found {} partial task(s) with repo-local evidence, but left [~] pending definition-of-done gates ({})",
+            manual_closeout_candidates.len(),
+            manual_closeout_candidates
+                .iter()
+                .map(|entry| entry.task_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if triage_changed && !completed_drift.is_empty() {
         parallel_logger.warn(format!(
-            "warning: repo-local completion evidence drifted for {} completed task(s); wrote RECEIPTS-DRIFT.md and left IMPLEMENTATION_PLAN.md unchanged ({})",
+            "warning: repo-local completion evidence drifted for {} completed task(s); wrote RECEIPTS-DRIFT.md and demoted IMPLEMENTATION_PLAN.md rows to [~] ({})",
             completed_drift.len(),
             completed_drift
                 .iter()
@@ -568,31 +588,28 @@ pub(crate) async fn land_parallel_lane_result(
     } else if completion_status == LoopTaskStatus::Partial {
         assignment.task.status = LoopTaskStatus::Partial;
     }
-    // Host re-execution verify gate: before trusting the worker's receipt to
-    // mark this task [x], the host re-runs the task's own declared verification
-    // commands at canonical HEAD (the integrated state) and only lets it land
-    // [x] on a green it produced itself. Runs before the diff-review gate so a
-    // genuinely-failing task is held at [~] without paying for a codex review.
-    // Gate is bounded, flag-gated (AUTO_PARALLEL_VERIFY_LANDINGS=0 disables), and
-    // fail-open on infra errors / timeouts; fail-closed only on a clean non-zero.
-    let completion_status =
-        apply_lane_verify_gate(repo_root, assignment, completion_status).await;
-    // Independent diff-review gate (openclaw "autoreview" contract): before
-    // the host marks this task [x], run an independent Codex review of the
-    // lane's diff. The gate runs on every lane (unless AUTO_PARALLEL_REVIEW=0),
-    // is bounded by AUTO_PARALLEL_REVIEW_TIMEOUT_SECS, and is FAIL-OPEN: any
-    // error degrades to "land as today + review_skipped". `apply_lane_review_gate`
-    // catches every error path internally so a bug in the gate can never wedge
-    // the orchestrator or change the committed work that already landed.
-    let completion_status = apply_lane_review_gate(
-        repo_root,
-        target_branch,
-        assignment,
-        &changed_files,
-        completion_status,
-        review_config,
-    )
-    .await;
+    // Definition of done: a task may stay `[x]` only if each finalization gate
+    // produces a positive pass on the current integrated tree. Once any gate
+    // holds it at `[~]`, later gates are skipped for this landing.
+    let mut completion_status = completion_status;
+    if completion_status == LoopTaskStatus::Done {
+        completion_status = apply_lane_verify_gate(repo_root, assignment, completion_status).await;
+    }
+    if completion_status == LoopTaskStatus::Done {
+        completion_status =
+            apply_workspace_test_gate(repo_root, assignment, completion_status).await;
+    }
+    if completion_status == LoopTaskStatus::Done {
+        completion_status = apply_lane_review_gate(
+            repo_root,
+            target_branch,
+            assignment,
+            &changed_files,
+            completion_status,
+            review_config,
+        )
+        .await;
+    }
     if repo_has_staged_queue_updates(repo_root)? {
         let message = format!(
             "{}: {} queue sync",
@@ -612,23 +629,21 @@ pub(crate) async fn land_parallel_lane_result(
 
 /// Orchestrator-side glue for the independent diff-review gate.
 ///
-/// Runs the bounded, fail-open review (see [`run_lane_review_gate`]) and maps
+/// Runs the bounded review (see [`run_lane_review_gate`]) and maps
 /// its outcome onto the lane's landing status WITHOUT touching the committed
 /// work that already landed:
 ///
-/// - Gate disabled (`AUTO_PARALLEL_REVIEW=0`) -> return `incoming_status`
-///   unchanged (legacy behavior).
+/// - Gate disabled (`AUTO_PARALLEL_REVIEW=0`) -> hold `[~]`.
 /// - `Clean` -> return `incoming_status` unchanged; the lane lands `[x]`.
 /// - `FindingsKeepPartial` -> append the structured findings to `REVIEW.md`
 ///   (staged for the closeout commit), demote a `Done` task to `Partial` in the
 ///   plan, stamp the lane closeout log, and return `Partial`. An already-Partial
 ///   task stays Partial; findings are still recorded.
-/// - `SkippedFailOpen` -> stamp `review_skipped: <reason>` into the lane's
-///   closeout log, log a warning, and return `incoming_status` unchanged.
+/// - `SkippedFailOpen` -> record the reason, stamp `review_skipped`, and keep
+///   the task `[~]`.
 ///
-/// Every fallible step here is itself fail-open: a write or git error is logged
-/// and degrades to "land as today", so a bug in the gate can never block, hang,
-/// or change a landing decision in a way that loses the worker's committed work.
+/// Write/git errors are logged, but the landing status stays conservative so a
+/// skipped review can never become `[x]`.
 async fn apply_lane_review_gate(
     repo_root: &Path,
     target_branch: &str,
@@ -638,7 +653,15 @@ async fn apply_lane_review_gate(
     review_config: &LaneReviewConfig,
 ) -> LoopTaskStatus {
     if !review_gate_enabled() {
-        return incoming_status;
+        return apply_lane_review_outcome(
+            repo_root,
+            assignment,
+            incoming_status,
+            LaneReviewOutcome::SkippedFailOpen {
+                reason: "AUTO_PARALLEL_REVIEW=0 disabled a mandatory definition-of-done gate"
+                    .to_string(),
+            },
+        );
     }
     let outcome = run_lane_review_gate(
         repo_root,
@@ -651,9 +674,42 @@ async fn apply_lane_review_gate(
     apply_lane_review_outcome(repo_root, assignment, incoming_status, outcome)
 }
 
+fn demote_task_for_failed_gate(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    gate_label: &str,
+) {
+    assignment.task.status = LoopTaskStatus::Partial;
+    if incoming_status != LoopTaskStatus::Done {
+        return;
+    }
+    match update_reconciled_task_completion_in_plan(
+        repo_root,
+        &assignment.task,
+        LoopTaskStatus::Partial,
+    ) {
+        Ok(true) => {
+            if let Err(err) = run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]) {
+                eprintln!(
+                    "warning: failed staging IMPLEMENTATION_PLAN.md after {gate_label} demote for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!(
+                "warning: failed demoting `{}` to [~] after {gate_label}: {err:#}",
+                assignment.task.id
+            );
+        }
+    }
+}
+
 /// Apply a [`LaneReviewOutcome`] to the lane's landing status. Synchronous and
 /// side-effecting (writes `REVIEW.md`, demotes the plan row, stamps the lane
-/// closeout log) but fail-open at every step. Split out of
+/// closeout log). Split out of
 /// [`apply_lane_review_gate`] so tests can drive the demote/append/stamp wiring
 /// with a stubbed outcome instead of calling real codex.
 pub(crate) fn apply_lane_review_outcome(
@@ -666,6 +722,23 @@ pub(crate) fn apply_lane_review_outcome(
         LaneReviewOutcome::Clean => {
             // Clean diff review satisfies any prior review hold on this task.
             clear_gate_hold(repo_root, &assignment.task.id);
+            match append_lane_review_clearance(repo_root, &assignment.task.id) {
+                Ok(true) => {
+                    if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                        eprintln!(
+                            "warning: failed staging REVIEW.md after standing-review clearance for `{}`: {err:#}",
+                            assignment.task.id
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed appending standing-review clearance for `{}`: {err:#}",
+                        assignment.task.id
+                    );
+                }
+            }
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
@@ -676,7 +749,11 @@ pub(crate) fn apply_lane_review_outcome(
         }
         LaneReviewOutcome::FindingsKeepPartial { findings_summary } => {
             // Hold so evidence-only promotion can't re-promote past these findings.
-            record_gate_hold(repo_root, &assignment.task.id, "independent review findings");
+            record_gate_hold(
+                repo_root,
+                &assignment.task.id,
+                "independent review findings",
+            );
             // Record findings for the next pass. Best-effort: a failure here
             // must not block landing the committed work.
             if let Err(err) =
@@ -693,30 +770,12 @@ pub(crate) fn apply_lane_review_outcome(
                 );
             }
             // Hold the task at [~] so it re-dispatches until a clean-review diff.
-            assignment.task.status = LoopTaskStatus::Partial;
-            if incoming_status == LoopTaskStatus::Done {
-                match update_reconciled_task_completion_in_plan(
-                    repo_root,
-                    &assignment.task,
-                    LoopTaskStatus::Partial,
-                ) {
-                    Ok(true) => {
-                        if let Err(err) = run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]) {
-                            eprintln!(
-                                "warning: failed staging IMPLEMENTATION_PLAN.md after independent-review demote for `{}`: {err:#}",
-                                assignment.task.id
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        eprintln!(
-                            "warning: failed demoting `{}` to [~] after independent-review findings: {err:#}",
-                            assignment.task.id
-                        );
-                    }
-                }
-            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "independent-review findings",
+            );
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
@@ -727,8 +786,30 @@ pub(crate) fn apply_lane_review_outcome(
         }
         LaneReviewOutcome::SkippedFailOpen { reason } => {
             eprintln!(
-                "warning: independent-review gate skipped (fail-open) for `{}`: {reason}",
+                "warning: independent-review gate skipped for `{}`; keeping task [~]: {reason}",
                 assignment.task.id
+            );
+            record_gate_hold(repo_root, &assignment.task.id, "independent review skipped");
+            if let Err(err) = append_lane_review_findings(
+                repo_root,
+                &assignment.task.id,
+                &format!("Independent review gate skipped before finalization: {reason}"),
+            ) {
+                eprintln!(
+                    "warning: failed appending independent-review skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                eprintln!(
+                    "warning: failed staging REVIEW.md after independent-review skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "independent-review skip",
             );
             append_lane_host_event(
                 &assignment.stdout_log_path,
@@ -736,40 +817,47 @@ pub(crate) fn apply_lane_review_outcome(
                 &assignment.task.id,
                 &format!("review_skipped: {reason}"),
             );
-            incoming_status
+            LoopTaskStatus::Partial
         }
     }
 }
 
 /// Orchestrator-side glue for the host re-execution verify gate (see
-/// [`super::verify_gate`]). Runs the bounded, fail-open re-execution and maps its
+/// [`super::verify_gate`]). Runs the bounded re-execution and maps its
 /// outcome onto the lane's landing status WITHOUT touching the committed work:
 ///
-/// - Gate disabled (`AUTO_PARALLEL_VERIFY_LANDINGS=0`) -> `incoming_status`.
+/// - Gate disabled (`AUTO_PARALLEL_VERIFY_LANDINGS=0`) -> hold `[~]`.
 /// - `AllPassed` -> `incoming_status` unchanged; the lane lands `[x]`.
 /// - `Failed` -> FAIL-CLOSED: append the failing command + output tail to
 ///   `REVIEW.md` (staged for the closeout), demote a `Done` task to `Partial` in
 ///   the plan, stamp the lane log, and return `Partial`. The task re-dispatches
 ///   until the host's own re-run is green.
-/// - `Skipped` -> FAIL-OPEN: stamp `verify_skipped: <reason>` and return
-///   `incoming_status` unchanged.
-///
-/// Every fallible step is itself fail-open: a write/git error degrades to "land
-/// as today", so the gate can never block, hang, or lose committed work.
+/// - `Skipped` -> FAIL-CLOSED for finalization: stamp `verify_skipped`, record
+///   the reason in `REVIEW.md`, and keep the task `[~]`.
 async fn apply_lane_verify_gate(
     repo_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     incoming_status: LoopTaskStatus,
 ) -> LoopTaskStatus {
     if !verify_gate_enabled() {
-        return incoming_status;
+        return apply_lane_verify_outcome(
+            repo_root,
+            assignment,
+            incoming_status,
+            LaneVerifyOutcome::Skipped {
+                reason:
+                    "AUTO_PARALLEL_VERIFY_LANDINGS=0 disabled a mandatory definition-of-done gate"
+                        .to_string(),
+            },
+        );
     }
-    let outcome = run_lane_verify_gate(repo_root, &assignment.task.markdown).await;
+    let outcome =
+        run_lane_verify_gate(repo_root, &assignment.task.id, &assignment.task.markdown).await;
     apply_lane_verify_outcome(repo_root, assignment, incoming_status, outcome)
 }
 
 /// Apply a [`LaneVerifyOutcome`] to the lane's landing status. Synchronous and
-/// side-effecting but fail-open at every step. Split out so tests can drive the
+/// side-effecting. Split out so tests can drive the
 /// demote/append/stamp wiring with a stubbed outcome instead of spawning builds.
 pub(crate) fn apply_lane_verify_outcome(
     repo_root: &Path,
@@ -810,30 +898,12 @@ pub(crate) fn apply_lane_verify_outcome(
                 );
             }
             // Hold the task at [~] so it re-dispatches until the host's re-run is green.
-            assignment.task.status = LoopTaskStatus::Partial;
-            if incoming_status == LoopTaskStatus::Done {
-                match update_reconciled_task_completion_in_plan(
-                    repo_root,
-                    &assignment.task,
-                    LoopTaskStatus::Partial,
-                ) {
-                    Ok(true) => {
-                        if let Err(err) = run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]) {
-                            eprintln!(
-                                "warning: failed staging IMPLEMENTATION_PLAN.md after host-reexec-verify demote for `{}`: {err:#}",
-                                assignment.task.id
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        eprintln!(
-                            "warning: failed demoting `{}` to [~] after host-reexec-verify failure: {err:#}",
-                            assignment.task.id
-                        );
-                    }
-                }
-            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "host-reexec-verify failure",
+            );
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
@@ -843,13 +913,139 @@ pub(crate) fn apply_lane_verify_outcome(
             LoopTaskStatus::Partial
         }
         LaneVerifyOutcome::Skipped { reason } => {
+            record_gate_hold(
+                repo_root,
+                &assignment.task.id,
+                "host re-execution verification skipped",
+            );
+            if let Err(err) = append_lane_verify_failure(
+                repo_root,
+                &assignment.task.id,
+                &format!("host re-execution verification skipped before finalization: {reason}"),
+            ) {
+                eprintln!(
+                    "warning: failed appending host-reexec-verify skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                eprintln!(
+                    "warning: failed staging REVIEW.md after host-reexec-verify skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "host-reexec-verify skip",
+            );
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
                 &assignment.task.id,
                 &format!("verify_skipped: {reason}"),
             );
+            LoopTaskStatus::Partial
+        }
+    }
+}
+
+async fn apply_workspace_test_gate(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+) -> LoopTaskStatus {
+    let outcome = run_workspace_test_gate(repo_root).await;
+    apply_workspace_test_outcome(repo_root, assignment, incoming_status, outcome)
+}
+
+pub(crate) fn apply_workspace_test_outcome(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    outcome: WorkspaceTestOutcome,
+) -> LoopTaskStatus {
+    match outcome {
+        WorkspaceTestOutcome::Passed => {
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                "workspace-test: `cargo test --workspace` passed at canonical HEAD",
+            );
             incoming_status
+        }
+        WorkspaceTestOutcome::Failed { detail } => {
+            record_gate_hold(
+                repo_root,
+                &assignment.task.id,
+                "workspace cargo test failed",
+            );
+            if let Err(err) = append_lane_workspace_test_failure(
+                repo_root,
+                &assignment.task.id,
+                "workspace cargo test failed before finalization",
+                &detail,
+            ) {
+                eprintln!(
+                    "warning: failed appending workspace-test failure for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                eprintln!(
+                    "warning: failed staging REVIEW.md after workspace-test failure for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "workspace-test failure",
+            );
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                "workspace-test: `cargo test --workspace` FAILED at canonical HEAD; task held [~]",
+            );
+            LoopTaskStatus::Partial
+        }
+        WorkspaceTestOutcome::Skipped { reason } => {
+            record_gate_hold(
+                repo_root,
+                &assignment.task.id,
+                "workspace cargo test skipped",
+            );
+            if let Err(err) = append_lane_workspace_test_failure(
+                repo_root,
+                &assignment.task.id,
+                "workspace cargo test skipped before finalization",
+                &reason,
+            ) {
+                eprintln!(
+                    "warning: failed appending workspace-test skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+                eprintln!(
+                    "warning: failed staging REVIEW.md after workspace-test skip for `{}`: {err:#}",
+                    assignment.task.id
+                );
+            }
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "workspace-test skip",
+            );
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!("workspace_test_skipped: {reason}"),
+            );
+            LoopTaskStatus::Partial
         }
     }
 }
@@ -870,6 +1066,33 @@ fn append_lane_verify_failure(repo_root: &Path, task_id: &str, detail: &str) -> 
         "\n## `{task_id}`: host re-execution verification failed\n\
 - Source: auto parallel host re-execution verify gate (held at `[~]`).\n\
 - The host re-ran this task's declared verification command(s) at canonical HEAD and one FAILED.\n  Fix the failure, then the task re-dispatches until the host's own re-run is green.\n\n\
+```\n{}\n```\n",
+        detail.trim()
+    ));
+    atomic_write(&review_path, review_text.as_bytes())?;
+    Ok(())
+}
+
+fn append_lane_workspace_test_failure(
+    repo_root: &Path,
+    task_id: &str,
+    title: &str,
+    detail: &str,
+) -> Result<()> {
+    let review_path = repo_root.join("REVIEW.md");
+    let mut review_text = if review_path.exists() {
+        std::fs::read_to_string(&review_path)?
+    } else {
+        "# REVIEW\n\nAwaiting auto review:\n".to_string()
+    };
+    if !review_text.ends_with('\n') {
+        review_text.push('\n');
+    }
+    review_text.push_str(&format!(
+        "\n## `{task_id}`: workspace cargo test failed\n\
+- Source: auto parallel workspace definition-of-done gate (held at `[~]`).\n\
+- The host requires `cargo test --workspace` to pass on the current tree before any task can be marked `[x]`.\n\
+- Gate result: {title}.\n\n\
 ```\n{}\n```\n",
         detail.trim()
     ));
@@ -964,7 +1187,10 @@ pub(crate) fn propagate_lane_receipts(
         if let Ok(plan_bytes) = std::fs::read(canonical_root.join("IMPLEMENTATION_PLAN.md")) {
             let plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(&plan_bytes);
             if let Some(obj) = value.as_object_mut() {
-                obj.insert("plan_hash".to_string(), serde_json::Value::String(plan_hash));
+                obj.insert(
+                    "plan_hash".to_string(),
+                    serde_json::Value::String(plan_hash),
+                );
             }
         }
         let pretty = serde_json::to_string_pretty(&value)
@@ -1016,9 +1242,9 @@ pub(crate) fn propagate_lane_receipts(
 
 pub(crate) fn reconcile_parallel_clean_no_commit(
     repo_root: &Path,
-    target_branch: &str,
+    _target_branch: &str,
     assignment: &ActiveLaneAssignment,
-    parallel_logger: &ParallelEventLogger,
+    _parallel_logger: &ParallelEventLogger,
 ) -> Result<bool> {
     write_clean_no_commit_verdict(
         assignment,
@@ -1037,69 +1263,17 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
     }
     let evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
-    let review_can_complete_evidence = !evidence_before.has_review_handoff
-        && evidence_before.verification_receipt_present
-        && evidence_before.missing_completion_artifacts.is_empty()
-        && evidence_before.unresolved_audit_findings.is_empty();
-    let review_added = if evidence_before.is_fully_evidenced() || review_can_complete_evidence {
-        ensure_host_review_handoff(repo_root, &assignment.task.id, &[], &evidence_before)?
-    } else {
-        false
-    };
-    let evidence_after =
-        inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
-    if !evidence_after.is_fully_evidenced() {
+    if !evidence_before.is_fully_evidenced() {
         return Ok(false);
     }
 
-    let plan_updated =
-        update_task_completion_in_plan(repo_root, &assignment.task.id, LoopTaskStatus::Done)?;
-    if review_added || plan_updated {
-        let mut queue_files = Vec::new();
-        if review_added {
-            queue_files.push("REVIEW.md");
-        }
-        if plan_updated {
-            queue_files.push("IMPLEMENTATION_PLAN.md");
-        }
-        let mut args = vec!["add"];
-        args.extend(queue_files);
-        run_git(repo_root, args)?;
-        if repo_has_staged_queue_updates(repo_root)? {
-            let message = format!(
-                "{}: {} evidence self-heal",
-                repo_name(repo_root),
-                assignment.task.id
-            );
-            commit_task_closeout(repo_root, &assignment.task.id, &message, false)?;
-            if push_branch_with_remote_sync(repo_root, target_branch)? {
-                parallel_logger.info(format!(
-                    "remote sync: rebased onto origin/{} after evidence self-heal",
-                    target_branch
-                ));
-            }
-        }
-    } else {
-        let message = format!(
-            "{}: {} evidence closeout",
-            repo_name(repo_root),
-            assignment.task.id
-        );
-        commit_task_closeout(repo_root, &assignment.task.id, &message, true)?;
-        if push_branch_with_remote_sync(repo_root, target_branch)? {
-            parallel_logger.info(format!(
-                "remote sync: rebased onto origin/{} after empty evidence closeout",
-                target_branch
-            ));
-        }
-    }
     write_clean_no_commit_verdict(
         assignment,
-        "task-already-done",
-        "canonical review, receipt, and declared artifact evidence are complete; host created an evidence closeout",
+        "landed-unverified",
+        "canonical evidence appears complete, but no-commit self-heal cannot run the mandatory current-tree definition-of-done gates; task stays [~]",
     )?;
 
-    Ok(true)
+    Ok(false)
 }
 
 /// Host-local run state marking a task as "held" by a host gate (verify or
@@ -1146,14 +1320,11 @@ pub(crate) fn task_is_gate_held(repo_root: &Path, task_id: &str) -> bool {
     gate_hold_path(repo_root, task_id).exists()
 }
 
-/// Promote a single task to `[x]` from canonical completion evidence alone,
-/// without dispatching a worker, when that evidence is already complete. This is
-/// the shared per-task core of both the end-of-run shelved recovery and the
-/// pre-dispatch self-heal: inspect canonical evidence, and only if it is fully
-/// evidenced (the SAME `is_fully_evidenced()` gate used everywhere) write the
-/// host review handoff, flip the plan checkbox to done, and commit the closeout.
-/// It performs NO push so batch callers can push once; returns whether the task
-/// was promoted.
+/// Legacy evidence-only promotion hook. The definition of done now requires
+/// current-tree task verification, workspace tests, and standing-review
+/// clearance, so canonical evidence alone can no longer flip `[~]` to `[x]`.
+/// Returns `false` after inspecting evidence so callers fall through to a real
+/// worker/gate pass.
 pub(crate) fn promote_task_from_canonical_evidence_no_push(
     repo_root: &Path,
     task_id: &str,
@@ -1168,38 +1339,14 @@ pub(crate) fn promote_task_from_canonical_evidence_no_push(
     if !evidence.is_fully_evidenced() {
         return Ok(false);
     }
-    let review_added = ensure_host_review_handoff(repo_root, task_id, &[], &evidence)?;
-    let plan_updated = update_task_completion_in_plan(repo_root, task_id, LoopTaskStatus::Done)?;
-    if review_added {
-        run_git(repo_root, ["add", "REVIEW.md"])?;
-    }
-    if plan_updated {
-        run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
-    }
-    let message = format!("{}: {} evidence recovery", repo_name(repo_root), task_id);
-    if repo_has_staged_queue_updates(repo_root)? {
-        commit_task_closeout(repo_root, task_id, &message, false)?;
-    } else {
-        commit_task_closeout(repo_root, task_id, &message, true)?;
-    }
-    Ok(true)
+    Ok(false)
 }
 
-/// Pre-dispatch self-heal: before spending an expensive worker on a `[~]`
-/// (partial) task, check whether its canonical evidence is already complete and,
-/// if so, promote it to `[x]` (and push) instead of dispatching. Returns whether
-/// the task was promoted (and therefore must NOT be dispatched).
-///
-/// This reclaims receipts that became valid only once HEAD advanced past the
-/// receipt's recorded commit: the freshness gate (`receipt.rs`) skips the
-/// plan-hash, dirty-state, and command checks once the receipt commit is an
-/// ancestor of HEAD rather than HEAD itself, so a follow-up that was marked
-/// `[~]` purely for a stale plan-hash self-heals as soon as any other task
-/// lands. Without this check, each such already-done follow-up still burns one
-/// full worker session (which exits clean-no-commit and is shelved) before the
-/// post-exit `reconcile_parallel_clean_no_commit` / end-of-run shelved recovery
-/// reclaims it. The genuine-partial tasks fail `is_fully_evidenced()` here and
-/// fall through to a normal worker dispatch unchanged.
+/// Pre-dispatch evidence check for legacy callers. This used to promote
+/// already-evidenced `[~]` rows to `[x]`, but the definition of done now
+/// requires current-tree task verification, workspace tests, and review
+/// clearance. Evidence-only paths therefore fall through to a real worker/gate
+/// pass.
 pub(crate) fn try_promote_partial_before_dispatch(
     repo_root: &Path,
     target_branch: &str,
@@ -1292,7 +1439,7 @@ pub(crate) fn reconcile_parallel_landed_task_state(
     let review_added =
         ensure_host_review_handoff(repo_root, &task.id, changed_files, &review_evidence)?;
     let evidence_after = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-    let completion_status = if evidence_after.is_fully_evidenced() {
+    let completion_status = if evidence_after.is_ready_for_definition_of_done_gates() {
         LoopTaskStatus::Done
     } else {
         LoopTaskStatus::Partial
@@ -1731,10 +1878,8 @@ mod tests {
         propagate_lane_receipts(&lane, &canonical, "TASK-1").expect("propagate should succeed");
 
         let propagated: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(
-                canonical.join(".auto/symphony/verification-receipts/TASK-1.json"),
-            )
-            .expect("failed to read canonical receipt"),
+            &fs::read_to_string(canonical.join(".auto/symphony/verification-receipts/TASK-1.json"))
+                .expect("failed to read canonical receipt"),
         )
         .expect("failed to parse canonical receipt");
 
@@ -1756,15 +1901,13 @@ mod tests {
     }
 
     #[test]
-    fn promote_from_canonical_evidence_flips_fully_evidenced_partial_to_done() {
+    fn promote_from_canonical_evidence_refuses_fully_evidenced_partial_without_gates() {
         let repo = unique_temp_dir("promote-evidence-done");
         init_git_repo(&repo);
 
-        // A partial task with NO executable verification commands (so a receipt
-        // is not required) and no declared completion artifacts: the only
-        // remaining evidence requirement is a REVIEW.md handoff, which is
-        // present. This is the already-done follow-up case the pre-dispatch
-        // self-heal must promote without burning a worker.
+        // Canonical evidence alone used to promote this already-evidenced
+        // follow-up. The definition of done now requires current-tree gates, so
+        // the evidence-only self-heal must leave it [~].
         let task_markdown = "- [~] `TASK-1` Already complete follow-up\n\nNo verification commands and no completion artifacts to chase.\n";
         fs::write(
             repo.join("IMPLEMENTATION_PLAN.md"),
@@ -1781,18 +1924,21 @@ mod tests {
         let head_before = git_output(&repo, ["rev-parse", "HEAD"]);
 
         let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
-            .expect("promotion should not error");
-        assert!(promoted, "fully-evidenced partial must be promoted");
+            .expect("promotion check should not error");
+        assert!(
+            !promoted,
+            "fully-evidenced partial must not promote without DoD gates"
+        );
 
         let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
         assert!(
-            plan.contains("- [x] `TASK-1`"),
-            "plan checkbox must flip [~] -> [x], got:\n{plan}"
+            plan.contains("- [~] `TASK-1`"),
+            "plan checkbox must stay [~], got:\n{plan}"
         );
         let head_after = git_output(&repo, ["rev-parse", "HEAD"]);
-        assert_ne!(
+        assert_eq!(
             head_before, head_after,
-            "promotion must create a closeout commit"
+            "no closeout commit should be created"
         );
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
@@ -1824,17 +1970,24 @@ mod tests {
         record_gate_hold(&repo, "TASK-1", "host re-execution verification failed");
         let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
             .expect("promotion check should not error");
-        assert!(!promoted, "gate-held task must not be promoted from evidence");
+        assert!(
+            !promoted,
+            "gate-held task must not be promoted from evidence"
+        );
         let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
         assert!(plan.contains("- [~] `TASK-1`"), "plan stays [~]: {plan}");
         assert_eq!(head_before, git_output(&repo, ["rev-parse", "HEAD"]));
 
-        // Clearing the hold (task re-verified) re-enables promotion.
+        // Clearing the old local hold is still not enough; [x] requires the
+        // current-tree verify, workspace-test, and review gates.
         clear_gate_hold(&repo, "TASK-1");
         assert!(!task_is_gate_held(&repo, "TASK-1"));
         let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
             .expect("promotion should not error after clear");
-        assert!(promoted, "task promotes once the gate hold is cleared");
+        assert!(
+            !promoted,
+            "task still must not promote from evidence after clearing hold"
+        );
 
         fs::remove_dir_all(&repo).expect("cleanup");
     }
@@ -1858,7 +2011,10 @@ mod tests {
 
         let promoted = promote_task_from_canonical_evidence_no_push(&repo, "TASK-1", task_markdown)
             .expect("promotion check should not error");
-        assert!(!promoted, "task without a REVIEW handoff must not be promoted");
+        assert!(
+            !promoted,
+            "task without a REVIEW handoff must not be promoted"
+        );
 
         let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
         assert!(
@@ -2085,6 +2241,75 @@ mod tests {
     }
 
     #[test]
+    fn landed_task_reconciliation_enters_gates_with_standing_review_findings() {
+        let repo = unique_temp_dir("parallel-landed-task-standing-review");
+        init_git_repo(&repo);
+        fs::write(repo.join("README.md"), "# seed\n").expect("failed to write seed");
+        run_git_in(&repo, ["add", "README.md"]);
+        run_git_in(&repo, ["commit", "-m", "initial"]);
+        let receipt_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [ ] `TASK-004` Clear standing finding\nVerification:\n  - `cargo test -p demo task_004`\nDependencies: none\n",
+        )
+        .expect("failed to write plan");
+        fs::create_dir_all(repo.join("scripts")).expect("failed to create scripts dir");
+        fs::write(repo.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(repo.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            repo.join(".auto/symphony/verification-receipts/TASK-004.json"),
+            format!(
+                r#"{{"commit":"{receipt_commit}","commands":[{{"command":"cargo test -p demo task_004","exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("failed to write receipt");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-004`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/lib.rs`: stale standing finding to re-run.\n",
+        )
+        .expect("failed to write review");
+        run_git_in(
+            &repo,
+            [
+                "add",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "scripts/run-task-verification.sh",
+                ".auto/symphony/verification-receipts/TASK-004.json",
+            ],
+        );
+        run_git_in(&repo, ["commit", "-m", "seed task"]);
+
+        let mut task = LoopTask {
+            id: "TASK-004".to_string(),
+            title: "Clear standing finding".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: Vec::new(),
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-004` Clear standing finding\nVerification:\n  - `cargo test -p demo task_004`\nDependencies: none\n".to_string(),
+        };
+
+        let status =
+            reconcile_parallel_landed_task_state(&repo, &mut task, &["src/lib.rs".to_string()])
+                .expect("landing reconciliation should complete");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(task.status, LoopTaskStatus::Done);
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md"))
+            .expect("plan should be readable");
+        assert!(
+            plan.contains("- [x] `TASK-004` Clear standing finding"),
+            "ready tasks should enter final gates even when REVIEW.md still has a standing finding: {plan}"
+        );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
     fn prepare_lane_landing_recovery_rebases_cleanly_when_possible() {
         let (root, remote, upstream, _worker) =
             init_remote_and_clones("parallel-landing-recovery-clean", "main");
@@ -2287,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_parallel_completion_drift_warns_without_demoting_plan() {
+    fn audit_parallel_completion_drift_demotes_completed_rows() {
         let repo = unique_temp_dir("parallel-drift-audit");
         let run_root = unique_temp_dir("parallel-drift-audit-run");
         fs::create_dir_all(&repo).expect("failed to create repo dir");
@@ -2304,18 +2529,18 @@ mod tests {
         )
         .expect("drift audit should succeed");
 
-        assert_eq!(updated, plan);
+        assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
-        assert_eq!(persisted, plan);
+        assert_eq!(persisted, updated);
         let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
             triage.contains("TASK-001") && triage.contains("Completed Tasks With Drift"),
-            "receipt drift should be report-only, not scheduler work"
+            "receipt drift should stay visible in triage"
         );
         let live_log = fs::read_to_string(run_root.join("live.log"))
             .expect("receipt repair should write host log");
-        assert!(live_log.contains("left IMPLEMENTATION_PLAN.md unchanged"));
+        assert!(live_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
     }
 
     #[test]
@@ -2330,10 +2555,10 @@ mod tests {
 
         let updated = audit_parallel_completion_drift(&repo, "main", plan, &logger)
             .expect("first drift audit should succeed");
-        assert_eq!(updated, plan);
+        assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
         let first_log =
             fs::read_to_string(run_root.join("live.log")).expect("first audit should log drift");
-        assert!(first_log.contains("left IMPLEMENTATION_PLAN.md unchanged"));
+        assert!(first_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
 
         audit_parallel_completion_drift(&repo, "main", &updated, &logger)
             .expect("second drift audit should succeed");
@@ -2344,10 +2569,12 @@ mod tests {
             "unchanged receipt drift should stay visible in RECEIPTS-DRIFT.md without appending another fresh host warning"
         );
 
+        let drift_summary = receipt_drift_status_summary(&repo);
         assert!(
-            receipt_drift_status_summary(&repo)
-                .is_some_and(|summary| summary.contains("1 completed task(s)")),
-            "completed receipt drift should remain status noise, not scheduler work"
+            drift_summary
+                .as_deref()
+                .is_none_or(|summary| !summary.contains("completed task(s)")),
+            "completed receipt drift should be cleared once the row is demoted: {drift_summary:?}"
         );
     }
 
@@ -2459,18 +2686,18 @@ mod tests {
         )
         .expect("drift audit should succeed");
 
-        assert!(updated.starts_with("- [x] `TASK-001`"));
+        assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
         assert_eq!(persisted, updated);
         let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
-            triage.is_empty() || triage.contains("No repo-local receipt drift detected."),
-            "closeout should not leave actionable receipt drift"
+            triage.contains("Manual Closeout Candidates") && triage.contains("TASK-001"),
+            "closeout candidate should be reported without promotion: {triage}"
         );
         let live_log =
             fs::read_to_string(run_root.join("live.log")).expect("closeout should write host log");
-        assert!(live_log.contains("receipt-closeout: closed 1 partial task(s)"));
+        assert!(live_log.contains("left [~] pending definition-of-done gates"));
     }
     fn review_gate_assignment(
         root: &std::path::Path,
@@ -2574,11 +2801,18 @@ mod tests {
     }
 
     #[test]
-    fn review_skipped_outcome_fails_open_and_stamps_review_skipped() {
+    fn review_skipped_outcome_demotes_done_and_records_review_md() {
         let root = unique_temp_dir("review-gate-skipped");
         init_git_repo(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-SKIP-1` review error stays partial\n",
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed plan"]);
         let mut assignment =
-            review_gate_assignment(&root, "TASK-SKIP-1", "review error lands as today");
+            review_gate_assignment(&root, "TASK-SKIP-1", "review error stays partial");
         let status = apply_lane_review_outcome(
             &root,
             &mut assignment,
@@ -2587,13 +2821,24 @@ mod tests {
                 reason: "review timed out after 900s".to_string(),
             },
         );
-        // Fail-open: status unchanged from what landed today.
-        assert_eq!(status, LoopTaskStatus::Done);
-        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("plan readable");
+        assert!(
+            plan.contains("- [~] `TASK-SKIP-1` review error stays partial"),
+            "plan should demote done row: {plan}"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("review written");
+        assert!(review.contains("## `TASK-SKIP-1`: independent review findings"));
+        assert!(review.contains("review timed out after 900s"));
         let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
         assert!(log.contains("review_skipped: review timed out after 900s"));
-        // Fail-open must not append findings.
-        assert!(!root.join("REVIEW.md").exists());
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -2636,7 +2881,8 @@ mod tests {
             &mut assignment,
             LoopTaskStatus::Done,
             LaneVerifyOutcome::Failed {
-                detail: "`cargo test foo` exited with status 101\nthread 'foo' panicked".to_string(),
+                detail: "`cargo test foo` exited with status 101\nthread 'foo' panicked"
+                    .to_string(),
             },
         );
         assert_eq!(status, LoopTaskStatus::Partial);
@@ -2651,9 +2897,94 @@ mod tests {
         assert!(review.contains("cargo test foo"));
         let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
         assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
-        assert!(staged.contains("IMPLEMENTATION_PLAN.md"), "plan staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
         let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
         assert!(log.contains("host-reexec-verify: a declared verification command FAILED"));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn verify_skipped_outcome_demotes_done_and_records_failure() {
+        let root = unique_temp_dir("verify-gate-skip");
+        init_git_repo(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-VSKIP-1` host re-run skipped demotes this\n",
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed plan"]);
+
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-VSKIP-1", "host re-run skipped demotes this");
+        let status = apply_lane_verify_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            LaneVerifyOutcome::Skipped {
+                reason: "no host-reproducible verification commands".to_string(),
+            },
+        );
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("plan readable");
+        assert!(
+            plan.contains("- [~] `TASK-VSKIP-1` host re-run skipped demotes this"),
+            "plan should demote done row: {plan}"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("review written");
+        assert!(review.contains("host re-execution verification skipped"));
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn workspace_test_failed_outcome_demotes_done_and_records_failure() {
+        let root = unique_temp_dir("workspace-gate-fail");
+        init_git_repo(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-WFAIL-1` workspace red demotes this\n",
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed plan"]);
+
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-WFAIL-1", "workspace red demotes this");
+        let status = apply_workspace_test_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            WorkspaceTestOutcome::Failed {
+                detail: "`cargo test --workspace` exited with status 101\ncompile error"
+                    .to_string(),
+            },
+        );
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("plan readable");
+        assert!(
+            plan.contains("- [~] `TASK-WFAIL-1` workspace red demotes this"),
+            "plan should demote done row: {plan}"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("review written");
+        assert!(review.contains("## `TASK-WFAIL-1`: workspace cargo test failed"));
+        assert!(review.contains("compile error"));
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }

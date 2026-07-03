@@ -356,28 +356,6 @@ pub(crate) fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
     Ok(parse_loop_plan(&plan))
 }
 
-pub(crate) fn update_task_completion_in_plan(
-    repo_root: &Path,
-    task_id: &str,
-    status: LoopTaskStatus,
-) -> Result<bool> {
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
-    if !plan_path.exists() {
-        return Ok(false);
-    }
-
-    let plan = fs::read_to_string(&plan_path)
-        .with_context(|| format!("failed to read {}", plan_path.display()))?;
-    let updated = update_task_completion_in_plan_text(&plan, task_id, status);
-    if updated == plan {
-        return Ok(false);
-    }
-
-    atomic_write(&plan_path, updated.as_bytes())
-        .with_context(|| format!("failed to write {}", plan_path.display()))?;
-    Ok(true)
-}
-
 pub(crate) fn update_reconciled_task_completion_in_plan(
     repo_root: &Path,
     task: &LoopTask,
