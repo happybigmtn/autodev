@@ -44,6 +44,7 @@ mod task_parser;
 mod util;
 mod verdict;
 mod verification_lint;
+mod verification_wrapper;
 
 use anyhow::Result;
 use clap::Parser;

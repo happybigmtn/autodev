@@ -1,4 +1,8 @@
 use super::*;
+use crate::verification_wrapper::{
+    ensure_verification_wrapper_executable, VerificationWrapperScaffold,
+    VERIFICATION_WRAPPER_RELATIVE,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ParallelPreflightReport {
@@ -92,6 +96,28 @@ pub(crate) fn run_parallel_preflight(
         .to_ascii_lowercase();
 
     let preflight_needs = classify_parallel_preflight_needs(&task_text, repo_root);
+
+    match ensure_verification_wrapper_executable(repo_root) {
+        Ok(VerificationWrapperScaffold::Installed) => report.add(
+            PreflightStatus::Ok,
+            "verification wrapper",
+            format!("scaffolded executable {VERIFICATION_WRAPPER_RELATIVE} for receipt-backed task proof"),
+        ),
+        Ok(VerificationWrapperScaffold::Present | VerificationWrapperScaffold::FixedMode) => {
+            report.add(
+                PreflightStatus::Ok,
+                "verification wrapper",
+                format!("executable {VERIFICATION_WRAPPER_RELATIVE} is present"),
+            );
+        }
+        Err(err) => report.add(
+            PreflightStatus::Warn,
+            "verification wrapper",
+            format!(
+                "could not scaffold {VERIFICATION_WRAPPER_RELATIVE}: {err:#}; lanes should run direct verification and report receipt blockers explicitly"
+            ),
+        ),
+    }
 
     if repo_uses_cargo(repo_root) {
         report.add(
@@ -458,6 +484,28 @@ mod tests {
                 regtest: false,
             }
         );
+
+        fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn preflight_scaffolds_missing_verification_wrapper() {
+        let repo = unique_temp_dir("parallel-preflight-wrapper");
+        let run_root = repo.join(".auto/parallel");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let plan = parse_loop_plan(
+            "# Plan\n\n- [ ] `TASK-1` Example\nVerification: `bash -c true`\nDependencies: none\n",
+        );
+
+        let report =
+            run_parallel_preflight(&repo, &plan, &run_root, &logger).expect("preflight succeeds");
+
+        let wrapper = repo.join("scripts/run-task-verification.sh");
+        assert!(wrapper.is_file(), "preflight should scaffold wrapper");
+        assert!(report.checks.iter().any(|check| {
+            check.name == "verification wrapper" && check.detail.contains("scaffolded")
+        }));
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
     }

@@ -9,6 +9,10 @@ use crate::corpus::load_planning_corpus;
 use crate::state::load_state;
 use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::git_repo_root;
+use crate::verification_wrapper::{
+    ensure_verification_wrapper_executable, VerificationWrapperScaffold,
+    VERIFICATION_WRAPPER_RELATIVE,
+};
 
 const AUTODEV_REQUIRED_LAYOUT: &[&str] = &["Cargo.toml", "src/main.rs", "README.md", "AGENTS.md"];
 const PROJECT_AGENT_INSTRUCTION_FILES: &[&str] =
@@ -507,6 +511,8 @@ fn check_disk_budget(path: &Path, min_disk_kb: u64) -> RequiredCheck {
 
 fn check_planning_health(repo_root: &Path) -> Vec<RequiredCheck> {
     let mut checks = Vec::new();
+    checks.push(check_verification_wrapper_scaffold(repo_root));
+
     let state = load_state(repo_root).unwrap_or_default();
     let planning_root = state
         .planning_root
@@ -597,6 +603,33 @@ fn check_planning_health(repo_root: &Path) -> Vec<RequiredCheck> {
     });
 
     checks
+}
+
+fn check_verification_wrapper_scaffold(repo_root: &Path) -> RequiredCheck {
+    match ensure_verification_wrapper_executable(repo_root) {
+        Ok(VerificationWrapperScaffold::Installed) => RequiredCheck {
+            name: "verification wrapper".to_string(),
+            passed: true,
+            detail: format!("scaffolded {VERIFICATION_WRAPPER_RELATIVE}"),
+            action: None,
+        },
+        Ok(VerificationWrapperScaffold::Present | VerificationWrapperScaffold::FixedMode) => {
+            RequiredCheck {
+                name: "verification wrapper".to_string(),
+                passed: true,
+                detail: format!("found executable {VERIFICATION_WRAPPER_RELATIVE}"),
+                action: None,
+            }
+        }
+        Err(err) => RequiredCheck {
+            name: "verification wrapper".to_string(),
+            passed: false,
+            detail: format!("failed to scaffold {VERIFICATION_WRAPPER_RELATIVE}: {err:#}"),
+            action: Some(format!(
+                "make the repository writable or create executable {VERIFICATION_WRAPPER_RELATIVE}"
+            )),
+        },
+    }
 }
 
 fn check_autodev_required_layout(repo_root: &Path) -> Vec<RequiredCheck> {

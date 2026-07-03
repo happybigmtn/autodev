@@ -108,11 +108,6 @@ pub(crate) async fn run_lane_verify_gate(
             reason: "no host-reproducible verification commands to re-run".to_string(),
         };
     }
-    if !repo_root.join("scripts/run-task-verification.sh").is_file() {
-        return LaneVerifyOutcome::Failed {
-            detail: "missing `scripts/run-task-verification.sh`; cannot produce current-tree verification receipt".to_string(),
-        };
-    }
     let deadline = verify_timeout();
     match tokio::time::timeout(
         deadline,
@@ -127,27 +122,42 @@ pub(crate) async fn run_lane_verify_gate(
     }
 }
 
-/// Run each command through the repo's receipt wrapper. `kill_on_drop` ensures
-/// a timeout terminates an in-flight build rather than orphaning it.
+/// Run each command through the repo's receipt wrapper when present, otherwise
+/// run it directly through the shell. Wrapper absence is a compatibility path,
+/// not a verification failure by itself.
 async fn run_verify_commands(
     repo_root: PathBuf,
     task_id: String,
     commands: Vec<String>,
 ) -> LaneVerifyOutcome {
+    let wrapper = repo_root.join("scripts/run-task-verification.sh");
+    let wrapper_present = wrapper.is_file();
     for command in &commands {
-        let Some(argv) = shell_split(command) else {
-            return LaneVerifyOutcome::Failed {
-                detail: format!("could not parse verification command `{command}` as shell argv"),
+        let result = if wrapper_present {
+            let Some(argv) = shell_split(command) else {
+                return LaneVerifyOutcome::Failed {
+                    detail: format!(
+                        "could not parse verification command `{command}` as shell argv"
+                    ),
+                };
             };
+            tokio::process::Command::new("scripts/run-task-verification.sh")
+                .arg(&task_id)
+                .arg("--")
+                .args(&argv)
+                .current_dir(&repo_root)
+                .kill_on_drop(true)
+                .output()
+                .await
+        } else {
+            tokio::process::Command::new("bash")
+                .arg("-lc")
+                .arg(command)
+                .current_dir(&repo_root)
+                .kill_on_drop(true)
+                .output()
+                .await
         };
-        let result = tokio::process::Command::new("scripts/run-task-verification.sh")
-            .arg(&task_id)
-            .arg("--")
-            .args(&argv)
-            .current_dir(&repo_root)
-            .kill_on_drop(true)
-            .output()
-            .await;
         match result {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
@@ -165,7 +175,7 @@ async fn run_verify_commands(
             }
             Err(err) => {
                 return LaneVerifyOutcome::Failed {
-                    detail: format!("could not run verification wrapper for `{command}`: {err}"),
+                    detail: format!("could not run verification command `{command}`: {err}"),
                 };
             }
         }
@@ -368,17 +378,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_lane_verify_gate_fails_when_wrapper_missing() {
+    async fn run_lane_verify_gate_falls_back_when_wrapper_missing() {
         let dir =
             std::env::temp_dir().join(format!("autodev-verify-wrapper-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
-        match run_lane_verify_gate(&dir, "TASK-1", markdown).await {
-            LaneVerifyOutcome::Failed { detail } => {
-                assert!(detail.contains("run-task-verification.sh"), "{detail}");
-            }
-            other => panic!("missing wrapper must fail closed, got {other:?}"),
-        }
+        assert_eq!(
+            run_lane_verify_gate(&dir, "TASK-1", markdown).await,
+            LaneVerifyOutcome::AllPassed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_lane_verify_gate_uses_wrapper_when_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "autodev-verify-wrapper-present-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let scripts = dir.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"$1:$3\" > wrapper-ran.txt\nshift\nif [[ ${1:-} == \"--\" ]]; then shift; fi\n\"$@\"\n",
+        )
+        .expect("write wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
+        assert_eq!(
+            run_lane_verify_gate(&dir, "TASK-1", markdown).await,
+            LaneVerifyOutcome::AllPassed
+        );
+        let marker = fs::read_to_string(dir.join("wrapper-ran.txt")).expect("wrapper marker");
+        assert_eq!(marker.trim(), "TASK-1:bash");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
