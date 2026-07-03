@@ -198,10 +198,10 @@ pub(crate) fn resolve_parallel_cargo_target_layout(
             }
         }
         ParallelCargoTarget::Auto => {
-            if let Some(target_dir) = inherited {
-                ParallelCargoTargetLayout::Fixed(target_dir)
-            } else if max_concurrent_workers > 1 && repo_uses_cargo {
+            if max_concurrent_workers > 1 && repo_uses_cargo {
                 ParallelCargoTargetLayout::LaneLocal
+            } else if let Some(target_dir) = inherited {
+                ParallelCargoTargetLayout::Fixed(target_dir)
             } else {
                 ParallelCargoTargetLayout::None
             }
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_worker_env_respects_inherited_cargo_target_dir() {
+    fn loop_worker_env_uses_lane_local_target_for_multi_lane_rust_runs() {
         let run_root = unique_temp_dir("loop-worker-env-inherited-target");
         fs::create_dir_all(&run_root).expect("failed to create run root");
 
@@ -678,19 +678,42 @@ mod tests {
         .expect("worker env should resolve");
         assert_eq!(
             env.extra_env,
+            vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())]
+        );
+        assert!(
+            env.cargo_target_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("lane-local")),
+            "multi-lane Rust runs should not inherit shared CARGO_TARGET_DIR"
+        );
+        assert!(env.lane_local_cargo_target);
+
+        let single_lane = resolve_loop_worker_env(
+            None,
+            ParallelCargoTarget::Auto,
+            None,
+            Some("/tmp/shared-target"),
+            22,
+            1,
+            true,
+            &run_root,
+        )
+        .expect("worker env should resolve");
+        assert_eq!(
+            single_lane.extra_env,
             vec![
                 (
                     "CARGO_TARGET_DIR".to_string(),
                     "/tmp/shared-target".to_string()
                 ),
-                ("CARGO_BUILD_JOBS".to_string(), "3".to_string())
+                ("CARGO_BUILD_JOBS".to_string(), "4".to_string())
             ]
         );
         assert_eq!(
-            env.cargo_target_summary,
+            single_lane.cargo_target_summary,
             Some("/tmp/shared-target".to_string())
         );
-        assert!(!env.lane_local_cargo_target);
+        assert!(!single_lane.lane_local_cargo_target);
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }

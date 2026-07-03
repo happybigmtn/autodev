@@ -14,8 +14,7 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
     ensure_repo_layout(&repo_root)?;
     let run_root = parallel_run_root(&repo_root, args);
-    fs::create_dir_all(&run_root)
-        .with_context(|| format!("failed to create {}", run_root.display()))?;
+    ensure_writable_run_root(&run_root)?;
 
     let plan_text = read_loop_plan(&repo_root)?;
     let snapshot = parse_loop_plan(&plan_text);

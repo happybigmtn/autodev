@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::state::AutoState;
-use crate::util::{copy_tree, list_markdown_files, timestamp_slug};
+use crate::util::{copy_tree, ensure_writable_run_root, list_markdown_files, timestamp_slug};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlanningRootSource {
@@ -195,6 +195,8 @@ pub(crate) fn prepare_planning_root_for_corpus(
         .unwrap_or_else(|| repo_root.join(".auto").join("fresh-input"));
     let staging_base = crate::util::auto_run_root_override(repo_root, "corpus-staging")
         .unwrap_or_else(|| repo_root.join(".auto").join("corpus-staging"));
+    ensure_writable_run_root(&fresh_input_base)?;
+    ensure_writable_run_root(&staging_base)?;
     prune_dir_children(&fresh_input_base);
     prune_dir_children(&staging_base);
 
@@ -295,8 +297,7 @@ pub(crate) fn promote_staged_planning_root(
 }
 
 pub(crate) fn prepare_generation_output_dir(output_dir: &Path) -> Result<()> {
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    ensure_writable_run_root(output_dir)?;
     for path in [
         output_dir.join("corpus"),
         output_dir.join("specs"),

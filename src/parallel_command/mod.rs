@@ -30,9 +30,9 @@ pub(crate) use crate::task_parser::{
     PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, git_cherry_pick_empty_arg,
-    git_repo_root, git_status_short_filtered, git_stdout, push_branch_with_remote_sync, repo_name,
-    run_git, sync_branch_with_remote, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, ensure_writable_run_root,
+    git_cherry_pick_empty_arg, git_repo_root, git_status_short_filtered, git_stdout,
+    push_branch_with_remote_sync, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
 };
 pub(crate) use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
@@ -139,8 +139,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         );
     }
     if args.max_concurrent_workers > 1 && should_launch_parallel_tmux(&args) {
-        fs::create_dir_all(&run_root)
-            .with_context(|| format!("failed to create {}", run_root.display()))?;
+        ensure_writable_run_root(&run_root)?;
         log_parallel_startup_prep(
             prepare_parallel_startup(&repo_root, target_branch.as_str())?,
             target_branch.as_str(),
@@ -169,8 +168,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if repo_forbids_legacy_review_trackers(&repo_root) {
         prompt_template.push_str(DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE);
     }
-    fs::create_dir_all(&run_root)
-        .with_context(|| format!("failed to create {}", run_root.display()))?;
+    ensure_writable_run_root(&run_root)?;
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;

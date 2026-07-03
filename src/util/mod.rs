@@ -9,8 +9,9 @@ use chrono::Utc;
 #[cfg(test)]
 pub(crate) use fsutil::test_process_env_lock;
 pub(crate) use fsutil::{
-    atomic_write, atomic_write_0o600_if_unix, copy_tree, ensure_repo_layout, list_markdown_files,
-    opencode_agent_dir, prune_pi_runtime_state, truncate_file_to_max_bytes, write_0o600_if_unix,
+    atomic_write, atomic_write_0o600_if_unix, copy_tree, ensure_repo_layout,
+    ensure_writable_run_root, list_markdown_files, opencode_agent_dir, prune_pi_runtime_state,
+    truncate_file_to_max_bytes, write_0o600_if_unix,
 };
 pub(crate) use git::{
     auto_checkpoint_if_needed, git_branch_exists, git_cherry_pick_empty_arg, git_repo_root,

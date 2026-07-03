@@ -8,7 +8,7 @@ use clap::Args;
 use crate::corpus::load_planning_corpus;
 use crate::state::load_state;
 use crate::task_parser::{parse_tasks, TaskStatus};
-use crate::util::git_repo_root;
+use crate::util::{auto_run_root_override, ensure_writable_run_root, git_repo_root};
 use crate::verification_wrapper::{
     ensure_verification_wrapper_executable, VerificationWrapperScaffold,
     VERIFICATION_WRAPPER_RELATIVE,
@@ -512,6 +512,7 @@ fn check_disk_budget(path: &Path, min_disk_kb: u64) -> RequiredCheck {
 fn check_planning_health(repo_root: &Path) -> Vec<RequiredCheck> {
     let mut checks = Vec::new();
     checks.push(check_verification_wrapper_scaffold(repo_root));
+    checks.push(check_auto_run_root(repo_root));
 
     let state = load_state(repo_root).unwrap_or_default();
     let planning_root = state
@@ -603,6 +604,35 @@ fn check_planning_health(repo_root: &Path) -> Vec<RequiredCheck> {
     });
 
     checks
+}
+
+fn check_auto_run_root(repo_root: &Path) -> RequiredCheck {
+    let Some(path) = auto_run_root_override(repo_root, "doctor-check") else {
+        return RequiredCheck {
+            name: "AUTO_RUN_ROOT".to_string(),
+            passed: true,
+            detail: "not set; default in-repo run roots will be used".to_string(),
+            action: None,
+        };
+    };
+
+    match ensure_writable_run_root(&path) {
+        Ok(()) => RequiredCheck {
+            name: "AUTO_RUN_ROOT".to_string(),
+            passed: true,
+            detail: format!("writable resolved run root {}", path.display()),
+            action: None,
+        },
+        Err(err) => RequiredCheck {
+            name: "AUTO_RUN_ROOT".to_string(),
+            passed: false,
+            detail: format!("{err:#}"),
+            action: Some(
+                "unset AUTO_RUN_ROOT or point it at an existing writable run-root mount"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 fn check_verification_wrapper_scaffold(repo_root: &Path) -> RequiredCheck {

@@ -1,5 +1,4 @@
 use std::fs;
-#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,6 +131,59 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         atomic_write_failure(err, &temp, format!("failed to write {}", temp.display()))
     })?;
     atomic_rename(&temp, path)
+}
+
+pub(crate) fn ensure_writable_run_root(run_root: &Path) -> Result<()> {
+    fs::create_dir_all(run_root).with_context(|| run_root_error_context(run_root, "create"))?;
+    let metadata = fs::metadata(run_root)
+        .with_context(|| run_root_error_context(run_root, "stat after create"))?;
+    if !metadata.is_dir() {
+        bail!("{}", run_root_error_context(run_root, "use as directory"));
+    }
+    let probe = run_root.join(format!(
+        ".auto-run-root-write-test-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+        .and_then(|mut file| file.write_all(b"ok"));
+    if let Err(err) = write_result {
+        return Err(err).with_context(|| run_root_error_context(run_root, "write probe in"));
+    }
+    if let Err(err) = fs::remove_file(&probe) {
+        return Err(err).with_context(|| {
+            format!(
+                "failed to remove run-root write probe {} after preparing {}",
+                probe.display(),
+                run_root.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn run_root_error_context(run_root: &Path, action: &str) -> String {
+    let mut message = format!("failed to {action} run root {}", run_root.display());
+    if let Some(value) = auto_run_root_env_value_for_path(run_root) {
+        message.push_str(&format!(
+            "; AUTO_RUN_ROOT={} resolved this path. Unset AUTO_RUN_ROOT, update it to an existing writable mount, or create/chown the directory.",
+            value.display()
+        ));
+    }
+    message
+}
+
+fn auto_run_root_env_value_for_path(path: &Path) -> Option<PathBuf> {
+    let raw = std::env::var_os("AUTO_RUN_ROOT")?;
+    let raw_path = PathBuf::from(raw);
+    let raw_text = raw_path.to_string_lossy();
+    if raw_text.trim().is_empty() {
+        return None;
+    }
+    path.starts_with(&raw_path).then_some(raw_path)
 }
 
 #[cfg(unix)]
@@ -391,7 +443,9 @@ mod tests {
 
     use super::{
         atomic_write, atomic_write_0o600_if_unix, chmod_0o600_if_unix, ensure_repo_layout_with,
-        prune_old_entries, truncate_file_to_max_bytes, write_0o600_if_unix,
+        ensure_writable_run_root, prune_old_entries, test_process_env_lock,
+        truncate_file_to_max_bytes,
+        write_0o600_if_unix,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -455,6 +509,33 @@ mod tests {
         let written = fs::read(&target).expect("failed to read atomic write output");
         assert_eq!(written, payload);
 
+        fs::remove_dir_all(&dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn ensure_writable_run_root_names_auto_run_root_on_failure() {
+        let _guard = test_process_env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var_os("AUTO_RUN_ROOT");
+        let dir = temp_repo_path("run-root-file");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let auto_root = dir.join("auto-runs");
+        fs::write(&auto_root, "not a directory").expect("failed to write file");
+        std::env::set_var("AUTO_RUN_ROOT", &auto_root);
+        let run_root = auto_root.join("repo").join("parallel");
+
+        let err = ensure_writable_run_root(&run_root).expect_err("file root should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("AUTO_RUN_ROOT"), "{message}");
+        assert!(message.contains(&run_root.display().to_string()), "{message}");
+        assert!(
+            message.contains("Unset AUTO_RUN_ROOT") || message.contains("update it"),
+            "{message}"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("AUTO_RUN_ROOT", value),
+            None => std::env::remove_var("AUTO_RUN_ROOT"),
+        }
         fs::remove_dir_all(&dir).expect("failed to remove temp dir");
     }
 
