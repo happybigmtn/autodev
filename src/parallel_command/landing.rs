@@ -346,21 +346,29 @@ pub(crate) async fn audit_parallel_completion_drift(
         .filter(|task| task.status == LoopTaskStatus::Partial)
     {
         let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-        if !evidence.is_fully_evidenced() {
-            continue;
-        }
-        // A fully-evidenced `[~]` row is the definition-of-done gate away
-        // from `[x]`. That gate is host re-execution of the row's declared
-        // verification — exactly what `run_lane_verify_gate` performs — so
-        // run it here and restore the row instead of parking it for a
-        // model-backed lane. External/live steps come back `Skipped`, which
-        // keeps intentionally-partial rows (e.g. fleet gates) untouched.
-        if drift_local_reverify_enabled() {
+        // Restore a `[~]` row to `[x]` when the definition-of-done gate — host
+        // re-execution of the declared verification via `run_lane_verify_gate`
+        // — passes. This covers BOTH already-fully-evidenced partials AND
+        // partials whose only gap is locally repairable (a stale or missing
+        // receipt is exactly why a previously-demoted row is here): the gate
+        // run re-stamps a fresh receipt, and we synthesize any missing REVIEW
+        // handoff, then re-check. A row with a genuinely failing test, or with
+        // external/live steps (`Skipped`), stays `[~]` — which correctly
+        // protects intentionally-partial rows like the fleet gate.
+        let gap = assess_task_completion_gap(&task.markdown, &evidence);
+        let repairable = evidence.is_fully_evidenced()
+            || gap.kind == CompletionGapKind::LocalRepairable;
+        if drift_local_reverify_enabled() && repairable {
             if let LaneVerifyOutcome::AllPassed =
                 run_lane_verify_gate(repo_root, &task.id, &task.markdown).await
             {
-                let refreshed =
+                let mut refreshed =
                     inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                if !refreshed.has_review_handoff {
+                    ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
+                    refreshed =
+                        inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                }
                 if refreshed.is_fully_evidenced() {
                     updated_plan_text = update_reconciled_task_completion_in_plan_text(
                         &updated_plan_text,
@@ -371,6 +379,12 @@ pub(crate) async fn audit_parallel_completion_drift(
                     continue;
                 }
             }
+        }
+        // Only rows that look complete but couldn't be auto-restored are
+        // reported as manual closeout candidates; genuinely-incomplete or
+        // external-gated partials are left silently at `[~]`.
+        if !evidence.is_fully_evidenced() {
+            continue;
         }
         manual_closeout_candidates.push(ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
