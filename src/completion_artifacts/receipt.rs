@@ -530,6 +530,15 @@ pub(crate) fn inspect_verification_receipt(
                 expected_commands,
             )
         })
+        // Only DECLARED verification commands and compile/test-family commands
+        // hard-gate completion. An incidental `rg`/`grep`/shell auxiliary a
+        // worker ran (e.g. a Review/closeout absence check) exiting non-zero is
+        // NOT a completion blocker: a search command exiting 1 means "no match",
+        // which is frequently the desired closeout outcome, and real regressions
+        // are already caught by the declared gate plus the separate workspace
+        // test gate. This prevents an exit-inverted `rg X is empty` closeout
+        // from self-blocking a task whose real verification passed.
+        .filter(|(_, entry)| receipt_command_hard_gates(entry, expected_commands))
         .map(|(_, entry)| entry.command.clone())
         .collect::<Vec<_>>();
     unsuperseded_failed.sort();
@@ -651,6 +660,15 @@ fn verification_receipt_content_problem(
                 expected_commands,
             )
         })
+        // Only DECLARED verification commands and compile/test-family commands
+        // hard-gate completion. An incidental `rg`/`grep`/shell auxiliary a
+        // worker ran (e.g. a Review/closeout absence check) exiting non-zero is
+        // NOT a completion blocker: a search command exiting 1 means "no match",
+        // which is frequently the desired closeout outcome, and real regressions
+        // are already caught by the declared gate plus the separate workspace
+        // test gate. This prevents an exit-inverted `rg X is empty` closeout
+        // from self-blocking a task whose real verification passed.
+        .filter(|(_, entry)| receipt_command_hard_gates(entry, expected_commands))
         .map(|(_, entry)| entry.command.clone())
         .collect::<Vec<_>>();
     unsuperseded_failed.sort();
@@ -963,6 +981,79 @@ fn verification_receipt_reports_zero_tests(entry: &VerificationReceiptCommand) -
             .runner_summary
             .as_ref()
             .is_some_and(|summary| summary.zero_test_detected)
+}
+
+/// A `VAR=value` shell env-assignment token (leading env prefix).
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Whether a FAILED receipt command should block task completion. Declared
+/// verification commands always gate. Otherwise, only compile/test-family
+/// commands (cargo test/build/check/clippy/bench/nextest, or a standard test
+/// runner) gate — an incidental search/shell auxiliary a worker ran does not,
+/// because its exit code is not a reliable pass/fail signal for completion.
+fn receipt_command_hard_gates(
+    entry: &VerificationReceiptCommand,
+    expected_commands: &[String],
+) -> bool {
+    if expected_commands
+        .iter()
+        .any(|expected| verification_receipt_command_matches(entry, expected))
+    {
+        return true;
+    }
+    // Resolve the real argv, unwrapping env/shell launchers.
+    let mut argv = if !entry.argv.is_empty() {
+        entry.argv.clone()
+    } else {
+        shell_split(&entry.command).unwrap_or_default()
+    };
+    for _ in 0..2 {
+        match unwrap_launcher_argv(&argv) {
+            Some(inner) => argv = inner,
+            None => break,
+        }
+    }
+    // Drop a leading VAR=value env prefix.
+    let program = argv
+        .iter()
+        .find(|tok| !is_env_assignment(tok))
+        .map(|tok| {
+            Path::new(tok)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(tok.as_str())
+        });
+    let Some(program) = program else {
+        return false;
+    };
+    match program {
+        "cargo" => {
+            // cargo <subcommand> — gate on the compile/test-family subcommands.
+            let sub = argv
+                .iter()
+                .skip_while(|tok| is_env_assignment(tok))
+                .nth(1)
+                .map(String::as_str);
+            matches!(
+                sub,
+                Some("test" | "build" | "check" | "clippy" | "bench" | "nextest")
+            )
+        }
+        "pytest" | "go" | "jest" | "vitest" | "mocha" | "gradle" | "mvn" | "ctest" | "make" => true,
+        _ => false,
+    }
 }
 
 fn verification_receipt_command_matches(
@@ -1399,6 +1490,58 @@ mod tests {
         .expect("receipt should parse")
         .expect("non-ancestor commit rejected");
         assert!(problem.contains("commit mismatch"));
+    }
+
+    fn cmd(command: &str, argv: &[&str]) -> VerificationReceiptCommand {
+        VerificationReceiptCommand {
+            command: command.to_string(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            exit_code: Some(1),
+            status: Some("failed".to_string()),
+            ..VerificationReceiptCommand::default()
+        }
+    }
+
+    #[test]
+    fn declared_failed_command_hard_gates() {
+        let entry = cmd("cargo test -p x t", &["cargo", "test", "-p", "x", "t"]);
+        let expected = vec!["cargo test -p x t".to_string()];
+        assert!(super::receipt_command_hard_gates(&entry, &expected));
+    }
+
+    #[test]
+    fn failed_cargo_test_hard_gates_even_if_not_declared() {
+        let entry = cmd("cargo test -p other", &["cargo", "test", "-p", "other"]);
+        assert!(super::receipt_command_hard_gates(&entry, &[]));
+    }
+
+    #[test]
+    fn incidental_ripgrep_absence_check_does_not_gate() {
+        // The exact self-block class: a bare `rg` closeout absence check that
+        // exited 1 (no match = desired) must NOT block completion.
+        let entry = cmd(
+            "rg certificate_for_block crates/x/src",
+            &["rg", "certificate_for_block", "crates/x/src"],
+        );
+        assert!(!super::receipt_command_hard_gates(&entry, &[]));
+    }
+
+    #[test]
+    fn incidental_negated_shell_grep_does_not_gate() {
+        let entry = cmd(
+            "bash -lc <neg>",
+            &["bash", "-lc", "! rg -q LocalValidatorFleet crates/x"],
+        );
+        assert!(!super::receipt_command_hard_gates(&entry, &[]));
+    }
+
+    #[test]
+    fn env_prefixed_cargo_build_still_gates() {
+        let entry = cmd(
+            "RUSTFLAGS=--cfg x cargo build",
+            &["RUSTFLAGS=--cfg x", "cargo", "build"],
+        );
+        assert!(super::receipt_command_hard_gates(&entry, &[]));
     }
 
     #[test]
