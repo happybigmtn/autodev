@@ -401,6 +401,7 @@ mod tests {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
+            json: false,
             max_iterations: None,
             max_concurrent_workers: 5,
             cargo_build_jobs: None,
@@ -548,6 +549,7 @@ mod tests {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
+            json: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,
@@ -723,6 +725,7 @@ mod tests {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
+            json: false,
             max_iterations: None,
             max_concurrent_workers: 5,
             cargo_build_jobs: None,

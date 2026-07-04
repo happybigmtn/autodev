@@ -130,6 +130,64 @@ pub(crate) fn clear_parallel_run_state(run_root: &Path) {
     }
 }
 
+/// Mint and persist a fresh run id for this host at `<run_root>/.current-run-id`.
+/// Format is `<unix_millis>-<pid>`, unique per host start. Best-effort: on write
+/// failure the returned id is still usable in-process, lanes just won't be able
+/// to compare against it (they degrade to "stale", never to a false "live").
+pub(crate) fn stamp_current_parallel_run_id(run_root: &Path) -> String {
+    let millis = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let run_id = format!("{millis}-{}", std::process::id());
+    let path = run_root.join(CURRENT_RUN_ID_FILE);
+    if let Err(err) = atomic_write(&path, run_id.as_bytes()) {
+        eprintln!("warning: failed persisting current run id: {err:#}");
+    }
+    run_id
+}
+
+/// Read the current run id for `run_root`, if a host has stamped one.
+pub(crate) fn current_parallel_run_id(run_root: &Path) -> Option<String> {
+    std::fs::read_to_string(run_root.join(CURRENT_RUN_ID_FILE))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Copy the current run id into a lane's `.run-id` at assignment. Derives the
+/// run root from `<run_root>/lanes/lane-N`. Best-effort.
+pub(crate) fn stamp_lane_run_id(lane_root: &Path) {
+    let Some(run_root) = lane_root.parent().and_then(|lanes| lanes.parent()) else {
+        return;
+    };
+    let Some(run_id) = current_parallel_run_id(run_root) else {
+        return;
+    };
+    if let Err(err) = atomic_write(&lane_root.join(LANE_RUN_ID_FILE), run_id.as_bytes()) {
+        eprintln!("warning: failed stamping lane run id: {err:#}");
+    }
+}
+
+/// Read a lane's stamped run id, if present.
+pub(crate) fn lane_run_id(lane_root: &Path) -> Option<String> {
+    std::fs::read_to_string(lane_root.join(LANE_RUN_ID_FILE))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// A lane is stale when the current run has an id and the lane's id is missing
+/// or differs. If the current run has no id (older host, or status invoked with
+/// no run ever started), nothing is classified stale — preserving prior
+/// behavior rather than over-hiding lanes.
+pub(crate) fn lane_is_from_previous_run(run_root: &Path, lane_root: &Path) -> bool {
+    match current_parallel_run_id(run_root) {
+        Some(current) => lane_run_id(lane_root).map(|id| id != current).unwrap_or(true),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +214,43 @@ mod tests {
         assert!(state.unblock_attempt_counts.is_empty());
         assert!(state.attempted_partial_followups.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lane_from_current_run_is_not_stale() {
+        let run_root = temp_dir("run-current");
+        let run_id = stamp_current_parallel_run_id(&run_root);
+        assert!(!run_id.is_empty());
+        let lane_root = run_root.join("lanes").join("lane-1");
+        std::fs::create_dir_all(&lane_root).expect("create lane");
+        stamp_lane_run_id(&lane_root);
+        assert_eq!(lane_run_id(&lane_root).as_deref(), Some(run_id.as_str()));
+        assert!(!lane_is_from_previous_run(&run_root, &lane_root));
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn lane_from_previous_run_is_stale() {
+        let run_root = temp_dir("run-prev");
+        // Simulate a lane stamped by an earlier run, then a new host start.
+        std::fs::create_dir_all(run_root.join("lanes").join("lane-1")).expect("create lane");
+        let lane_root = run_root.join("lanes").join("lane-1");
+        stamp_current_parallel_run_id(&run_root);
+        stamp_lane_run_id(&lane_root);
+        // New host start mints a different current run id.
+        std::fs::write(run_root.join(CURRENT_RUN_ID_FILE), b"999999-1").expect("rewrite run id");
+        assert!(lane_is_from_previous_run(&run_root, &lane_root));
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn no_current_run_id_means_no_lane_is_stale() {
+        // Preserve prior behavior when no host ever stamped a run id.
+        let run_root = temp_dir("run-none");
+        let lane_root = run_root.join("lanes").join("lane-1");
+        std::fs::create_dir_all(&lane_root).expect("create lane");
+        assert!(!lane_is_from_previous_run(&run_root, &lane_root));
+        std::fs::remove_dir_all(&run_root).ok();
     }
 
     #[test]

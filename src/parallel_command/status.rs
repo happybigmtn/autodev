@@ -1,6 +1,34 @@
 use super::*;
 
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct LaneStatusRecord {
+    lane: usize,
+    task_id: String,
+    running: bool,
+    stale: bool,
+    pid_state: String,
+    last_log_age: String,
+}
+
+#[derive(Serialize)]
+struct ParallelStatusReport {
+    repo_root: String,
+    branch: String,
+    run_root: String,
+    tmux_session: String,
+    tmux_running: bool,
+    host_pids: Vec<String>,
+    lanes: Vec<LaneStatusRecord>,
+    active_task_ids: Vec<String>,
+    frontier: Option<String>,
+    safety_verdict: Option<String>,
+    health: String,
+}
+
 pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
+    let json = args.json;
     let repo_root = git_repo_root()?;
     let run_root = parallel_run_root(&repo_root, args);
     let session_name = parallel_tmux_session_name(&repo_root);
@@ -8,14 +36,21 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    println!("auto parallel status");
-    println!("repo root:   {}", repo_root.display());
-    println!("branch:      {}", current_branch);
-    println!("run root:    {}", run_root.display());
+    let mut lane_records: Vec<LaneStatusRecord> = Vec::new();
+    if !json {
+        println!("auto parallel status");
+        println!("repo root:   {}", repo_root.display());
+        println!("branch:      {}", current_branch);
+        println!("run root:    {}", run_root.display());
+    }
     let mut tmux_worker_running = false;
+    let mut tmux_running = false;
     match tmux_session_exists(&session_name) {
         Ok(true) => {
-            println!("tmux:        {session_name} running");
+            tmux_running = true;
+            if !json {
+                println!("tmux:        {session_name} running");
+            }
             match tmux_stdout([
                 "list-windows",
                 "-t",
@@ -26,34 +61,48 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
                 Ok(windows) => {
                     for line in windows.lines().filter(|line| !line.trim().is_empty()) {
                         tmux_worker_running |= tmux_status_line_has_live_worker(line);
-                        println!("  {line}");
+                        if !json {
+                            println!("  {line}");
+                        }
                     }
                 }
-                Err(err) => println!("  warning: failed to inspect tmux windows: {err:#}"),
+                Err(err) => {
+                    if !json {
+                        println!("  warning: failed to inspect tmux windows: {err:#}")
+                    }
+                }
             }
         }
         Ok(false) => {
-            println!("tmux:        {session_name} not running");
+            if !json {
+                println!("tmux:        {session_name} not running");
+            }
         }
         Err(err) => {
-            println!("tmux:        unknown ({err:#})");
+            if !json {
+                println!("tmux:        unknown ({err:#})");
+            }
         }
     }
 
     let host_processes = parallel_host_processes_for_repo(&repo_root);
-    if host_processes.is_empty() {
-        println!("host pids:   none detected");
-    } else {
-        println!("host pids:");
-        for line in &host_processes {
-            println!("  {line}");
+    if !json {
+        if host_processes.is_empty() {
+            println!("host pids:   none detected");
+        } else {
+            println!("host pids:");
+            for line in &host_processes {
+                println!("  {line}");
+            }
         }
     }
     let no_live_parallel_host = host_processes.is_empty() && !tmux_worker_running;
 
     let lanes_root = run_root.join("lanes");
     let mut lanes = if !lanes_root.exists() {
-        println!("lanes:       none ({})", lanes_root.display());
+        if !json {
+            println!("lanes:       none ({})", lanes_root.display());
+        }
         Vec::new()
     } else {
         fs::read_dir(&lanes_root)
@@ -76,12 +125,15 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     let mut stale_recovery_lanes = Vec::new();
     let mut active_task_ids = BTreeSet::new();
 
-    println!("lanes:");
+    if !json {
+        println!("lanes:");
+    }
     for (lane_index, lane_root) in lanes {
         let stored_task_id = read_lane_task_id(&lane_root)
             .ok()
             .flatten()
             .unwrap_or_else(|| "[unknown]".to_string());
+        let stale = lane_is_from_previous_run(&run_root, &lane_root);
         let lane_repo_root = lane_root.join("repo");
         let (worker_running, pid_state) = lane_worker_status(&lane_root, &lane_repo_root)
             .unwrap_or_else(|err| {
@@ -90,8 +142,32 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
                     format!("worker liveness check failed for lane repo: {err:#}"),
                 )
             });
-        if worker_running {
+        // A lane from a previous run is not live work for THIS run: keep it out
+        // of the active-task set and the health assessment so a dead run's
+        // lanes never read as in-flight.
+        if worker_running && !stale {
             active_task_ids.insert(stored_task_id.clone());
+        }
+        let (log_age, _) = latest_lane_log_line(&lane_root);
+        lane_records.push(LaneStatusRecord {
+            lane: lane_index,
+            task_id: stored_task_id.clone(),
+            running: worker_running && !stale,
+            stale,
+            pid_state: pid_state.clone(),
+            last_log_age: log_age.clone(),
+        });
+        if stale {
+            if !json {
+                let (_, log_line) = latest_lane_log_line(&lane_root);
+                println!(
+                    "  lane-{lane_index}: {stored_task_id} | stale (previous run) | last log {log_age}"
+                );
+                if let Some(line) = log_line {
+                    println!("    {line}");
+                }
+            }
+            continue;
         }
         let superseded_recovery =
             superseded_lane_cherry_pick_recovery(&repo_root, &lane_repo_root, &stored_task_id)
@@ -110,29 +186,33 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         let repo_status = lane_repo_status_summary(&lane_repo_root);
         let (log_age, log_line) = latest_lane_log_line(&lane_root);
         let task_id = lane_status_task_id(&stored_task_id, worker_running, log_line.as_deref());
-        println!(
-            "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
-        );
-        if let Some(reason) = superseded_recovery {
+        if !json {
             println!(
-                "    recovery: superseded duplicate ({}); next host resume can retire it",
-                reason.summary()
+                "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
             );
-        }
-        if recovery_active && no_live_parallel_host && !worker_running {
-            println!(
-                "    recovery: stale recovery (no host pid or tmux session); not active progress"
-            );
-            println!("    recovery artifact: {}", lane_repo_root.display());
-            println!(
-                "    reset command: rm -rf {} # after preserving task-owned work",
-                shell_quote(&lane_root.display().to_string())
-            );
-        }
-        if let Some(line) = log_line {
-            println!("    {line}");
+            if let Some(reason) = superseded_recovery {
+                println!(
+                    "    recovery: superseded duplicate ({}); next host resume can retire it",
+                    reason.summary()
+                );
+            }
+            if recovery_active && no_live_parallel_host && !worker_running {
+                println!(
+                    "    recovery: stale recovery (no host pid or tmux session); not active progress"
+                );
+                println!("    recovery artifact: {}", lane_repo_root.display());
+                println!(
+                    "    reset command: rm -rf {} # after preserving task-owned work",
+                    shell_quote(&lane_root.display().to_string())
+                );
+            }
+            if let Some(line) = log_line {
+                println!("    {line}");
+            }
         }
     }
+    let mut report_frontier: Option<String> = None;
+    let mut report_verdict: Option<String> = None;
     if let Ok(plan) = inspect_loop_plan(&repo_root) {
         let shelved = stop_state
             .as_ref()
@@ -157,31 +237,54 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         if let Some(frontier) =
             format_parallel_blocker_frontier(&plan, &active_task_ids, &shelved, &deferred, 8)
         {
-            println!("frontier:    {frontier}");
+            if !json {
+                println!("frontier:    {frontier}");
+            }
+            report_frontier = Some(frontier);
         }
-        println!(
-            "safety verdict: {}",
-            parallel_status_safety_verdict(
-                &plan,
-                &active_task_ids,
-                &shelved,
-                &deferred,
-                no_live_parallel_host,
-                &active_recovery_lanes,
-                &stale_recovery_lanes,
-            )
-        );
-    }
-    println!(
-        "health:      {}",
-        render_parallel_health_summary(
-            &preflight_warnings,
-            &recent_host_warnings,
-            receipt_drift.as_deref(),
+        let verdict = parallel_status_safety_verdict(
+            &plan,
+            &active_task_ids,
+            &shelved,
+            &deferred,
+            no_live_parallel_host,
             &active_recovery_lanes,
             &stale_recovery_lanes,
-        )
+        );
+        if !json {
+            println!("safety verdict: {verdict}");
+        }
+        report_verdict = Some(verdict);
+    }
+    let health = render_parallel_health_summary(
+        &preflight_warnings,
+        &recent_host_warnings,
+        receipt_drift.as_deref(),
+        &active_recovery_lanes,
+        &stale_recovery_lanes,
     );
+    if !json {
+        println!("health:      {health}");
+    } else {
+        let report = ParallelStatusReport {
+            repo_root: repo_root.display().to_string(),
+            branch: current_branch,
+            run_root: run_root.display().to_string(),
+            tmux_session: session_name,
+            tmux_running,
+            host_pids: host_processes,
+            lanes: lane_records,
+            active_task_ids: active_task_ids.into_iter().collect(),
+            frontier: report_frontier,
+            safety_verdict: report_verdict,
+            health,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|err| format!("{{\"error\":\"failed to serialize status: {err}\"}}"))
+        );
+    }
     Ok(())
 }
 

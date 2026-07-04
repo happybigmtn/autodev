@@ -204,6 +204,11 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     pub(crate) apply_receipt_backfill_handoffs: bool,
 
+    /// For `auto parallel status`: emit machine-readable JSON instead of the
+    /// human summary.
+    #[arg(long)]
+    pub(crate) json: bool,
+
     /// Stop after this many successful parallel lands. Default is unlimited.
     #[arg(long)]
     pub(crate) max_iterations: Option<usize>,

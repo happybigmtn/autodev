@@ -422,6 +422,7 @@ mod tests {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
+            json: false,
             max_iterations: Some(3),
             max_concurrent_workers: 8,
             cargo_build_jobs: Some(2),
@@ -459,6 +460,7 @@ mod tests {
         let args = ParallelArgs {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
+            json: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,

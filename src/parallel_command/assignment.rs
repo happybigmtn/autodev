@@ -694,6 +694,7 @@ pub(crate) fn parse_lane_index(name: &str) -> Option<usize> {
 }
 
 pub(crate) fn write_lane_task_id(lane_root: &Path, task_id: &str) -> Result<()> {
+    stamp_lane_run_id(lane_root);
     atomic_write(&lane_root.join(LANE_TASK_ID_FILE), task_id.as_bytes()).with_context(|| {
         format!(
             "failed to write {}",

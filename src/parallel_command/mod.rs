@@ -107,6 +107,14 @@ Repo-specific direct `REVIEW.md` handoff:
 
 pub(crate) const LANE_TASK_ID_FILE: &str = "task-id";
 
+/// Run identity, written once per host at startup to `<run_root>/.current-run-id`
+/// and copied into each lane's `.run-id` at assignment. `auto parallel status`
+/// treats a lane whose `.run-id` differs from (or is missing against) the
+/// current run as an artifact of a previous run: shown as stale and excluded
+/// from health, so a dead run's lanes never masquerade as live work.
+pub(crate) const CURRENT_RUN_ID_FILE: &str = ".current-run-id";
+pub(crate) const LANE_RUN_ID_FILE: &str = ".run-id";
+
 pub(crate) const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
@@ -173,6 +181,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     }
     ensure_writable_run_root(&run_root)?;
     purge_previous_parallel_run_artifacts(&repo_root, &run_root);
+    stamp_current_parallel_run_id(&run_root);
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;
