@@ -282,6 +282,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     let mut completed_drift = Vec::new();
     let mut backfilled_receipts = Vec::new();
     let mut locally_reverified = Vec::new();
+    let mut locally_repromoted = Vec::new();
     let mut manual_closeout_candidates = Vec::new();
 
     for task in snapshot
@@ -348,6 +349,29 @@ pub(crate) async fn audit_parallel_completion_drift(
         if !evidence.is_fully_evidenced() {
             continue;
         }
+        // A fully-evidenced `[~]` row is the definition-of-done gate away
+        // from `[x]`. That gate is host re-execution of the row's declared
+        // verification — exactly what `run_lane_verify_gate` performs — so
+        // run it here and restore the row instead of parking it for a
+        // model-backed lane. External/live steps come back `Skipped`, which
+        // keeps intentionally-partial rows (e.g. fleet gates) untouched.
+        if drift_local_reverify_enabled() {
+            if let LaneVerifyOutcome::AllPassed =
+                run_lane_verify_gate(repo_root, &task.id, &task.markdown).await
+            {
+                let refreshed =
+                    inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                if refreshed.is_fully_evidenced() {
+                    updated_plan_text = update_reconciled_task_completion_in_plan_text(
+                        &updated_plan_text,
+                        task,
+                        LoopTaskStatus::Done,
+                    );
+                    locally_repromoted.push(task.id.clone());
+                    continue;
+                }
+            }
+        }
         manual_closeout_candidates.push(ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
@@ -380,6 +404,13 @@ pub(crate) async fn audit_parallel_completion_drift(
             "drift-reverify: locally re-proven {} completed task(s) without demotion ({})",
             locally_reverified.len(),
             locally_reverified.join(", ")
+        ));
+    }
+    if !locally_repromoted.is_empty() {
+        parallel_logger.info(format!(
+            "drift-reverify: restored {} partial task(s) to [x] after host re-execution passed ({})",
+            locally_repromoted.len(),
+            locally_repromoted.join(", ")
         ));
     }
     if !backfilled_receipts.is_empty() {
