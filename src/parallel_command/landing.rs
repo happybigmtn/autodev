@@ -271,6 +271,22 @@ fn drift_local_reverify_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Wall-clock budget for the whole local drift re-verify sweep within one audit
+/// invocation (`AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS`, default 900). Local
+/// re-verification re-runs a task's real test commands, so a large stale set
+/// could otherwise turn one audit into a serial test marathon that starves the
+/// run. Once the budget is spent, remaining stale rows take the honest path
+/// (Done -> demote to [~]; fully-evidenced Partial -> manual closeout) — a stale
+/// row never silently stays [x] without either fresh receipts or demotion. `0`
+/// disables the sweep entirely, reproducing pre-re-verify behavior.
+fn drift_reverify_budget() -> Duration {
+    let secs = std::env::var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(900);
+    Duration::from_secs(secs)
+}
+
 pub(crate) async fn audit_parallel_completion_drift(
     repo_root: &Path,
     target_branch: &str,
@@ -284,6 +300,9 @@ pub(crate) async fn audit_parallel_completion_drift(
     let mut locally_reverified = Vec::new();
     let mut locally_repromoted = Vec::new();
     let mut manual_closeout_candidates = Vec::new();
+    let reverify_budget = drift_reverify_budget();
+    let mut reverify_spent = Duration::ZERO;
+    let mut reverify_deferred: Vec<String> = Vec::new();
 
     for task in snapshot
         .tasks
@@ -302,27 +321,34 @@ pub(crate) async fn audit_parallel_completion_drift(
             }
         }
         if drift_local_reverify_enabled()
+            && !reverify_budget.is_zero()
             && assess_task_completion_gap(&task.markdown, &evidence).kind
                 == CompletionGapKind::LocalRepairable
         {
-            parallel_logger.info(format!(
-                "drift-reverify: `{}` completion evidence went stale ({}); re-running its verification locally before demoting",
-                task.id,
-                evidence.missing_reasons().join("; ")
-            ));
-            if let LaneVerifyOutcome::AllPassed =
-                run_lane_verify_gate(repo_root, &task.id, &task.markdown).await
-            {
-                let mut refreshed =
-                    inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-                if !refreshed.has_review_handoff {
-                    ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
-                    refreshed =
+            if reverify_spent >= reverify_budget {
+                // Budget spent: fall through to the honest demote path below.
+                reverify_deferred.push(task.id.clone());
+            } else {
+                parallel_logger.info(format!(
+                    "drift-reverify: `{}` completion evidence went stale ({}); re-running its verification locally before demoting",
+                    task.id,
+                    evidence.missing_reasons().join("; ")
+                ));
+                let started = Instant::now();
+                let outcome = run_lane_verify_gate(repo_root, &task.id, &task.markdown).await;
+                reverify_spent += started.elapsed();
+                if let LaneVerifyOutcome::AllPassed = outcome {
+                    let mut refreshed =
                         inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-                }
-                if refreshed.is_fully_evidenced() {
-                    locally_reverified.push(task.id.clone());
-                    continue;
+                    if !refreshed.has_review_handoff {
+                        ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
+                        refreshed =
+                            inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                    }
+                    if refreshed.is_fully_evidenced() {
+                        locally_reverified.push(task.id.clone());
+                        continue;
+                    }
                 }
             }
         }
@@ -358,25 +384,31 @@ pub(crate) async fn audit_parallel_completion_drift(
         let gap = assess_task_completion_gap(&task.markdown, &evidence);
         let repairable = evidence.is_fully_evidenced()
             || gap.kind == CompletionGapKind::LocalRepairable;
-        if drift_local_reverify_enabled() && repairable {
-            if let LaneVerifyOutcome::AllPassed =
-                run_lane_verify_gate(repo_root, &task.id, &task.markdown).await
-            {
-                let mut refreshed =
-                    inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-                if !refreshed.has_review_handoff {
-                    ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
-                    refreshed =
+        if drift_local_reverify_enabled() && !reverify_budget.is_zero() && repairable {
+            if reverify_spent >= reverify_budget {
+                // Budget spent: leave the row [~] (honest — no false promotion).
+                reverify_deferred.push(task.id.clone());
+            } else {
+                let started = Instant::now();
+                let outcome = run_lane_verify_gate(repo_root, &task.id, &task.markdown).await;
+                reverify_spent += started.elapsed();
+                if let LaneVerifyOutcome::AllPassed = outcome {
+                    let mut refreshed =
                         inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-                }
-                if refreshed.is_fully_evidenced() {
-                    updated_plan_text = update_reconciled_task_completion_in_plan_text(
-                        &updated_plan_text,
-                        task,
-                        LoopTaskStatus::Done,
-                    );
-                    locally_repromoted.push(task.id.clone());
-                    continue;
+                    if !refreshed.has_review_handoff {
+                        ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
+                        refreshed =
+                            inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                    }
+                    if refreshed.is_fully_evidenced() {
+                        updated_plan_text = update_reconciled_task_completion_in_plan_text(
+                            &updated_plan_text,
+                            task,
+                            LoopTaskStatus::Done,
+                        );
+                        locally_repromoted.push(task.id.clone());
+                        continue;
+                    }
                 }
             }
         }
@@ -413,6 +445,24 @@ pub(crate) async fn audit_parallel_completion_drift(
     } else {
         false
     };
+    // Only report the sweep duration when it actually consumed wall time worth
+    // noting; an instant no-op sweep would otherwise append a fresh host-log
+    // line on every idempotent re-audit.
+    if reverify_spent >= Duration::from_secs(1) {
+        parallel_logger.info(format!(
+            "drift-reverify: local sweep spent {}s of {}s budget",
+            reverify_spent.as_secs(),
+            reverify_budget.as_secs()
+        ));
+    }
+    if !reverify_deferred.is_empty() {
+        parallel_logger.warn(format!(
+            "drift-reverify: budget exhausted after {}s; deferred {} task(s) to next audit ({})",
+            reverify_spent.as_secs(),
+            reverify_deferred.len(),
+            reverify_deferred.join(", ")
+        ));
+    }
     if !locally_reverified.is_empty() {
         parallel_logger.info(format!(
             "drift-reverify: locally re-proven {} completed task(s) without demotion ({})",
@@ -2604,6 +2654,18 @@ mod tests {
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
 
+    #[test]
+    fn drift_reverify_budget_parses_env() {
+        use std::time::Duration;
+        std::env::remove_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS");
+        assert_eq!(super::drift_reverify_budget(), Duration::from_secs(900));
+        std::env::set_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS", "120");
+        assert_eq!(super::drift_reverify_budget(), Duration::from_secs(120));
+        std::env::set_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS", "0");
+        assert!(super::drift_reverify_budget().is_zero());
+        std::env::remove_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS");
+    }
+
     #[tokio::test]
     async fn audit_parallel_completion_drift_demotes_completed_rows() {
         let repo = unique_temp_dir("parallel-drift-audit");
@@ -2614,6 +2676,10 @@ mod tests {
         fs::write(repo.join("IMPLEMENTATION_PLAN.md"), plan).expect("failed to write plan");
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
+        // A row with no receipts and no runnable verification demotes whether or
+        // not the budget is spent — the budgeted re-verify path finds nothing to
+        // run and falls through honestly. (Budget parsing is covered directly by
+        // `drift_reverify_budget_parses_env`.)
         let updated = audit_parallel_completion_drift(
             &repo,
             "main",
