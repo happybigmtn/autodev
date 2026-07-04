@@ -15,9 +15,27 @@ fn verify_command_is_runnable(task_id: &str, field: &str, command: &str) -> Resu
         );
     }
 
-    let Some(argv) = shell_split(command).filter(|argv| !argv.is_empty()) else {
-        return Ok(());
+    // A verification command must be a single exec-able argv: the host runs it
+    // as `wrapper -- <argv>`, and the receipt only matches when the recorded
+    // run and the plan row share one argv split. Commands that need a shell —
+    // pipes, `&&`/`;`, redirection, command substitution — cannot exec as argv
+    // and historically produced receipts that never matched, so the row
+    // demoted and re-dispatched forever. A leading `VAR=value` env prefix is
+    // fine (the wrapper routes it through `env`).
+    let Some(argv) = shell_split(command) else {
+        bail!(
+            "task `{task_id}` `{field}` has an unparseable verification command `{command}` (unbalanced quote?); write one exec-able command (a leading VAR=value env prefix is allowed)"
+        );
     };
+    if let Some(operator) = shell_operator_token(&argv, command) {
+        bail!(
+            "task `{task_id}` `{field}` verification command `{command}` needs a shell (found `{operator}`); write one exec-able command per proof and use dedicated flags instead of pipes/`&&`/redirection (a leading VAR=value env prefix is allowed)"
+        );
+    }
+    let argv = argv.into_iter().filter(|arg| !arg.is_empty()).collect::<Vec<_>>();
+    if argv.is_empty() {
+        return Ok(());
+    }
     let argv = skip_env_assignments(&argv);
     if argv.is_empty() {
         return Ok(());
@@ -34,6 +52,43 @@ fn verify_command_is_runnable(task_id: &str, field: &str, command: &str) -> Resu
     }
 
     Ok(())
+}
+
+/// Return the first unquoted shell control operator in `command`, or in the
+/// tokenized `argv` (shlex keeps a space-delimited `|` as its own token).
+/// Quote-aware so a value like `RUSTFLAGS="--cfg a"` or a regex operand is not
+/// misread as an operator.
+fn shell_operator_token(argv: &[String], command: &str) -> Option<String> {
+    // Standalone operator tokens (e.g. `... | grep ...` → token "|").
+    for token in argv {
+        if matches!(
+            token.as_str(),
+            "|" | "||" | "&&" | "&" | ";" | ">" | ">>" | "<" | "|&"
+        ) {
+            return Some(token.clone());
+        }
+    }
+    // Unquoted metacharacters embedded in the raw string (e.g. `a|b`, `$(...)`).
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ if in_single || in_double => {}
+            '|' | ';' => return Some(ch.to_string()),
+            '&' => return Some("&".to_string()),
+            '>' | '<' => return Some(ch.to_string()),
+            '`' => return Some("`".to_string()),
+            '$' if bytes.get(i + 1) == Some(&b'(') => return Some("$(".to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn verify_cargo_test_command(
@@ -293,4 +348,100 @@ fn strip_plan_bullet(line: &str) -> &str {
         }
     }
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(command: &str) -> String {
+        format!("Verification:\n\n```sh\n{command}\n```\n")
+    }
+
+    #[test]
+    fn accepts_env_prefixed_command() {
+        verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body(r#"RUSTFLAGS="--cfg commonware_stability_BETA" cargo check -p rsociety-chain"#),
+        )
+        .expect("env-prefixed command should be runnable");
+    }
+
+    #[test]
+    fn accepts_plain_filtered_cargo_test() {
+        verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body("cargo test -p demo my_exact_test -- --exact"),
+        )
+        .expect("filtered cargo test should be runnable");
+    }
+
+    #[test]
+    fn rejects_pipeline_command() {
+        let err = verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body("cargo test -p demo t | grep ok"),
+        )
+        .expect_err("pipeline should be rejected");
+        assert!(err.to_string().contains("needs a shell"), "{err}");
+    }
+
+    #[test]
+    fn rejects_chained_command() {
+        let err = verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body("cargo test -p demo a && cargo test -p demo b"),
+        )
+        .expect_err("chained command should be rejected");
+        assert!(err.to_string().contains("needs a shell"), "{err}");
+    }
+
+    #[test]
+    fn rejects_command_substitution() {
+        let err = verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body("cargo test -p demo $(cat list)"),
+        )
+        .expect_err("command substitution should be rejected");
+        assert!(err.to_string().contains("needs a shell"), "{err}");
+    }
+
+    #[test]
+    fn rejects_redirection() {
+        let err = verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body("cargo test -p demo t > out.log"),
+        )
+        .expect_err("redirection should be rejected");
+        assert!(err.to_string().contains("needs a shell"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unparseable_command() {
+        let err = verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body(r#"cargo test -p demo "unterminated"#),
+        )
+        .expect_err("unbalanced quote should be rejected");
+        assert!(err.to_string().contains("unparseable"), "{err}");
+    }
+
+    #[test]
+    fn env_value_with_special_chars_is_not_an_operator() {
+        // A quoted value containing shell-ish chars must not trip the operator
+        // scan; only unquoted operators do.
+        verify_commands_are_runnable(
+            "TASK-1",
+            "Verification:",
+            &body(r#"FOO="a>b|c" cargo test -p demo t"#),
+        )
+        .expect("quoted operator chars should be allowed");
+    }
 }
