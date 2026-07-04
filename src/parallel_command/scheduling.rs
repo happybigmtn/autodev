@@ -273,8 +273,46 @@ pub(crate) fn ready_parallel_tasks(
     let (mut pending, partials): (Vec<_>, Vec<_>) = ready
         .into_iter()
         .partition(|task| task.status == LoopTaskStatus::Pending);
+    // Frontier-first: dispatch pending tasks that unblock the most downstream
+    // work before independent leaves, so a dependency chain's critical path is
+    // never left waiting behind a task nothing depends on. Stable sort keeps
+    // plan order as the tie-break. Partials (landed-partial backlog) always
+    // follow all pending, so a re-dispatch never preempts a ready pending task.
+    let dependents = transitive_dependent_counts(plan);
+    pending.sort_by_key(|task| std::cmp::Reverse(dependents.get(&task.id).copied().unwrap_or(0)));
     pending.extend(partials);
     pending
+}
+
+/// For each task id, how many OTHER tasks transitively depend on it (reachable
+/// through `dependencies` edges). Used to order the ready queue frontier-first.
+pub(crate) fn transitive_dependent_counts(plan: &LoopPlanSnapshot) -> BTreeMap<String, usize> {
+    // Reverse adjacency: dep -> tasks that directly list it.
+    let mut dependents_of: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for task in &plan.tasks {
+        for dep in &task.dependencies {
+            dependents_of
+                .entry(dep.as_str())
+                .or_default()
+                .push(task.id.as_str());
+        }
+    }
+    let mut counts = BTreeMap::new();
+    for task in &plan.tasks {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![task.id.as_str()];
+        while let Some(current) = stack.pop() {
+            if let Some(children) = dependents_of.get(current) {
+                for &child in children {
+                    if seen.insert(child) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        counts.insert(task.id.clone(), seen.len());
+    }
+    counts
 }
 
 pub(crate) fn prioritize_ready_parallel_tasks(
@@ -1033,6 +1071,104 @@ mod tests {
         assert_eq!(
             ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
             vec!["TASK-002", "TASK-001", "TASK-003"]
+        );
+    }
+
+    #[test]
+    fn ready_parallel_tasks_orders_frontier_first() {
+        // Chain A <- B <- C (C depends on B, B on A) plus independent D. Only A
+        // and D are dependency-ready. A unblocks two downstream tasks; D none.
+        // D is listed first in plan order to prove the reorder actually fires.
+        let plan = r#"
+- [ ] `TASK-D` independent leaf
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-A` critical-path root
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-B` depends on A
+  Dependencies: `TASK-A`
+  Estimated scope: S
+- [ ] `TASK-C` depends on B
+  Dependencies: `TASK-B`
+  Estimated scope: S
+"#;
+        let snapshot = parse_loop_plan(plan);
+        let counts = transitive_dependent_counts(&snapshot);
+        assert_eq!(counts.get("TASK-A").copied(), Some(2));
+        assert_eq!(counts.get("TASK-B").copied(), Some(1));
+        assert_eq!(counts.get("TASK-C").copied(), Some(0));
+        assert_eq!(counts.get("TASK-D").copied(), Some(0));
+
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-A", "TASK-D"],
+            "frontier task A must dispatch before independent leaf D"
+        );
+    }
+
+    #[test]
+    fn ready_parallel_tasks_keeps_flat_graph_in_plan_order() {
+        // No dependency edges -> all counts 0 -> stable sort preserves order.
+        let plan = r#"
+- [ ] `TASK-1` first
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-2` second
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-3` third
+  Dependencies: none
+  Estimated scope: S
+"#;
+        let snapshot = parse_loop_plan(plan);
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            ready.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec!["TASK-1", "TASK-2", "TASK-3"]
+        );
+    }
+
+    #[test]
+    fn ready_parallel_tasks_backlog_partial_never_preempts_pending() {
+        // A high-fan-out partial P must still follow the plain pending Q: the
+        // frontier reorder applies only within the pending group.
+        let plan = r#"
+- [~] `TASK-P` partial with many dependents
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-Q` plain pending
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-R` depends on P
+  Dependencies: `TASK-P`
+  Estimated scope: S
+"#;
+        let snapshot = parse_loop_plan(plan);
+        let ready = ready_parallel_tasks(
+            &snapshot,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        // Q (pending) before P (partial), even though P has a dependent.
+        let ids = ready.into_iter().map(|task| task.id).collect::<Vec<_>>();
+        assert_eq!(ids.first().map(String::as_str), Some("TASK-Q"));
+        assert!(
+            ids.iter().position(|id| id == "TASK-Q")
+                < ids.iter().position(|id| id == "TASK-P"),
+            "pending must precede backlog partial: {ids:?}"
         );
     }
 
