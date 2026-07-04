@@ -159,7 +159,7 @@ Inspect the target repository's `REVIEW.md` for this task, then inspect the diff
 Your job and its strict boundaries:
 - This is an ADVISORY review. Report ONLY concrete, actionable problems that are clearly attributable to THIS diff: real correctness bugs, real security risks, or clear regressions that the diff introduces.
 - A standing REVIEW.md finding for this task is in scope. Re-run it against the CURRENT tree. If the current tree does not clear it, the verdict is FINDINGS.
-- An empty lane diff is NOT clean when a standing REVIEW.md finding exists for this task.
+- An empty lane diff is not proof that a standing REVIEW.md finding is clear. The host may clear that case only after this task's current-tree verification commands and `cargo test --workspace` have passed.
 - REJECT speculative findings, hypothetical edge cases, "what if" concerns, style nits, and anything you are not confident is a real defect in this diff.
 - Do NOT request refactors, rewrites, broad redesigns, added abstractions, or scope expansion. Those are not findings.
 - Do NOT spawn or request any nested reviewers, sub-agents, or further review passes.
@@ -311,7 +311,7 @@ pub(crate) fn append_lane_review_clearance(repo_root: &Path, task_id: &str) -> R
     }
     review_text.push_str(&format!(
         "\n## `{task_id}`: standing review cleared\n\
-- Source: auto parallel standing-review gate cleared this task after a clean independent review of the current tree.\n\
+- Source: auto parallel standing-review gate cleared this task after current-tree verification and review gates passed.\n\
 - Remaining blockers: none.\n"
     ));
     atomic_write(&review_path, review_text.as_bytes())?;
@@ -336,30 +336,26 @@ fn render_lane_review_findings_entry(task_id: &str, findings_summary: &str) -> S
 ///
 /// This is the public entry wired into the landing seam. It runs a real Codex
 /// review via [`run_logged_codex_review`], bounded by the configured timeout,
-/// and classifies the resulting report. Every error path degrades to
-/// `SkippedFailOpen` — this function never returns `Err` and never panics.
+/// and classifies the resulting report. `current_tree_verification_passed` must
+/// only be true after the host's task verification and workspace-test gates have
+/// passed at canonical HEAD. Every error path degrades to `SkippedFailOpen` —
+/// this function never returns `Err` and never panics.
 pub(crate) async fn run_lane_review_gate(
     repo_root: &Path,
     target_branch: &str,
     assignment: &ActiveLaneAssignment,
     changed_files: &[String],
+    current_tree_verification_passed: bool,
     config: &LaneReviewConfig,
 ) -> LaneReviewOutcome {
     let review_text = std::fs::read_to_string(repo_root.join("REVIEW.md")).unwrap_or_default();
     let standing_review_findings =
         unresolved_review_findings_for_task(&review_text, &assignment.task.id);
     if changed_files.is_empty() && !standing_review_findings.is_empty() {
-        return LaneReviewOutcome::FindingsKeepPartial {
-            findings_summary: format!(
-                "Standing REVIEW.md finding remains for `{}` and the landed lane recorded no changed files to clear it:\n\n{}",
-                assignment.task.id,
-                standing_review_findings
-                    .iter()
-                    .map(|item| format!("- {item}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        };
+        if current_tree_verification_passed {
+            return LaneReviewOutcome::Clean;
+        }
+        return standing_review_not_cleared_outcome(&assignment.task.id, &standing_review_findings);
     }
     let report_path = codex_review_report_path(repo_root, "parallel-lane-review");
     let prompt = build_lane_review_prompt(
@@ -392,6 +388,23 @@ pub(crate) async fn run_lane_review_gate(
         Err(_) => LaneReviewOutcome::SkippedFailOpen {
             reason: format!("review timed out after {}s", review_timeout().as_secs()),
         },
+    }
+}
+
+fn standing_review_not_cleared_outcome(
+    task_id: &str,
+    standing_review_findings: &[String],
+) -> LaneReviewOutcome {
+    LaneReviewOutcome::FindingsKeepPartial {
+        findings_summary: format!(
+            "Standing REVIEW.md finding remains for `{}` and the landed lane recorded no changed files; current-tree verification did not pass, so the host cannot clear it:\n\n{}",
+            task_id,
+            standing_review_findings
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
     }
 }
 
@@ -573,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_diff_with_standing_review_finding_is_not_clean() {
+    async fn empty_diff_with_standing_review_finding_without_current_tree_pass_is_not_clean() {
         let root = temp_dir("standing-empty-diff");
         fs::write(
             root.join("REVIEW.md"),
@@ -587,12 +600,67 @@ mod tests {
             codex_bin: PathBuf::from("/bin/false"),
         };
 
-        match run_lane_review_gate(&root, "main", &assignment, &[], &config).await {
+        match run_lane_review_gate(&root, "main", &assignment, &[], false, &config).await {
             LaneReviewOutcome::FindingsKeepPartial { findings_summary } => {
                 assert!(findings_summary.contains("Standing REVIEW.md finding remains"));
                 assert!(findings_summary.contains("TASK-007"));
             }
             other => panic!("empty diff with standing finding must not be clean: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn empty_diff_with_standing_review_finding_and_current_tree_pass_is_clean() {
+        let root = temp_dir("standing-empty-diff-passed");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-007`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/x.rs`: already fixed in the current tree.\n",
+        )
+        .expect("write review");
+        let assignment = test_assignment(&root, "TASK-007");
+        let config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: PathBuf::from("/bin/false"),
+        };
+
+        assert_eq!(
+            run_lane_review_gate(&root, "main", &assignment, &[], true, &config,).await,
+            LaneReviewOutcome::Clean
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn non_empty_diff_with_standing_review_finding_still_runs_independent_review() {
+        let root = temp_dir("standing-nonempty-diff");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-007`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/x.rs`: re-check alongside this lane diff.\n",
+        )
+        .expect("write review");
+        let assignment = test_assignment(&root, "TASK-007");
+        let config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: PathBuf::from("/bin/false"),
+        };
+
+        match run_lane_review_gate(
+            &root,
+            "main",
+            &assignment,
+            &["src/x.rs".to_string()],
+            true,
+            &config,
+        )
+        .await
+        {
+            LaneReviewOutcome::SkippedFailOpen { reason } => {
+                assert!(reason.contains("review subprocess failed"), "{reason}");
+            }
+            other => panic!("non-empty diff should still invoke review runner: {other:?}"),
         }
         let _ = fs::remove_dir_all(&root);
     }

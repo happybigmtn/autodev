@@ -663,11 +663,15 @@ async fn apply_lane_review_gate(
             },
         );
     }
+    // Reaching this point means the host just re-ran the task's declared
+    // verification and `cargo test --workspace` successfully at canonical HEAD.
+    let current_tree_verification_passed = true;
     let outcome = run_lane_review_gate(
         repo_root,
         target_branch,
         assignment,
         changed_files,
+        current_tree_verification_passed,
         review_config,
     )
     .await;
@@ -2704,6 +2708,20 @@ mod tests {
         task_id: &str,
         title: &str,
     ) -> ActiveLaneAssignment {
+        review_gate_assignment_with_markdown(
+            root,
+            task_id,
+            title,
+            format!("- [ ] `{task_id}` {title}\n"),
+        )
+    }
+
+    fn review_gate_assignment_with_markdown(
+        root: &std::path::Path,
+        task_id: &str,
+        title: &str,
+        markdown: String,
+    ) -> ActiveLaneAssignment {
         ActiveLaneAssignment {
             lane_index: 3,
             attempts: 1,
@@ -2715,7 +2733,7 @@ mod tests {
                 estimated_scope: Some("S".to_string()),
                 completion_path_target: None,
                 lane_kind: LaneKind::Code,
-                markdown: format!("- [ ] `{task_id}` {title}\n"),
+                markdown,
             },
             resumed: false,
             lane_root: root.join("lane-review-root"),
@@ -2728,6 +2746,156 @@ mod tests {
             terminate_requested_at: None,
             host_recovery_note: None,
         }
+    }
+
+    fn seed_cargo_workspace_with_test(
+        root: &std::path::Path,
+        package_name: &str,
+        test_name: &str,
+        passes: bool,
+    ) {
+        fs::create_dir_all(root.join("src")).expect("create src dir");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nmembers = [\".\"]\n\n[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        )
+        .expect("write Cargo.toml");
+        let assertion = if passes {
+            ""
+        } else {
+            "panic!(\"current tree is still red\");"
+        };
+        fs::write(
+            root.join("src/lib.rs"),
+            format!(
+                "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn {test_name}() {{\n        {assertion}\n    }}\n}}\n"
+            ),
+        )
+        .expect("write src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn empty_diff_standing_review_clears_after_current_tree_gates_pass() {
+        let root = unique_temp_dir("empty-diff-standing-review-pass");
+        init_git_repo(&root);
+        let package_name = "dod_fixture_pass";
+        seed_cargo_workspace_with_test(&root, package_name, "task_dod_pass", true);
+        let task_id = "TASK-DOD-PASS";
+        let title = "standing finding already fixed";
+        let task_markdown = format!(
+            "- [x] `{task_id}` {title}\nVerification:\n  - `cargo test -q -p {package_name} tests::task_dod_pass -- --exact`\nDependencies: none\n"
+        );
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!("# IMPLEMENTATION_PLAN\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/lib.rs`: old failure now fixed in the current tree.\n"
+            ),
+        )
+        .expect("write review");
+        git_ok(&root, ["add", "."]);
+        git_ok(&root, ["commit", "-q", "-m", "seed passing current tree"]);
+
+        let mut assignment =
+            review_gate_assignment_with_markdown(&root, task_id, title, task_markdown);
+        let review_config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: PathBuf::from("/bin/false"),
+        };
+
+        let mut status =
+            super::apply_lane_verify_gate(&root, &mut assignment, LoopTaskStatus::Done).await;
+        assert_eq!(status, LoopTaskStatus::Done);
+        status = super::apply_workspace_test_gate(&root, &mut assignment, status).await;
+        assert_eq!(status, LoopTaskStatus::Done);
+        status = super::apply_lane_review_gate(
+            &root,
+            "main",
+            &mut assignment,
+            &[],
+            status,
+            &review_config,
+        )
+        .await;
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("standing review cleared"));
+        assert!(
+            unresolved_review_findings_for_task(&review, task_id).is_empty(),
+            "clearance should supersede the old finding: {review}"
+        );
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
+        assert!(log.contains("host-reexec-verify: declared verification re-passed"));
+        assert!(log.contains("workspace-test: `cargo test --workspace` passed"));
+        assert!(log.contains("independent-review: clean"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn empty_diff_standing_review_stays_partial_when_current_tree_verify_fails() {
+        let root = unique_temp_dir("empty-diff-standing-review-fail");
+        init_git_repo(&root);
+        let package_name = "dod_fixture_fail";
+        seed_cargo_workspace_with_test(&root, package_name, "task_dod_fail", false);
+        let task_id = "TASK-DOD-FAIL";
+        let title = "standing finding still fails";
+        let task_markdown = format!(
+            "- [x] `{task_id}` {title}\nVerification:\n  - `cargo test -q -p {package_name} tests::task_dod_fail -- --exact`\nDependencies: none\n"
+        );
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!("# IMPLEMENTATION_PLAN\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/lib.rs`: failure remains red in the current tree.\n"
+            ),
+        )
+        .expect("write review");
+        git_ok(&root, ["add", "."]);
+        git_ok(&root, ["commit", "-q", "-m", "seed failing current tree"]);
+
+        let mut assignment =
+            review_gate_assignment_with_markdown(&root, task_id, title, task_markdown);
+        let status =
+            super::apply_lane_verify_gate(&root, &mut assignment, LoopTaskStatus::Done).await;
+
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(
+            plan.contains(&format!("- [~] `{task_id}` {title}")),
+            "plan should stay partial when current-tree verification fails: {plan}"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(!review.contains("standing review cleared"));
+        assert!(
+            !unresolved_review_findings_for_task(&review, task_id).is_empty(),
+            "standing finding must remain unresolved: {review}"
+        );
+        assert!(review.contains("host re-execution verification failed"));
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "plan staged: {staged}"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

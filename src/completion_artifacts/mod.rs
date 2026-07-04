@@ -990,7 +990,7 @@ mod tests {
         );
 
         let cleared = format!(
-            "{review}\n## `TASK-REVIEW`: standing review cleared\n- Source: auto parallel standing-review gate cleared this task after a clean independent review of the current tree.\n- Remaining blockers: none.\n"
+            "{review}\n## `TASK-REVIEW`: standing review cleared\n- Source: auto parallel standing-review gate cleared this task after current-tree verification and review gates passed.\n- Remaining blockers: none.\n"
         );
         assert!(
             super::unresolved_review_findings_for_task(&cleared, "TASK-REVIEW").is_empty(),
