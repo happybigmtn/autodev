@@ -1971,6 +1971,20 @@ pub(crate) fn spawn_parallel_lane_attempt(
     let extra_env = lane_config.env_for_lane(&assignment.lane_root);
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
+    let effort = lane_config.effective_reasoning_effort(
+        assignment.task.estimated_scope.as_deref(),
+        assignment.attempts,
+    );
+    if effort != lane_config.reasoning_effort {
+        eprintln!(
+            "effort-routing: {} scope {} attempt {} -> {} (ceiling {})",
+            task_id,
+            assignment.task.estimated_scope.as_deref().unwrap_or("?"),
+            assignment.attempts,
+            effort,
+            lane_config.reasoning_effort
+        );
+    }
     let lane_config = lane_config.clone();
 
     join_set.spawn(async move {
@@ -1989,7 +2003,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
                 &repo_root,
                 &full_prompt,
                 &lane_config.model,
-                &lane_config.reasoning_effort,
+                &effort,
                 lane_config.max_turns,
                 &stderr_log_path,
                 Some(&stdout_log_path),
@@ -2004,7 +2018,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
                 &repo_root,
                 &full_prompt,
                 &lane_config.model,
-                &lane_config.reasoning_effort,
+                &effort,
                 &lane_config.codex_bin,
                 &stderr_log_path,
                 Some(&stdout_log_path),

@@ -1,5 +1,45 @@
 use super::*;
 
+fn scope_effort_routing_enabled() -> bool {
+    std::env::var("AUTO_PARALLEL_SCOPE_EFFORT")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeClass {
+    Small,
+    Medium,
+    Large,
+}
+
+/// Map a plan row's `Estimated scope:` value to a class. Accepts single-letter
+/// (S/M/L, XS->Small, XL->Large) and word forms (small/medium/large).
+fn normalize_scope(scope: Option<&str>) -> Option<ScopeClass> {
+    let raw = scope?.trim().to_ascii_lowercase();
+    let token = raw.split_whitespace().next().unwrap_or("");
+    match token {
+        "xs" | "s" | "small" | "trivial" | "tiny" => Some(ScopeClass::Small),
+        "m" | "med" | "medium" => Some(ScopeClass::Medium),
+        "l" | "xl" | "xxl" | "large" | "big" | "huge" => Some(ScopeClass::Large),
+        _ => None,
+    }
+}
+
+/// Total order over Codex/Claude effort levels, low to high. Unknown strings
+/// rank at the top so an unrecognized ceiling never silently caps routing down.
+fn effort_rank(effort: &str) -> u8 {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        _ => u8::MAX,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LaneRunConfig {
     pub(crate) claude: bool,
@@ -29,6 +69,29 @@ impl LaneRunConfig {
             lane_local_cargo_target: worker_env.lane_local_cargo_target,
             cargo_target_prompt_clause: worker_env.cargo_target_prompt_clause.clone(),
             preflight_prompt_clause,
+        }
+    }
+
+    /// Reasoning effort to actually run this attempt at. Scope-based routing
+    /// (on by default; disable with `AUTO_PARALLEL_SCOPE_EFFORT=0`) spends less
+    /// on mechanical tasks: S/XS -> medium, M -> high, L/unknown -> the
+    /// operator's `--reasoning-effort`. The operator value is a hard ceiling —
+    /// routing never exceeds it. Any retry (attempt > 1) uses the ceiling, so a
+    /// task that failed cheap is re-run at full strength.
+    pub(crate) fn effective_reasoning_effort(&self, scope: Option<&str>, attempt: usize) -> String {
+        if !scope_effort_routing_enabled() || attempt > 1 {
+            return self.reasoning_effort.clone();
+        }
+        let target = match normalize_scope(scope) {
+            Some(ScopeClass::Small) => "medium",
+            Some(ScopeClass::Medium) => "high",
+            Some(ScopeClass::Large) | None => return self.reasoning_effort.clone(),
+        };
+        // Cap at the operator ceiling.
+        if effort_rank(target) <= effort_rank(&self.reasoning_effort) {
+            target.to_string()
+        } else {
+            self.reasoning_effort.clone()
         }
     }
 
@@ -963,6 +1026,50 @@ pub(crate) fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
 mod tests {
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
+
+    fn effort_config(ceiling: &str) -> LaneRunConfig {
+        LaneRunConfig {
+            claude: false,
+            max_turns: None,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: ceiling.to_string(),
+            codex_bin: std::path::PathBuf::from("codex"),
+            extra_env: Vec::new(),
+            lane_local_cargo_target: false,
+            cargo_target_prompt_clause: String::new(),
+            preflight_prompt_clause: String::new(),
+        }
+    }
+
+    // All scope-effort assertions live in one test: the feature is gated by a
+    // process-global env var, and splitting across parallel tests would race on
+    // it. Sequential phases here set the var explicitly before each block.
+    #[test]
+    fn scope_effort_routing_behaviour() {
+        // Routing ON (explicit): S/M route down under a high ceiling.
+        std::env::set_var("AUTO_PARALLEL_SCOPE_EFFORT", "1");
+        let high = effort_config("xhigh");
+        assert_eq!(high.effective_reasoning_effort(Some("S"), 1), "medium");
+        assert_eq!(high.effective_reasoning_effort(Some("small"), 1), "medium");
+        assert_eq!(high.effective_reasoning_effort(Some("M"), 1), "high");
+        // Large / unknown fall back to the operator ceiling.
+        assert_eq!(high.effective_reasoning_effort(Some("L"), 1), "xhigh");
+        assert_eq!(high.effective_reasoning_effort(None, 1), "xhigh");
+
+        // Ceiling caps routing: an M task capped at a medium ceiling.
+        let medium = effort_config("medium");
+        assert_eq!(medium.effective_reasoning_effort(Some("M"), 1), "medium");
+        assert_eq!(medium.effective_reasoning_effort(Some("S"), 1), "medium");
+
+        // Retry escalates to the ceiling regardless of scope.
+        assert_eq!(high.effective_reasoning_effort(Some("S"), 2), "xhigh");
+
+        // Routing OFF: always the ceiling.
+        std::env::set_var("AUTO_PARALLEL_SCOPE_EFFORT", "0");
+        assert_eq!(high.effective_reasoning_effort(Some("S"), 1), "xhigh");
+
+        std::env::remove_var("AUTO_PARALLEL_SCOPE_EFFORT");
+    }
 
     fn sample_worker_metadata() -> LaneWorkerMetadata {
         LaneWorkerMetadata {
