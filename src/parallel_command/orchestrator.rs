@@ -1538,7 +1538,8 @@ pub(crate) async fn refresh_parallel_plan(
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
     plan_text =
-        audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)?;
+        audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
+            .await?;
     if let Some(tracker) = linear_tracker.as_mut() {
         if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
             if !maybe_disable_linear_auto_sync_for_run(

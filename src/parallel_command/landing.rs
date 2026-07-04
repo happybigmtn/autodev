@@ -260,7 +260,18 @@ pub(crate) struct ReceiptDriftTriageEntry {
     pub(crate) reasons: Vec<String>,
 }
 
-pub(crate) fn audit_parallel_completion_drift(
+/// Local drift re-verify is on unless `AUTO_PARALLEL_DRIFT_REVERIFY=0`.
+/// When completion evidence for a `[x]` row goes stale for a locally
+/// repairable reason (receipt/plan/artifact freshness), re-running the row's
+/// declared verification commands on the host is strictly cheaper than
+/// demoting the row and re-dispatching it to a model-backed lane.
+fn drift_local_reverify_enabled() -> bool {
+    std::env::var("AUTO_PARALLEL_DRIFT_REVERIFY")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+pub(crate) async fn audit_parallel_completion_drift(
     repo_root: &Path,
     target_branch: &str,
     plan_text: &str,
@@ -270,6 +281,7 @@ pub(crate) fn audit_parallel_completion_drift(
     let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
     let mut backfilled_receipts = Vec::new();
+    let mut locally_reverified = Vec::new();
     let mut manual_closeout_candidates = Vec::new();
 
     for task in snapshot
@@ -286,6 +298,31 @@ pub(crate) fn audit_parallel_completion_drift(
             if refreshed.is_fully_evidenced() {
                 backfilled_receipts.push(task.id.clone());
                 continue;
+            }
+        }
+        if drift_local_reverify_enabled()
+            && assess_task_completion_gap(&task.markdown, &evidence).kind
+                == CompletionGapKind::LocalRepairable
+        {
+            parallel_logger.info(format!(
+                "drift-reverify: `{}` completion evidence went stale ({}); re-running its verification locally before demoting",
+                task.id,
+                evidence.missing_reasons().join("; ")
+            ));
+            if let LaneVerifyOutcome::AllPassed =
+                run_lane_verify_gate(repo_root, &task.id, &task.markdown).await
+            {
+                let mut refreshed =
+                    inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                if !refreshed.has_review_handoff {
+                    ensure_host_review_handoff(repo_root, &task.id, &[], &refreshed)?;
+                    refreshed =
+                        inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+                }
+                if refreshed.is_fully_evidenced() {
+                    locally_reverified.push(task.id.clone());
+                    continue;
+                }
             }
         }
         let entry = ReceiptDriftTriageEntry {
@@ -338,6 +375,13 @@ pub(crate) fn audit_parallel_completion_drift(
     } else {
         false
     };
+    if !locally_reverified.is_empty() {
+        parallel_logger.info(format!(
+            "drift-reverify: locally re-proven {} completed task(s) without demotion ({})",
+            locally_reverified.len(),
+            locally_reverified.join(", ")
+        ));
+    }
     if !backfilled_receipts.is_empty() {
         if push_branch_with_remote_sync(repo_root, target_branch)? {
             parallel_logger.info(format!(
@@ -2515,8 +2559,8 @@ mod tests {
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
     }
 
-    #[test]
-    fn audit_parallel_completion_drift_demotes_completed_rows() {
+    #[tokio::test]
+    async fn audit_parallel_completion_drift_demotes_completed_rows() {
         let repo = unique_temp_dir("parallel-drift-audit");
         let run_root = unique_temp_dir("parallel-drift-audit-run");
         fs::create_dir_all(&repo).expect("failed to create repo dir");
@@ -2531,6 +2575,7 @@ mod tests {
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
             &logger,
         )
+        .await
         .expect("drift audit should succeed");
 
         assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
@@ -2547,8 +2592,8 @@ mod tests {
         assert!(live_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
     }
 
-    #[test]
-    fn audit_parallel_completion_drift_logs_only_changed_triage() {
+    #[tokio::test]
+    async fn audit_parallel_completion_drift_logs_only_changed_triage() {
         let repo = unique_temp_dir("parallel-drift-audit-stable-log");
         let run_root = unique_temp_dir("parallel-drift-audit-stable-log-run");
         fs::create_dir_all(&repo).expect("failed to create repo dir");
@@ -2558,6 +2603,7 @@ mod tests {
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
         let updated = audit_parallel_completion_drift(&repo, "main", plan, &logger)
+            .await
             .expect("first drift audit should succeed");
         assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
         let first_log =
@@ -2565,6 +2611,7 @@ mod tests {
         assert!(first_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
 
         audit_parallel_completion_drift(&repo, "main", &updated, &logger)
+            .await
             .expect("second drift audit should succeed");
         let second_log =
             fs::read_to_string(run_root.join("live.log")).expect("second audit should keep log");
@@ -2582,8 +2629,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn audit_parallel_completion_drift_backfills_safe_legacy_receipt_footer() {
+    #[tokio::test]
+    async fn audit_parallel_completion_drift_backfills_safe_legacy_receipt_footer() {
         let (_root, _remote, repo, _worker) =
             init_remote_and_clones("parallel-drift-backfill", "trunk");
         let run_root = unique_temp_dir("parallel-drift-backfill-run");
@@ -2605,6 +2652,7 @@ mod tests {
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
         let updated = audit_parallel_completion_drift(&repo, "trunk", plan, &logger)
+            .await
             .expect("drift audit should backfill receipt footer");
 
         assert_eq!(updated, plan);
@@ -2670,8 +2718,8 @@ mod tests {
         assert!(status.contains("genesis/GBRAIN-CONTEXT.md"));
     }
 
-    #[test]
-    fn audit_parallel_completion_drift_reports_closeout_candidates_without_promoting_plan() {
+    #[tokio::test]
+    async fn audit_parallel_completion_drift_reports_closeout_candidates_without_promoting_plan() {
         let repo = unique_temp_dir("parallel-closeout-audit");
         let run_root = unique_temp_dir("parallel-closeout-audit-run");
         fs::create_dir_all(&repo).expect("failed to create repo dir");
@@ -2688,6 +2736,7 @@ mod tests {
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
             &logger,
         )
+        .await
         .expect("drift audit should succeed");
 
         assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");

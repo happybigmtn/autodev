@@ -48,6 +48,7 @@ mod recovery_notes;
 mod review_gate;
 mod run_state;
 mod scheduling;
+mod purge;
 mod status;
 mod tmux;
 mod verify_gate;
@@ -65,6 +66,7 @@ pub(crate) use recovery_notes::*;
 pub(crate) use review_gate::*;
 pub(crate) use run_state::*;
 pub(crate) use scheduling::*;
+pub(crate) use purge::*;
 pub(crate) use status::*;
 pub(crate) use tmux::*;
 pub(crate) use verify_gate::*;
@@ -140,6 +142,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     }
     if args.max_concurrent_workers > 1 && should_launch_parallel_tmux(&args) {
         ensure_writable_run_root(&run_root)?;
+        purge_previous_parallel_run_artifacts(&repo_root, &run_root);
         log_parallel_startup_prep(
             prepare_parallel_startup(&repo_root, target_branch.as_str())?,
             target_branch.as_str(),
@@ -169,6 +172,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         prompt_template.push_str(DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE);
     }
     ensure_writable_run_root(&run_root)?;
+    purge_previous_parallel_run_artifacts(&repo_root, &run_root);
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;

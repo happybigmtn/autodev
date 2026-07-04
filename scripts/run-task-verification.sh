@@ -34,7 +34,14 @@ trap cleanup EXIT
 cd "$repo_root"
 
 set +e
-"$@" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+# Leading VAR=value tokens cannot exec as "$@" (bash only treats them as
+# assignments syntactically, not after expansion); route through env so
+# env-prefixed verification commands run and record their literal argv.
+if [[ ${1:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+  env "$@" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+else
+  "$@" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+fi
 status=$?
 set -e
 

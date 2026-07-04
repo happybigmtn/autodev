@@ -859,10 +859,16 @@ fn verification_command_argv_problem(
     if matching.is_empty() {
         return None;
     }
-    if matching
-        .iter()
-        .any(|entry| entry.expected_argv.as_ref() == Some(&expected_argv))
-    {
+    if matching.iter().any(|entry| {
+        entry.expected_argv.as_ref().is_some_and(|argv| {
+            argv == &expected_argv
+                || unwrap_launcher_argv(argv).is_some_and(|unwrapped| {
+                    unwrapped == expected_argv
+                        || unwrap_launcher_argv(&unwrapped)
+                            .is_some_and(|inner| inner == expected_argv)
+                })
+        })
+    }) {
         return None;
     }
     Some(format!(
@@ -972,13 +978,50 @@ fn verification_receipt_command_matches(
         None => return false,
     };
 
-    if !entry.argv.is_empty() {
-        return expected_argv == entry.argv;
+    let entry_argv = if !entry.argv.is_empty() {
+        Some(entry.argv.clone())
+    } else {
+        shell_split(&entry.command)
+    };
+    let Some(mut candidate) = entry_argv else {
+        return false;
+    };
+    if expected_argv == candidate {
+        return true;
     }
+    // Workers legitimately wrap env-var-prefixed verification commands in a
+    // shell launcher (`bash -lc "<cmd>"`) or an `env` launcher because a
+    // leading VAR=value token cannot exec as bare argv. Unwrap launcher
+    // shapes (at most twice: `bash -lc "env VAR=... cmd"`) before comparing
+    // so the recorded run still matches the plan row's literal command.
+    for _ in 0..2 {
+        let Some(next) = unwrap_launcher_argv(&candidate) else {
+            return false;
+        };
+        if expected_argv == next {
+            return true;
+        }
+        candidate = next;
+    }
+    false
+}
 
-    shell_split(&entry.command)
-        .map(|entry_argv| expected_argv == entry_argv)
-        .unwrap_or(false)
+fn unwrap_launcher_argv(argv: &[String]) -> Option<Vec<String>> {
+    let arg0 = argv.first().map(|arg0| {
+        Path::new(arg0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(arg0.as_str())
+    })?;
+    match arg0 {
+        "bash" | "sh" | "zsh" | "dash"
+            if argv.len() == 3 && matches!(argv[1].as_str(), "-c" | "-lc" | "-cl") =>
+        {
+            shell_split(&argv[2])
+        }
+        "env" if argv.len() > 1 => Some(argv[1..].to_vec()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1356,5 +1399,60 @@ mod tests {
         .expect("receipt should parse")
         .expect("non-ancestor commit rejected");
         assert!(problem.contains("commit mismatch"));
+    }
+
+    #[test]
+    fn command_matches_unwraps_bash_lc_launcher_for_env_prefixed_commands() {
+        let expected =
+            r#"RUSTFLAGS="--cfg commonware_stability_BETA" cargo check -p rsociety-chain"#;
+        let entry = VerificationReceiptCommand {
+            command: "bash -lc <quoted>".to_string(),
+            argv: vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                expected.to_string(),
+            ],
+            ..VerificationReceiptCommand::default()
+        };
+        assert!(super::verification_receipt_command_matches(
+            &entry, expected
+        ));
+    }
+
+    #[test]
+    fn command_matches_unwraps_env_launcher() {
+        let expected = r#"RUSTFLAGS="--cfg beta" cargo check -p demo"#;
+        let entry = VerificationReceiptCommand {
+            command: "env launcher".to_string(),
+            argv: vec![
+                "env".to_string(),
+                "RUSTFLAGS=--cfg beta".to_string(),
+                "cargo".to_string(),
+                "check".to_string(),
+                "-p".to_string(),
+                "demo".to_string(),
+            ],
+            ..VerificationReceiptCommand::default()
+        };
+        assert!(super::verification_receipt_command_matches(
+            &entry, expected
+        ));
+    }
+
+    #[test]
+    fn command_matches_rejects_launcher_with_different_inner_command() {
+        let expected = r#"RUSTFLAGS="--cfg beta" cargo check -p demo"#;
+        let entry = VerificationReceiptCommand {
+            command: "bash -lc other".to_string(),
+            argv: vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "cargo test -p other-crate".to_string(),
+            ],
+            ..VerificationReceiptCommand::default()
+        };
+        assert!(!super::verification_receipt_command_matches(
+            &entry, expected
+        ));
     }
 }
