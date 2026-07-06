@@ -382,8 +382,8 @@ pub(crate) async fn audit_parallel_completion_drift(
         // external/live steps (`Skipped`), stays `[~]` — which correctly
         // protects intentionally-partial rows like the fleet gate.
         let gap = assess_task_completion_gap(&task.markdown, &evidence);
-        let repairable = evidence.is_fully_evidenced()
-            || gap.kind == CompletionGapKind::LocalRepairable;
+        let repairable =
+            evidence.is_fully_evidenced() || gap.kind == CompletionGapKind::LocalRepairable;
         if drift_local_reverify_enabled() && !reverify_budget.is_zero() && repairable {
             if reverify_spent >= reverify_budget {
                 // Budget spent: leave the row [~] (honest — no false promotion).
@@ -1410,13 +1410,19 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
         return Ok(false);
     }
 
+    let mut task = assignment.task.clone();
+    let completion_status = reconcile_parallel_landed_task_state(repo_root, &mut task, &[])?;
     write_clean_no_commit_verdict(
         assignment,
-        "landed-unverified",
-        "canonical evidence appears complete, but no-commit self-heal cannot run the mandatory current-tree definition-of-done gates; task stays [~]",
+        match completion_status {
+            LoopTaskStatus::Done => "done",
+            LoopTaskStatus::Partial => "landed-unverified",
+            _ => "needs-human-triage",
+        },
+        "canonical evidence is complete; reconciled the task through the host definition-of-done path without requiring a new worker commit",
     )?;
 
-    Ok(false)
+    Ok(true)
 }
 
 /// Host-local run state marking a task as "held" by a host gate (verify or
@@ -2131,6 +2137,93 @@ mod tests {
             !promoted,
             "task still must not promote from evidence after clearing hold"
         );
+
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_no_commit_reconciles_fully_evidenced_pending_task() {
+        let repo = unique_temp_dir("parallel-clean-no-commit-evidenced");
+        init_git_repo(&repo);
+        let task_markdown = "- [ ] `TASK-006` Evidence already landed\nVerification:\n  - `cargo test -p demo task_006`\nDependencies: none\n";
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        fs::create_dir_all(repo.join("scripts")).expect("create scripts");
+        fs::write(repo.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("write wrapper");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# Review\n\n## `TASK-006`\n- Source: test handoff.\n- Remaining blockers: none.\n",
+        )
+        .expect("write review");
+        run_git_in(&repo, ["add", "."]);
+        run_git_in(&repo, ["commit", "-m", "seed task"]);
+        let receipt_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+        fs::create_dir_all(repo.join(".auto/symphony/verification-receipts"))
+            .expect("create receipt dir");
+        fs::write(
+            repo.join(".auto/symphony/verification-receipts/TASK-006.json"),
+            format!(
+                r#"{{"commit":"{receipt_commit}","commands":[{{"command":"cargo test -p demo task_006","exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("write receipt");
+        run_git_in(
+            &repo,
+            ["add", ".auto/symphony/verification-receipts/TASK-006.json"],
+        );
+        run_git_in(&repo, ["commit", "-m", "seed receipt"]);
+
+        let lane_root = repo.join("lane-clean-no-commit");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let run_root = repo.join("parallel-run");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-006".to_string(),
+                title: "Evidence already landed".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: task_markdown.to_string(),
+            },
+            resumed: false,
+            lane_root: lane_root.clone(),
+            lane_repo_root: repo.join("lane-repo"),
+            base_commit: receipt_commit,
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let reconciled = reconcile_parallel_clean_no_commit(&repo, "main", &assignment, &logger)
+            .expect("clean no-commit reconciliation should succeed");
+
+        assert!(reconciled, "fully evidenced pending task should reconcile");
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(
+            plan.contains("- [x] `TASK-006` Evidence already landed"),
+            "plan should advance to [x], got:\n{plan}"
+        );
+        let staged = run_git_in(&repo, ["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.contains("IMPLEMENTATION_PLAN.md"),
+            "queue update should be staged for host sync: {staged}"
+        );
+        let verdict = fs::read_to_string(lane_root.join("clean-no-commit-verdict.json"))
+            .expect("read verdict");
+        assert!(verdict.contains("\"verdict\": \"done\""), "{verdict}");
 
         fs::remove_dir_all(&repo).expect("cleanup");
     }
