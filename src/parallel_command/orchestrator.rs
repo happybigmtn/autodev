@@ -720,6 +720,38 @@ pub(crate) async fn run_parallel_loop(
                     executable_ready.push(task);
                 }
             }
+            let mut reconciled_evidence = false;
+            for task in &evidence_ready {
+                match reconcile_ready_evidence_task_from_canonical_evidence(repo_root, task) {
+                    Ok(Some(status)) => {
+                        parallel_logger.info(format!(
+                            "evidence-sync: {} reconciled from canonical evidence as {:?}",
+                            task.id, status
+                        ));
+                        reconciled_evidence = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        parallel_logger.warn(format!(
+                            "warning: evidence reconciliation for `{}` failed: {err:#}",
+                            task.id
+                        ));
+                    }
+                }
+            }
+            if reconciled_evidence {
+                plan = refresh_parallel_plan_or_last_good(
+                    repo_root,
+                    target_branch,
+                    linear_tracker,
+                    &mut linear_auto_sync_state,
+                    &plan,
+                    parallel_logger,
+                )
+                .await?;
+                last_idle_summary = None;
+                continue;
+            }
             if !operator_ready.is_empty() {
                 match write_operator_actions_for_ready_tasks(run_root, &operator_ready) {
                     Ok(path) => parallel_logger.info(format!(

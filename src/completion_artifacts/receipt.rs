@@ -1064,10 +1064,13 @@ fn verification_receipt_command_matches(
         return true;
     }
 
-    let expected_argv = match shell_split(expected_command) {
+    let mut expected_argv = match shell_split(expected_command) {
         Some(argv) => argv,
         None => return false,
     };
+    if let Some(inner) = unwrap_task_verification_wrapper_argv(&expected_argv) {
+        expected_argv = inner;
+    }
 
     let entry_argv = if !entry.argv.is_empty() {
         Some(entry.argv.clone())
@@ -1115,6 +1118,21 @@ fn unwrap_launcher_argv(argv: &[String]) -> Option<Vec<String>> {
     }
 }
 
+fn unwrap_task_verification_wrapper_argv(argv: &[String]) -> Option<Vec<String>> {
+    let wrapper = argv.first().map(|arg0| {
+        Path::new(arg0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(arg0.as_str())
+    })?;
+    if wrapper != "run-task-verification.sh" {
+        return None;
+    }
+    let separator = argv.iter().position(|arg| arg == "--")?;
+    let inner = argv.get(separator + 1..)?.to_vec();
+    (!inner.is_empty()).then_some(inner)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1124,8 +1142,9 @@ mod tests {
     use crate::completion_artifacts::artifacts::artifact_hash;
 
     use super::{
-        normalized_plan_hash_bytes, verification_receipt_freshness_problem, VerificationDirtyState,
-        VerificationReceipt, VerificationReceiptArtifact, VerificationReceiptCommand,
+        normalized_plan_hash_bytes, verification_receipt_freshness_problem,
+        VerificationDirtyState, VerificationReceipt, VerificationReceiptArtifact,
+        VerificationReceiptCommand,
     };
 
     #[test]
@@ -1579,6 +1598,31 @@ mod tests {
         };
         assert!(super::verification_receipt_command_matches(
             &entry, expected
+        ));
+    }
+
+    #[test]
+    fn command_matches_unwraps_task_verification_wrapper() {
+        let inner = "cargo test -p rsociety-driver live_driver_generates_ludeme_forge_archive_and_portfolio_paid_readback -- --exact";
+        let expected = format!(
+            "scripts/run-task-verification.sh TASK-080726-EARNING-PROOF-CHECKPOINT -- {inner}"
+        );
+        let entry = VerificationReceiptCommand {
+            command: inner.to_string(),
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "rsociety-driver".to_string(),
+                "live_driver_generates_ludeme_forge_archive_and_portfolio_paid_readback"
+                    .to_string(),
+                "--".to_string(),
+                "--exact".to_string(),
+            ],
+            ..VerificationReceiptCommand::default()
+        };
+        assert!(super::verification_receipt_command_matches(
+            &entry, &expected
         ));
     }
 

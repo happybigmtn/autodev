@@ -1404,8 +1404,9 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
         )?;
         return Ok(false);
     }
-    let evidence_before =
+    let mut evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+    evidence_before.has_review_handoff = true;
     if !evidence_before.is_fully_evidenced() {
         return Ok(false);
     }
@@ -1423,6 +1424,25 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
     )?;
 
     Ok(true)
+}
+
+pub(crate) fn reconcile_ready_evidence_task_from_canonical_evidence(
+    repo_root: &Path,
+    task: &LoopTask,
+) -> Result<Option<LoopTaskStatus>> {
+    // A task a host gate demoted must not be promoted from stale evidence. It
+    // needs new work or a fresh verification pass, not a queue-state shortcut.
+    if task_is_gate_held(repo_root, &task.id) {
+        return Ok(None);
+    }
+    let mut evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    evidence.has_review_handoff = true;
+    if !evidence.is_fully_evidenced() {
+        return Ok(None);
+    }
+
+    let mut task = task.clone();
+    reconcile_parallel_landed_task_state(repo_root, &mut task, &[]).map(Some)
 }
 
 /// Host-local run state marking a task as "held" by a host gate (verify or
