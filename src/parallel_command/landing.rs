@@ -1408,7 +1408,7 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
     let mut evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     evidence_before.has_review_handoff = true;
-    if !evidence_before.is_fully_evidenced() {
+    if !evidence_before.is_ready_for_definition_of_done_gates() {
         return Ok(false);
     }
 
@@ -2269,7 +2269,7 @@ mod tests {
             .expect("write wrapper");
         fs::write(
             repo.join("REVIEW.md"),
-            "# Review\n\n## `TASK-007`\n- Source: test handoff.\n- Remaining blockers: none.\n",
+            "# Review\n\n## `TASK-007`: host re-execution verification failed\n- Source: stale host gate.\n- The host re-ran this task's declared verification command(s) at canonical HEAD and one FAILED.\n\n```\nprevious stale failure\n```\n\n## `TASK-007`\n- Source: test handoff.\n- Remaining blockers: none.\n",
         )
         .expect("write review");
         run_git_in(&repo, ["add", "."]);
