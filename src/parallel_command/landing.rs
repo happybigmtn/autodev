@@ -1404,6 +1404,7 @@ pub(crate) fn reconcile_parallel_clean_no_commit(
         )?;
         return Ok(false);
     }
+    propagate_lane_receipts(&assignment.lane_repo_root, repo_root, &assignment.task.id)?;
     let mut evidence_before =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     evidence_before.has_review_handoff = true;
@@ -2240,6 +2241,95 @@ mod tests {
         assert!(
             staged.contains("IMPLEMENTATION_PLAN.md"),
             "queue update should be staged for host sync: {staged}"
+        );
+        let verdict = fs::read_to_string(lane_root.join("clean-no-commit-verdict.json"))
+            .expect("read verdict");
+        assert!(verdict.contains("\"verdict\": \"done\""), "{verdict}");
+
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_no_commit_reconciles_from_lane_local_receipt() {
+        let repo = unique_temp_dir("parallel-clean-no-commit-lane-receipt");
+        init_git_repo(&repo);
+        let task_markdown = "- [ ] `TASK-007` Already implemented\nVerification:\n  - `cargo test -p demo task_007`\nDependencies: none\n";
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        fs::write(
+            repo.join(".gitignore"),
+            ".auto/\nlane-clean-no-commit/\nlane-repo/\nparallel-run/\n",
+        )
+        .expect("write gitignore");
+        fs::create_dir_all(repo.join("scripts")).expect("create scripts");
+        fs::write(repo.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("write wrapper");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# Review\n\n## `TASK-007`\n- Source: test handoff.\n- Remaining blockers: none.\n",
+        )
+        .expect("write review");
+        run_git_in(&repo, ["add", "."]);
+        run_git_in(&repo, ["commit", "-m", "seed task"]);
+        let base_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+
+        let lane_repo = repo.join("lane-repo");
+        fs::create_dir_all(lane_repo.join(".auto/symphony/verification-receipts"))
+            .expect("create lane receipt dir");
+        fs::write(
+            lane_repo.join(".auto/symphony/verification-receipts/TASK-007.json"),
+            format!(
+                r#"{{"commit":"{base_commit}","commands":[{{"command":"cargo test -p demo task_007","expected_argv":["cargo","test","-p","demo","task_007"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("write lane receipt");
+
+        let lane_root = repo.join("lane-clean-no-commit");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let run_root = repo.join("parallel-run");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+        let assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-007".to_string(),
+                title: "Already implemented".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: task_markdown.to_string(),
+            },
+            resumed: false,
+            lane_root: lane_root.clone(),
+            lane_repo_root: lane_repo,
+            base_commit,
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        let reconciled = reconcile_parallel_clean_no_commit(&repo, "main", &assignment, &logger)
+            .expect("lane-local receipt should be propagated and reconciled");
+
+        assert!(reconciled, "lane-local receipt should reconcile the task");
+        assert!(
+            repo.join(".auto/symphony/verification-receipts/TASK-007.json")
+                .is_file(),
+            "lane receipt should be copied to canonical"
+        );
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(
+            plan.contains("- [x] `TASK-007` Already implemented"),
+            "plan should advance to [x], got:\n{plan}"
         );
         let verdict = fs::read_to_string(lane_root.join("clean-no-commit-verdict.json"))
             .expect("read verdict");
