@@ -436,7 +436,7 @@ fn artifact_paths_from_line(line: &str) -> Vec<String> {
         return paths;
     }
 
-    let candidate = trimmed
+    let unquoted = trimmed
         .split(" -- ")
         .next()
         .unwrap_or(trimmed)
@@ -444,8 +444,15 @@ fn artifact_paths_from_line(line: &str) -> Vec<String> {
         .next()
         .unwrap_or(trimmed)
         .trim();
-    if looks_like_repo_relative_path(candidate) {
-        paths.push(candidate.to_string());
+    // Unquoted artifact lists are comma-separated; treating the whole line as
+    // one candidate produced a single nonexistent "a/src, b/tests/x.rs" path
+    // that permanently blocked completion (2026-07-09 rsociety ST-ladder
+    // incident).
+    for candidate in unquoted.split(',') {
+        let candidate = candidate.trim();
+        if looks_like_repo_relative_path(candidate) {
+            paths.push(candidate.to_string());
+        }
     }
     paths
 }
@@ -464,6 +471,19 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 mod tests {
     use crate::task_parser::model::TaskStatus;
     use crate::task_parser::parse::{is_task_id_like, parse_task_header, parse_tasks};
+
+    #[test]
+    fn unquoted_comma_separated_completion_artifacts_split_per_path() {
+        let plan = "- [~] `AD-777` Comma artifacts\n\n    Completion artifacts: crates/rsociety-app/src, crates/rsociety-app/tests/action_core.rs\n    Dependencies: none\n";
+        let tasks = parse_tasks(plan);
+        assert_eq!(
+            tasks[0].completion_artifacts,
+            vec![
+                "crates/rsociety-app/src",
+                "crates/rsociety-app/tests/action_core.rs"
+            ]
+        );
+    }
 
     #[test]
     fn parses_all_plan_statuses_and_fields() {
