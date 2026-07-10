@@ -19,9 +19,11 @@ pub(crate) use crate::claude_exec::{
 };
 pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
-    assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
+    assess_task_completion_gap, compute_task_owned_inputs_fingerprint, ensure_host_review_handoff,
+    footer_task_owned_inputs, git_verification_receipt_footers, inspect_task_completion_evidence,
     legacy_verification_receipt_backfill_footer, unresolved_review_findings_for_task,
     verification_plan, verification_receipt_commit_footer, CompletionGapKind,
+    VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;

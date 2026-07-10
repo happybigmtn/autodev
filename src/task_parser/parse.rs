@@ -213,6 +213,71 @@ fn parse_completion_artifacts(markdown: &str) -> Vec<String> {
     body.lines().flat_map(artifact_paths_from_line).collect()
 }
 
+/// Extract the concrete repo-relative path tokens from a task's `Owns:` field.
+///
+/// Shared by the per-task owned-inputs fingerprint. Unlike
+/// [`parse_completion_artifacts`] this deliberately also accepts bare directory
+/// names (`docs`, `refs/tags/v1`) — the `Owns:` contract is validated to be
+/// path-like and non-prose, and a fingerprint that silently dropped a bare
+/// owned directory could wrongly trust a receipt after that directory changed.
+pub(crate) fn parse_owns_paths(markdown: &str) -> Vec<String> {
+    let Some(body) = task_field_body_until_any(markdown, "Owns:", TASK_FIELD_BOUNDARIES) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for line in body.lines() {
+        let trimmed = strip_list_bullet(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Backticked tokens are the canonical `Owns:` convention.
+        let mut found_backtick = false;
+        let mut rest = trimmed;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('`') else {
+                break;
+            };
+            let candidate = rest[..end].trim();
+            if is_owns_path_token(candidate) {
+                paths.push(candidate.to_string());
+                found_backtick = true;
+            }
+            rest = &rest[end + 1..];
+        }
+        if found_backtick {
+            continue;
+        }
+        // Unquoted, comma-separated fallback (drop trailing ` -- `/` — ` notes).
+        let head = trimmed
+            .split(" -- ")
+            .next()
+            .unwrap_or(trimmed)
+            .split(" — ")
+            .next()
+            .unwrap_or(trimmed);
+        for candidate in head.split(',') {
+            let candidate = candidate.trim();
+            if is_owns_path_token(candidate) {
+                paths.push(candidate.to_string());
+            }
+        }
+    }
+    dedup_task_refs(paths)
+}
+
+/// A single, whitespace-free repo-relative path token (no absolute paths, no
+/// prose). Accepts `src/`, `docs`, `crates/x/src`, `refs/tags/v1`, `README.md`.
+fn is_owns_path_token(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && !candidate.starts_with('/')
+        && !candidate.chars().any(|ch| ch.is_whitespace())
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/'))
+        && candidate.chars().any(|ch| ch.is_ascii_alphanumeric())
+}
+
 fn parse_task_completion_path(markdown: &str) -> Option<String> {
     markdown.lines().find_map(|line| {
         let lower = line.to_ascii_lowercase();

@@ -287,6 +287,95 @@ fn drift_reverify_budget() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Forced full re-verify override. When `AUTO_PARALLEL_FORCE_FULL_REVERIFY` is
+/// set to a non-empty, non-`0` value, the per-task owned-inputs gate is bypassed
+/// and every `[x]` row is re-verified regardless of its fingerprint (a
+/// deliberate full audit).
+fn force_full_reverify_enabled() -> bool {
+    std::env::var("AUTO_PARALLEL_FORCE_FULL_REVERIFY")
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty() && trimmed != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// A task opts an expensive verification out of periodic drift sweeps with a
+/// discoverable `[sweep-excluded]` marker anywhere in its plan row (conventionally
+/// in the `Verification:` block). Once `[x]` with a valid receipt it is never
+/// re-run by a sweep unless its own owned inputs change or a forced full
+/// re-verify is requested.
+fn task_is_sweep_excluded(task_markdown: &str) -> bool {
+    task_markdown.to_ascii_lowercase().contains("[sweep-excluded]")
+}
+
+/// Per-task decision from the owned-inputs gate for a completed `[x]` row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedInputsDecision {
+    /// Owned inputs are provably unchanged since the receipt was stamped —
+    /// trust the receipt and skip inspection/re-verification entirely.
+    SkipTrusted,
+    /// Owned inputs definitively changed (or an error must be treated as change)
+    /// — force re-verification even if the receipt still looks fresh.
+    ForceReverify,
+    /// No stamped fingerprint (legacy receipt) or nothing conclusive — fall back
+    /// to the pre-existing evidence-freshness behavior.
+    FallThrough,
+}
+
+/// Decide how a completed `[x]` task should be treated by the drift sweep, using
+/// the stamped-vs-recomputed owned-inputs fingerprint.
+///
+/// - `forced`: bypass everything and re-verify (`ForceReverify`).
+/// - `sweep_excluded` + a valid receipt: never re-run on mere staleness/legacy/
+///   hash-error; only a definitive fingerprint mismatch (own inputs changed)
+///   triggers re-verification.
+/// - Otherwise: match ⇒ trust; mismatch or hash-error-with-a-stamp ⇒ re-verify;
+///   no stamp (legacy) ⇒ fall back.
+fn decide_owned_inputs(
+    forced: bool,
+    sweep_excluded: bool,
+    has_receipt_footer: bool,
+    stored_fp: Option<&str>,
+    current_fp: Option<&str>,
+) -> OwnedInputsDecision {
+    if forced {
+        return OwnedInputsDecision::ForceReverify;
+    }
+    match (stored_fp, current_fp) {
+        (Some(stored), Some(current)) if stored == current => OwnedInputsDecision::SkipTrusted,
+        (Some(_), Some(_)) => OwnedInputsDecision::ForceReverify, // own inputs changed
+        (Some(_), None) => {
+            // Stamped, but we could not recompute (git/hash error).
+            if sweep_excluded {
+                OwnedInputsDecision::SkipTrusted // trust the valid receipt
+            } else {
+                OwnedInputsDecision::ForceReverify // conservative: treat as changed
+            }
+        }
+        (None, _) => {
+            // Legacy receipt (no stamped fingerprint).
+            if sweep_excluded && has_receipt_footer {
+                OwnedInputsDecision::SkipTrusted
+            } else {
+                OwnedInputsDecision::FallThrough
+            }
+        }
+    }
+}
+
+/// Resolve `(has_receipt_footer, stored_fingerprint)` for a task from the most
+/// recent committed verification-receipt footer.
+fn stored_owned_inputs(
+    footers: &[VerificationReceiptFooter],
+    task_id: &str,
+) -> (bool, Option<String>) {
+    match footers.iter().find(|footer| footer.task_id == task_id) {
+        Some(footer) => (true, footer_task_owned_inputs(footer)),
+        None => (false, None),
+    }
+}
+
 pub(crate) async fn audit_parallel_completion_drift(
     repo_root: &Path,
     target_branch: &str,
@@ -294,6 +383,13 @@ pub(crate) async fn audit_parallel_completion_drift(
     parallel_logger: &ParallelEventLogger,
 ) -> Result<(String, bool)> {
     let snapshot = parse_loop_plan(plan_text);
+    // Parse the plan once for owned-inputs fingerprinting (task contracts, Owns
+    // paths, dependencies, declared artifacts) and read committed receipt
+    // footers once so the per-task gate below does not rescan git history per row.
+    let all_plan_tasks = parse_shared_tasks(plan_text);
+    let receipt_footers = git_verification_receipt_footers(repo_root);
+    let forced_full_reverify = force_full_reverify_enabled();
+    let mut owned_inputs_trusted: Vec<String> = Vec::new();
     let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
     let mut backfilled_receipts = Vec::new();
@@ -309,21 +405,52 @@ pub(crate) async fn audit_parallel_completion_drift(
         .iter()
         .filter(|task| task.status == LoopTaskStatus::Done)
     {
-        let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
-        if evidence.is_fully_evidenced() {
+        // Per-task owned-inputs gate: narrow re-verification from the global
+        // tree signal to this task's own inputs. When the stamped fingerprint
+        // still matches, trust the receipt without re-running; when it changed,
+        // force re-verification even if the footer otherwise looks fresh (this
+        // closes the legacy gap where footer/ancestor receipts skip whole-tree
+        // freshness and could miss source drift outside declared artifacts).
+        let sweep_excluded = task_is_sweep_excluded(&task.markdown);
+        let (has_receipt_footer, stored_fp) = stored_owned_inputs(&receipt_footers, &task.id);
+        let current_fp =
+            compute_task_owned_inputs_fingerprint(repo_root, &task.id, &all_plan_tasks);
+        let decision = decide_owned_inputs(
+            forced_full_reverify,
+            sweep_excluded,
+            has_receipt_footer,
+            stored_fp.as_deref(),
+            current_fp.as_deref(),
+        );
+        if decision == OwnedInputsDecision::SkipTrusted {
+            owned_inputs_trusted.push(task.id.clone());
             continue;
         }
-        if backfill_completed_legacy_receipt_footer(repo_root, task, &evidence)? {
+        // A changed fingerprint only forces a demote path when the local
+        // re-verify sweep is actually active; with the sweep disabled we never
+        // demote an otherwise-fresh [x] row (there is nothing to re-prove it
+        // with), preserving pre-sweep behavior.
+        let reverify_active = drift_local_reverify_enabled() && !reverify_budget.is_zero();
+        let must_reverify = decision == OwnedInputsDecision::ForceReverify;
+        let must_reverify_effective = must_reverify && reverify_active;
+
+        let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        if !must_reverify_effective && evidence.is_fully_evidenced() {
+            continue;
+        }
+        if !must_reverify_effective
+            && backfill_completed_legacy_receipt_footer(repo_root, task, &evidence)?
+        {
             let refreshed = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
             if refreshed.is_fully_evidenced() {
                 backfilled_receipts.push(task.id.clone());
                 continue;
             }
         }
-        if drift_local_reverify_enabled()
-            && !reverify_budget.is_zero()
-            && assess_task_completion_gap(&task.markdown, &evidence).kind
-                == CompletionGapKind::LocalRepairable
+        if reverify_active
+            && (must_reverify
+                || assess_task_completion_gap(&task.markdown, &evidence).kind
+                    == CompletionGapKind::LocalRepairable)
         {
             if reverify_spent >= reverify_budget {
                 // Budget spent: fall through to the honest demote path below.
@@ -352,11 +479,21 @@ pub(crate) async fn audit_parallel_completion_drift(
                 }
             }
         }
+        let mut reasons = evidence.missing_reasons();
+        if reasons.is_empty() && must_reverify {
+            // A fingerprint-forced demote of a row whose receipt still looked
+            // fresh: its own inputs changed and host re-verification did not
+            // re-prove [x]. Record a legible reason.
+            reasons.push(
+                "task-owned inputs changed since the receipt was stamped and host re-verification did not re-prove [x]"
+                    .to_string(),
+            );
+        }
         let entry = ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
             status: LoopTaskStatus::Partial,
-            reasons: evidence.missing_reasons(),
+            reasons,
         };
         updated_plan_text = update_reconciled_task_completion_in_plan_text(
             &updated_plan_text,
@@ -461,6 +598,13 @@ pub(crate) async fn audit_parallel_completion_drift(
             reverify_spent.as_secs(),
             reverify_deferred.len(),
             reverify_deferred.join(", ")
+        ));
+    }
+    if !owned_inputs_trusted.is_empty() {
+        parallel_logger.info(format!(
+            "drift-reverify: trusted {} completed task(s) via unchanged owned-inputs fingerprint; skipped re-verification ({})",
+            owned_inputs_trusted.len(),
+            owned_inputs_trusted.join(", ")
         ));
     }
     if !locally_reverified.is_empty() {
@@ -3576,5 +3720,89 @@ mod tests {
             "plan staged: {staged}"
         );
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn owned_inputs_gate_trusts_matching_fingerprint() {
+        // Stored == current owned-inputs fingerprint -> trust the receipt.
+        assert_eq!(
+            super::decide_owned_inputs(false, false, true, Some("abc"), Some("abc")),
+            super::OwnedInputsDecision::SkipTrusted
+        );
+    }
+
+    #[test]
+    fn owned_inputs_gate_reverifies_on_mismatch() {
+        // Own inputs changed -> re-verify even though a receipt exists.
+        assert_eq!(
+            super::decide_owned_inputs(false, false, true, Some("abc"), Some("def")),
+            super::OwnedInputsDecision::ForceReverify
+        );
+        // Mismatch still forces re-verify for a sweep-excluded task (own inputs
+        // changed is the one exception that re-runs it).
+        assert_eq!(
+            super::decide_owned_inputs(false, true, true, Some("abc"), Some("def")),
+            super::OwnedInputsDecision::ForceReverify
+        );
+    }
+
+    #[test]
+    fn owned_inputs_gate_forced_bypasses_fingerprints() {
+        // Forced full re-verify ignores a matching fingerprint.
+        assert_eq!(
+            super::decide_owned_inputs(true, false, true, Some("abc"), Some("abc")),
+            super::OwnedInputsDecision::ForceReverify
+        );
+        // ...and even a sweep-excluded task.
+        assert_eq!(
+            super::decide_owned_inputs(true, true, true, Some("abc"), Some("abc")),
+            super::OwnedInputsDecision::ForceReverify
+        );
+    }
+
+    #[test]
+    fn owned_inputs_gate_legacy_receipt_falls_back() {
+        // No stamped fingerprint -> pre-existing evidence-freshness behavior.
+        assert_eq!(
+            super::decide_owned_inputs(false, false, true, None, Some("def")),
+            super::OwnedInputsDecision::FallThrough
+        );
+    }
+
+    #[test]
+    fn owned_inputs_gate_hash_error_forces_reverify() {
+        // Stamped but not recomputable (git/hash error) -> conservative change.
+        assert_eq!(
+            super::decide_owned_inputs(false, false, true, Some("abc"), None),
+            super::OwnedInputsDecision::ForceReverify
+        );
+    }
+
+    #[test]
+    fn owned_inputs_gate_sweep_excluded_trusts_legacy_and_hash_error() {
+        // A sweep-excluded task with a valid receipt is never re-run by a sweep
+        // on mere legacy-ness or a hash error.
+        assert_eq!(
+            super::decide_owned_inputs(false, true, true, None, Some("def")),
+            super::OwnedInputsDecision::SkipTrusted
+        );
+        assert_eq!(
+            super::decide_owned_inputs(false, true, true, Some("abc"), None),
+            super::OwnedInputsDecision::SkipTrusted
+        );
+        // But a sweep-excluded row with NO receipt footer at all is not blindly
+        // trusted — it falls through to normal evidence inspection.
+        assert_eq!(
+            super::decide_owned_inputs(false, true, false, None, Some("def")),
+            super::OwnedInputsDecision::FallThrough
+        );
+    }
+
+    #[test]
+    fn sweep_excluded_marker_is_discoverable_in_markdown() {
+        assert!(super::task_is_sweep_excluded(
+            "- [x] `T1` x\n  Verification:\n    - `cargo test` [sweep-excluded]\n"
+        ));
+        assert!(!super::task_is_sweep_excluded("- [x] `T1` x\n  Verification:\n    - `cargo test`\n"));
     }
 }

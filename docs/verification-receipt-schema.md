@@ -51,6 +51,58 @@ receipts as a compatibility/staging fallback.
 - Evidence Class: archive -- historical audit/report artifact that is cited as
   context, not as fresh executable proof.
 
+## Task-Owned Inputs Fingerprint (`task-owned-inputs-v1`)
+
+When `auto parallel` stamps a task's closeout-commit footer it also embeds a
+versioned per-task input fingerprint under the JSON key `task_owned_inputs_v1`.
+This is the finer of two drift gates. The whole-repo drift-sweep fingerprint
+(HEAD + `git status`) is the first, cheap gate: if nothing in the tree changed
+at all, the sweep is skipped. When that global signal *does* change, the
+per-task fingerprint decides, row by row, whether a completed `[x]` task must
+re-verify.
+
+The fingerprint hashes only what a task's verification can legitimately depend
+on: (a) the task's normalized contract (its plan-row markdown with the status
+checkbox neutralized, so a `[x]`/`[~]` flip is never a change), (b) its `Owns:`
+paths, (c) its direct dependency task IDs, and (d) the union of each direct
+dependency's `Owns:` paths plus their non-receipt completion-artifact paths. The
+task's own declared completion-artifact paths are content-addressed too so a
+declared-artifact drift is never silently trusted. All paths are content-
+addressed via git enumeration (tracked + untracked, respecting `.gitignore`) so
+file names, contents, executable/symlink modes, deletions, untracked files,
+refs, and submodule gitlink commits all fold in, while unrelated repo paths are
+absent from the hash.
+
+Semantics during a drift sweep:
+
+- Stamped fingerprint still matches the recomputed one -> the task's own inputs
+  are unchanged; trust the receipt and skip re-verification even though the
+  global tree moved.
+- Stamped fingerprint changed -> the task's own inputs moved; re-verify even if
+  the footer otherwise looks fresh. This also closes the legacy gap where footer
+  and ancestor-commit receipts skip whole-tree dirty/plan freshness and could
+  otherwise miss source drift outside a receipt's declared artifacts.
+- No stamped fingerprint (legacy receipt) -> fall back to the pre-existing
+  evidence-freshness behavior. Legacy receipts are never retroactively
+  invalidated; the field applies going forward.
+- Any git/hash failure computing the fingerprint is treated as "changed" (force
+  re-verify), never as "unchanged".
+
+### `[sweep-excluded]`
+
+A task may carry a discoverable `[sweep-excluded]` marker anywhere in its plan
+row (conventionally in the `Verification:` block). Once the task is `[x]` with a
+valid receipt, a periodic drift sweep never re-runs its (often expensive)
+verification on mere staleness, legacy-ness, or a hash error — only a definitive
+owned-inputs fingerprint mismatch (its own inputs changed) or a forced full
+re-verify re-runs it.
+
+### Forced full re-verify
+
+Setting `AUTO_PARALLEL_FORCE_FULL_REVERIFY` to a non-empty, non-`0` value
+bypasses both fingerprints and re-verifies every completed row (a deliberate
+full audit).
+
 ## Directory Hash Limit
 
 Directory completion artifacts are hashed recursively by stable relative path

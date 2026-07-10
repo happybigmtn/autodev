@@ -36,7 +36,13 @@ pub(crate) fn verification_receipt_commit_footer(
     }
     let receipt_text =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let compact = compact_receipt_json_for_footer(&receipt_text)
+    // Stamp the versioned per-task owned-inputs fingerprint (computed against
+    // the plan being committed) so future drift sweeps can trust this receipt
+    // without re-running its verification when the task's own inputs are
+    // unchanged. Absent when the task is not in the plan or git enumeration
+    // fails — a receipt without the field falls back to legacy behavior.
+    let owned_inputs_fp = task_owned_inputs_fingerprint_for(repo_root, task_id);
+    let compact = compact_receipt_json_for_footer(&receipt_text, owned_inputs_fp.as_deref())
         .with_context(|| format!("failed to prepare receipt footer from {}", path.display()))?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(compact.as_bytes());
     Ok(Some(format!(
@@ -208,10 +214,37 @@ fn parse_verification_receipt_footer(
     })
 }
 
-fn compact_receipt_json_for_footer(receipt_text: &str) -> Result<String> {
+fn compact_receipt_json_for_footer(
+    receipt_text: &str,
+    owned_inputs_fp: Option<&str>,
+) -> Result<String> {
     let mut value = serde_json::from_str::<Value>(receipt_text)?;
     prune_receipt_output_tails(&mut value);
+    if let (Some(fp), Some(object)) = (owned_inputs_fp, value.as_object_mut()) {
+        object.insert(
+            "task_owned_inputs_v1".to_string(),
+            Value::String(fp.to_string()),
+        );
+    }
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Compute the `task-owned-inputs-v1` fingerprint for `task_id` by parsing the
+/// plan currently on disk. Returns `None` (no stamp) when the plan is missing,
+/// the task is absent from it, or git enumeration fails.
+fn task_owned_inputs_fingerprint_for(repo_root: &Path, task_id: &str) -> Option<String> {
+    let plan_text = fs::read_to_string(repo_root.join("IMPLEMENTATION_PLAN.md")).ok()?;
+    let tasks = crate::task_parser::parse_tasks(&plan_text);
+    super::owned_inputs::compute_task_owned_inputs_fingerprint(repo_root, task_id, &tasks)
+}
+
+/// Read the stamped `task-owned-inputs-v1` fingerprint out of a footer receipt's
+/// embedded JSON. `None` when the footer predates the field (legacy) or is
+/// unparseable.
+pub(crate) fn footer_task_owned_inputs(footer: &VerificationReceiptFooter) -> Option<String> {
+    serde_json::from_str::<VerificationReceipt>(&footer.receipt_text)
+        .ok()?
+        .task_owned_inputs_v1
 }
 
 fn prune_receipt_output_tails(value: &mut Value) {
@@ -262,6 +295,11 @@ struct VerificationReceipt {
     declared_artifacts: Vec<VerificationReceiptArtifact>,
     #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
+    /// Versioned per-task owned-inputs fingerprint (`task-owned-inputs-v1`),
+    /// stamped by the host into the closeout-commit footer. Absent on legacy
+    /// receipts, which fall back to whole-repo drift behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_owned_inputs_v1: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -1252,6 +1290,7 @@ mod tests {
                 path: "docs/ops/proof.md".to_string(),
                 sha256: Some(artifact_hash.clone()),
             }],
+            task_owned_inputs_v1: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 expected_argv: Some(expected_argv),
@@ -1359,6 +1398,7 @@ mod tests {
             }),
             plan_hash: super::current_plan_hash(&root),
             declared_artifacts: Vec::new(),
+            task_owned_inputs_v1: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 expected_argv: Some(vec![
@@ -1422,6 +1462,7 @@ mod tests {
                 path: "REVIEW.md".to_string(),
                 sha256: Some("not-the-current-review-hash".to_string()),
             }],
+            task_owned_inputs_v1: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 expected_argv: Some(expected_argv),

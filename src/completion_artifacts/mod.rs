@@ -2,6 +2,7 @@
 
 mod artifacts;
 mod audit;
+mod owned_inputs;
 mod receipt;
 mod verification;
 
@@ -23,10 +24,12 @@ use crate::completion_artifacts::receipt::{
 };
 pub(crate) use crate::completion_artifacts::verification::verification_step_looks_external;
 
+pub(crate) use owned_inputs::compute_task_owned_inputs_fingerprint;
 pub(crate) use receipt::{
-    git_verification_receipt_footers, legacy_verification_receipt_backfill_footer,
-    normalized_plan_hash_bytes, shared_footer_receipt_freshness_problem,
-    shared_receipt_freshness_problem, verification_receipt_commit_footer,
+    footer_task_owned_inputs, git_verification_receipt_footers,
+    legacy_verification_receipt_backfill_footer, normalized_plan_hash_bytes,
+    shared_footer_receipt_freshness_problem, shared_receipt_freshness_problem,
+    verification_receipt_commit_footer, VerificationReceiptFooter,
 };
 pub(crate) use verification::verification_plan;
 
@@ -563,6 +566,68 @@ mod tests {
 
         assert!(evidence.verification_receipt_present);
         assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn footer_stamps_and_reads_back_task_owned_inputs_fingerprint() {
+        let root = temp_dir("footer-owned-inputs");
+        init_git_repo(&root);
+        // A real plan row so the owned-inputs fingerprint can be computed.
+        let plan = "\
+- [x] `TASK-OI` Owned inputs demo
+  Spec: build it
+  Owns: `src/lib.rs`
+  Verification:
+    - `cargo test oi`
+  Completion artifacts: none
+  Dependencies: none
+";
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), plan).expect("write plan");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/lib.rs"), "pub fn oi() {}\n").expect("write owned src");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-OI.json"),
+            r#"{"task_id":"TASK-OI","commands":[{"command":"cargo test oi","exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("write receipt");
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-m", "owned inputs demo"]);
+
+        let footer = verification_receipt_commit_footer(&root, "TASK-OI")
+            .expect("footer generation should succeed")
+            .expect("footer should be present");
+        git_ok(
+            &root,
+            &["commit", "--allow-empty", "-m", "closeout", "-m", &footer],
+        );
+
+        let landed = latest_verification_receipt_footer(&root, "TASK-OI")
+            .expect("footer receipt should be discoverable");
+        let stamped = super::footer_task_owned_inputs(&landed)
+            .expect("footer should carry a task_owned_inputs_v1 fingerprint");
+        assert!(!stamped.is_empty());
+
+        // Recomputing against the unchanged tree reproduces the stamped value.
+        let recomputed = super::compute_task_owned_inputs_fingerprint(
+            &root,
+            "TASK-OI",
+            &crate::task_parser::parse_tasks(plan),
+        )
+        .expect("recompute should succeed");
+        assert_eq!(stamped, recomputed, "stamped fingerprint must match recompute");
+
+        // Editing the owned source moves the recomputed fingerprint.
+        fs::write(root.join("src/lib.rs"), "pub fn oi() { /* changed */ }\n")
+            .expect("edit owned src");
+        let after = super::compute_task_owned_inputs_fingerprint(
+            &root,
+            "TASK-OI",
+            &crate::task_parser::parse_tasks(plan),
+        )
+        .expect("recompute should succeed");
+        assert_ne!(stamped, after, "owned-source change must move the fingerprint");
     }
 
     #[test]
