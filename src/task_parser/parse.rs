@@ -5,7 +5,12 @@ pub(crate) fn parse_tasks(plan: &str) -> Vec<PlanTask> {
     let mut current_lines = Vec::<String>::new();
 
     for line in plan.lines() {
-        if parse_task_header(line).is_some() {
+        // Task headers live at column 0 by plan convention. Indented
+        // `- [~] Foo-123 ...` bullets are body prose; the lenient bare-ID
+        // rule must not turn them into phantom dispatchable tasks
+        // (2026-07-10 ludeme Wave-004 incident).
+        let column_zero = !line.starts_with(' ') && !line.starts_with('\t');
+        if column_zero && parse_task_header(line).is_some() {
             if let Some(task) = finalize_task(&current_lines) {
                 tasks.push(task);
             }
@@ -471,6 +476,14 @@ fn looks_like_repo_relative_path(candidate: &str) -> bool {
 mod tests {
     use crate::task_parser::model::TaskStatus;
     use crate::task_parser::parse::{is_task_id_like, parse_task_header, parse_tasks};
+
+    #[test]
+    fn indented_prose_bullets_are_not_task_headers() {
+        let plan = "- [~] `AD-900` Real task\n\n    Why now: context.\n    - [~] Wave-004 is not a promotion input: accepted_count=0\n    Dependencies: none\n";
+        let tasks = parse_tasks(plan);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "AD-900");
+    }
 
     #[test]
     fn unquoted_comma_separated_completion_artifacts_split_per_path() {
