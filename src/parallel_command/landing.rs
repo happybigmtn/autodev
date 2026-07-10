@@ -1154,6 +1154,17 @@ pub(crate) fn apply_workspace_test_outcome(
             );
             LoopTaskStatus::Partial
         }
+        WorkspaceTestOutcome::Skipped { reason } if reason.contains("not applicable") => {
+            // Non-Rust repo: the gate has nothing to check. Treat as pass-through
+            // rather than demoting every task in Python/TS repos to [~] forever.
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!("workspace-test: gate not applicable ({reason}); pass-through"),
+            );
+            incoming_status
+        }
         WorkspaceTestOutcome::Skipped { reason } => {
             record_gate_hold(
                 repo_root,
