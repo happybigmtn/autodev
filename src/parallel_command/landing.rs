@@ -721,16 +721,54 @@ pub(crate) async fn land_parallel_lane_result(
             assignment.lane_index, assignment.task.id
         );
     }
-    let completion_status = reconcile_parallel_landed_task(repo_root, assignment, &changed_files)?;
+    let mut completion_status =
+        reconcile_parallel_landed_task(repo_root, assignment, &changed_files)?;
     if completion_status == LoopTaskStatus::Done {
         assignment.task.status = LoopTaskStatus::Done;
     } else if completion_status == LoopTaskStatus::Partial {
         assignment.task.status = LoopTaskStatus::Partial;
     }
+    // Inline receipt-gap repair (2026-07-10): if the ONLY thing holding this
+    // task at `[~]` is a missing verification receipt — the worker landed
+    // correct code but did not run its declared commands through the wrapper —
+    // run the host verify gate NOW. It re-runs the full declared set at
+    // canonical HEAD (the same `[x]` bar, not a weakened subset) and writes the
+    // receipt on pass; a re-reconcile then promotes to `[x]` in THIS landing.
+    // Measured: ~50% of landings were bouncing to `[~]` and burning a whole
+    // fresh model lane just to record verification the code already satisfied.
+    if completion_status == LoopTaskStatus::Partial && verify_gate_enabled() {
+        let evidence =
+            inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
+        let receipt_only_local_gap = evidence.has_review_handoff
+            && !evidence.verification_receipt_present
+            && repo_root.join("scripts/run-task-verification.sh").is_file()
+            && evidence.missing_completion_artifacts.is_empty()
+            && evidence.unresolved_audit_findings.is_empty()
+            && assess_task_completion_gap(&assignment.task.markdown, &evidence).kind
+                == CompletionGapKind::LocalRepairable;
+        if receipt_only_local_gap {
+            let outcome = run_lane_verify_gate(
+                repo_root,
+                &assignment.task.id,
+                &assignment.task.markdown,
+            )
+            .await;
+            if outcome == LaneVerifyOutcome::AllPassed {
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    "host-reexec-verify(inline): receipt gap repaired at landing; no follow-up lane",
+                );
+                completion_status =
+                    reconcile_parallel_landed_task(repo_root, assignment, &changed_files)?;
+                assignment.task.status = completion_status;
+            }
+        }
+    }
     // Definition of done: a task may stay `[x]` only if each finalization gate
     // produces a positive pass on the current integrated tree. Once any gate
     // holds it at `[~]`, later gates are skipped for this landing.
-    let mut completion_status = completion_status;
     if completion_status == LoopTaskStatus::Done {
         completion_status = apply_lane_verify_gate(repo_root, assignment, completion_status).await;
     }
