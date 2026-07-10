@@ -729,24 +729,32 @@ pub(crate) async fn land_parallel_lane_result(
         assignment.task.status = LoopTaskStatus::Partial;
     }
     // Inline receipt-gap repair (2026-07-10): if the ONLY thing holding this
-    // task at `[~]` is a missing verification receipt — the worker landed
-    // correct code but did not run its declared commands through the wrapper —
-    // run the host verify gate NOW. It re-runs the full declared set at
-    // canonical HEAD (the same `[x]` bar, not a weakened subset) and writes the
-    // receipt on pass; a re-reconcile then promotes to `[x]` in THIS landing.
-    // Measured: ~50% of landings were bouncing to `[~]` and burning a whole
-    // fresh model lane just to record verification the code already satisfied.
+    // task at `[~]` is a locally-repairable verification gap — a MISSING
+    // receipt (worker skipped the wrapper) OR a STALE receipt (a concurrent
+    // lane changed a declared artifact so its pinned hash drifted) — run the
+    // host verify gate NOW. It re-runs the full declared set at canonical HEAD
+    // (the same `[x]` bar, not a weakened subset) and rewrites a fresh receipt
+    // on pass; a re-reconcile then promotes to `[x]` in THIS landing.
+    //
+    // Measured on the live runners: the dominant rework mode was NOT missing
+    // receipts (0) but receipt STALENESS from cross-lane contention on shared
+    // monolith files (e.g. crates/rsociety-tui/src/lib.rs appears in 47 tasks'
+    // Owns) — 48 hash-mismatch demotions, 19 of which queued a fresh model lane
+    // and several looping the same task 2-3x. Keying on the LocalRepairable gap
+    // classification (the same signal the drift audit uses to decide
+    // re-verification) moves that re-verification inline to landing time, so a
+    // stale-but-still-passing task closes as `[x]` immediately instead of
+    // demoting and burning a follow-up model lane.
     if completion_status == LoopTaskStatus::Partial && verify_gate_enabled() {
         let evidence =
             inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
-        let receipt_only_local_gap = evidence.has_review_handoff
-            && !evidence.verification_receipt_present
+        let repairable_verification_gap = evidence.has_review_handoff
             && repo_root.join("scripts/run-task-verification.sh").is_file()
             && evidence.missing_completion_artifacts.is_empty()
             && evidence.unresolved_audit_findings.is_empty()
             && assess_task_completion_gap(&assignment.task.markdown, &evidence).kind
                 == CompletionGapKind::LocalRepairable;
-        if receipt_only_local_gap {
+        if repairable_verification_gap {
             let outcome = run_lane_verify_gate(
                 repo_root,
                 &assignment.task.id,
