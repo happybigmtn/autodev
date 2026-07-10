@@ -19,6 +19,35 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 const RUN_STATE_FILE: &str = ".run-state.json";
+const COMPLETED_SWEEP_FILE: &str = ".completed-drift-sweep";
+
+/// Fingerprint of the last EXHAUSTIVE (non-deferred) drift-reverify sweep's
+/// input surface: the tracked source tree + plan text + receipts state. When
+/// the current fingerprint matches, no verification-relevant input has changed
+/// since that sweep, so re-running the whole sweep would reproduce the same
+/// result — it is skipped. This is repo-agnostic and provably safe: a
+/// cross-task regression can only exist if some source changed, which changes
+/// the fingerprint and forces a fresh sweep. Persisted across restarts so a
+/// config-only relaunch (model/flag change, incident recovery) does not re-run
+/// the sweep, which was the dominant wasted-cycle source (1500s+ per restart).
+fn completed_sweep_path(run_root: &Path) -> PathBuf {
+    run_root.join(COMPLETED_SWEEP_FILE)
+}
+
+pub(crate) fn load_completed_sweep_fingerprint(run_root: &Path) -> Option<String> {
+    std::fs::read_to_string(completed_sweep_path(run_root))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn save_completed_sweep_fingerprint(run_root: &Path, fingerprint: &str) {
+    let _ = crate::util::atomic_write(&completed_sweep_path(run_root), fingerprint.as_bytes());
+}
+
+pub(crate) fn clear_completed_sweep_fingerprint(run_root: &Path) {
+    let _ = std::fs::remove_file(completed_sweep_path(run_root));
+}
 
 /// Snapshot of the host's per-run scheduling bookkeeping. Field names are stable
 /// (serialized to disk); add new fields with `#[serde(default)]` to stay

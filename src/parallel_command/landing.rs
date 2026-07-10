@@ -292,7 +292,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     target_branch: &str,
     plan_text: &str,
     parallel_logger: &ParallelEventLogger,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let snapshot = parse_loop_plan(plan_text);
     let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
@@ -512,7 +512,9 @@ pub(crate) async fn audit_parallel_completion_drift(
                 .join(", ")
         ));
     }
-    Ok(updated_plan_text)
+    // exhaustive = the sweep finished without deferring any row for budget.
+    // Only an exhaustive sweep may be cached as "nothing left to check".
+    Ok((updated_plan_text, reverify_deferred.is_empty()))
 }
 
 pub(crate) fn backfill_completed_legacy_receipt_footer(
@@ -2940,7 +2942,7 @@ mod tests {
         // not the budget is spent — the budgeted re-verify path finds nothing to
         // run and falls through honestly. (Budget parsing is covered directly by
         // `drift_reverify_budget_parses_env`.)
-        let updated = audit_parallel_completion_drift(
+        let (updated, _) = audit_parallel_completion_drift(
             &repo,
             "main",
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),
@@ -2973,7 +2975,7 @@ mod tests {
         fs::write(repo.join("IMPLEMENTATION_PLAN.md"), plan).expect("failed to write plan");
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
-        let updated = audit_parallel_completion_drift(&repo, "main", plan, &logger)
+        let (updated, _) = audit_parallel_completion_drift(&repo, "main", plan, &logger)
             .await
             .expect("first drift audit should succeed");
         assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
@@ -2981,7 +2983,7 @@ mod tests {
             fs::read_to_string(run_root.join("live.log")).expect("first audit should log drift");
         assert!(first_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
 
-        audit_parallel_completion_drift(&repo, "main", &updated, &logger)
+        let _ = audit_parallel_completion_drift(&repo, "main", &updated, &logger)
             .await
             .expect("second drift audit should succeed");
         let second_log =
@@ -3022,7 +3024,7 @@ mod tests {
         run_git_in(&repo, ["push", "origin", "trunk"]);
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
-        let updated = audit_parallel_completion_drift(&repo, "trunk", plan, &logger)
+        let (updated, _) = audit_parallel_completion_drift(&repo, "trunk", plan, &logger)
             .await
             .expect("drift audit should backfill receipt footer");
 
@@ -3101,7 +3103,7 @@ mod tests {
             .expect("failed to write review");
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
-        let updated = audit_parallel_completion_drift(
+        let (updated, _) = audit_parallel_completion_drift(
             &repo,
             "main",
             &fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should exist"),

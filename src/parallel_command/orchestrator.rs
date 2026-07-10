@@ -32,6 +32,13 @@ impl ParallelEventLogger {
         Ok(Self { live_log_path })
     }
 
+    pub(crate) fn run_root(&self) -> PathBuf {
+        self.live_log_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     pub(crate) fn info(&self, message: impl AsRef<str>) {
         let message = message.as_ref();
         println!("{message}");
@@ -1561,6 +1568,35 @@ pub(crate) async fn run_parallel_loop(
     Ok(())
 }
 
+/// Fingerprint of everything a drift-reverify sweep could depend on: the
+/// committed HEAD plus the full working tree (tracked, modified, and untracked
+/// — source, plan, and receipts all live here). Changes iff some
+/// verification-relevant input changed. `None` on any git error, which
+/// conservatively forces the sweep to run (never a false skip).
+fn drift_sweep_input_fingerprint(repo_root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let mut hasher = Sha256::new();
+    hasher.update(&head.stdout);
+    hasher.update(b"\0");
+    hasher.update(&status.stdout);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 pub(crate) async fn refresh_parallel_plan(
     repo_root: &Path,
     target_branch: &str,
@@ -1569,9 +1605,42 @@ pub(crate) async fn refresh_parallel_plan(
     parallel_logger: &ParallelEventLogger,
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
-    plan_text =
-        audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
-            .await?;
+    // Content-addressed sweep skip (2026-07-10 radical harness fix, all repos):
+    // the drift-reverify sweep re-runs every row's declared verification
+    // defensively on every refresh and every restart, which for slow
+    // (Java-oracle / cargo) verification burned 1500s+ per sweep and deferred
+    // real work. A cross-task regression can only exist if some verification
+    // input changed; the fingerprint below (HEAD + full working-tree status =
+    // source + plan + receipts) changes iff any such input changed. When it
+    // matches the last EXHAUSTIVE sweep, re-running would reproduce the same
+    // result, so the sweep is skipped and lanes dispatch immediately.
+    let run_root = parallel_logger.run_root();
+    let sweep_fp = drift_sweep_input_fingerprint(repo_root);
+    let already_swept = sweep_fp
+        .as_deref()
+        .zip(load_completed_sweep_fingerprint(&run_root).as_deref())
+        .map(|(now, last)| now == last)
+        .unwrap_or(false);
+    if already_swept {
+        parallel_logger.info(
+            "drift-reverify: inputs unchanged since last exhaustive sweep; skipping re-verification"
+                .to_string(),
+        );
+    } else {
+        let (audited, exhaustive) =
+            audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
+                .await?;
+        plan_text = audited;
+        // Only cache when the sweep verified every row (no budget defer), and
+        // recompute the fingerprint AFTER the audit's own receipt/plan writes.
+        if exhaustive {
+            if let Some(fp) = drift_sweep_input_fingerprint(repo_root) {
+                save_completed_sweep_fingerprint(&run_root, &fp);
+            }
+        } else {
+            clear_completed_sweep_fingerprint(&run_root);
+        }
+    }
     if let Some(tracker) = linear_tracker.as_mut() {
         if let Err(err) = tracker.refresh_if_plan_changed(&plan_text).await {
             if !maybe_disable_linear_auto_sync_for_run(
