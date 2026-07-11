@@ -928,7 +928,8 @@ pub(crate) async fn land_parallel_lane_result(
     }
     if completion_status == LoopTaskStatus::Done {
         completion_status =
-            apply_workspace_test_gate(repo_root, assignment, completion_status).await;
+            apply_workspace_test_gate(repo_root, assignment, &changed_files, completion_status)
+                .await;
     }
     if completion_status == LoopTaskStatus::Done {
         completion_status = apply_lane_review_gate(
@@ -1285,13 +1286,306 @@ pub(crate) fn apply_lane_verify_outcome(
     }
 }
 
+/// Definition-of-done workspace gate. In the default `baseline` mode it demotes
+/// a task ONLY when the task introduced a NEW regression vs the run's
+/// best-observed baseline (a previously-passing test now failing, or a
+/// previously-compiling crate the task touched now failing to compile) — a
+/// pre-existing failure elsewhere in the shared workspace no longer blocks every
+/// task's promotion. `AUTO_PARALLEL_WORKSPACE_GATE_MODE=strict` restores the
+/// legacy "whole workspace must be green" bar.
 async fn apply_workspace_test_gate(
     repo_root: &Path,
     assignment: &mut ActiveLaneAssignment,
+    changed_files: &[String],
     incoming_status: LoopTaskStatus,
 ) -> LoopTaskStatus {
-    let outcome = run_workspace_test_gate(repo_root).await;
-    apply_workspace_test_outcome(repo_root, assignment, incoming_status, outcome)
+    match workspace_gate_mode() {
+        WorkspaceGateMode::Strict => {
+            let outcome = run_workspace_test_gate(repo_root).await;
+            apply_workspace_test_outcome(repo_root, assignment, incoming_status, outcome)
+        }
+        WorkspaceGateMode::Baseline => {
+            apply_workspace_baseline_gate(repo_root, assignment, changed_files, incoming_status)
+                .await
+        }
+    }
+}
+
+/// Derive the run root (`<run_root>/lanes/lane-N` -> `<run_root>`) from a lane
+/// root, but ONLY when the path actually has the canonical `lanes/lane-*` shape.
+/// Test fixtures use ad-hoc lane roots; returning `None` there makes the gate
+/// fail open (pass-through) instead of writing a stray baseline file into a
+/// shared temp directory.
+fn workspace_baseline_run_root(lane_root: &Path) -> Option<PathBuf> {
+    let lanes = lane_root.parent()?;
+    if lanes.file_name()?.to_str()? != "lanes" {
+        return None;
+    }
+    Some(lanes.parent()?.to_path_buf())
+}
+
+async fn apply_workspace_baseline_gate(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    changed_files: &[String],
+    incoming_status: LoopTaskStatus,
+) -> LoopTaskStatus {
+    let obs = match run_workspace_probe(repo_root).await {
+        WorkspaceProbe::Skipped { reason } if reason.contains("not applicable") => {
+            // Non-Rust repo: nothing to check. Pass-through (never demote every
+            // task in a Python/TS repo to [~]).
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!("workspace-baseline: gate not applicable ({reason}); pass-through"),
+            );
+            return incoming_status;
+        }
+        WorkspaceProbe::Skipped { reason } => {
+            // Infra-level skip (timeout / spawn error / ambiguous non-zero). The
+            // per-task verify gate already produced a positive at canonical HEAD,
+            // so a slow-or-broken workspace probe must NOT hold this task hostage.
+            // Baseline mode fails OPEN here by design (logged for review).
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!(
+                    "workspace-baseline: probe skipped ({reason}); pass-through (own verification already re-passed)"
+                ),
+            );
+            return incoming_status;
+        }
+        WorkspaceProbe::Ran(obs) => obs,
+    };
+
+    let Some(run_root) = workspace_baseline_run_root(&assignment.lane_root) else {
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            "workspace-baseline: no lane run root; cannot compare against baseline; pass-through",
+        );
+        return incoming_status;
+    };
+
+    let baseline = load_workspace_baseline(&run_root);
+    let baseline_note = format!(
+        "workspace-baseline: baseline had {} pre-existing failing test(s), {} broken crate(s); best-observed {} passing test(s), {} compiled crate(s)",
+        baseline.baseline_failing_tests.len(),
+        baseline.baseline_broken_crates.len(),
+        baseline.ever_passed_tests.len(),
+        baseline.ever_compiled_crates.len(),
+    );
+
+    // Only pay for `cargo metadata` attribution when a candidate regression
+    // actually exists; the clean path stays cheap.
+    let decision = if has_candidate_regression(&baseline, &obs) {
+        let touched = touched_workspace_crates(repo_root, changed_files);
+        classify_workspace_regressions(&baseline, &obs, &touched)
+    } else {
+        WorkspaceRegressionDecision::default()
+    };
+
+    // Advance the best-observed baseline (monotonic) and persist BEFORE acting,
+    // so a demote/redispatch cycle still records this run's passes/compiles.
+    let mut advanced = baseline;
+    advance_workspace_baseline(&mut advanced, &obs);
+    save_workspace_baseline(&run_root, &advanced);
+
+    // Nonblocking (another lane's) regressions are always surfaced for operators.
+    for note in &decision.nonblocking {
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            &format!("workspace-baseline: NEW regression not attributed to this task: {note}"),
+        );
+    }
+
+    if decision.is_blocked() {
+        let detail = format!(
+            "{baseline_note}\n\nNEW regression(s) introduced by this task:\n- {}",
+            decision.blocking.join("\n- ")
+        );
+        record_gate_hold(
+            repo_root,
+            &assignment.task.id,
+            "workspace baseline regression",
+        );
+        if let Err(err) = append_lane_workspace_test_failure(
+            repo_root,
+            &assignment.task.id,
+            "workspace baseline gate: task introduced a NEW regression vs best-observed baseline",
+            &detail,
+        ) {
+            eprintln!(
+                "warning: failed appending workspace-baseline failure for `{}`: {err:#}",
+                assignment.task.id
+            );
+        } else if let Err(err) = run_git(repo_root, ["add", "REVIEW.md"]) {
+            eprintln!(
+                "warning: failed staging REVIEW.md after workspace-baseline failure for `{}`: {err:#}",
+                assignment.task.id
+            );
+        }
+        demote_task_for_failed_gate(
+            repo_root,
+            assignment,
+            incoming_status,
+            "workspace-baseline regression",
+        );
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            &format!(
+                "workspace-baseline: task introduced NEW regression(s); held [~]: {}",
+                decision.blocking.join("; ")
+            ),
+        );
+        return LoopTaskStatus::Partial;
+    }
+
+    let promote_reason = if obs.compiled && obs.failing_tests.is_empty() {
+        format!("{baseline_note}; workspace fully green")
+    } else if !obs.compiled {
+        format!(
+            "{baseline_note}; workspace does not compile but the break(s) are pre-existing/another lane's ({}); no NEW regression from this task",
+            obs.broken_crates
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        format!(
+            "{baseline_note}; {} failing test(s) remain but all are pre-existing baseline failures; no NEW regression from this task",
+            obs.failing_tests.len()
+        )
+    };
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &format!("workspace-baseline: promoted [x] — {promote_reason}"),
+    );
+    incoming_status
+}
+
+/// Capture the run's pre-existing workspace failure/compile baseline ONCE, at run
+/// start before any lane lands, so a regression introduced by the very first
+/// landing cannot be silently absorbed into the baseline. Skipped in strict mode,
+/// on non-Rust repos, and on resume (a baseline is already persisted). Bounded by
+/// the same timeout as the gate; a timeout/skip just defers to lazy capture at
+/// the first landing.
+pub(crate) async fn maybe_capture_workspace_baseline(
+    repo_root: &Path,
+    run_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+) {
+    if matches!(workspace_gate_mode(), WorkspaceGateMode::Strict) {
+        return;
+    }
+    if !repo_root.join("Cargo.toml").is_file() {
+        return;
+    }
+    let existing = load_workspace_baseline(run_root);
+    if existing.captured {
+        parallel_logger.info(format!(
+            "workspace-baseline: reusing persisted baseline ({} pre-existing failing test(s), {} broken crate(s); best-observed {} passing / {} compiled)",
+            existing.baseline_failing_tests.len(),
+            existing.baseline_broken_crates.len(),
+            existing.ever_passed_tests.len(),
+            existing.ever_compiled_crates.len(),
+        ));
+        return;
+    }
+    parallel_logger
+        .info("workspace-baseline: capturing pre-existing workspace baseline at run start (one-time; `cargo test --workspace --no-fail-fast`)...");
+    match run_workspace_probe(repo_root).await {
+        WorkspaceProbe::Ran(obs) => {
+            let mut baseline = WorkspaceBaseline::default();
+            advance_workspace_baseline(&mut baseline, &obs);
+            save_workspace_baseline(run_root, &baseline);
+            parallel_logger.info(format!(
+                "workspace-baseline: captured — compiles={}, {} pre-existing failing test(s), {} broken crate(s), {} passing test(s) recorded as best-observed",
+                obs.compiled,
+                obs.failing_tests.len(),
+                obs.broken_crates.len(),
+                obs.passing_tests.len(),
+            ));
+        }
+        WorkspaceProbe::Skipped { reason } => {
+            parallel_logger.warn(format!(
+                "workspace-baseline: could not capture baseline at run start ({reason}); will capture lazily at first landing"
+            ));
+        }
+    }
+}
+
+/// Map a task's changed files to the normalized names of the workspace crates
+/// they live in (the task's compile/test blast radius), via `cargo metadata`.
+/// Only invoked when a candidate regression exists, keeping metadata off the
+/// clean landing path.
+fn touched_workspace_crates(repo_root: &Path, changed_files: &[String]) -> BTreeSet<String> {
+    let members = workspace_member_dirs(repo_root);
+    let mut touched = BTreeSet::new();
+    for file in changed_files {
+        let abs = repo_root.join(file);
+        let mut best: Option<(usize, &str)> = None;
+        for (dir, name) in &members {
+            if abs.starts_with(dir) {
+                let len = dir.as_os_str().len();
+                if best.map(|(best_len, _)| len > best_len).unwrap_or(true) {
+                    best = Some((len, name.as_str()));
+                }
+            }
+        }
+        if let Some((_, name)) = best {
+            touched.insert(name.to_string());
+        }
+    }
+    touched
+}
+
+/// `(crate_dir, normalized_crate_name)` for each workspace member, from
+/// `cargo metadata --no-deps`. Returns empty on any error (attribution then
+/// treats all regressions as un-attributed/nonblocking — conservative for
+/// throughput, and the own-verify gate still guards the task's own crate).
+fn workspace_member_dirs(repo_root: &Path) -> Vec<(PathBuf, String)> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(repo_root)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    #[derive(Deserialize)]
+    struct Metadata {
+        packages: Vec<Package>,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        name: String,
+        manifest_path: String,
+    }
+    let Ok(metadata) = serde_json::from_slice::<Metadata>(&output.stdout) else {
+        return Vec::new();
+    };
+    metadata
+        .packages
+        .into_iter()
+        .filter_map(|pkg| {
+            Path::new(&pkg.manifest_path)
+                .parent()
+                .map(|dir| (dir.to_path_buf(), normalize_crate_name(&pkg.name)))
+        })
+        .collect()
 }
 
 pub(crate) fn apply_workspace_test_outcome(
@@ -3379,7 +3673,7 @@ mod tests {
         let mut status =
             super::apply_lane_verify_gate(&root, &mut assignment, LoopTaskStatus::Done).await;
         assert_eq!(status, LoopTaskStatus::Done);
-        status = super::apply_workspace_test_gate(&root, &mut assignment, status).await;
+        status = super::apply_workspace_test_gate(&root, &mut assignment, &[], status).await;
         assert_eq!(status, LoopTaskStatus::Done);
         status = super::apply_lane_review_gate(
             &root,
@@ -3403,7 +3697,9 @@ mod tests {
         assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
         let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
         assert!(log.contains("host-reexec-verify: declared verification re-passed"));
-        assert!(log.contains("workspace-test: `cargo test --workspace` passed"));
+        // Baseline gate on a fixture lane root (no `lanes/lane-*` shape) fails
+        // open with a pass-through, leaving the incoming [x] intact.
+        assert!(log.contains("workspace-baseline: no lane run root"));
         assert!(log.contains("independent-review: clean"));
 
         fs::remove_dir_all(&root).expect("cleanup");

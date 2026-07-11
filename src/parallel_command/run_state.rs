@@ -20,6 +20,86 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const RUN_STATE_FILE: &str = ".run-state.json";
 const COMPLETED_SWEEP_FILE: &str = ".completed-drift-sweep";
+const WORKSPACE_BASELINE_FILE: &str = ".workspace-baseline.json";
+
+/// Best-observed baseline of the shared workspace's health for a single
+/// `auto parallel` run, persisted under the run root so the baseline-aware
+/// landing gate (see [`super::verify_gate`]) can tell a NEW regression apart
+/// from a pre-existing failure.
+///
+/// Monotonicity is the whole point of `ever_*`: once a test is observed passing
+/// (or a crate observed compiling) anywhere in the run, it must STAY that way —
+/// a later failure of it is a regression even if it was red in the original
+/// baseline snapshot. The `baseline_*` fields hold only the first (pre-existing)
+/// snapshot and are informational for host logs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct WorkspaceBaseline {
+    /// Set once the first workspace probe of the run has been folded in.
+    #[serde(default)]
+    pub(crate) captured: bool,
+    /// Whether the workspace compiled cleanly at first capture (informational).
+    #[serde(default)]
+    pub(crate) baseline_compiles: bool,
+    /// Crate names that failed to compile at first capture (informational).
+    #[serde(default)]
+    pub(crate) baseline_broken_crates: BTreeSet<String>,
+    /// Test IDs failing at first capture: the pre-existing failures that are
+    /// ALLOWED to remain failing without blocking any task (informational; the
+    /// live allow decision is "absent from `ever_passed_tests`").
+    #[serde(default)]
+    pub(crate) baseline_failing_tests: BTreeSet<String>,
+    /// Every test id EVER observed passing this run. A member here that now fails
+    /// is a regression.
+    #[serde(default)]
+    pub(crate) ever_passed_tests: BTreeSet<String>,
+    /// Every crate/target stem EVER observed compiling this run. A member here
+    /// that now fails to compile is a regression.
+    #[serde(default)]
+    pub(crate) ever_compiled_crates: BTreeSet<String>,
+}
+
+fn workspace_baseline_path(run_root: &Path) -> PathBuf {
+    run_root.join(WORKSPACE_BASELINE_FILE)
+}
+
+/// Restore the persisted workspace baseline, or a default (uncaptured) one when
+/// absent or unreadable. Never fails: a corrupt baseline degrades to "recapture".
+pub(crate) fn load_workspace_baseline(run_root: &Path) -> WorkspaceBaseline {
+    match std::fs::read_to_string(workspace_baseline_path(run_root)) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
+            eprintln!(
+                "warning: ignoring unreadable workspace baseline {}: {err:#}",
+                workspace_baseline_path(run_root).display()
+            );
+            WorkspaceBaseline::default()
+        }),
+        Err(_) => WorkspaceBaseline::default(),
+    }
+}
+
+/// Persist the workspace baseline (best-effort atomic write).
+pub(crate) fn save_workspace_baseline(run_root: &Path, baseline: &WorkspaceBaseline) {
+    match serde_json::to_string_pretty(baseline) {
+        Ok(json) => {
+            if let Err(err) = atomic_write(&workspace_baseline_path(run_root), json.as_bytes()) {
+                eprintln!("warning: failed persisting workspace baseline: {err:#}");
+            }
+        }
+        Err(err) => eprintln!("warning: failed serializing workspace baseline: {err:#}"),
+    }
+}
+
+/// Drop the persisted workspace baseline so a fresh run on the same run root
+/// recaptures its own pre-existing snapshot rather than inheriting a finished
+/// run's best-observed sets.
+pub(crate) fn clear_workspace_baseline(run_root: &Path) {
+    let path = workspace_baseline_path(run_root);
+    if path.exists() {
+        if let Err(err) = std::fs::remove_file(&path) {
+            eprintln!("warning: failed clearing workspace baseline: {err:#}");
+        }
+    }
+}
 
 /// Fingerprint of the last EXHAUSTIVE (non-deferred) drift-reverify sweep's
 /// input surface: the tracked source tree + plan text + receipts state. When
@@ -312,6 +392,49 @@ mod tests {
         std::fs::write(run_state_path(&dir), b"{not valid json").expect("write");
         let state = load_parallel_run_state(&dir);
         assert!(state.shelved_tasks.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_baseline_round_trips_and_clears() {
+        let dir = temp_dir("workspace-baseline");
+        assert!(
+            !load_workspace_baseline(&dir).captured,
+            "absent baseline is uncaptured"
+        );
+        let baseline = WorkspaceBaseline {
+            captured: true,
+            baseline_compiles: false,
+            baseline_broken_crates: ["boardlab_tui".to_string()].into_iter().collect(),
+            baseline_failing_tests: ["ludii_core::board::flaky".to_string()]
+                .into_iter()
+                .collect(),
+            ever_passed_tests: ["ludii_core::board::stable".to_string()]
+                .into_iter()
+                .collect(),
+            ever_compiled_crates: ["ludii_core".to_string()].into_iter().collect(),
+        };
+
+        save_workspace_baseline(&dir, &baseline);
+        let restored = load_workspace_baseline(&dir);
+        assert!(restored.captured);
+        assert!(!restored.baseline_compiles);
+        assert!(restored.baseline_broken_crates.contains("boardlab_tui"));
+        assert!(restored
+            .ever_passed_tests
+            .contains("ludii_core::board::stable"));
+        assert!(restored.ever_compiled_crates.contains("ludii_core"));
+
+        clear_workspace_baseline(&dir);
+        assert!(!load_workspace_baseline(&dir).captured);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_workspace_baseline_degrades_to_default() {
+        let dir = temp_dir("workspace-baseline-corrupt");
+        std::fs::write(workspace_baseline_path(&dir), b"{not json").expect("write");
+        assert!(!load_workspace_baseline(&dir).captured);
         std::fs::remove_dir_all(&dir).ok();
     }
 

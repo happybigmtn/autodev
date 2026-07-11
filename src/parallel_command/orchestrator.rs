@@ -438,6 +438,10 @@ pub(crate) async fn run_parallel_loop(
     )
     .await?;
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
+    // Capture the pre-existing workspace failure/compile baseline before any lane
+    // lands, so the baseline-aware landing gate can tell a NEW regression apart
+    // from a failure that was already red at the run's base commit.
+    maybe_capture_workspace_baseline(repo_root, run_root, parallel_logger).await;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     let review_config = LaneReviewConfig::from_run_config(&args.model, &args.codex_bin);
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
@@ -921,6 +925,10 @@ pub(crate) async fn run_parallel_loop(
                     // Clean completion: drop the ledger so a later run on this
                     // run_root starts fresh instead of reloading finished state.
                     clear_parallel_run_state(run_root);
+                    // Drop the workspace baseline too, so a fresh run recaptures
+                    // its own pre-existing snapshot rather than inheriting this
+                    // run's best-observed sets.
+                    clear_workspace_baseline(run_root);
                 } else {
                     parallel_logger.info(format!(
                         "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
