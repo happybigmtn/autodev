@@ -276,14 +276,50 @@ pub(crate) fn auto_clear_shelved_on_head_change(
 
 /// Persist the current scheduling bookkeeping. Best-effort: a write error is
 /// logged and ignored so the ledger can never wedge or slow a real run.
-pub(crate) fn save_parallel_run_state(
+/// Persist the ledger only when its serialized form changed since the last
+/// persist this process performed (`last_serialized` caches it across calls).
+///
+/// The main loop calls this every ~5s tick even when nothing changed; skipping
+/// the redundant atomic write avoids needless rename/fsync churn while preserving
+/// crash-safety — every REAL state transition (a shelve, a follow-up attempt, a
+/// landed commit advancing HEAD) changes the serialization and is written
+/// immediately. Returns `true` when a write happened.
+pub(crate) fn save_parallel_run_state_if_changed(
+    last_serialized: &mut Option<String>,
     run_root: &Path,
     shelved_tasks: &BTreeMap<String, String>,
     deferred_partial_tasks: &BTreeSet<String>,
     unblock_attempt_counts: &BTreeMap<String, usize>,
     attempted_partial_followups: &BTreeMap<String, usize>,
     head_at_save: Option<&str>,
-) {
+) -> bool {
+    let Some(json) = serialize_run_state(
+        shelved_tasks,
+        deferred_partial_tasks,
+        unblock_attempt_counts,
+        attempted_partial_followups,
+        head_at_save,
+    ) else {
+        return false;
+    };
+    if last_serialized.as_deref() == Some(json.as_str()) {
+        return false; // unchanged since the last persist; skip the redundant write
+    }
+    if let Err(err) = atomic_write(&run_state_path(run_root), json.as_bytes()) {
+        eprintln!("warning: failed persisting parallel run-state ledger: {err:#}");
+        return false;
+    }
+    *last_serialized = Some(json);
+    true
+}
+
+fn serialize_run_state(
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    unblock_attempt_counts: &BTreeMap<String, usize>,
+    attempted_partial_followups: &BTreeMap<String, usize>,
+    head_at_save: Option<&str>,
+) -> Option<String> {
     let state = ParallelRunState {
         shelved_tasks: shelved_tasks.clone(),
         deferred_partial_tasks: deferred_partial_tasks.clone(),
@@ -292,12 +328,11 @@ pub(crate) fn save_parallel_run_state(
         head_at_save: head_at_save.map(|s| s.to_string()),
     };
     match serde_json::to_string_pretty(&state) {
-        Ok(json) => {
-            if let Err(err) = atomic_write(&run_state_path(run_root), json.as_bytes()) {
-                eprintln!("warning: failed persisting parallel run-state ledger: {err:#}");
-            }
+        Ok(json) => Some(json),
+        Err(err) => {
+            eprintln!("warning: failed serializing parallel run-state ledger: {err:#}");
+            None
         }
-        Err(err) => eprintln!("warning: failed serializing parallel run-state ledger: {err:#}"),
     }
 }
 
@@ -447,7 +482,15 @@ mod tests {
         let mut followups = BTreeMap::new();
         followups.insert("TASK-1".to_string(), 2usize);
 
-        save_parallel_run_state(&dir, &shelved, &deferred, &unblock, &followups, Some("abc123"));
+        save_parallel_run_state_if_changed(
+            &mut None,
+            &dir,
+            &shelved,
+            &deferred,
+            &unblock,
+            &followups,
+            Some("abc123"),
+        );
         let restored = load_parallel_run_state(&dir);
         assert_eq!(restored.shelved_tasks, shelved);
         assert_eq!(restored.deferred_partial_tasks, deferred);
@@ -457,6 +500,42 @@ mod tests {
 
         clear_parallel_run_state(&dir);
         assert!(load_parallel_run_state(&dir).shelved_tasks.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_if_changed_skips_redundant_writes_but_persists_real_changes() {
+        let dir = temp_dir("save-if-changed");
+        let path = run_state_path(&dir);
+        let mut shelved = BTreeMap::new();
+        shelved.insert("TASK-1".to_string(), "md".to_string());
+        let deferred = BTreeSet::new();
+        let unblock = BTreeMap::new();
+        let followups = BTreeMap::new();
+        let mut cache: Option<String> = None;
+
+        // First call writes and records the serialization.
+        let wrote = save_parallel_run_state_if_changed(
+            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h1"),
+        );
+        assert!(wrote, "first persist must write");
+        assert!(path.exists());
+
+        // Identical state: no write, cache unchanged.
+        let wrote = save_parallel_run_state_if_changed(
+            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h1"),
+        );
+        assert!(!wrote, "unchanged state must not rewrite the ledger");
+
+        // A real change (HEAD advanced) writes again and round-trips.
+        let wrote = save_parallel_run_state_if_changed(
+            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h2"),
+        );
+        assert!(wrote, "changed HEAD must rewrite the ledger");
+        let restored = load_parallel_run_state(&dir);
+        assert_eq!(restored.head_at_save.as_deref(), Some("h2"));
+        assert_eq!(restored.shelved_tasks, shelved);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

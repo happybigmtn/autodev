@@ -497,6 +497,104 @@ pub(crate) fn preserve_resume_recovery_notes(
     }
 }
 
+/// Bounded failure context threaded into the prompt on a generic non-zero retry.
+///
+/// Without this, a refreshed-plan retry re-runs BLIND: the next model call sees
+/// the same task with no record of why the last attempt failed, so it typically
+/// repeats the same mistake. This surfaces the TERMINAL cause of the failed
+/// attempt — the exit disposition, the lane repo's git state (what the attempt
+/// did or did not commit), and the tails of the worker's own stdout/stderr (where
+/// the failing command's output lives). Every section is individually bounded so
+/// a runaway log can never bloat the next prompt.
+pub(crate) fn retry_failure_recovery_note(
+    lane_repo_root: &Path,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+    exit_code: i32,
+    is_futility: bool,
+) -> String {
+    const MAX_TAIL_LINES: usize = 40;
+    const MAX_SECTION_CHARS: usize = 4000;
+
+    let exit_desc = if is_futility {
+        "the worker gave up in a futility spiral (repeated no-progress turns)".to_string()
+    } else {
+        format!("the worker exited non-zero (code {exit_code})")
+    };
+
+    let status = git_stdout(lane_repo_root, ["status", "--short"]).unwrap_or_default();
+    let status = clamp_recovery_section(status.trim(), MAX_SECTION_CHARS);
+    let status_block = if status.is_empty() {
+        "clean (no uncommitted changes)".to_string()
+    } else {
+        status
+    };
+
+    let diffstat = git_stdout(lane_repo_root, ["diff", "--stat"]).unwrap_or_default();
+    let diffstat = clamp_recovery_section(diffstat.trim(), MAX_SECTION_CHARS);
+    let diffstat_block = if diffstat.is_empty() {
+        "no unstaged changes".to_string()
+    } else {
+        diffstat
+    };
+
+    let stderr_tail =
+        clamp_recovery_section(&recovery_log_tail(stderr_log_path, MAX_TAIL_LINES), MAX_SECTION_CHARS);
+    let stderr_block = if stderr_tail.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        stderr_tail
+    };
+
+    let stdout_tail =
+        clamp_recovery_section(&recovery_log_tail(stdout_log_path, MAX_TAIL_LINES), MAX_SECTION_CHARS);
+    let stdout_block = if stdout_tail.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        stdout_tail
+    };
+
+    format!(
+        r#"The previous attempt on this task FAILED: {exit_desc}. This is an automatic retry with a refreshed plan. Diagnose and fix the terminal cause shown below instead of repeating the same steps blindly.
+
+Do not treat this as a fresh start: read the failure evidence first, form a hypothesis about why the last attempt failed, and change your approach accordingly. If the real blocker is missing external infrastructure or environment, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero rather than looping on the same failure.
+
+Lane repo `git status --short` after the failed attempt:
+{status_block}
+
+Lane repo `git diff --stat` (unstaged) after the failed attempt:
+{diffstat_block}
+
+Last {MAX_TAIL_LINES} non-empty stderr lines from the failed attempt:
+{stderr_block}
+
+Last {MAX_TAIL_LINES} non-empty stdout lines from the failed attempt:
+{stdout_block}"#
+    )
+}
+
+fn recovery_log_tail(path: &Path, max_lines: usize) -> String {
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+fn clamp_recovery_section(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let skip = count - max_chars;
+    let tail: String = text.chars().skip(skip).collect();
+    format!("[... truncated {skip} chars ...]\n{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parallel_command::*;
@@ -585,6 +683,74 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn retry_failure_recovery_note_captures_exit_git_and_log_tails() {
+        let dir = unique_temp_dir("retry-failure-note");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&repo).expect("failed to create repo");
+        run_git_in(&repo, ["init", "-q"]);
+        run_git_in(&repo, ["config", "user.email", "test@example.com"]);
+        run_git_in(&repo, ["config", "user.name", "Autodev Test"]);
+        fs::write(repo.join("committed.txt"), "base\n").expect("write base");
+        run_git_in(&repo, ["add", "committed.txt"]);
+        run_git_in(&repo, ["commit", "-q", "-m", "base"]);
+        // Leave the worktree dirty so status/diff have content to report.
+        fs::write(repo.join("committed.txt"), "changed\n").expect("dirty file");
+
+        let stdout_log = dir.join("stdout.log");
+        let stderr_log = dir.join("stderr.log");
+        fs::write(&stdout_log, "worker stdout line one\nworker stdout line two\n")
+            .expect("write stdout");
+        fs::write(
+            &stderr_log,
+            "error[E0433]: failed to resolve: use of undeclared crate `foo`\n",
+        )
+        .expect("write stderr");
+
+        let note = retry_failure_recovery_note(&repo, &stdout_log, &stderr_log, 101, false);
+        assert!(note.contains("exited non-zero (code 101)"), "{note}");
+        assert!(note.contains("M committed.txt"), "git status tail: {note}");
+        assert!(note.contains("committed.txt"), "diff stat: {note}");
+        assert!(note.contains("error[E0433]"), "stderr tail: {note}");
+        assert!(note.contains("worker stdout line two"), "stdout tail: {note}");
+
+        // Futility disposition renders its own description.
+        let futile = retry_failure_recovery_note(&repo, &stdout_log, &stderr_log, -9, true);
+        assert!(futile.contains("futility spiral"), "{futile}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retry_failure_recovery_note_bounds_runaway_logs() {
+        let dir = unique_temp_dir("retry-failure-note-bounds");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&repo).expect("failed to create repo");
+        run_git_in(&repo, ["init", "-q"]);
+        run_git_in(&repo, ["config", "user.email", "test@example.com"]);
+        run_git_in(&repo, ["config", "user.name", "Autodev Test"]);
+
+        let stdout_log = dir.join("stdout.log");
+        let stderr_log = dir.join("stderr.log");
+        // 500 distinct non-empty lines; only the last 40 should survive.
+        let big = (0..500)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&stdout_log, &big).expect("write big stdout");
+        fs::write(&stderr_log, "").expect("write empty stderr");
+
+        let note = retry_failure_recovery_note(&repo, &stdout_log, &stderr_log, 1, false);
+        assert!(note.contains("line-499"), "keeps the most recent line");
+        assert!(!note.contains("line-400"), "drops old lines beyond the tail");
+        assert!(
+            note.contains("Last 40 non-empty stderr lines from the failed attempt:\n(empty)"),
+            "empty stderr renders as (empty): {note}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

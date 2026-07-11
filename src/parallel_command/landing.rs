@@ -1993,6 +1993,41 @@ pub(crate) fn task_is_gate_held(repo_root: &Path, task_id: &str) -> bool {
     gate_hold_path(repo_root, task_id).exists()
 }
 
+/// Whether a gate-HELD Partial (`[~]`) blocks its dependents from dispatching
+/// (default on; `AUTO_PARALLEL_GATE_HOLD_DEPS=0` restores the legacy behavior
+/// where every Partial satisfies a dependency regardless of a durable gate hold).
+pub(crate) fn gate_hold_blocks_dependents_enabled() -> bool {
+    std::env::var("AUTO_PARALLEL_GATE_HOLD_DEPS")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// Task ids currently carrying a durable gate hold. A gate hold is recorded only
+/// on a REAL gate failure (host re-verification failed, workspace regression, or
+/// unresolved review findings) and cleared when the task lands cleanly, so its
+/// presence means the task's landed code is known to not pass a gate. Returns an
+/// empty set when the feature is disabled, the hold directory is absent, or it is
+/// unreadable — the caller then falls back to treating every Partial as resolved.
+pub(crate) fn gate_held_task_ids(repo_root: &Path) -> BTreeSet<String> {
+    if !gate_hold_blocks_dependents_enabled() {
+        return BTreeSet::new();
+    }
+    let dir = repo_root.join(".auto/parallel/gate-holds");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".hold"))
+                .map(|id| id.to_string())
+        })
+        .collect()
+}
+
 /// Legacy evidence-only promotion hook. The definition of done now requires
 /// current-tree task verification, workspace tests, and standing-review
 /// clearance, so canonical evidence alone can no longer flip `[~]` to `[x]`.

@@ -80,7 +80,20 @@ impl LoopPlanSnapshot {
     }
 
     pub(crate) fn ready_tasks(&self, inflight: &BTreeSet<String>) -> Vec<LoopTask> {
-        let unresolved = self.unresolved_dependency_ids(inflight);
+        self.ready_tasks_with_gate_holds(inflight, &BTreeSet::new())
+    }
+
+    /// Ready tasks, treating any Partial listed in `gate_held` as an UNRESOLVED
+    /// dependency for its dependents (see
+    /// [`Self::unresolved_dependency_ids_with_gate_holds`]). The gate-held Partial
+    /// itself stays dispatchable (its own closeout still needs to run) — only its
+    /// dependents are held back until the hold clears.
+    pub(crate) fn ready_tasks_with_gate_holds(
+        &self,
+        inflight: &BTreeSet<String>,
+        gate_held: &BTreeSet<String>,
+    ) -> Vec<LoopTask> {
+        let unresolved = self.unresolved_dependency_ids_with_gate_holds(inflight, gate_held);
 
         self.tasks
             .iter()
@@ -106,6 +119,24 @@ impl LoopPlanSnapshot {
         &self,
         inflight: &BTreeSet<String>,
     ) -> BTreeSet<String> {
+        self.unresolved_dependency_ids_with_gate_holds(inflight, &BTreeSet::new())
+    }
+
+    /// Dependency-unresolved task ids, additionally treating any Partial task in
+    /// `gate_held` as unresolved.
+    ///
+    /// A merely receipt-pending Partial has landed working code to canonical main,
+    /// so its dependents (built from main) are safe — it must NOT block them. But a
+    /// Partial that carries a durable GATE HOLD failed a real gate (host
+    /// re-verification, workspace regression, or unresolved review findings): its
+    /// landed code is known to not pass, so a dependent built on it will rework.
+    /// Those gate-held Partials are treated as unresolved so their dependents wait
+    /// until the hold clears (the task lands cleanly through the full pipeline).
+    pub(crate) fn unresolved_dependency_ids_with_gate_holds(
+        &self,
+        inflight: &BTreeSet<String>,
+        gate_held: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
         let mut unresolved = self
             .tasks
             .iter()
@@ -117,11 +148,13 @@ impl LoopPlanSnapshot {
                 // so a missing receipt must not block them. Treating `Partial`
                 // as unresolved self-blocks every downstream task in a queue
                 // where work routinely lands `[~]` before receipts close out.
-                // Only genuinely-unlanded upstreams gate dependents.
+                // Only genuinely-unlanded upstreams — and gate-HELD partials,
+                // whose landed code is known to fail a gate — gate dependents.
                 matches!(
                     task.status,
                     LoopTaskStatus::Pending | LoopTaskStatus::Blocked
-                )
+                ) || (task.status == LoopTaskStatus::Partial
+                    && gate_held.contains(&task.id))
             })
             .filter(|task| !self.is_completion_path_placeholder(task))
             .map(|task| task.id.clone())
@@ -768,6 +801,60 @@ mod tests {
                 .map(|task| task.id)
                 .collect::<Vec<_>>(),
             vec!["TASK-001", "TASK-002"]
+        );
+    }
+
+    #[test]
+    fn gate_held_partial_blocks_dependent_but_receipt_pending_partial_does_not() {
+        // TASK-HELD is a `[~]` partial that failed a gate (durable hold) -> its
+        // dependent TASK-A must WAIT. TASK-OK is a `[~]` partial whose code
+        // landed and is only receipt-pending -> its dependent TASK-B stays ready.
+        // Both partials themselves remain dispatchable for their own closeout.
+        let plan = parse_loop_plan(
+            r#"
+- [~] `TASK-HELD` Partial that failed a gate
+  Dependencies: none
+  Estimated scope: S
+- [~] `TASK-OK` Partial pending only receipts
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-A` depends on gate-held partial
+  Dependencies: `TASK-HELD`
+  Estimated scope: S
+- [ ] `TASK-B` depends on receipt-pending partial
+  Dependencies: `TASK-OK`
+  Estimated scope: S
+"#,
+        );
+        let gate_held = BTreeSet::from(["TASK-HELD".to_string()]);
+        let ready = plan
+            .ready_tasks_with_gate_holds(&BTreeSet::new(), &gate_held)
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert!(
+            !ready.contains(&"TASK-A".to_string()),
+            "dependent of a gate-held partial must be held: {ready:?}"
+        );
+        assert!(
+            ready.contains(&"TASK-B".to_string()),
+            "dependent of a merely receipt-pending partial stays ready: {ready:?}"
+        );
+        assert!(
+            ready.contains(&"TASK-HELD".to_string()),
+            "the gate-held partial itself stays dispatchable for closeout: {ready:?}"
+        );
+        assert!(ready.contains(&"TASK-OK".to_string()));
+
+        // Default path (no gate holds) preserves prior behavior: TASK-A ready.
+        let ready_no_holds = plan
+            .ready_tasks(&BTreeSet::new())
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert!(
+            ready_no_holds.contains(&"TASK-A".to_string()),
+            "without a gate hold every partial satisfies its dependency: {ready_no_holds:?}"
         );
     }
 

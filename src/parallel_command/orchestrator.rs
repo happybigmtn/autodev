@@ -424,6 +424,9 @@ pub(crate) async fn run_parallel_loop(
     let mut attempted_partial_followups = restored_run_state.attempted_partial_followups;
     let mut deferred_partial_tasks = restored_run_state.deferred_partial_tasks;
     let mut unblock_attempt_counts = restored_run_state.unblock_attempt_counts;
+    // Cache the last-persisted run-state JSON so the ~5s main loop only rewrites
+    // the ledger when its serialized value actually changed (not every idle tick).
+    let mut last_persisted_run_state: Option<String> = None;
     if !shelved_tasks.is_empty()
         || !deferred_partial_tasks.is_empty()
         || !unblock_attempt_counts.is_empty()
@@ -538,8 +541,10 @@ pub(crate) async fn run_parallel_loop(
         });
         // Persist the just-pruned bookkeeping so a crash/restart resumes it.
         // Record the current HEAD so the NEXT run can auto-recover these shelved
-        // tasks if a fix lands (advances HEAD) between runs.
-        save_parallel_run_state(
+        // tasks if a fix lands (advances HEAD) between runs. Only writes when the
+        // serialized ledger actually changed, so idle ticks don't churn the disk.
+        save_parallel_run_state_if_changed(
+            &mut last_persisted_run_state,
             run_root,
             &shelved_tasks,
             &deferred_partial_tasks,
@@ -579,13 +584,18 @@ pub(crate) async fn run_parallel_loop(
                 break;
             }
 
+            // Gate-held partials failed a real gate; their landed code is known
+            // to not pass, so dependents built on them would rework. Hold those
+            // dependents until the hold clears (task lands cleanly).
+            let gate_held = gate_held_task_ids(repo_root);
             let ready = prioritize_ready_parallel_tasks(
                 repo_root,
-                ready_parallel_tasks(
+                ready_parallel_tasks_with_gate_holds(
                     &plan,
                     &active_tasks,
                     &shelved_tasks,
                     &deferred_partial_tasks,
+                    &gate_held,
                 ),
             );
             if ready.is_empty() {
@@ -1323,6 +1333,15 @@ pub(crate) async fn run_parallel_loop(
                     args.max_retries + 1
                 ),
             );
+            // Thread the terminal cause of THIS failed attempt into the next
+            // prompt so the retry sees why it failed instead of re-running blind.
+            assignment.host_recovery_note = Some(retry_failure_recovery_note(
+                &assignment.lane_repo_root,
+                &assignment.stdout_log_path,
+                &assignment.stderr_log_path,
+                exit_code,
+                is_futility,
+            ));
             let plan_for_prompt = refresh_parallel_plan_or_last_good(
                 repo_root,
                 target_branch,

@@ -264,8 +264,27 @@ pub(crate) fn ready_parallel_tasks(
     shelved_tasks: &BTreeMap<String, String>,
     deferred_partial_tasks: &BTreeSet<String>,
 ) -> Vec<LoopTask> {
+    ready_parallel_tasks_with_gate_holds(
+        plan,
+        active_tasks,
+        shelved_tasks,
+        deferred_partial_tasks,
+        &BTreeSet::new(),
+    )
+}
+
+/// Dispatch-ready tasks, holding back dependents of any gate-held Partial in
+/// `gate_held` (see [`LoopPlanSnapshot::ready_tasks_with_gate_holds`]). The
+/// gate-held Partial itself still surfaces for its own closeout.
+pub(crate) fn ready_parallel_tasks_with_gate_holds(
+    plan: &LoopPlanSnapshot,
+    active_tasks: &BTreeSet<String>,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    gate_held: &BTreeSet<String>,
+) -> Vec<LoopTask> {
     let ready = plan
-        .ready_tasks(active_tasks)
+        .ready_tasks_with_gate_holds(active_tasks, gate_held)
         .into_iter()
         .filter(|task| !shelved_tasks.contains_key(&task.id))
         .filter(|task| !deferred_partial_tasks.contains(&task.id))
