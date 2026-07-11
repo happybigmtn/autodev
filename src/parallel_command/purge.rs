@@ -17,7 +17,7 @@
 
 use super::*;
 
-const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin", "salvage"];
+const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin", "salvage", "lane-caches"];
 const PURGEABLE_LOGS: &[&str] = &["host.stdout.log", "host.stderr.log"];
 
 fn purge_previous_run_enabled() -> bool {

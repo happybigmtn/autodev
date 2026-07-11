@@ -6,6 +6,49 @@ fn scope_effort_routing_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether a lane-local Cargo target dir is kept OUTSIDE the disposable worktree
+/// so incremental compilation survives assignment churn (default on; `=0`
+/// restores the legacy in-worktree `<lane_root>/cargo-target` that is deleted
+/// with every fresh clone, forcing a cold compile per task).
+pub(crate) fn lane_persistent_cargo_target_enabled() -> bool {
+    std::env::var("AUTO_LANE_PERSISTENT_TARGET")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// Resolve the persistent per-lane Cargo target for a lane-local layout, derived
+/// purely from the lane-root layout invariant `<run_root>/lanes/lane-<n>`.
+///
+/// Every fresh assignment deletes and re-clones `<run_root>/lanes/lane-<n>` (see
+/// [`reset_parallel_lane_root`]), so a target dir *inside* that worktree is thrown
+/// away every task and each compile starts cold. Relocating it to a stable
+/// `<run_root>/lane-caches/lane-<n>/cargo-target` — a sibling of `lanes/`, outside
+/// the disposable worktree — lets incremental compilation be reused across every
+/// task that runs on the same lane.
+///
+/// Keyed per lane index: a lane index is held by at most one active worker at a
+/// time (see [`next_free_lane_index`]), so concurrent lanes never share a target
+/// dir and there is no cargo lock contention or artifact corruption.
+///
+/// Returns `None` (caller falls back to the legacy in-worktree target) when the
+/// feature is disabled or the lane-root layout cannot be parsed — a safe
+/// degradation, never a hard failure.
+fn lane_persistent_cargo_target_for(lane_root: &Path) -> Option<PathBuf> {
+    if !lane_persistent_cargo_target_enabled() {
+        return None;
+    }
+    let lane_name = lane_root.file_name()?.to_str()?;
+    let lane_index = parse_lane_index(lane_name)?;
+    // `<run_root>/lanes/lane-<n>` -> `<run_root>`.
+    let run_root = lane_root.parent()?.parent()?;
+    Some(
+        run_root
+            .join("lane-caches")
+            .join(format!("lane-{lane_index}"))
+            .join("cargo-target"),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopeClass {
     Small,
@@ -98,12 +141,11 @@ impl LaneRunConfig {
     pub(crate) fn env_for_lane(&self, lane_root: &Path) -> Vec<(String, String)> {
         let mut extra_env = self.extra_env.clone();
         if self.lane_local_cargo_target {
+            let target = lane_persistent_cargo_target_for(lane_root)
+                .unwrap_or_else(|| lane_root.join("cargo-target"));
             extra_env.push((
                 "CARGO_TARGET_DIR".to_string(),
-                lane_root
-                    .join("cargo-target")
-                    .to_string_lossy()
-                    .into_owned(),
+                target.to_string_lossy().into_owned(),
             ));
         }
         extra_env
@@ -1069,6 +1111,46 @@ mod tests {
         assert_eq!(high.effective_reasoning_effort(Some("S"), 1), "xhigh");
 
         std::env::remove_var("AUTO_PARALLEL_SCOPE_EFFORT");
+    }
+
+    #[test]
+    fn lane_local_cargo_target_persists_outside_disposable_worktree() {
+        // AUTO_LANE_PERSISTENT_TARGET is process-global; drive all phases
+        // sequentially in one test to avoid racing on it.
+        let lane_root = PathBuf::from("/srv/run/lanes/lane-3");
+        let mut lane_local = effort_config("high");
+        lane_local.lane_local_cargo_target = true;
+
+        // Default (persistence on): the target lives under
+        // <run_root>/lane-caches/lane-3, a sibling of lanes/, so it survives the
+        // per-assignment worktree wipe and incremental compilation is reused.
+        std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "1");
+        let target = lane_local
+            .env_for_lane(&lane_root)
+            .into_iter()
+            .find(|(key, _)| key == "CARGO_TARGET_DIR")
+            .map(|(_, value)| value)
+            .expect("lane-local run must set CARGO_TARGET_DIR");
+        assert_eq!(target, "/srv/run/lane-caches/lane-3/cargo-target");
+
+        // Disabled: legacy in-worktree target, deleted with every fresh clone.
+        std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "0");
+        let target = lane_local
+            .env_for_lane(&lane_root)
+            .into_iter()
+            .find(|(key, _)| key == "CARGO_TARGET_DIR")
+            .map(|(_, value)| value)
+            .expect("lane-local run must still set CARGO_TARGET_DIR when disabled");
+        assert_eq!(target, "/srv/run/lanes/lane-3/cargo-target");
+        std::env::remove_var("AUTO_LANE_PERSISTENT_TARGET");
+
+        // A non-lane-local config never sets CARGO_TARGET_DIR: Fixed/None layouts
+        // already carry their own target in extra_env and must not be clobbered.
+        let shared = effort_config("high"); // lane_local_cargo_target: false
+        assert!(shared
+            .env_for_lane(&lane_root)
+            .iter()
+            .all(|(key, _)| key != "CARGO_TARGET_DIR"));
     }
 
     fn sample_worker_metadata() -> LaneWorkerMetadata {

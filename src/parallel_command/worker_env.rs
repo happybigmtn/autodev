@@ -145,10 +145,17 @@ pub(crate) fn inherited_target_loop_worker_env(
         }
         ParallelCargoTargetLayout::LaneLocal => {
             lane_local_cargo_target = true;
-            Some(format!(
-                "lane-local under {}/lanes/lane-*/cargo-target",
-                run_root.display()
-            ))
+            if lane_persistent_cargo_target_enabled() {
+                Some(format!(
+                    "lane-local persistent under {}/lane-caches/lane-*/cargo-target (survives per-task worktree churn)",
+                    run_root.display()
+                ))
+            } else {
+                Some(format!(
+                    "lane-local under {}/lanes/lane-*/cargo-target",
+                    run_root.display()
+                ))
+            }
         }
     };
     let cargo_target_prompt_clause =
