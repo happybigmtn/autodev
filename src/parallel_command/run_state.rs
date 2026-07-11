@@ -56,6 +56,14 @@ pub(crate) struct WorkspaceBaseline {
     /// that now fails to compile is a regression.
     #[serde(default)]
     pub(crate) ever_compiled_crates: BTreeSet<String>,
+    /// A short excerpt of the actual `cargo` compiler error lines captured at
+    /// FIRST snapshot when the workspace did not compile (e.g. the missing
+    /// `include_str!` fixture path). Purely diagnostic: surfaced verbatim so a
+    /// human reading a "no code lanes dispatchable" stop sees the real cause
+    /// (a broken build) instead of decoding it. Empty when the workspace
+    /// compiled at first capture.
+    #[serde(default)]
+    pub(crate) compile_error_excerpt: Vec<String>,
 }
 
 fn workspace_baseline_path(run_root: &Path) -> PathBuf {
@@ -413,6 +421,9 @@ mod tests {
                 .into_iter()
                 .collect(),
             ever_compiled_crates: ["ludii_core".to_string()].into_iter().collect(),
+            compile_error_excerpt: vec![
+                "error: couldn't read a.lud: No such file or directory (os error 2)".to_string(),
+            ],
         };
 
         save_workspace_baseline(&dir, &baseline);
@@ -424,6 +435,11 @@ mod tests {
             .ever_passed_tests
             .contains("ludii_core::board::stable"));
         assert!(restored.ever_compiled_crates.contains("ludii_core"));
+        assert_eq!(
+            restored.compile_error_excerpt,
+            baseline.compile_error_excerpt,
+            "compile-error excerpt round-trips through the persisted baseline"
+        );
 
         clear_workspace_baseline(&dir);
         assert!(!load_workspace_baseline(&dir).captured);

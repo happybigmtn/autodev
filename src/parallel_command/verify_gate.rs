@@ -277,7 +277,16 @@ pub(crate) struct WorkspaceObservation {
     pub(crate) passing_tests: BTreeSet<String>,
     /// Test IDs that ran and FAILED.
     pub(crate) failing_tests: BTreeSet<String>,
+    /// Verbatim `cargo`/`rustc` error lines (those beginning with `error`)
+    /// captured when the workspace did not compile, capped for log sanity. This
+    /// is what lets a "workspace won't compile" diagnostic name the ACTUAL cause
+    /// (e.g. `error: couldn't read .../Cannon.lud: No such file (os error 2)`)
+    /// rather than only the crate name. Empty on a clean compile.
+    pub(crate) compile_error_excerpt: Vec<String>,
 }
+
+/// Maximum number of `error` lines retained in [`WorkspaceObservation::compile_error_excerpt`].
+const MAX_COMPILE_ERROR_EXCERPT_LINES: usize = 12;
 
 /// Either a parsed observation, or an infra-level skip (non-Rust repo, spawn
 /// error, timeout, or an ambiguous non-zero exit with no parseable signal).
@@ -376,6 +385,15 @@ pub(crate) fn parse_workspace_test_output(text: &str) -> WorkspaceObservation {
     let mut current_target: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
+
+        // Any `error`/`error[E…]`/`error:` line is retained verbatim (capped) so
+        // the compile-block diagnostic can show the real cause — the missing
+        // fixture path, the unresolved import, etc. — not just the crate name.
+        if trimmed.starts_with("error")
+            && obs.compile_error_excerpt.len() < MAX_COMPILE_ERROR_EXCERPT_LINES
+        {
+            obs.compile_error_excerpt.push(trimmed.to_string());
+        }
 
         // `error: could not compile `<crate>` (…) due to …` -> compile break.
         if let Some(rest) = trimmed.strip_prefix("error: could not compile `") {
@@ -651,6 +669,7 @@ pub(crate) fn advance_workspace_baseline(
         baseline.baseline_compiles = obs.compiled;
         baseline.baseline_broken_crates = obs.broken_crates.clone();
         baseline.baseline_failing_tests = obs.failing_tests.clone();
+        baseline.compile_error_excerpt = obs.compile_error_excerpt.clone();
     }
     if obs.compiled {
         for id in &obs.passing_tests {
@@ -660,6 +679,52 @@ pub(crate) fn advance_workspace_baseline(
             baseline.ever_compiled_crates.insert(stem.clone());
         }
     }
+}
+
+/// A prominent, human-actionable diagnostic when the shared workspace has NEVER
+/// compiled this run. A compile break makes `cargo test --workspace` and every
+/// task whose own verification builds a dependent crate fail, so tasks correctly
+/// stall at `[~]`/shelved rather than promoting to `[x]`. The bare "no executable
+/// dependency-ready code tasks remain" stop then leaves a human decoding why —
+/// with zero indication the real cause is a broken build (classically a
+/// missing/renamed source or fixture referenced by `include_str!`). This turns
+/// that into an explicit, copy-pasteable explanation.
+///
+/// Returns `None` when the workspace has compiled at some point this run (every
+/// crate broken at first capture was later observed compiling) or no baseline was
+/// captured — i.e. nothing to warn about.
+pub(crate) fn workspace_compile_block_diagnostic(baseline: &WorkspaceBaseline) -> Option<String> {
+    if !baseline.captured {
+        return None;
+    }
+    // Crates broken at first capture that were NEVER observed compiling this run
+    // are still a hard blocker for every dependent task.
+    let still_broken: Vec<String> = baseline
+        .baseline_broken_crates
+        .iter()
+        .filter(|c| !baseline.ever_compiled_crates.contains(*c))
+        .cloned()
+        .collect();
+    if still_broken.is_empty() {
+        return None;
+    }
+    let mut msg = format!(
+        "the shared workspace has NOT compiled at any point this run: crate(s) {} fail to compile. \
+Every task whose own verification builds a dependent crate cannot pass, so tasks correctly stall at `[~]`/shelved instead of promoting to `[x]` — a broken build, NOT a scheduler defect, is why no code lanes are dispatchable.",
+        still_broken.join(", ")
+    );
+    if !baseline.compile_error_excerpt.is_empty() {
+        msg.push_str("\n  first compiler error line(s):");
+        for line in &baseline.compile_error_excerpt {
+            msg.push_str("\n    ");
+            msg.push_str(line);
+        }
+    }
+    msg.push_str(
+        "\n  Recovery: fix the compile error — a common cause is a missing/renamed/deleted source or fixture file referenced by `include_str!`/`include_bytes!`; run `cargo build --workspace` for the exact path and check `git status` for deleted untracked files. \
+Once the workspace compiles, re-run `auto parallel`; if tasks were shelved this run, add `AUTO_PARALLEL_RETRY_SHELVED=1` to give them a fresh attempt.",
+    );
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -830,6 +895,7 @@ mod tests {
             baseline_failing_tests: baseline_failing.iter().map(|s| s.to_string()).collect(),
             ever_passed_tests: ever_passed.iter().map(|s| s.to_string()).collect(),
             ever_compiled_crates: ever_compiled.iter().map(|s| s.to_string()).collect(),
+            compile_error_excerpt: Vec::new(),
         }
     }
 
@@ -1007,6 +1073,62 @@ error: could not compile `boardlab-tui` (lib test) due to 1 previous error
         let decision = classify_workspace_regressions(&baseline, &obs, &set_of(&["mycrate"]));
         assert!(decision.is_blocked(), "{decision:?}");
         assert!(decision.blocking[0].contains("mycrate"));
+    }
+
+    #[test]
+    fn parse_workspace_test_output_captures_compile_error_excerpt() {
+        // Regression coverage for the compile-block diagnostic: the parser must
+        // retain the real error line (a missing `include_str!` fixture), not just
+        // the crate name, so the operator sees the actual cause.
+        let out = "   Compiling ludii-core v0.1.0\n\
+error: couldn't read crates/ludii-core/src/../Cannon.lud: No such file or directory (os error 2)\n\
+error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
+        let obs = parse_workspace_test_output(out);
+        assert!(!obs.compiled, "missing include_str! target breaks the build");
+        assert!(obs.broken_crates.contains("ludii_core"));
+        assert!(
+            obs.compile_error_excerpt
+                .iter()
+                .any(|line| line.contains("Cannon.lud") && line.contains("No such file")),
+            "excerpt must retain the verbatim compiler error: {:?}",
+            obs.compile_error_excerpt
+        );
+    }
+
+    #[test]
+    fn workspace_compile_block_diagnostic_surfaces_persistent_break() {
+        // A crate broken at first capture and NEVER observed compiling this run is
+        // a persistent build blocker — the true reason tasks are shelved and no
+        // code lanes are dispatchable. The diagnostic must fire, name the crate,
+        // echo the captured compiler error, and point at the recovery.
+        let baseline = WorkspaceBaseline {
+            captured: true,
+            baseline_broken_crates: ["ludii_core".to_string()].into_iter().collect(),
+            compile_error_excerpt: vec![
+                "error: couldn't read crates/ludii-core/src/../Cannon.lud: No such file or directory (os error 2)".to_string(),
+            ],
+            ..Default::default()
+        };
+        let diag = workspace_compile_block_diagnostic(&baseline)
+            .expect("a persistent compile break must produce a diagnostic");
+        assert!(diag.contains("ludii_core"), "names the broken crate: {diag}");
+        assert!(diag.contains("Cannon.lud"), "echoes the real compiler error: {diag}");
+        assert!(
+            diag.contains("AUTO_PARALLEL_RETRY_SHELVED=1"),
+            "points at the shelved-task recovery: {diag}"
+        );
+
+        // Once the crate is observed compiling later in the run, it is no longer a
+        // blocker and the diagnostic goes silent (best-observed monotonicity).
+        let mut recovered = baseline.clone();
+        recovered.ever_compiled_crates.insert("ludii_core".to_string());
+        assert!(
+            workspace_compile_block_diagnostic(&recovered).is_none(),
+            "a crate that compiled later this run is not a persistent blocker"
+        );
+
+        // An uncaptured baseline (strict mode / probe skipped) never warns.
+        assert!(workspace_compile_block_diagnostic(&WorkspaceBaseline::default()).is_none());
     }
 
     #[test]

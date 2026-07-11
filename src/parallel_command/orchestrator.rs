@@ -958,6 +958,15 @@ pub(crate) async fn run_parallel_loop(
                 continue;
             }
 
+            // Before the terminal stop, surface the single most common real cause
+            // of "nothing dispatchable while unfinished work remains": a workspace
+            // that has never compiled this run. Without this, the stop message
+            // above reads as an inscrutable scheduler giving up, when the true
+            // fix is a broken build (e.g. a swept/missing `include_str!` fixture).
+            if let Some(diag) = workspace_compile_block_diagnostic(&load_workspace_baseline(run_root))
+            {
+                parallel_logger.warn(format!("workspace-compile-block: {diag}"));
+            }
             parallel_logger.info(no_dependency_ready_stop_message(
                 &plan,
                 &active_tasks,

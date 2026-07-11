@@ -1500,6 +1500,9 @@ pub(crate) async fn maybe_capture_workspace_baseline(
             existing.ever_passed_tests.len(),
             existing.ever_compiled_crates.len(),
         ));
+        if let Some(diag) = workspace_compile_block_diagnostic(&existing) {
+            parallel_logger.warn(format!("workspace-compile-block: {diag}"));
+        }
         return;
     }
     parallel_logger
@@ -1516,6 +1519,9 @@ pub(crate) async fn maybe_capture_workspace_baseline(
                 obs.broken_crates.len(),
                 obs.passing_tests.len(),
             ));
+            if let Some(diag) = workspace_compile_block_diagnostic(&baseline) {
+                parallel_logger.warn(format!("workspace-compile-block: {diag}"));
+            }
         }
         WorkspaceProbe::Skipped { reason } => {
             parallel_logger.warn(format!(
@@ -2310,6 +2316,29 @@ pub(crate) fn scrub_parallel_receipt_staging(repo_root: &Path) -> Result<()> {
             ".auto/symphony/verification-receipts",
         ],
     );
+    // Log exactly what the `git clean` will remove (dry-run preview) BEFORE
+    // deleting, so any swept file is diagnosable from the run log instead of
+    // vanishing silently. This sweep is deliberately path-scoped to the
+    // host-owned receipts dir; the preview makes that scope auditable and would
+    // make an accidental over-broad deletion visible rather than mysterious.
+    if let Ok(preview) = git_stdout(
+        repo_root,
+        [
+            "clean",
+            "-nd",
+            "--",
+            ".auto/symphony/verification-receipts",
+        ],
+    ) {
+        let removals: Vec<&str> = preview.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !removals.is_empty() {
+            eprintln!(
+                "parallel receipt-scrub: git clean will remove {} untracked path(s) under .auto/symphony/verification-receipts:\n{}",
+                removals.len(),
+                removals.join("\n")
+            );
+        }
+    }
     let _ = run_git(
         repo_root,
         ["clean", "-fd", "--", ".auto/symphony/verification-receipts"],
