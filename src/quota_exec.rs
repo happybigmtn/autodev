@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -498,12 +499,86 @@ fn restore_and_update_state(
     state_result
 }
 
+/// Default cap on the cumulative time a single `run_with_quota` call will spend
+/// waiting for a Codex/Claude *session* quota window to reset before giving up
+/// and surfacing the exhaustion error. A transient session window is ~15 min, so
+/// 20 min covers one window plus margin while staying bounded. Override with
+/// `AUTO_QUOTA_BACKOFF_MAX_SECS`; set it to `0` to disable backoff entirely
+/// (restoring the pre-2026-07 "fail immediately when all accounts are
+/// exhausted" behavior).
+const DEFAULT_QUOTA_BACKOFF_MAX_SECS: u64 = 1200;
+
+/// Extra seconds slept past a reported reset horizon so the provider-side window
+/// has definitely rolled over before we retry.
+const QUOTA_BACKOFF_MARGIN_SECS: u64 = 15;
+
+fn quota_backoff_cap() -> Duration {
+    let secs = std::env::var("AUTO_QUOTA_BACKOFF_MAX_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_QUOTA_BACKOFF_MAX_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Decide whether to back off and wait for a session-quota reset after every
+/// account was exhausted/unavailable in a single selection pass, and for how
+/// long. Pure so the policy is unit-testable without live accounts.
+///
+/// Returns `Some(sleep)` to wait then retry the whole selection loop, or `None`
+/// to give up (surface the exhaustion error). We only wait when ALL of:
+/// - backoff is enabled (`cap` > 0),
+/// - at least one account hit a genuine *quota* exhaustion this pass (waiting
+///   cannot fix a pass that was purely auth/unavailable failures),
+/// - a concrete soonest session-reset horizon is known from live usage, and
+/// - waiting until that reset (plus a small margin) still fits inside the
+///   remaining cap budget — if even the soonest reset is beyond budget, waiting
+///   cannot recover in time, so we surface the error immediately rather than
+///   sleep pointlessly.
+fn quota_backoff_wait(
+    cap: Duration,
+    already_waited: Duration,
+    saw_quota_exhaustion: bool,
+    soonest_session_reset_secs: Option<u64>,
+) -> Option<Duration> {
+    if cap.is_zero() || !saw_quota_exhaustion {
+        return None;
+    }
+    let reset = soonest_session_reset_secs?;
+    let target = Duration::from_secs(reset).saturating_add(Duration::from_secs(
+        QUOTA_BACKOFF_MARGIN_SECS,
+    ));
+    let remaining = cap.checked_sub(already_waited).filter(|r| !r.is_zero())?;
+    if target > remaining {
+        return None;
+    }
+    Some(target)
+}
+
+/// Soonest session-reset horizon (seconds) across all accounts that reported
+/// live usage this pass — the earliest moment ANY account should be usable
+/// again. `None` when no account reported usage data.
+fn soonest_session_reset(
+    scored: &[(&crate::quota_config::AccountEntry, Option<crate::quota_usage::AccountUsage>)],
+) -> Option<u64> {
+    scored
+        .iter()
+        .filter_map(|(_, usage)| usage.as_ref().map(|u| u.session_resets_in_secs))
+        .min()
+}
+
 /// Run a CLI command with quota-aware account selection and failover.
 ///
 /// `exec_fn` is invoked with the `SelectedAccount` the router chose; the
 /// closure must merge `account.extra_env()` into its own env when spawning
 /// the provider CLI so isolated CODEX_HOME profiles route correctly.
 /// Returns `(ExitStatus, stderr_text)`.
+///
+/// When every configured account is session-exhausted in a full pass, this
+/// backs off and waits for the soonest session-quota reset (bounded by
+/// `AUTO_QUOTA_BACKOFF_MAX_SECS`) and retries, so a transient ~15-min session
+/// window can no longer turn a queued run's worth of work into a cascade of
+/// shelved tasks. Genuine sustained exhaustion (soonest reset beyond the cap,
+/// e.g. a weekly limit) still surfaces the error after the bounded wait.
 pub(crate) async fn run_with_quota<F, Fut>(
     provider: Provider,
     exec_fn: F,
@@ -514,73 +589,107 @@ where
 {
     let config = QuotaConfig::load()?;
     let max_attempts = config.accounts_for_provider(provider).len();
+    let backoff_cap = quota_backoff_cap();
+    let mut waited = Duration::ZERO;
 
-    for attempt in 0..max_attempts {
-        let scored = quota_selector::score_accounts(&config, provider).await?;
-        let (account, mut guard) = reserve_account_and_swap(provider, &config, &scored)?;
-        let account_name = account.name.clone();
+    loop {
+        let mut saw_quota_exhaustion = false;
+        let mut soonest_reset: Option<u64> = None;
 
-        eprintln!(
-            "[quota-router] attempt {}/{max_attempts}: using account '{account_name}'",
-            attempt + 1,
-        );
+        for attempt in 0..max_attempts {
+            let scored = quota_selector::score_accounts(&config, provider).await?;
+            if let Some(reset) = soonest_session_reset(&scored) {
+                soonest_reset = Some(soonest_reset.map_or(reset, |cur| cur.min(reset)));
+            }
+            let (account, mut guard) = reserve_account_and_swap(provider, &config, &scored)?;
+            let account_name = account.name.clone();
 
-        let result = exec_fn(account.clone()).await;
+            eprintln!(
+                "[quota-router] attempt {}/{max_attempts}: using account '{account_name}'",
+                attempt + 1,
+            );
 
-        match result {
-            Ok((status, stderr_text)) => {
-                let verdict = quota_patterns::check_stderr(provider, &stderr_text);
-                restore_and_update_state(provider, &account_name, &mut guard, |state, now| {
-                    state.mark_used(&account_name, now)?;
-                    match verdict {
-                        QuotaVerdict::Exhausted | QuotaVerdict::Unavailable => {
-                            state.mark_exhausted(&account_name, now)?;
-                        }
-                        QuotaVerdict::Ok | QuotaVerdict::OtherError => {
-                            if status.success() {
-                                state.mark_success(&account_name, now)?;
+            let result = exec_fn(account.clone()).await;
+
+            match result {
+                Ok((status, stderr_text)) => {
+                    let verdict = quota_patterns::check_stderr(provider, &stderr_text);
+                    restore_and_update_state(provider, &account_name, &mut guard, |state, now| {
+                        state.mark_used(&account_name, now)?;
+                        match verdict {
+                            QuotaVerdict::Exhausted | QuotaVerdict::Unavailable => {
+                                state.mark_exhausted(&account_name, now)?;
+                            }
+                            QuotaVerdict::Ok | QuotaVerdict::OtherError => {
+                                if status.success() {
+                                    state.mark_success(&account_name, now)?;
+                                }
                             }
                         }
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })?;
 
-                match verdict {
-                    QuotaVerdict::Exhausted => {
-                        if quota_output_has_agent_progress(&stderr_text) {
-                            let recovery_marker =
-                                write_quota_progress_recovery_marker(provider, &account_name)?;
-                            anyhow::bail!(
-                                "account '{account_name}' quota exhausted after worker progress was detected; credentials restored and retry stopped to avoid duplicate side effects. recovery marker: {}",
-                                recovery_marker.display()
+                    match verdict {
+                        QuotaVerdict::Exhausted => {
+                            if quota_output_has_agent_progress(&stderr_text) {
+                                let recovery_marker =
+                                    write_quota_progress_recovery_marker(provider, &account_name)?;
+                                anyhow::bail!(
+                                    "account '{account_name}' quota exhausted after worker progress was detected; credentials restored and retry stopped to avoid duplicate side effects. recovery marker: {}",
+                                    recovery_marker.display()
+                                );
+                            }
+                            saw_quota_exhaustion = true;
+                            eprintln!(
+                                "[quota-router] account '{account_name}' quota exhausted, trying next..."
                             );
+                            continue;
                         }
-                        eprintln!(
-                            "[quota-router] account '{account_name}' quota exhausted, trying next..."
-                        );
-                        continue;
+                        QuotaVerdict::Unavailable => {
+                            eprintln!(
+                                "[quota-router] account '{account_name}' auth/availability failed, \
+                                 trying next..."
+                            );
+                            continue;
+                        }
+                        QuotaVerdict::Ok | QuotaVerdict::OtherError => {}
                     }
-                    QuotaVerdict::Unavailable => {
-                        eprintln!(
-                            "[quota-router] account '{account_name}' auth/availability failed, \
-                             trying next..."
-                        );
-                        continue;
-                    }
-                    QuotaVerdict::Ok | QuotaVerdict::OtherError => {}
-                }
 
-                return Ok(QuotaExecResult {
-                    exit_status: status,
-                    stderr_text,
-                });
+                    return Ok(QuotaExecResult {
+                        exit_status: status,
+                        stderr_text,
+                    });
+                }
+                Err(e) => {
+                    restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {
+                        Ok(())
+                    })?;
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {
-                    Ok(())
-                })?;
-                return Err(e);
+        }
+
+        // Every account was exhausted/unavailable this pass. If the exhaustion
+        // is a transient session window whose reset lands inside our remaining
+        // wait budget, sleep for it and retry the whole loop instead of failing
+        // the run. No lock/lease/credential guard is held here (each attempt
+        // restored its guard before `continue`), so the sleep is safe and does
+        // not block other lanes' account selection.
+        match quota_backoff_wait(backoff_cap, waited, saw_quota_exhaustion, soonest_reset) {
+            Some(sleep_for) => {
+                waited = waited.saturating_add(sleep_for);
+                eprintln!(
+                    "[quota-router] all {provider} accounts session-exhausted; backing off {}s for the soonest session reset, then resuming dispatch (waited {}s / {}s cap)",
+                    sleep_for.as_secs(),
+                    waited.as_secs(),
+                    backoff_cap.as_secs(),
+                );
+                tokio::time::sleep(sleep_for).await;
+                // Loop: score_accounts re-fetches live usage; the reset should
+                // now show session headroom and the next exec should succeed.
+                continue;
             }
+            None => break,
         }
     }
 
@@ -773,10 +882,101 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_oauth_expires_at, quota_output_has_agent_progress, restore_credentials,
-        run_with_quota, swap_credentials_legacy as swap_credentials, sync_newer_claude_credentials,
+        claude_oauth_expires_at, quota_backoff_wait, quota_output_has_agent_progress,
+        restore_credentials, run_with_quota, swap_credentials_legacy as swap_credentials,
+        sync_newer_claude_credentials, Duration,
     };
     use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
+
+    #[test]
+    fn backoff_waits_for_soonest_session_reset_within_cap() {
+        // Transient session window: reset in 933s, 20-min cap -> wait reset+margin.
+        let wait = quota_backoff_wait(
+            Duration::from_secs(1200),
+            Duration::ZERO,
+            true,
+            Some(933),
+        );
+        assert_eq!(wait, Some(Duration::from_secs(933 + 15)));
+    }
+
+    #[test]
+    fn backoff_disabled_when_cap_is_zero() {
+        assert_eq!(
+            quota_backoff_wait(Duration::ZERO, Duration::ZERO, true, Some(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_skipped_when_no_quota_exhaustion_seen() {
+        // A pass that failed purely on auth/unavailable must not wait.
+        assert_eq!(
+            quota_backoff_wait(Duration::from_secs(1200), Duration::ZERO, false, Some(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_skipped_without_a_known_reset_horizon() {
+        assert_eq!(
+            quota_backoff_wait(Duration::from_secs(1200), Duration::ZERO, true, None),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_gives_up_when_soonest_reset_exceeds_remaining_budget() {
+        // Weekly-scale exhaustion (reset beyond cap): surface the error instead
+        // of sleeping pointlessly.
+        assert_eq!(
+            quota_backoff_wait(
+                Duration::from_secs(1200),
+                Duration::ZERO,
+                true,
+                Some(100_000)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_respects_cumulative_budget_across_passes() {
+        // Already waited 1150s of a 1200s cap: only 50s left, a 60s reset+margin
+        // won't fit -> give up (bounded total wait).
+        assert_eq!(
+            quota_backoff_wait(
+                Duration::from_secs(1200),
+                Duration::from_secs(1150),
+                true,
+                Some(60)
+            ),
+            None
+        );
+        // But a short reset that fits the remaining budget is still honored.
+        assert_eq!(
+            quota_backoff_wait(
+                Duration::from_secs(1200),
+                Duration::from_secs(1100),
+                true,
+                Some(60)
+            ),
+            Some(Duration::from_secs(75))
+        );
+    }
+
+    #[test]
+    fn backoff_gives_up_once_budget_is_fully_spent() {
+        assert_eq!(
+            quota_backoff_wait(
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+                true,
+                Some(1)
+            ),
+            None
+        );
+    }
 
     #[cfg(unix)]
     use std::ffi::OsString;
