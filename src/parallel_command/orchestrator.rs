@@ -408,7 +408,18 @@ pub(crate) async fn run_parallel_loop(
     // a stale ledger can never resurrect a Done/spec-changed task; this only
     // preserves shelve/defer decisions and retry budgets across a restart so the
     // resumed host doesn't reset them and re-thrash through the same failures.
-    let restored_run_state = load_parallel_run_state(run_root);
+    let mut restored_run_state = load_parallel_run_state(run_root);
+    let current_head = current_repo_head(repo_root);
+    let auto_cleared = auto_clear_shelved_on_head_change(
+        &mut restored_run_state,
+        current_head.as_deref(),
+        autoclear_shelved_disabled(),
+    );
+    if auto_cleared > 0 {
+        parallel_logger.info(format!(
+            "resume: HEAD advanced since the last run; auto-retrying {auto_cleared} shelved/deferred task(s) whose transient blocker plausibly resolved (set AUTO_PARALLEL_AUTOCLEAR_SHELVED=0 to disable)"
+        ));
+    }
     let mut shelved_tasks = restored_run_state.shelved_tasks;
     let mut attempted_partial_followups = restored_run_state.attempted_partial_followups;
     let mut deferred_partial_tasks = restored_run_state.deferred_partial_tasks;
@@ -526,12 +537,15 @@ pub(crate) async fn run_parallel_loop(
                 .is_some_and(|task| task.status != LoopTaskStatus::Done)
         });
         // Persist the just-pruned bookkeeping so a crash/restart resumes it.
+        // Record the current HEAD so the NEXT run can auto-recover these shelved
+        // tasks if a fix lands (advances HEAD) between runs.
         save_parallel_run_state(
             run_root,
             &shelved_tasks,
             &deferred_partial_tasks,
             &unblock_attempt_counts,
             &attempted_partial_followups,
+            current_repo_head(repo_root).as_deref(),
         );
 
         if args

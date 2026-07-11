@@ -154,6 +154,13 @@ pub(crate) struct ParallelRunState {
     /// task id -> in-run partial follow-up attempts already consumed.
     #[serde(default)]
     pub(crate) attempted_partial_followups: BTreeMap<String, usize>,
+    /// Repo HEAD (canonical) at the last ledger persist. Lets the next run
+    /// auto-recover shelved/deferred tasks when HEAD has since advanced — a
+    /// landed fix plausibly resolved the transient blocker — without the human
+    /// hand-setting AUTO_PARALLEL_RETRY_SHELVED=1. `None` for ledgers written by
+    /// older binaries (they simply never auto-clear).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) head_at_save: Option<String>,
 }
 
 fn run_state_path(run_root: &Path) -> PathBuf {
@@ -211,6 +218,62 @@ fn apply_retry_shelved_override(state: &mut ParallelRunState, requested: bool) {
     state.attempted_partial_followups.clear();
 }
 
+/// Current canonical HEAD of `repo_root`, or `None` when it cannot be read.
+pub(crate) fn current_repo_head(repo_root: &Path) -> Option<String> {
+    git_stdout(repo_root, ["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the operator disabled automatic recovery of shelved/deferred tasks
+/// when HEAD advances between runs (`AUTO_PARALLEL_AUTOCLEAR_SHELVED=0`).
+pub(crate) fn autoclear_shelved_disabled() -> bool {
+    std::env::var("AUTO_PARALLEL_AUTOCLEAR_SHELVED")
+        .ok()
+        .as_deref()
+        == Some("0")
+}
+
+/// Auto-recover shelved/deferred tasks at run start when the repo HEAD has
+/// advanced since the ledger was last persisted: new commits have landed that
+/// plausibly resolved whatever transient blocker caused the shelving (a broken
+/// workspace crate that now compiles, a dependency that has since landed, a
+/// fixed fixture, etc. — every such fix is itself a commit, so it advances
+/// HEAD). This is the automatic counterpart to the manual
+/// `AUTO_PARALLEL_RETRY_SHELVED=1` escape hatch, but unlike a blanket retry it
+/// only fires when something actually changed since the shelving run. Attempt
+/// counters are reset so the retry is genuine, not immediately re-exhausted.
+///
+/// A crash/relaunch on the SAME HEAD (nothing changed) deliberately does NOT
+/// clear: the shelve decisions are preserved so the resumed host doesn't
+/// re-thrash the same failures. Returns the number of shelved+deferred tasks
+/// cleared (0 when nothing changed, HEAD is unknown, or the feature is off).
+pub(crate) fn auto_clear_shelved_on_head_change(
+    state: &mut ParallelRunState,
+    current_head: Option<&str>,
+    disabled: bool,
+) -> usize {
+    if disabled {
+        return 0;
+    }
+    if state.shelved_tasks.is_empty() && state.deferred_partial_tasks.is_empty() {
+        return 0;
+    }
+    let (Some(prev), Some(now)) = (state.head_at_save.as_deref(), current_head) else {
+        return 0;
+    };
+    if prev == now {
+        return 0;
+    }
+    let cleared = state.shelved_tasks.len() + state.deferred_partial_tasks.len();
+    state.shelved_tasks.clear();
+    state.deferred_partial_tasks.clear();
+    state.unblock_attempt_counts.clear();
+    state.attempted_partial_followups.clear();
+    cleared
+}
+
 /// Persist the current scheduling bookkeeping. Best-effort: a write error is
 /// logged and ignored so the ledger can never wedge or slow a real run.
 pub(crate) fn save_parallel_run_state(
@@ -219,12 +282,14 @@ pub(crate) fn save_parallel_run_state(
     deferred_partial_tasks: &BTreeSet<String>,
     unblock_attempt_counts: &BTreeMap<String, usize>,
     attempted_partial_followups: &BTreeMap<String, usize>,
+    head_at_save: Option<&str>,
 ) {
     let state = ParallelRunState {
         shelved_tasks: shelved_tasks.clone(),
         deferred_partial_tasks: deferred_partial_tasks.clone(),
         unblock_attempt_counts: unblock_attempt_counts.clone(),
         attempted_partial_followups: attempted_partial_followups.clone(),
+        head_at_save: head_at_save.map(|s| s.to_string()),
     };
     match serde_json::to_string_pretty(&state) {
         Ok(json) => {
@@ -382,12 +447,13 @@ mod tests {
         let mut followups = BTreeMap::new();
         followups.insert("TASK-1".to_string(), 2usize);
 
-        save_parallel_run_state(&dir, &shelved, &deferred, &unblock, &followups);
+        save_parallel_run_state(&dir, &shelved, &deferred, &unblock, &followups, Some("abc123"));
         let restored = load_parallel_run_state(&dir);
         assert_eq!(restored.shelved_tasks, shelved);
         assert_eq!(restored.deferred_partial_tasks, deferred);
         assert_eq!(restored.unblock_attempt_counts, unblock);
         assert_eq!(restored.attempted_partial_followups, followups);
+        assert_eq!(restored.head_at_save.as_deref(), Some("abc123"));
 
         clear_parallel_run_state(&dir);
         assert!(load_parallel_run_state(&dir).shelved_tasks.is_empty());
@@ -478,5 +544,60 @@ mod tests {
         assert!(state.deferred_partial_tasks.is_empty());
         assert!(state.unblock_attempt_counts.is_empty());
         assert!(state.attempted_partial_followups.is_empty());
+    }
+
+    fn shelved_state_at(head: &str) -> ParallelRunState {
+        let mut state = ParallelRunState {
+            head_at_save: Some(head.to_string()),
+            ..Default::default()
+        };
+        state
+            .shelved_tasks
+            .insert("TASK-9".to_string(), "task md".to_string());
+        state.deferred_partial_tasks.insert("TASK-8".to_string());
+        state.unblock_attempt_counts.insert("TASK-9".to_string(), 3);
+        state
+            .attempted_partial_followups
+            .insert("TASK-8".to_string(), 2);
+        state
+    }
+
+    #[test]
+    fn autoclear_recovers_shelved_when_head_advanced() {
+        let mut state = shelved_state_at("oldsha");
+        let cleared = auto_clear_shelved_on_head_change(&mut state, Some("newsha"), false);
+        assert_eq!(cleared, 2, "one shelved + one deferred recovered");
+        assert!(state.shelved_tasks.is_empty());
+        assert!(state.deferred_partial_tasks.is_empty());
+        assert!(state.unblock_attempt_counts.is_empty());
+        assert!(state.attempted_partial_followups.is_empty());
+    }
+
+    #[test]
+    fn autoclear_preserves_shelved_when_head_unchanged() {
+        // A crash/relaunch on the same HEAD must keep the shelve decisions.
+        let mut state = shelved_state_at("samesha");
+        let cleared = auto_clear_shelved_on_head_change(&mut state, Some("samesha"), false);
+        assert_eq!(cleared, 0);
+        assert_eq!(state.shelved_tasks.len(), 1);
+        assert_eq!(state.deferred_partial_tasks.len(), 1);
+    }
+
+    #[test]
+    fn autoclear_noop_when_prior_head_unknown() {
+        // Ledger written by an older binary (no head_at_save): never auto-clear.
+        let mut state = shelved_state_at("newsha");
+        state.head_at_save = None;
+        let cleared = auto_clear_shelved_on_head_change(&mut state, Some("newsha"), false);
+        assert_eq!(cleared, 0);
+        assert_eq!(state.shelved_tasks.len(), 1);
+    }
+
+    #[test]
+    fn autoclear_respects_disable_flag() {
+        let mut state = shelved_state_at("oldsha");
+        let cleared = auto_clear_shelved_on_head_change(&mut state, Some("newsha"), true);
+        assert_eq!(cleared, 0);
+        assert_eq!(state.shelved_tasks.len(), 1);
     }
 }
