@@ -64,6 +64,15 @@ pub(crate) struct WorkspaceBaseline {
     /// compiled at first capture.
     #[serde(default)]
     pub(crate) compile_error_excerpt: Vec<String>,
+    /// Canonical repo HEAD at first capture (or last recapture). Enables the
+    /// strict-baseline recapture-on-drift path: when a run RESTARTS on an
+    /// advanced HEAD, the pre-existing tolerated snapshot is refreshed (new
+    /// greens folded into the best-observed sets, newly-red non-environmental
+    /// failures SURFACED) instead of blindly reusing a possibly-days-stale
+    /// baseline. `None` for baselines written by older binaries — they simply
+    /// never recapture (behave as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) head_at_capture: Option<String>,
 }
 
 fn workspace_baseline_path(run_root: &Path) -> PathBuf {
@@ -569,6 +578,7 @@ mod tests {
             compile_error_excerpt: vec![
                 "error: couldn't read a.lud: No such file or directory (os error 2)".to_string(),
             ],
+            head_at_capture: Some("deadbeef".to_string()),
         };
 
         save_workspace_baseline(&dir, &baseline);
@@ -584,6 +594,11 @@ mod tests {
             restored.compile_error_excerpt,
             baseline.compile_error_excerpt,
             "compile-error excerpt round-trips through the persisted baseline"
+        );
+        assert_eq!(
+            restored.head_at_capture.as_deref(),
+            Some("deadbeef"),
+            "head_at_capture round-trips through the persisted baseline"
         );
 
         clear_workspace_baseline(&dir);

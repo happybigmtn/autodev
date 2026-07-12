@@ -581,6 +581,11 @@ pub(crate) fn workspace_gate_mode() -> WorkspaceGateMode {
 pub(crate) struct WorkspaceRegressionDecision {
     pub(crate) blocking: Vec<String>,
     pub(crate) nonblocking: Vec<String>,
+    /// Currently-failing tests tolerated purely because they match an
+    /// ENVIRONMENTAL pattern (multiprocess/live/PTY/MCP/port-binding contention),
+    /// not because they were pre-existing. Surfaced for operator visibility so a
+    /// pattern that is silently swallowing a real regression is auditable.
+    pub(crate) tolerated_environmental: Vec<String>,
 }
 
 impl WorkspaceRegressionDecision {
@@ -652,6 +657,258 @@ pub(crate) fn classify_workspace_regressions(
         }
     }
     decision
+}
+
+// ---------------------------------------------------------------------------
+// Strict-baseline gate (default `AUTO_WORKSPACE_STRICT_BASELINE=1`).
+//
+// Restores the invariant `green rows => green workspace`: a landing must BLOCK
+// when the workspace carries a NEW deterministic failure not attributable to the
+// pre-existing/known set, REGARDLESS of which lane/files it touches. This closes
+// two compounding holes in the lane-scoped `classify_workspace_regressions`:
+//   1. A NEW deterministic failure in a file NO active lane touches was
+//      downgraded to advisory (`nonblocking`) and never blocked any landing.
+//   2. A failure that broke after the once-captured baseline, and was never
+//      observed passing this run, was neither pre-existing nor a monotonic
+//      regression, so it slipped through entirely.
+//
+// Anti-stall: the shared workspace legitimately carries ENVIRONMENTAL failures
+// (multiprocess/live/PTY/MCP/port-binding tests that only fail under contention
+// with a live devnet + concurrent fleet load). Hard-blocking on those would
+// stall the ENTIRE fleet — strictly worse than the hole. The strict gate
+// therefore classifies a currently-failing test as ENVIRONMENTAL (always
+// tolerated, by curated pattern) vs DETERMINISTIC (a pre-existing deterministic
+// failure is tolerated; a NEW one blocks regardless of lane scope).
+// ---------------------------------------------------------------------------
+
+/// Env toggle for the strict-baseline gate. Default ON; `"0"` (trimmed) rolls
+/// back to the legacy lane-scoped [`classify_workspace_regressions`] behavior
+/// operationally, without a rebuild.
+const WORKSPACE_STRICT_BASELINE_ENV: &str = "AUTO_WORKSPACE_STRICT_BASELINE";
+
+/// Operator override for the environmental-failure pattern set. Comma/whitespace
+/// separated substrings; matched case-insensitively against the test id
+/// (`<stem>::<name>`). ADDITIVE: the built-in defaults always apply and the
+/// operator's entries are added on top — the operator can never accidentally
+/// DROP a default (which would risk stalling on a known-environmental test).
+const WORKSPACE_ENV_FAILURE_PATTERNS_ENV: &str = "AUTO_WORKSPACE_ENV_FAILURE_PATTERNS";
+
+/// Curated built-in substrings marking a failing test as ENVIRONMENTAL — a
+/// failure that stems from live-devnet/PTY/MCP/port contention under concurrent
+/// fleet load rather than a deterministic product regression. These NEVER block
+/// a landing. Kept deliberately specific (not e.g. a bare `mcp`) so a NEW
+/// deterministic failure OUTSIDE this set always blocks.
+pub(crate) const DEFAULT_ENV_FAILURE_PATTERNS: &[&str] = &[
+    "multiprocess",
+    "task_008c_wbs5",
+    "table_conductor",
+    "high_height_restart",
+    "devnet",
+    "port_binding",
+    "localhost_port",
+    "no localhost port",
+    "_live",
+    "live_",
+    "::live",
+    "_pty",
+    "pty_",
+];
+
+/// True unless explicitly disabled with `AUTO_WORKSPACE_STRICT_BASELINE=0`.
+pub(crate) fn workspace_strict_baseline_enabled() -> bool {
+    match std::env::var(WORKSPACE_STRICT_BASELINE_ENV) {
+        Ok(value) => value.trim() != "0",
+        Err(_) => true,
+    }
+}
+
+/// Resolve the environmental-failure pattern set: the built-in defaults plus any
+/// operator additions from `AUTO_WORKSPACE_ENV_FAILURE_PATTERNS`. All patterns
+/// are lowercased so matching is case-insensitive.
+pub(crate) fn env_failure_patterns() -> Vec<String> {
+    let mut patterns: Vec<String> = DEFAULT_ENV_FAILURE_PATTERNS
+        .iter()
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    if let Ok(raw) = std::env::var(WORKSPACE_ENV_FAILURE_PATTERNS_ENV) {
+        for token in raw.split([',', '\n', '\t', ' ']) {
+            let token = token.trim().to_ascii_lowercase();
+            if !token.is_empty() && !patterns.contains(&token) {
+                patterns.push(token);
+            }
+        }
+    }
+    patterns
+}
+
+/// Whether a failing test id matches any environmental pattern (case-insensitive
+/// substring). Environmental failures are always tolerated by the strict gate.
+pub(crate) fn is_environmental_failure(test_id: &str, patterns: &[String]) -> bool {
+    let hay = test_id.to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| !pattern.is_empty() && hay.contains(pattern.as_str()))
+}
+
+/// A currently-failing DETERMINISTIC test is tolerated iff it was failing at
+/// first capture (`baseline_failing_tests`) AND was never observed passing this
+/// run (`ever_passed_tests`). A test that flipped green->red this run, or that is
+/// failing but was NOT a pre-existing baseline failure, is a NEW regression.
+fn deterministic_failure_is_pre_existing(baseline: &WorkspaceBaseline, test_id: &str) -> bool {
+    baseline.baseline_failing_tests.contains(test_id)
+        && !baseline.ever_passed_tests.contains(test_id)
+}
+
+/// A broken crate is tolerated iff it failed to compile at first capture
+/// (`baseline_broken_crates`) AND was never observed compiling this run. A crate
+/// that compiled earlier and now breaks, or a crate broken now that was not a
+/// pre-existing break, is a NEW compile regression.
+fn compile_break_is_pre_existing(baseline: &WorkspaceBaseline, crate_name: &str) -> bool {
+    baseline.baseline_broken_crates.contains(crate_name)
+        && !baseline.ever_compiled_crates.contains(crate_name)
+}
+
+/// Cheap set-math predicate: does `obs` contain any failure the STRICT gate would
+/// block on? Used to keep the expensive `cargo metadata` crate-attribution off
+/// the clean landing path (attribution only decorates the block message).
+pub(crate) fn strict_workspace_has_blocking(
+    baseline: &WorkspaceBaseline,
+    obs: &WorkspaceObservation,
+    env_patterns: &[String],
+) -> bool {
+    obs.broken_crates
+        .iter()
+        .any(|c| !compile_break_is_pre_existing(baseline, c))
+        || obs.failing_tests.iter().any(|t| {
+            !is_environmental_failure(t, env_patterns)
+                && !deterministic_failure_is_pre_existing(baseline, t)
+        })
+}
+
+/// STRICT classification (the default gate). Blocks on EVERY new deterministic
+/// failure — a broken crate that is not a pre-existing break, or a failing test
+/// that is neither environmental nor a pre-existing deterministic failure —
+/// REGARDLESS of the task's file/lane blast radius. `touched_crates` is used only
+/// to annotate the block message (touched vs another lane's), never to downgrade.
+pub(crate) fn classify_workspace_regressions_strict(
+    baseline: &WorkspaceBaseline,
+    obs: &WorkspaceObservation,
+    touched_crates: &BTreeSet<String>,
+    env_patterns: &[String],
+) -> WorkspaceRegressionDecision {
+    let mut decision = WorkspaceRegressionDecision::default();
+    for crate_name in &obs.broken_crates {
+        if compile_break_is_pre_existing(baseline, crate_name) {
+            continue; // pre-existing break, never recovered -> tolerate
+        }
+        let msg = if baseline.ever_compiled_crates.contains(crate_name) {
+            format!("crate `{crate_name}` compiled earlier this run but no longer compiles")
+        } else {
+            format!("crate `{crate_name}` fails to compile and was not a pre-existing baseline break")
+        };
+        if touched_crates.contains(crate_name) {
+            decision
+                .blocking
+                .push(format!("{msg} (task touched `{crate_name}`)"));
+        } else {
+            decision.blocking.push(format!(
+                "{msg} (task did not touch `{crate_name}`, but a NEW workspace compile regression blocks any landing under the strict baseline gate)"
+            ));
+        }
+    }
+    for test_id in &obs.failing_tests {
+        if is_environmental_failure(test_id, env_patterns) {
+            decision.tolerated_environmental.push(test_id.clone());
+            continue;
+        }
+        if deterministic_failure_is_pre_existing(baseline, test_id) {
+            continue; // pre-existing deterministic failure -> tolerate (anti-stall)
+        }
+        let stem = test_id.split("::").next().unwrap_or("").to_string();
+        let msg = if baseline.ever_passed_tests.contains(test_id) {
+            format!("test `{test_id}` passed earlier this run but now FAILS")
+        } else {
+            format!("test `{test_id}` FAILS and was not a pre-existing baseline failure")
+        };
+        if touched_crates.contains(&stem) {
+            decision
+                .blocking
+                .push(format!("{msg} (task touched crate `{stem}`)"));
+        } else {
+            decision.blocking.push(format!(
+                "{msg} (task did not touch crate `{stem}`, but a NEW deterministic failure blocks any landing under the strict baseline gate)"
+            ));
+        }
+    }
+    decision
+}
+
+/// Outcome of recapturing the pre-existing baseline when a run RESTARTS on an
+/// advanced HEAD (see [`recapture_workspace_baseline_on_drift`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BaselineRecapture {
+    /// The refreshed baseline (monotonic best-observed sets folded forward, plus
+    /// the drifted HEAD's fresh greens; `head_at_capture` advanced).
+    pub(crate) baseline: WorkspaceBaseline,
+    /// Environmental failures observed at the drifted HEAD that were not already
+    /// tolerated — kept tolerated, reported for the log.
+    pub(crate) newly_tolerated_environmental: Vec<String>,
+    /// NON-environmental failures observed at the drifted HEAD that are NOT a
+    /// pre-existing deterministic failure. These are SURFACED (loud warning) and
+    /// deliberately NOT folded into the tolerated set, so the strict landing gate
+    /// still BLOCKS on them: recapture surfaces, it never silently swallows.
+    pub(crate) surfaced_nonenvironmental: Vec<String>,
+}
+
+/// Recompute the persisted baseline when a run restarts on a materially-advanced
+/// HEAD instead of blindly reusing a possibly-days-stale snapshot.
+///
+/// Safety: this never ADDS a non-environmental failure to the tolerated set, so
+/// it cannot re-open the hole by absorbing a regression that landed while the
+/// process was down. It (a) carries the monotonic `ever_*` sets forward and folds
+/// the drifted HEAD's fresh passes/compiles in (so a test that is green at the
+/// new HEAD is protected from here on), (b) keeps environmental failures
+/// tolerated (by pattern) and records newly-seen ones, and (c) SURFACES any new
+/// non-environmental red for the operator while leaving it blockable.
+pub(crate) fn recapture_workspace_baseline_on_drift(
+    old: &WorkspaceBaseline,
+    obs: &WorkspaceObservation,
+    env_patterns: &[String],
+    new_head: &str,
+) -> BaselineRecapture {
+    let mut baseline = old.clone();
+    baseline.head_at_capture = Some(new_head.to_string());
+    if obs.compiled {
+        for id in &obs.passing_tests {
+            baseline.ever_passed_tests.insert(id.clone());
+        }
+        for stem in &obs.compiled_targets {
+            baseline.ever_compiled_crates.insert(stem.clone());
+        }
+    }
+    let mut newly_tolerated_environmental = Vec::new();
+    let mut surfaced_nonenvironmental = Vec::new();
+    for test_id in &obs.failing_tests {
+        if is_environmental_failure(test_id, env_patterns) {
+            if !old.baseline_failing_tests.contains(test_id)
+                && !old.ever_passed_tests.contains(test_id)
+            {
+                newly_tolerated_environmental.push(test_id.clone());
+            }
+            continue;
+        }
+        if deterministic_failure_is_pre_existing(old, test_id) {
+            continue; // persistent pre-existing deterministic red -> stays tolerated
+        }
+        // New (or flipped) non-environmental red at the drifted HEAD: surface it,
+        // do NOT tolerate it — the strict gate will still block on it.
+        surfaced_nonenvironmental.push(test_id.clone());
+    }
+    BaselineRecapture {
+        baseline,
+        newly_tolerated_environmental,
+        surfaced_nonenvironmental,
+    }
 }
 
 /// Fold an observation into the best-observed baseline (monotonic). The FIRST
@@ -896,6 +1153,7 @@ mod tests {
             ever_passed_tests: ever_passed.iter().map(|s| s.to_string()).collect(),
             ever_compiled_crates: ever_compiled.iter().map(|s| s.to_string()).collect(),
             compile_error_excerpt: Vec::new(),
+            head_at_capture: None,
         }
     }
 
@@ -1186,6 +1444,241 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             Some(value) => std::env::set_var(WORKSPACE_GATE_MODE_ENV, value),
             None => std::env::remove_var(WORKSPACE_GATE_MODE_ENV),
         }
+    }
+
+    #[test]
+    fn workspace_strict_baseline_defaults_on_and_only_zero_disables() {
+        let prev = std::env::var(WORKSPACE_STRICT_BASELINE_ENV).ok();
+        std::env::remove_var(WORKSPACE_STRICT_BASELINE_ENV);
+        assert!(workspace_strict_baseline_enabled(), "default-on when unset");
+        std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, "0");
+        assert!(!workspace_strict_baseline_enabled());
+        std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, " 0 ");
+        assert!(!workspace_strict_baseline_enabled(), "trimmed 0 still disables");
+        std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, "1");
+        assert!(workspace_strict_baseline_enabled());
+        match prev {
+            Some(value) => std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, value),
+            None => std::env::remove_var(WORKSPACE_STRICT_BASELINE_ENV),
+        }
+    }
+
+    #[test]
+    fn env_failure_patterns_are_additive_over_defaults() {
+        let prev = std::env::var(WORKSPACE_ENV_FAILURE_PATTERNS_ENV).ok();
+        std::env::remove_var(WORKSPACE_ENV_FAILURE_PATTERNS_ENV);
+        let defaults = env_failure_patterns();
+        assert!(defaults.iter().any(|p| p == "multiprocess"));
+        // Operator additions are appended; defaults are never dropped.
+        std::env::set_var(
+            WORKSPACE_ENV_FAILURE_PATTERNS_ENV,
+            "my_custom_live_probe, another_env_case",
+        );
+        let extended = env_failure_patterns();
+        assert!(extended.iter().any(|p| p == "multiprocess"), "default retained");
+        assert!(extended.iter().any(|p| p == "my_custom_live_probe"));
+        assert!(extended.iter().any(|p| p == "another_env_case"));
+        match prev {
+            Some(value) => std::env::set_var(WORKSPACE_ENV_FAILURE_PATTERNS_ENV, value),
+            None => std::env::remove_var(WORKSPACE_ENV_FAILURE_PATTERNS_ENV),
+        }
+    }
+
+    #[test]
+    fn is_environmental_failure_matches_curated_patterns() {
+        let patterns: Vec<String> = DEFAULT_ENV_FAILURE_PATTERNS
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect();
+        assert!(is_environmental_failure(
+            "rsociety_full_port::full_port_labor_multiprocess::settles",
+            &patterns
+        ));
+        assert!(is_environmental_failure(
+            "rsociety_node::task_008c_wbs5_live_readpath",
+            &patterns
+        ));
+        assert!(is_environmental_failure("tui::table_conductor_ticks", &patterns));
+        assert!(is_environmental_failure(
+            "node::high_height_restart_recovers",
+            &patterns
+        ));
+        // A plain deterministic unit test is NOT environmental.
+        assert!(!is_environmental_failure(
+            "rsociety_core::labor::reserve_conservation_holds",
+            &patterns
+        ));
+        assert!(!is_environmental_failure(
+            "rsociety_tui::render::board_snapshot_80x24",
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn strict_new_deterministic_failure_in_untouched_crate_blocks() {
+        // THE HOLE: a NEW deterministic failure whose crate the landing task did
+        // not touch. The legacy gate downgraded this to advisory; the strict gate
+        // must BLOCK it regardless of lane scope.
+        let baseline = baseline_with(&["rsociety_core::labor::gate"], &["rsociety_core"], &[]);
+        let obs = WorkspaceObservation {
+            compiled: true,
+            failing_tests: set_of(&["rsociety_core::labor::gate"]),
+            compiled_targets: set_of(&["rsociety_core"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        assert!(strict_workspace_has_blocking(&baseline, &obs, &patterns));
+        let decision = classify_workspace_regressions_strict(
+            &baseline,
+            &obs,
+            &set_of(&["some_unrelated_crate"]),
+            &patterns,
+        );
+        assert!(decision.is_blocked(), "{decision:?}");
+        assert!(decision.blocking[0].contains("labor::gate"));
+        assert!(
+            decision.blocking[0].contains("did not touch"),
+            "message records the lane-agnostic block: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn strict_new_failure_never_observed_passing_blocks() {
+        // Part-1 of the hole: a failure that broke AFTER capture and was never in
+        // the pre-existing set nor ever observed passing. It is not a monotonic
+        // ever-passed regression, yet it must still block — it is simply not a
+        // known/pre-existing failure.
+        let baseline = baseline_with(&[], &["rsociety_core"], &[]);
+        let obs = WorkspaceObservation {
+            compiled: true,
+            failing_tests: set_of(&["rsociety_core::render::new_deterministic_break"]),
+            compiled_targets: set_of(&["rsociety_core"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        assert!(strict_workspace_has_blocking(&baseline, &obs, &patterns));
+        let decision =
+            classify_workspace_regressions_strict(&baseline, &obs, &BTreeSet::new(), &patterns);
+        assert!(decision.is_blocked(), "{decision:?}");
+        assert!(decision.blocking[0].contains("not a pre-existing baseline failure"));
+    }
+
+    #[test]
+    fn strict_environmental_failure_never_blocks_even_when_ever_passed() {
+        // A multiprocess/live test flaps green->red under contention. Under the
+        // monotonic rule it would look like a regression; the strict gate must
+        // tolerate it by pattern so the fleet does not stall.
+        let baseline = baseline_with(
+            &["rsociety_full_port::full_port_labor_multiprocess::settles"],
+            &["rsociety_full_port"],
+            &[],
+        );
+        let obs = WorkspaceObservation {
+            compiled: true,
+            failing_tests: set_of(&[
+                "rsociety_full_port::full_port_labor_multiprocess::settles",
+            ]),
+            compiled_targets: set_of(&["rsociety_full_port"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        assert!(
+            !strict_workspace_has_blocking(&baseline, &obs, &patterns),
+            "environmental failure must not trip the cheap blocking predicate"
+        );
+        let decision = classify_workspace_regressions_strict(
+            &baseline,
+            &obs,
+            &set_of(&["rsociety_full_port"]),
+            &patterns,
+        );
+        assert!(!decision.is_blocked(), "{decision:?}");
+        assert_eq!(decision.tolerated_environmental.len(), 1);
+    }
+
+    #[test]
+    fn strict_pre_existing_deterministic_failure_does_not_block() {
+        let baseline = baseline_with(&[], &["c"], &["c::known_red"]);
+        let obs = WorkspaceObservation {
+            compiled: true,
+            failing_tests: set_of(&["c::known_red"]),
+            compiled_targets: set_of(&["c"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        assert!(!strict_workspace_has_blocking(&baseline, &obs, &patterns));
+        let decision =
+            classify_workspace_regressions_strict(&baseline, &obs, &BTreeSet::new(), &patterns);
+        assert!(!decision.is_blocked(), "{decision:?}");
+    }
+
+    #[test]
+    fn strict_new_compile_break_in_untouched_crate_blocks() {
+        let baseline = baseline_with(&[], &["c", "other"], &[]);
+        let obs = WorkspaceObservation {
+            compiled: false,
+            broken_crates: set_of(&["other"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        assert!(strict_workspace_has_blocking(&baseline, &obs, &patterns));
+        let decision =
+            classify_workspace_regressions_strict(&baseline, &obs, &set_of(&["c"]), &patterns);
+        assert!(decision.is_blocked(), "{decision:?}");
+        assert!(decision.blocking[0].contains("other"));
+    }
+
+    #[test]
+    fn recapture_on_drift_tolerates_environmental_and_surfaces_new_nonenvironmental() {
+        // Test (iii): recapture keeps environmental failures tolerated while
+        // surfacing a newly-introduced non-environmental one, folds fresh greens
+        // into the best-observed set, and never absorbs a new non-env red.
+        let old = baseline_with(&["c::was_green"], &["c"], &["c::pre_red"]);
+        let obs = WorkspaceObservation {
+            compiled: true,
+            failing_tests: set_of(&[
+                "c::full_port_labor_multiprocess_flap", // environmental
+                "c::new_deterministic_red",             // NEW non-env
+                "c::pre_red",                            // persistent pre-existing
+            ]),
+            passing_tests: set_of(&["c::fresh_green"]),
+            compiled_targets: set_of(&["c"]),
+            ..Default::default()
+        };
+        let patterns = env_failure_patterns_defaults();
+        let recapture =
+            recapture_workspace_baseline_on_drift(&old, &obs, &patterns, "newhead");
+
+        assert_eq!(
+            recapture.newly_tolerated_environmental,
+            vec!["c::full_port_labor_multiprocess_flap".to_string()]
+        );
+        assert_eq!(
+            recapture.surfaced_nonenvironmental,
+            vec!["c::new_deterministic_red".to_string()],
+            "a new non-environmental red is surfaced, not swallowed"
+        );
+        // Fresh green folded in; head advanced.
+        assert!(recapture.baseline.ever_passed_tests.contains("c::fresh_green"));
+        assert!(recapture.baseline.ever_passed_tests.contains("c::was_green"));
+        assert_eq!(recapture.baseline.head_at_capture.as_deref(), Some("newhead"));
+        // Crucially: the surfaced non-env red was NOT folded into tolerance, so
+        // the strict gate still blocks on it after recapture.
+        assert!(
+            !recapture
+                .baseline
+                .baseline_failing_tests
+                .contains("c::new_deterministic_red"),
+            "recapture must not absorb a new non-env regression"
+        );
+        assert!(strict_workspace_has_blocking(&recapture.baseline, &obs, &patterns));
+    }
+
+    fn env_failure_patterns_defaults() -> Vec<String> {
+        DEFAULT_ENV_FAILURE_PATTERNS
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect()
     }
 
     #[tokio::test]

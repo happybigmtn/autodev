@@ -1379,9 +1379,27 @@ async fn apply_workspace_baseline_gate(
         baseline.ever_compiled_crates.len(),
     );
 
-    // Only pay for `cargo metadata` attribution when a candidate regression
-    // actually exists; the clean path stays cheap.
-    let decision = if has_candidate_regression(&baseline, &obs) {
+    // Only pay for `cargo metadata` attribution when a blocking regression
+    // actually exists; the clean path stays cheap. The default STRICT gate blocks
+    // on any NEW deterministic (non-environmental) failure REGARDLESS of lane
+    // scope; the legacy path downgrades out-of-lane-scope regressions to advisory.
+    let strict = workspace_strict_baseline_enabled();
+    let decision = if strict {
+        let env_patterns = env_failure_patterns();
+        if strict_workspace_has_blocking(&baseline, &obs, &env_patterns) {
+            let touched = touched_workspace_crates(repo_root, changed_files);
+            classify_workspace_regressions_strict(&baseline, &obs, &touched, &env_patterns)
+        } else {
+            // No blocking regression, but still classify to surface tolerated
+            // environmental failures without paying for `cargo metadata`.
+            classify_workspace_regressions_strict(
+                &baseline,
+                &obs,
+                &BTreeSet::new(),
+                &env_patterns,
+            )
+        }
+    } else if has_candidate_regression(&baseline, &obs) {
         let touched = touched_workspace_crates(repo_root, changed_files);
         classify_workspace_regressions(&baseline, &obs, &touched)
     } else {
@@ -1394,7 +1412,30 @@ async fn apply_workspace_baseline_gate(
     advance_workspace_baseline(&mut advanced, &obs);
     save_workspace_baseline(&run_root, &advanced);
 
+    // Environmental failures tolerated by pattern are surfaced (not swallowed) so
+    // a mis-scoped pattern silently absorbing a real regression is auditable.
+    if !decision.tolerated_environmental.is_empty() {
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            &format!(
+                "workspace-baseline: tolerated {} environmental failure(s) by pattern (never block): {}",
+                decision.tolerated_environmental.len(),
+                decision
+                    .tolerated_environmental
+                    .iter()
+                    .take(25)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
     // Nonblocking (another lane's) regressions are always surfaced for operators.
+    // Only the legacy lane-scoped path produces these; the strict gate blocks
+    // them instead.
     for note in &decision.nonblocking {
         append_lane_host_event(
             &assignment.stdout_log_path,
@@ -1405,8 +1446,13 @@ async fn apply_workspace_baseline_gate(
     }
 
     if decision.is_blocked() {
+        let scope_note = if strict {
+            "NEW deterministic regression(s) in the workspace (strict baseline gate blocks REGARDLESS of lane scope — a green row must mean a green workspace):"
+        } else {
+            "NEW regression(s) introduced by this task:"
+        };
         let detail = format!(
-            "{baseline_note}\n\nNEW regression(s) introduced by this task:\n- {}",
+            "{baseline_note}\n\n{scope_note}\n- {}",
             decision.blocking.join("\n- ")
         );
         record_gate_hold(
@@ -1417,7 +1463,7 @@ async fn apply_workspace_baseline_gate(
         if let Err(err) = append_lane_workspace_test_failure(
             repo_root,
             &assignment.task.id,
-            "workspace baseline gate: task introduced a NEW regression vs best-observed baseline",
+            "workspace baseline gate: workspace carries a NEW deterministic regression vs best-observed baseline",
             &detail,
         ) {
             eprintln!(
@@ -1441,7 +1487,8 @@ async fn apply_workspace_baseline_gate(
             assignment.lane_index,
             &assignment.task.id,
             &format!(
-                "workspace-baseline: task introduced NEW regression(s); held [~]: {}",
+                "workspace-baseline: NEW deterministic regression(s) present; held [~]{}: {}",
+                if strict { " (strict gate, lane-agnostic)" } else { "" },
                 decision.blocking.join("; ")
             ),
         );
@@ -1493,6 +1540,59 @@ pub(crate) async fn maybe_capture_workspace_baseline(
     }
     let existing = load_workspace_baseline(run_root);
     if existing.captured {
+        // Recapture-on-drift: when a run RESTARTS on a materially-advanced HEAD,
+        // refresh the tolerated snapshot instead of blindly reusing a possibly
+        // days-stale baseline. Safe by construction — recapture never folds a
+        // non-environmental red into the tolerated set (it surfaces it), so it
+        // cannot re-open the hole by absorbing a regression that landed while the
+        // process was down.
+        if workspace_strict_baseline_enabled() {
+            let current_head = current_repo_head(repo_root);
+            let drifted = matches!(
+                (existing.head_at_capture.as_deref(), current_head.as_deref()),
+                (Some(prev), Some(now)) if prev != now
+            );
+            if drifted {
+                if let (Some(now), WorkspaceProbe::Ran(obs)) =
+                    (current_head.as_deref(), run_workspace_probe(repo_root).await)
+                {
+                    let env_patterns = env_failure_patterns();
+                    let recapture = recapture_workspace_baseline_on_drift(
+                        &existing,
+                        &obs,
+                        &env_patterns,
+                        now,
+                    );
+                    save_workspace_baseline(run_root, &recapture.baseline);
+                    parallel_logger.info(format!(
+                        "workspace-baseline: HEAD advanced since capture ({} -> {}); recaptured on drift ({} newly-tolerated environmental failure(s))",
+                        existing.head_at_capture.as_deref().unwrap_or("?"),
+                        now,
+                        recapture.newly_tolerated_environmental.len(),
+                    ));
+                    if !recapture.surfaced_nonenvironmental.is_empty() {
+                        parallel_logger.warn(format!(
+                            "workspace-baseline: recapture surfaced {} NEW non-environmental failing test(s) at the advanced HEAD — these are NOT tolerated and WILL block landings until fixed or classified environmental (AUTO_WORKSPACE_ENV_FAILURE_PATTERNS): {}",
+                            recapture.surfaced_nonenvironmental.len(),
+                            recapture
+                                .surfaced_nonenvironmental
+                                .iter()
+                                .take(25)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
+                    if let Some(diag) = workspace_compile_block_diagnostic(&recapture.baseline) {
+                        parallel_logger.warn(format!("workspace-compile-block: {diag}"));
+                    }
+                    return;
+                }
+                parallel_logger.warn(
+                    "workspace-baseline: HEAD advanced but recapture probe was skipped; reusing persisted baseline",
+                );
+            }
+        }
         parallel_logger.info(format!(
             "workspace-baseline: reusing persisted baseline ({} pre-existing failing test(s), {} broken crate(s); best-observed {} passing / {} compiled)",
             existing.baseline_failing_tests.len(),
@@ -1511,6 +1611,9 @@ pub(crate) async fn maybe_capture_workspace_baseline(
         WorkspaceProbe::Ran(obs) => {
             let mut baseline = WorkspaceBaseline::default();
             advance_workspace_baseline(&mut baseline, &obs);
+            // Stamp the capture HEAD so a later restart on an advanced HEAD can
+            // recapture-on-drift instead of reusing a stale snapshot.
+            baseline.head_at_capture = current_repo_head(repo_root);
             save_workspace_baseline(run_root, &baseline);
             parallel_logger.info(format!(
                 "workspace-baseline: captured — compiles={}, {} pre-existing failing test(s), {} broken crate(s), {} passing test(s) recorded as best-observed",
