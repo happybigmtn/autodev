@@ -106,9 +106,22 @@ fn collect_artifact_dir_entries(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        // Build residue mutates on every test run and would make directory
+        // artifact hashes permanently unstable; it is never completion
+        // evidence.
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some("__pycache__") | Some("node_modules") | Some(".venv") | Some(".pytest_cache")
+        ) {
+            continue;
+        }
         if path.is_dir() {
             collect_artifact_dir_entries(root, &path, entries)?;
         } else if path.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("pyc") {
+                continue;
+            }
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
