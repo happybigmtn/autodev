@@ -427,6 +427,10 @@ pub(crate) async fn run_parallel_loop(
     // Cache the last-persisted run-state JSON so the ~5s main loop only rewrites
     // the ledger when its serialized value actually changed (not every idle tick).
     let mut last_persisted_run_state: Option<String> = None;
+    // Per-task quota ride-out budget (F1 single-account gap). Transient to this
+    // run: tracks cumulative wait + wait count so a session-quota exhaustion is
+    // ridden out (bounded) instead of shelving the run, without ever hot-looping.
+    let mut quota_ride_out: BTreeMap<String, QuotaRideOutState> = BTreeMap::new();
     if !shelved_tasks.is_empty()
         || !deferred_partial_tasks.is_empty()
         || !unblock_attempt_counts.is_empty()
@@ -1052,6 +1056,56 @@ pub(crate) async fn run_parallel_loop(
                 ),
             );
             shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+            continue;
+        }
+
+        // Quota ride-out (F1 single-account gap): if this lane failed purely
+        // because the Codex/Claude account is session-quota exhausted — not a
+        // genuine task failure — and produced no landable work, wait out the
+        // session reset and re-dispatch the SAME task instead of shelving the
+        // run or burning a task-failure retry. Bounded + env-gated; falls
+        // through to the normal handling below when it does not apply.
+        if let Some(sleep_for) = maybe_lane_quota_ride_out(
+            &assignment,
+            &lane_config,
+            &lane_result,
+            &mut quota_ride_out,
+            parallel_logger,
+        )
+        .await
+        {
+            tokio::time::sleep(sleep_for).await;
+            // A quota wait is not a task failure: don't consume a retry attempt
+            // (spawn_parallel_lane_attempt re-increments) and don't thread a
+            // failure recovery note into the next prompt.
+            assignment.attempts = assignment.attempts.saturating_sub(1);
+            assignment.host_recovery_note = None;
+            let plan_for_prompt = refresh_parallel_plan_or_last_good(
+                repo_root,
+                target_branch,
+                linear_tracker,
+                &mut linear_auto_sync_state,
+                &plan,
+                parallel_logger,
+            )
+            .await?;
+            if let Err(err) = spawn_parallel_lane_attempt(
+                &mut join_set,
+                &lane_config,
+                prompt_template,
+                &plan_for_prompt,
+                &mut assignment,
+                target_branch,
+            ) {
+                parallel_logger.warn(format!(
+                    "warning: failed re-dispatching lane-{} `{}` after a quota ride-out; shelving for the rest of this run: {err:#}",
+                    assignment.lane_index, assignment.task.id
+                ));
+                shelved_tasks.insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                continue;
+            }
+            active_tasks.insert(assignment.task.id.clone());
+            active_lanes.insert(assignment.lane_index, assignment);
             continue;
         }
 
@@ -2088,6 +2142,111 @@ fn strip_ansi_codes(input: &str) -> String {
         .get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("valid ansi regex"))
         .replace_all(input, "")
         .into_owned()
+}
+
+/// Per-task quota ride-out budget (see `maybe_lane_quota_ride_out`).
+#[derive(Default)]
+struct QuotaRideOutState {
+    waited: Duration,
+    waits: u32,
+}
+
+/// Decide whether a failed lane should ride out a Codex/Claude session-quota
+/// window and re-dispatch the SAME task, instead of shelving / burning a
+/// task-failure retry (the F1 single-account gap: the only live account is
+/// over-quota, the router selects it anyway, and the exec fails with a
+/// usage-limit signature that the plain non-zero-exit path would treat as a
+/// task failure).
+///
+/// Returns `Some(sleep)` only when ALL of: the lane failed, the failure carries
+/// a real usage-limit signature (log tail via `quota_patterns`, or a
+/// `run_with_quota` all-accounts bail), the lane produced no landable work,
+/// live usage confirms every account is session-exhausted with a concrete reset
+/// horizon, and that reset fits the bounded per-task budget. Otherwise `None` —
+/// the caller falls through to the normal retry/shelve path. Env-gate:
+/// `AUTO_QUOTA_BACKOFF_MAX_SECS=0` disables it entirely.
+async fn maybe_lane_quota_ride_out(
+    assignment: &ActiveLaneAssignment,
+    lane_config: &LaneRunConfig,
+    lane_result: &LaneAttemptResult,
+    ledger: &mut BTreeMap<String, QuotaRideOutState>,
+    parallel_logger: &ParallelEventLogger,
+) -> Option<Duration> {
+    let provider = if lane_config.claude {
+        crate::quota_config::Provider::Claude
+    } else {
+        crate::quota_config::Provider::Codex
+    };
+    if !crate::quota_exec::is_quota_available(provider) {
+        return None;
+    }
+
+    // Only an actual failure can be a quota exhaustion.
+    let failed =
+        lane_result.error.is_some() || lane_result.exit_status.is_some_and(|s| !s.success());
+    if !failed {
+        return None;
+    }
+
+    // Cheap signature gate first (log tail + bail-string), before any git /
+    // network IO, so healthy runs and ordinary failures pay almost nothing.
+    let verdict = crate::quota_exec::lane_output_quota_verdict(
+        provider,
+        Some(&assignment.stdout_log_path),
+        Some(&assignment.stderr_log_path),
+    );
+    let bail_is_quota = lane_result
+        .error
+        .as_deref()
+        .is_some_and(crate::quota_exec::error_text_is_quota_exhaustion);
+    let signature_exhausted =
+        matches!(verdict, crate::quota_patterns::QuotaVerdict::Exhausted) || bail_is_quota;
+    if !signature_exhausted {
+        return None;
+    }
+
+    // Never clobber committed/dirty work: if the worker produced anything
+    // landable before hitting the wall, let the normal landing path harvest it.
+    match inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit) {
+        Ok(LaneRepoProgress::None) => {}
+        _ => return None,
+    }
+
+    // Confirm against live usage and get the reset horizon. `None` (usage
+    // unknown / disabled / all-invalid) means we do NOT wait — a missing reset
+    // horizon can never cause a hot-loop.
+    let (all_exhausted, soonest) = crate::quota_exec::probe_session_exhaustion(provider).await?;
+    let cap = crate::quota_exec::lane_quota_backoff_cap();
+    let entry = ledger.entry(assignment.task.id.clone()).or_default();
+    let sleep_for = crate::quota_exec::lane_quota_backoff_decision(
+        cap,
+        entry.waited,
+        entry.waits,
+        signature_exhausted,
+        all_exhausted,
+        soonest,
+    )?;
+    entry.waited = entry.waited.saturating_add(sleep_for);
+    entry.waits += 1;
+
+    let message = format!(
+        "quota-ride-out: lane-{} `{}` {provider} session-quota exhausted; waiting {}s for the session reset then re-dispatching the SAME task (wait {}/{}, budget {}s/{}s). Set AUTO_QUOTA_BACKOFF_MAX_SECS=0 to disable, or higher to ride out longer windows.",
+        assignment.lane_index,
+        assignment.task.id,
+        sleep_for.as_secs(),
+        entry.waits,
+        crate::quota_exec::LANE_QUOTA_MAX_WAITS_PER_TASK,
+        entry.waited.as_secs(),
+        cap.as_secs(),
+    );
+    parallel_logger.info(&message);
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &message,
+    );
+    Some(sleep_for)
 }
 
 pub(crate) fn spawn_parallel_lane_attempt(

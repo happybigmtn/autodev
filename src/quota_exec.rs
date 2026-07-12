@@ -534,7 +534,7 @@ fn quota_backoff_cap() -> Duration {
 ///   remaining cap budget — if even the soonest reset is beyond budget, waiting
 ///   cannot recover in time, so we surface the error immediately rather than
 ///   sleep pointlessly.
-fn quota_backoff_wait(
+pub(crate) fn quota_backoff_wait(
     cap: Duration,
     already_waited: Duration,
     saw_quota_exhaustion: bool,
@@ -564,6 +564,166 @@ fn soonest_session_reset(
         .iter()
         .filter_map(|(_, usage)| usage.as_ref().map(|u| u.session_resets_in_secs))
         .min()
+}
+
+// ── Orchestrator lane-level quota ride-out (F1 single-account gap) ─────────
+//
+// `run_with_quota`'s backoff only fires when an entire account-selection pass
+// is exhausted. It does NOT cover the common single-live-account case: the
+// router selects the only account (no alternative), the Codex lane exec runs
+// and fails with a usage-limit signature, and — because Codex reports that
+// signature on its `--json` stdout in some modes (so `check_stderr` on the
+// captured stderr never sees it) — `run_with_quota` returns a non-zero exit
+// that the parallel orchestrator treats as a plain task failure (retry ×N then
+// shelve, killing the run on a transient window). These helpers let the
+// orchestrator recognize that signature, wait out the session reset, and
+// re-dispatch the SAME task instead of shelving.
+
+/// Default cap (seconds) for the orchestrator's *lane-level* quota ride-out when
+/// `AUTO_QUOTA_BACKOFF_MAX_SECS` is unset. Larger than the in-loop
+/// `DEFAULT_QUOTA_BACKOFF_MAX_SECS` (1200) because riding out a session reset
+/// *between* lane dispatches holds no worker, lease, or credential guard and
+/// strictly prevents a run from dying on a transient window, so tolerating a
+/// full ~1h Codex session reset is worth it. Setting `AUTO_QUOTA_BACKOFF_MAX_SECS`
+/// overrides this on both paths; `=0` disables the ride-out entirely. The
+/// in-loop backoff default is deliberately left unchanged.
+const DEFAULT_LANE_QUOTA_BACKOFF_MAX_SECS: u64 = 5400;
+
+/// Hard cap on how many quota ride-out waits a single task may take before it is
+/// allowed to shelve normally — a belt-and-suspenders guard against a
+/// persistently-exhausted account stalling one task forever (the cumulative
+/// time budget is the primary bound; this stops a pathological drip of tiny
+/// sub-cap waits from looping).
+pub(crate) const LANE_QUOTA_MAX_WAITS_PER_TASK: u32 = 8;
+
+/// Cap for the orchestrator lane-level quota ride-out. Honors
+/// `AUTO_QUOTA_BACKOFF_MAX_SECS` when set (single operator dial; `=0` disables
+/// ride-out), otherwise uses `DEFAULT_LANE_QUOTA_BACKOFF_MAX_SECS`.
+pub(crate) fn lane_quota_backoff_cap() -> Duration {
+    match std::env::var("AUTO_QUOTA_BACKOFF_MAX_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(secs) => Duration::from_secs(secs),
+        None => Duration::from_secs(DEFAULT_LANE_QUOTA_BACKOFF_MAX_SECS),
+    }
+}
+
+/// Pure decision for the orchestrator lane-level quota ride-out. Given the
+/// per-task wait ledger and the observed exhaustion signals, returns
+/// `Some(sleep)` to wait then re-dispatch the SAME task, or `None` to fall
+/// through to the normal task-failure retry/shelve path. Reuses
+/// `quota_backoff_wait` so the time-budget policy is identical to the in-loop
+/// backoff. Returns `None` whenever: the per-task wait count is spent, the
+/// failure is not a real quota signal, not every account is session-exhausted,
+/// the reset horizon is unknown, or the wait would exceed the remaining cap
+/// budget — so an unknown or longer-than-cap reset shelves rather than spins.
+pub(crate) fn lane_quota_backoff_decision(
+    cap: Duration,
+    already_waited: Duration,
+    waits_taken: u32,
+    signature_exhausted: bool,
+    all_accounts_session_exhausted: bool,
+    soonest_session_reset_secs: Option<u64>,
+) -> Option<Duration> {
+    if waits_taken >= LANE_QUOTA_MAX_WAITS_PER_TASK {
+        return None;
+    }
+    let saw_quota_exhaustion = signature_exhausted && all_accounts_session_exhausted;
+    quota_backoff_wait(
+        cap,
+        already_waited,
+        saw_quota_exhaustion,
+        soonest_session_reset_secs,
+    )
+}
+
+/// True when an error message (e.g. a `run_with_quota` all-accounts bail) is the
+/// quota-exhaustion signal, so the orchestrator can ride it out rather than
+/// shelve on it.
+pub(crate) fn error_text_is_quota_exhaustion(text: &str) -> bool {
+    text.contains("accounts exhausted after")
+}
+
+const LANE_LOG_TAIL_BYTES: u64 = 65_536;
+
+fn read_log_tail(path: &Path, max_bytes: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > max_bytes {
+        if file.seek(SeekFrom::Start(len - max_bytes)).is_err() {
+            return String::new();
+        }
+        let mut buf = Vec::with_capacity(max_bytes as usize);
+        if file.take(max_bytes).read_to_end(&mut buf).is_err() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    } else {
+        fs::read_to_string(path).unwrap_or_default()
+    }
+}
+
+/// Scan the tail of a lane's stdout/stderr logs for a provider quota/usage-limit
+/// signature, reusing the same `quota_patterns` machinery as the exec seam.
+/// Codex emits the usage-limit line on its `--json` stdout stream in some
+/// failure modes and on stderr in others, so both are scanned (stderr first).
+pub(crate) fn lane_output_quota_verdict(
+    provider: Provider,
+    stdout_log: Option<&Path>,
+    stderr_log: Option<&Path>,
+) -> QuotaVerdict {
+    for path in [stderr_log, stdout_log].into_iter().flatten() {
+        let tail = read_log_tail(path, LANE_LOG_TAIL_BYTES);
+        match quota_patterns::check_stderr(provider, &tail) {
+            QuotaVerdict::Exhausted => return QuotaVerdict::Exhausted,
+            QuotaVerdict::Unavailable => return QuotaVerdict::Unavailable,
+            QuotaVerdict::Ok | QuotaVerdict::OtherError => {}
+        }
+    }
+    QuotaVerdict::OtherError
+}
+
+/// Live-usage probe for the orchestrator quota ride-out. Returns
+/// `Some((all_accounts_session_exhausted, soonest_session_reset_secs))` for the
+/// provider, or `None` when usage cannot be determined (no config, all-invalid
+/// credentials, or usage lookups disabled) — in which case the caller must NOT
+/// wait, so a missing reset horizon can never cause a hot-loop. `all_exhausted`
+/// is false if any account has unknown or non-exhausted usage, so the router
+/// could still route around the exhaustion and we should not pause the run.
+pub(crate) async fn probe_session_exhaustion(provider: Provider) -> Option<(bool, Option<u64>)> {
+    let config = QuotaConfig::load_or_none().ok().flatten()?;
+    if config.accounts_for_provider(provider).is_empty() {
+        return None;
+    }
+    let scored = quota_selector::score_accounts(&config, provider).await.ok()?;
+    let mut any_usage = false;
+    let mut all_exhausted = true;
+    let mut soonest: Option<u64> = None;
+    for (_, usage) in &scored {
+        match usage {
+            Some(u) => {
+                any_usage = true;
+                if u.limit_reached || u.session_remaining_pct == 0 {
+                    soonest = Some(soonest.map_or(u.session_resets_in_secs, |cur| {
+                        cur.min(u.session_resets_in_secs)
+                    }));
+                } else {
+                    all_exhausted = false;
+                }
+            }
+            // Unknown usage (fetch failed, non-auth): treat as possibly-healthy
+            // so we don't pause when the router could route around it.
+            None => all_exhausted = false,
+        }
+    }
+    if !any_usage {
+        return None;
+    }
+    Some((all_exhausted, soonest))
 }
 
 /// Run a CLI command with quota-aware account selection and failover.
@@ -975,6 +1135,171 @@ mod tests {
                 Some(1)
             ),
             None
+        );
+    }
+
+    // ── Orchestrator lane-level quota ride-out ────────────────────────────
+
+    use super::{
+        error_text_is_quota_exhaustion, lane_output_quota_verdict, lane_quota_backoff_decision,
+        LANE_QUOTA_MAX_WAITS_PER_TASK,
+    };
+    use crate::quota_patterns::QuotaVerdict;
+
+    #[test]
+    fn lane_ride_out_waits_then_retries_on_near_reset() {
+        // (a) usage-limit lane failure with a known near reset within cap and
+        // every account session-exhausted -> wait reset+margin, then re-dispatch.
+        let wait = lane_quota_backoff_decision(
+            Duration::from_secs(5400),
+            Duration::ZERO,
+            0,
+            /* signature_exhausted */ true,
+            /* all_accounts_session_exhausted */ true,
+            Some(3600),
+        );
+        assert_eq!(wait, Some(Duration::from_secs(3600 + 15)));
+    }
+
+    #[test]
+    fn lane_ride_out_falls_through_when_reset_unknown_or_beyond_cap() {
+        // (b1) reset unknown -> None (shelve, never spin on a missing horizon).
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(5400),
+                Duration::ZERO,
+                0,
+                true,
+                true,
+                None,
+            ),
+            None
+        );
+        // (b2) reset beyond cap (weekly-scale) -> None (shelve after no wait).
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(5400),
+                Duration::ZERO,
+                0,
+                true,
+                true,
+                Some(100_000),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lane_ride_out_ignores_genuine_non_quota_failure() {
+        // (c) a real (non-quota) task failure: no usage-limit signature -> None,
+        // so it is NEVER mistaken for quota and rides the normal retry/shelve.
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(5400),
+                Duration::ZERO,
+                0,
+                /* signature_exhausted */ false,
+                true,
+                Some(60),
+            ),
+            None
+        );
+        // A quota-looking signature but the router still has a non-exhausted /
+        // unknown account -> don't pause the run (let the router route around it).
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(5400),
+                Duration::ZERO,
+                0,
+                true,
+                /* all_accounts_session_exhausted */ false,
+                Some(60),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lane_ride_out_is_bounded_by_max_waits_per_task() {
+        // Even with a fits-in-budget reset, once the per-task wait count is spent
+        // the task must be allowed to shelve rather than loop forever.
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(100_000),
+                Duration::ZERO,
+                LANE_QUOTA_MAX_WAITS_PER_TASK,
+                true,
+                true,
+                Some(60),
+            ),
+            None
+        );
+        // One below the cap still rides out.
+        assert_eq!(
+            lane_quota_backoff_decision(
+                Duration::from_secs(100_000),
+                Duration::ZERO,
+                LANE_QUOTA_MAX_WAITS_PER_TASK - 1,
+                true,
+                true,
+                Some(60),
+            ),
+            Some(Duration::from_secs(75))
+        );
+    }
+
+    #[test]
+    fn lane_ride_out_disabled_when_cap_is_zero() {
+        // AUTO_QUOTA_BACKOFF_MAX_SECS=0 disables ride-out (backward compatible).
+        assert_eq!(
+            lane_quota_backoff_decision(Duration::ZERO, Duration::ZERO, 0, true, true, Some(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn error_text_quota_exhaustion_matches_bail() {
+        assert!(error_text_is_quota_exhaustion(
+            "all Codex accounts exhausted after 2 attempts. Run `auto quota reset` to force-clear."
+        ));
+        assert!(!error_text_is_quota_exhaustion(
+            "failed to launch Codex at /usr/bin/codex: No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn lane_output_verdict_detects_usage_limit_on_stdout() {
+        // Codex writes the usage-limit line on its --json stdout in the failure
+        // mode this fix targets; the stderr log is empty. The tail scan must
+        // still classify it as Exhausted.
+        let dir = TempDir::new();
+        let stdout_log = dir.path().join("stdout.log");
+        let stderr_log = dir.path().join("stderr.log");
+        fs::write(
+            &stdout_log,
+            b"{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at 2:31 PM.\"}\n",
+        )
+        .expect("write stdout log");
+        fs::write(&stderr_log, b"").expect("write stderr log");
+
+        assert_eq!(
+            lane_output_quota_verdict(
+                Provider::Codex,
+                Some(&stdout_log),
+                Some(&stderr_log),
+            ),
+            QuotaVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn lane_output_verdict_ignores_ordinary_failure_logs() {
+        let dir = TempDir::new();
+        let stderr_log = dir.path().join("stderr.log");
+        fs::write(&stderr_log, b"error[E0308]: mismatched types\n").expect("write stderr log");
+        assert_eq!(
+            lane_output_quota_verdict(Provider::Codex, None, Some(&stderr_log)),
+            QuotaVerdict::OtherError
         );
     }
 
