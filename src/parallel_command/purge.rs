@@ -85,7 +85,7 @@ pub(crate) fn purge_previous_parallel_run_artifacts(repo_root: &Path, run_root: 
     }
 }
 
-fn dir_size_bytes(path: &Path) -> u64 {
+pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -106,7 +106,7 @@ fn dir_size_bytes(path: &Path) -> u64 {
     total
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

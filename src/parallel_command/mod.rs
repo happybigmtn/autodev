@@ -183,6 +183,11 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     }
     ensure_writable_run_root(&run_root)?;
     purge_previous_parallel_run_artifacts(&repo_root, &run_root);
+    // Reclaim persistent lane-caches for lane indices this run will never use
+    // (e.g. after dialing lanes down). Safe at startup: those indices are never
+    // active this run. A purge above (clean run) already removed lane-caches
+    // wholesale; this catches the resuming-run case where the purge is skipped.
+    prune_orphan_lane_caches(&run_root, args.max_concurrent_workers);
     stamp_current_parallel_run_id(&run_root);
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {

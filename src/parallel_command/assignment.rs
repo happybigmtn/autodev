@@ -49,6 +49,206 @@ fn lane_persistent_cargo_target_for(lane_root: &Path) -> Option<PathBuf> {
     )
 }
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Default per-lane cap on the persistent Cargo-target cache, in GiB. The
+/// persistent target (P1, commit 8024d30) survives worktree churn so a resuming
+/// run reuses warm artifacts, but it therefore also grows unbounded across a
+/// long run — stale test/bin artifacts and `debug/incremental` accumulate with
+/// every HEAD advance and never get GC'd by cargo. Left uncapped it filled the
+/// shared build volume and killed the fleet. This caps it so total lane-caches
+/// disk is bounded by roughly `cap × lanes`.
+const DEFAULT_LANE_CACHE_MAX_GIB: u64 = 24;
+
+/// Parse the `AUTO_LANE_CACHE_MAX_GB` per-lane cap. `Some(bytes)` = enforce that
+/// cap; `None` = disabled (unbounded, the pre-cap behavior). Empty/garbage falls
+/// back to the safe default rather than disabling — a typo must never silently
+/// re-arm the unbounded-growth failure. `0` explicitly disables.
+fn parse_lane_cache_max_bytes(raw: Option<&str>) -> Option<u64> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(DEFAULT_LANE_CACHE_MAX_GIB * GIB),
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(gib) => Some(gib.saturating_mul(GIB)),
+            Err(_) => Some(DEFAULT_LANE_CACHE_MAX_GIB * GIB),
+        },
+    }
+}
+
+fn lane_cache_max_bytes() -> Option<u64> {
+    parse_lane_cache_max_bytes(std::env::var("AUTO_LANE_CACHE_MAX_GB").ok().as_deref())
+}
+
+/// Whether first-party incremental compilation is kept for lane builds. Default
+/// OFF: `*/incremental` is the fastest-growing, fully regenerable component of a
+/// lane cache (measured ~12-14 GiB/lane in production), and the P1 speedup comes
+/// from the warm `deps/` rlib cache — dependency compilation — which
+/// `CARGO_INCREMENTAL=0` does NOT touch. Because each task starts from a fresh
+/// clone (new file mtimes), cross-task incremental reuse is weak anyway, so the
+/// tradeoff is small: within a task, non-incremental first-party recompiles vs.
+/// the still-warm dependency graph. Set `AUTO_LANE_CARGO_INCREMENTAL=1` to
+/// restore incremental (the pre-cap behavior).
+fn parse_lane_cargo_incremental_enabled(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+fn lane_cargo_incremental_enabled() -> bool {
+    parse_lane_cargo_incremental_enabled(std::env::var("AUTO_LANE_CARGO_INCREMENTAL").ok().as_deref())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum LaneCachePrune {
+    /// Under the cap (or nothing to prune) — warm cache left intact.
+    UnderCap,
+    /// Over the cap; dropped the regenerable `*/incremental` dirs and that
+    /// brought it back under. Warm `deps/` rlibs preserved.
+    PrunedIncremental,
+    /// Over the cap even without incremental (bulk is `deps/`); removed the
+    /// whole target. The next task on this lane recompiles cold once — the
+    /// accepted worst case that guarantees the hard bound.
+    Reset,
+}
+
+/// Delete every `incremental` directory anywhere under `target` (typically
+/// `<target>/debug/incremental` and `<target>/release/incremental`, plus any
+/// target-triple-nested variants). Fully regenerable; preserves `deps/` rlibs.
+/// Returns bytes reclaimed.
+fn prune_incremental_dirs(target: &Path) -> u64 {
+    let mut freed = 0u64;
+    let mut stack = vec![target.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_name() == "incremental" {
+                freed += dir_size_bytes(&path);
+                if let Err(err) = fs::remove_dir_all(&path) {
+                    eprintln!(
+                        "warning: lane-cache: failed pruning incremental {}: {err:#}",
+                        path.display()
+                    );
+                }
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    freed
+}
+
+/// Pure, testable core of the size cap: given a lane's cargo-target and a byte
+/// cap, prune tiered so warm dependency artifacts survive when possible.
+pub(crate) fn prune_lane_cache_over_cap(target: &Path, cap: u64) -> LaneCachePrune {
+    if !target.exists() {
+        return LaneCachePrune::UnderCap;
+    }
+    if dir_size_bytes(target) <= cap {
+        return LaneCachePrune::UnderCap;
+    }
+    // Tier 1: drop incremental (fastest-growing, fully regenerable); keep deps warm.
+    prune_incremental_dirs(target);
+    if dir_size_bytes(target) <= cap {
+        return LaneCachePrune::PrunedIncremental;
+    }
+    // Tier 2: the bulk is deps/ (accumulated stale artifacts) — reset the target.
+    if let Err(err) = fs::remove_dir_all(target) {
+        eprintln!(
+            "warning: lane-cache: failed resetting over-cap target {}: {err:#}",
+            target.display()
+        );
+    }
+    LaneCachePrune::Reset
+}
+
+/// Bound the persistent lane-cache for `lane_root` at (re)assignment time.
+///
+/// Safe by construction: this runs on the fresh-assignment path, immediately
+/// before [`reset_parallel_lane_root`] wipes the lane worktree. The lane index
+/// has just been freed by [`next_free_lane_index`], so the previous worker on
+/// this index has finished and the next has not started — nothing is compiling
+/// into this lane's persistent target, so pruning it cannot corrupt a live
+/// build. No-ops when the persistent-target feature is off (`None` target) or
+/// the cap is disabled (`AUTO_LANE_CACHE_MAX_GB=0`).
+pub(crate) fn enforce_lane_cache_size_cap(lane_root: &Path) {
+    let Some(cap) = lane_cache_max_bytes() else {
+        return;
+    };
+    let Some(target) = lane_persistent_cargo_target_for(lane_root) else {
+        return;
+    };
+    if !target.exists() {
+        return;
+    }
+    let before = dir_size_bytes(&target);
+    match prune_lane_cache_over_cap(&target, cap) {
+        LaneCachePrune::UnderCap => {}
+        LaneCachePrune::PrunedIncremental => {
+            println!(
+                "lane-cache: {} over cap {} — pruned incremental, now {} (warm deps kept)",
+                target.display(),
+                human_bytes(cap),
+                human_bytes(dir_size_bytes(&target))
+            );
+        }
+        LaneCachePrune::Reset => {
+            println!(
+                "lane-cache: {} was {} over cap {} — reset (cold recompile next task)",
+                target.display(),
+                human_bytes(before),
+                human_bytes(cap)
+            );
+        }
+    }
+}
+
+/// Remove `<run_root>/lane-caches/lane-M` for `M > max_concurrent_workers` at
+/// startup. These are orphans from a prior run that used more lanes (e.g. after
+/// dialing 8 lanes down to 6, `lane-7`/`lane-8` linger); the current run never
+/// assigns those indices, so their persistent targets are pure dead weight.
+/// Always safe: no lane with index > `max_concurrent_workers` is ever active
+/// this run. Best-effort; failures are logged and never block the run.
+pub(crate) fn prune_orphan_lane_caches(run_root: &Path, max_concurrent_workers: usize) {
+    let caches = run_root.join("lane-caches");
+    let Ok(entries) = fs::read_dir(&caches) else {
+        return;
+    };
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(index) = parse_lane_index(name) else {
+            continue;
+        };
+        if index > max_concurrent_workers {
+            let path = entry.path();
+            freed += dir_size_bytes(&path);
+            if let Err(err) = fs::remove_dir_all(&path) {
+                eprintln!(
+                    "warning: lane-cache: failed removing orphan {}: {err:#}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if freed > 0 {
+        println!(
+            "lane-cache: reclaimed {} from orphan lane-caches (lanes > {})",
+            human_bytes(freed),
+            max_concurrent_workers
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopeClass {
     Small,
@@ -147,6 +347,12 @@ impl LaneRunConfig {
                 "CARGO_TARGET_DIR".to_string(),
                 target.to_string_lossy().into_owned(),
             ));
+            if !lane_cargo_incremental_enabled() {
+                // Bound the fastest-growing, fully-regenerable slice of the
+                // persistent lane cache. Warm `deps/` rlibs (the P1 win) are
+                // unaffected by CARGO_INCREMENTAL.
+                extra_env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
+            }
         }
         extra_env
     }
@@ -321,6 +527,12 @@ pub(crate) fn prepare_parallel_lane_assignment(
     }
 
     let lane_root = run_root.join("lanes").join(format!("lane-{lane_index}"));
+    // Bound the persistent lane-cache before the next task compiles into it.
+    // The lane is idle here (index just freed, previous worker done), so this
+    // only ever prunes a cache no build is using. See enforce_lane_cache_size_cap.
+    if lane_config.lane_local_cargo_target {
+        enforce_lane_cache_size_cap(&lane_root);
+    }
     reset_parallel_lane_root(&lane_root)?;
     let lane_repo_root = lane_root.join("repo");
     clone_loop_lane_repo(repo_root, target_branch, &lane_repo_root)?;
@@ -1066,6 +1278,10 @@ pub(crate) fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        parse_lane_cache_max_bytes, parse_lane_cargo_incremental_enabled,
+        DEFAULT_LANE_CACHE_MAX_GIB, GIB,
+    };
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -1438,6 +1654,188 @@ mod tests {
         );
 
         fs::remove_dir_all(&lane_root).expect("failed to remove lane root");
+    }
+
+    fn write_blob(path: &Path, bytes: usize) {
+        fs::create_dir_all(path.parent().expect("blob parent")).expect("create blob parent");
+        fs::write(path, vec![0u8; bytes]).expect("write blob");
+    }
+
+    #[test]
+    fn lane_cache_max_bytes_parses_default_disable_and_override() {
+        // Empty / unset / garbage -> safe default (never silently unbounded).
+        assert_eq!(
+            parse_lane_cache_max_bytes(None),
+            Some(DEFAULT_LANE_CACHE_MAX_GIB * GIB)
+        );
+        assert_eq!(
+            parse_lane_cache_max_bytes(Some("   ")),
+            Some(DEFAULT_LANE_CACHE_MAX_GIB * GIB)
+        );
+        assert_eq!(
+            parse_lane_cache_max_bytes(Some("not-a-number")),
+            Some(DEFAULT_LANE_CACHE_MAX_GIB * GIB)
+        );
+        // Explicit 0 disables the cap (opt back into unbounded behavior).
+        assert_eq!(parse_lane_cache_max_bytes(Some("0")), None);
+        // A concrete GiB value.
+        assert_eq!(parse_lane_cache_max_bytes(Some("10")), Some(10 * GIB));
+        assert_eq!(parse_lane_cache_max_bytes(Some(" 3 ")), Some(3 * GIB));
+    }
+
+    #[test]
+    fn lane_cargo_incremental_disabled_by_default() {
+        // Default (unset) disables incremental; only an explicit "1" restores it.
+        assert!(!parse_lane_cargo_incremental_enabled(None));
+        assert!(!parse_lane_cargo_incremental_enabled(Some("0")));
+        assert!(!parse_lane_cargo_incremental_enabled(Some("")));
+        assert!(parse_lane_cargo_incremental_enabled(Some("1")));
+        assert!(parse_lane_cargo_incremental_enabled(Some(" 1 ")));
+    }
+
+    #[test]
+    fn prune_lane_cache_keeps_warm_cache_under_cap() {
+        let target = unique_temp_dir("lane-cache-under");
+        write_blob(&target.join("debug").join("deps").join("libfoo.rlib"), 4096);
+        write_blob(
+            &target.join("debug").join("incremental").join("state.bin"),
+            4096,
+        );
+
+        // 1 GiB cap, ~8 KiB of content -> nothing pruned.
+        assert_eq!(
+            prune_lane_cache_over_cap(&target, GIB),
+            LaneCachePrune::UnderCap
+        );
+        assert!(target.join("debug").join("incremental").exists());
+        assert!(target.join("debug").join("deps").join("libfoo.rlib").exists());
+
+        fs::remove_dir_all(&target).expect("cleanup");
+    }
+
+    #[test]
+    fn prune_lane_cache_drops_incremental_first_and_keeps_deps() {
+        let target = unique_temp_dir("lane-cache-incremental");
+        // deps: 4 KiB, incremental: 64 KiB. Cap between the two.
+        write_blob(&target.join("debug").join("deps").join("libfoo.rlib"), 4096);
+        write_blob(
+            &target.join("debug").join("incremental").join("state.bin"),
+            64 * 1024,
+        );
+        write_blob(
+            &target
+                .join("release")
+                .join("incremental")
+                .join("state.bin"),
+            64 * 1024,
+        );
+
+        // Cap = 16 KiB: over cap with incremental, under cap once it's gone.
+        assert_eq!(
+            prune_lane_cache_over_cap(&target, 16 * 1024),
+            LaneCachePrune::PrunedIncremental
+        );
+        assert!(
+            !target.join("debug").join("incremental").exists(),
+            "debug incremental should be pruned"
+        );
+        assert!(
+            !target.join("release").join("incremental").exists(),
+            "release incremental should be pruned"
+        );
+        assert!(
+            target.join("debug").join("deps").join("libfoo.rlib").exists(),
+            "warm deps rlibs must survive an incremental prune"
+        );
+
+        fs::remove_dir_all(&target).expect("cleanup");
+    }
+
+    #[test]
+    fn prune_lane_cache_resets_whole_target_when_deps_exceed_cap() {
+        let target = unique_temp_dir("lane-cache-reset");
+        // deps alone (no incremental) exceeds the cap -> only the nuke bounds it.
+        write_blob(
+            &target.join("debug").join("deps").join("big.rlib"),
+            64 * 1024,
+        );
+
+        assert_eq!(
+            prune_lane_cache_over_cap(&target, 16 * 1024),
+            LaneCachePrune::Reset
+        );
+        assert!(
+            !target.exists(),
+            "over-cap deps-heavy target must be fully removed"
+        );
+    }
+
+    #[test]
+    fn prune_orphan_lane_caches_removes_higher_indexed_lanes_only() {
+        let run_root = unique_temp_dir("orphan-lane-caches");
+        let caches = run_root.join("lane-caches");
+        for lane in 1..=8usize {
+            write_blob(
+                &caches
+                    .join(format!("lane-{lane}"))
+                    .join("cargo-target")
+                    .join("marker"),
+                1024,
+            );
+        }
+        // A non-lane dir must be ignored, not deleted.
+        write_blob(&caches.join("scratch").join("keep"), 1024);
+
+        prune_orphan_lane_caches(&run_root, 6);
+
+        for lane in 1..=6usize {
+            assert!(
+                caches.join(format!("lane-{lane}")).exists(),
+                "lane-{lane} within budget must survive"
+            );
+        }
+        for lane in 7..=8usize {
+            assert!(
+                !caches.join(format!("lane-{lane}")).exists(),
+                "orphan lane-{lane} above budget must be removed"
+            );
+        }
+        assert!(caches.join("scratch").exists(), "non-lane dirs untouched");
+
+        fs::remove_dir_all(&run_root).expect("cleanup");
+    }
+
+    #[test]
+    fn enforce_lane_cache_size_cap_noops_when_disabled() {
+        // AUTO_LANE_CACHE_MAX_GB=0 disables the cap: an over-sized cache is kept.
+        // Env is process-global, so isolate the whole assertion in one test.
+        let run_root = unique_temp_dir("lane-cache-disabled");
+        let lane_root = run_root.join("lanes").join("lane-2");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let target = run_root
+            .join("lane-caches")
+            .join("lane-2")
+            .join("cargo-target");
+        write_blob(&target.join("debug").join("deps").join("big.rlib"), 64 * 1024);
+
+        // enforce reads AUTO_LANE_PERSISTENT_TARGET via lane_persistent_cargo_target_for,
+        // but with the cap disabled it returns before consulting the target at all,
+        // so this assertion is robust regardless of that (parallel-test-shared) env.
+        std::env::set_var("AUTO_LANE_CACHE_MAX_GB", "0");
+        enforce_lane_cache_size_cap(&lane_root);
+        assert!(
+            target.join("debug").join("deps").join("big.rlib").exists(),
+            "disabled cap (=0) must leave the cache untouched"
+        );
+        std::env::remove_var("AUTO_LANE_CACHE_MAX_GB");
+
+        // With a real cap below the content, the pure core bounds the same cache.
+        assert_eq!(
+            prune_lane_cache_over_cap(&target, 16 * 1024),
+            LaneCachePrune::Reset
+        );
+
+        fs::remove_dir_all(&run_root).ok();
     }
 
     #[test]
