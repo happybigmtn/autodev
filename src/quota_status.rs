@@ -33,7 +33,7 @@ pub(crate) async fn run_status() -> Result<()> {
             Ok(usage) => {
                 let status = if usage.limit_reached {
                     red.apply_to("LIMIT HIT").to_string()
-                } else if usage.weekly_used_pct >= 80 {
+                } else if usage.weekly_known && usage.weekly_used_pct >= 80 {
                     yellow.apply_to("low").to_string()
                 } else {
                     green.apply_to("ok").to_string()
@@ -61,11 +61,17 @@ pub(crate) async fn run_status() -> Result<()> {
                 print_bar(usage.session_used_pct, &green, &red, &yellow);
                 println!(" {session_remaining:>3}% remaining  {session_reset}",);
 
-                let weekly_remaining = 100u32.saturating_sub(usage.weekly_used_pct);
-                let weekly_reset = format_secs(usage.weekly_resets_in_secs);
-                print!("  weekly   ");
-                print_bar(usage.weekly_used_pct, &green, &red, &yellow);
-                println!(" {weekly_remaining:>3}% remaining  {weekly_reset}",);
+                if usage.weekly_known {
+                    let weekly_remaining = 100u32.saturating_sub(usage.weekly_used_pct);
+                    let weekly_reset = format_secs(usage.weekly_resets_in_secs);
+                    print!("  weekly   ");
+                    print_bar(usage.weekly_used_pct, &green, &red, &yellow);
+                    println!(" {weekly_remaining:>3}% remaining  {weekly_reset}",);
+                } else {
+                    // No weekly window exposed (e.g. a plan with only a session
+                    // cap): report it as not-tracked rather than a fake number.
+                    println!("  weekly   {}", dim.apply_to("not tracked by this plan"));
+                }
             }
             Err(e) => {
                 println!(

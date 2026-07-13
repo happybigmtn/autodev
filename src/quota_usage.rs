@@ -39,7 +39,66 @@ pub(crate) struct CodexRateLimit {
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexWindow {
     pub(crate) used_percent: u32,
+    /// Duration of this rate-limit window in seconds. Used to tell the fast
+    /// "session" window (≈5h) apart from the "weekly" window (7d). Defaults to
+    /// 0 when the field is absent (older API), which forces the legacy
+    /// positional mapping.
+    #[serde(default)]
+    pub(crate) limit_window_seconds: u64,
     pub(crate) reset_after_seconds: u64,
+}
+
+/// A rate-limit window whose duration is at least this long is treated as the
+/// weekly (7-day) budget; anything shorter is the fast "session" window.
+/// Real durations are session ≈ 5h (18000s) and weekly = 7d (604800s), so a
+/// 2-day split separates them cleanly and classifies any hypothetical daily
+/// (86400s) window as session.
+const WEEKLY_WINDOW_MIN_SECS: u64 = 2 * 24 * 60 * 60;
+
+struct CodexWindows<'a> {
+    session: Option<&'a CodexWindow>,
+    weekly: Option<&'a CodexWindow>,
+}
+
+/// Map Codex's `primary`/`secondary` rate-limit windows onto the router's
+/// session vs weekly dimensions by their actual `limit_window_seconds`.
+///
+/// Plus/Team plans return `primary` = 5-hour session window and `secondary` =
+/// 7-day weekly window. The Pro plan returns a single 7-day window in
+/// `primary_window` with `secondary_window: null`, so a fixed
+/// primary=session / secondary=weekly mapping would mislabel Pro's weekly
+/// budget as "session" and then treat the absent weekly window as fully
+/// consumed — wrongly gating a perfectly healthy Pro account. When window
+/// durations are unavailable (older API that omits `limit_window_seconds`),
+/// fall back to the legacy positional mapping.
+fn classify_codex_windows<'a>(
+    primary: &'a CodexWindow,
+    secondary: Option<&'a CodexWindow>,
+) -> CodexWindows<'a> {
+    let durations_known = primary.limit_window_seconds > 0
+        || secondary.is_some_and(|w| w.limit_window_seconds > 0);
+
+    if !durations_known {
+        return CodexWindows {
+            session: Some(primary),
+            weekly: secondary,
+        };
+    }
+
+    let mut session: Option<&CodexWindow> = None;
+    let mut weekly: Option<&CodexWindow> = None;
+    for window in std::iter::once(primary).chain(secondary) {
+        if window.limit_window_seconds >= WEEKLY_WINDOW_MIN_SECS {
+            // Keep the longest weekly-scale window if several qualify.
+            if weekly.is_none_or(|cur| window.limit_window_seconds > cur.limit_window_seconds) {
+                weekly = Some(window);
+            }
+        } else if session.is_none_or(|cur| window.limit_window_seconds < cur.limit_window_seconds) {
+            // Keep the shortest session-scale window.
+            session = Some(window);
+        }
+    }
+    CodexWindows { session, weekly }
 }
 
 // ── Claude usage ───────────────────────────────────────────────────────
@@ -67,6 +126,10 @@ pub(crate) struct AccountUsage {
     pub(crate) weekly_used_pct: u32,
     pub(crate) weekly_remaining_pct: u32,
     pub(crate) weekly_resets_in_secs: u64,
+    /// Whether a weekly budget window was actually observed. `false` means the
+    /// provider exposed no weekly window (its usage is unknown, NOT exhausted),
+    /// so the selector must treat the account as eligible rather than gating it.
+    pub(crate) weekly_known: bool,
     pub(crate) limit_reached: bool,
 }
 
@@ -231,15 +294,37 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
 
     let usage: CodexUsageResponse = resp.json().await.context("failed to parse ChatGPT usage")?;
 
-    let session_used = usage.rate_limit.primary_window.used_percent;
-    let session_reset = usage.rate_limit.primary_window.reset_after_seconds;
-    let (weekly_used, weekly_reset) = match &usage.rate_limit.secondary_window {
+    Ok(codex_usage_from_response(usage))
+}
+
+/// Pure mapping from a parsed ChatGPT usage response to the router's unified
+/// `AccountUsage`. Separated from the HTTP fetch so the window-classification
+/// logic can be unit-tested with mocked rate-limit inputs.
+fn codex_usage_from_response(usage: CodexUsageResponse) -> AccountUsage {
+    let windows = classify_codex_windows(
+        &usage.rate_limit.primary_window,
+        usage.rate_limit.secondary_window.as_ref(),
+    );
+
+    // Session dimension: when the plan exposes no fast window (e.g. Pro, which
+    // only has a weekly cap) there is no separate session budget to spend, so
+    // treat it as fully available.
+    let (session_used, session_reset) = match windows.session {
         Some(w) => (w.used_percent, w.reset_after_seconds),
-        // No weekly window means no weekly budget — treat as fully consumed
-        None => (100, 0),
+        None => (0, 0),
     };
 
-    Ok(AccountUsage {
+    // Weekly dimension: a PRESENT weekly window carries the real budget. An
+    // ABSENT weekly window means we could not observe the weekly usage — mark
+    // it unknown (assume available) so the selector never gates the account.
+    // A genuinely exhausted weekly window is PRESENT with used_percent≈100, so
+    // absent ≠ exhausted.
+    let (weekly_used, weekly_reset, weekly_known) = match windows.weekly {
+        Some(w) => (w.used_percent, w.reset_after_seconds, true),
+        None => (0, 0, false),
+    };
+
+    AccountUsage {
         plan: usage.plan_type,
         session_used_pct: session_used,
         session_remaining_pct: 100u32.saturating_sub(session_used),
@@ -247,8 +332,9 @@ pub(crate) async fn fetch_codex_usage(profile_dir: &Path) -> Result<AccountUsage
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),
         weekly_resets_in_secs: weekly_reset,
+        weekly_known,
         limit_reached: usage.rate_limit.limit_reached,
-    })
+    }
 }
 
 pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsage> {
@@ -308,6 +394,8 @@ pub(crate) async fn fetch_claude_usage(profile_dir: &Path) -> Result<AccountUsag
         weekly_used_pct: weekly_used,
         weekly_remaining_pct: 100u32.saturating_sub(weekly_used),
         weekly_resets_in_secs: weekly_reset_secs,
+        // Claude's usage endpoint always reports the seven-day window.
+        weekly_known: true,
         limit_reached,
     })
 }
@@ -572,6 +660,125 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn codex_window(used_percent: u32, limit_window_seconds: u64, reset_after_seconds: u64) -> CodexWindow {
+        CodexWindow {
+            used_percent,
+            limit_window_seconds,
+            reset_after_seconds,
+        }
+    }
+
+    fn codex_response(
+        plan: &str,
+        limit_reached: bool,
+        primary: CodexWindow,
+        secondary: Option<CodexWindow>,
+    ) -> CodexUsageResponse {
+        CodexUsageResponse {
+            plan_type: plan.into(),
+            rate_limit: CodexRateLimit {
+                limit_reached,
+                primary_window: primary,
+                secondary_window: secondary,
+            },
+        }
+    }
+
+    #[test]
+    fn pro_plan_single_weekly_window_maps_to_weekly_not_session() {
+        // Real Pro-plan payload: one 7-day window in `primary_window`, no
+        // `secondary_window`. Prior code mislabeled this as "session" and
+        // treated the absent weekly window as 100% used, gating the account.
+        let usage = codex_usage_from_response(codex_response(
+            "pro",
+            false,
+            codex_window(8, 604800, 574224),
+            None,
+        ));
+
+        assert!(usage.weekly_known, "the 7-day primary window IS the weekly budget");
+        assert_eq!(usage.weekly_used_pct, 8);
+        assert_eq!(usage.weekly_remaining_pct, 92);
+        assert_eq!(usage.weekly_resets_in_secs, 574224);
+        // No fast window on Pro ⇒ session is fully available, never gated.
+        assert_eq!(usage.session_remaining_pct, 100);
+        assert!(!usage.limit_reached);
+    }
+
+    #[test]
+    fn pro_plan_fresh_weekly_window_is_fully_available() {
+        let usage = codex_usage_from_response(codex_response(
+            "pro",
+            false,
+            codex_window(0, 604800, 604800),
+            None,
+        ));
+        assert!(usage.weekly_known);
+        assert_eq!(usage.weekly_remaining_pct, 100);
+        assert_eq!(usage.session_remaining_pct, 100);
+    }
+
+    #[test]
+    fn plus_plan_maps_primary_to_session_and_secondary_to_weekly() {
+        // Plus/Team: 5-hour session window + 7-day weekly window.
+        let usage = codex_usage_from_response(codex_response(
+            "plus",
+            false,
+            codex_window(40, 18000, 9000),
+            Some(codex_window(70, 604800, 300000)),
+        ));
+
+        assert_eq!(usage.session_used_pct, 40);
+        assert_eq!(usage.session_remaining_pct, 60);
+        assert_eq!(usage.session_resets_in_secs, 9000);
+        assert!(usage.weekly_known);
+        assert_eq!(usage.weekly_used_pct, 70);
+        assert_eq!(usage.weekly_remaining_pct, 30);
+        assert_eq!(usage.weekly_resets_in_secs, 300000);
+    }
+
+    #[test]
+    fn present_weekly_window_at_full_use_is_reported_exhausted_not_unknown() {
+        let usage = codex_usage_from_response(codex_response(
+            "plus",
+            true,
+            codex_window(50, 18000, 9000),
+            Some(codex_window(100, 604800, 200000)),
+        ));
+        assert!(usage.weekly_known, "a real exhausted weekly window is PRESENT");
+        assert_eq!(usage.weekly_remaining_pct, 0);
+    }
+
+    #[test]
+    fn legacy_response_without_durations_falls_back_to_positional_mapping() {
+        // Older API omits `limit_window_seconds` (deserializes to 0). Keep the
+        // historical primary=session / secondary=weekly mapping.
+        let usage = codex_usage_from_response(codex_response(
+            "plus",
+            false,
+            codex_window(30, 0, 9000),
+            Some(codex_window(80, 0, 300000)),
+        ));
+        assert_eq!(usage.session_used_pct, 30);
+        assert!(usage.weekly_known);
+        assert_eq!(usage.weekly_used_pct, 80);
+    }
+
+    #[test]
+    fn session_only_response_leaves_weekly_unknown_available() {
+        // A response with only a short window and no weekly window: weekly is
+        // unknown (assume available), never gated as exhausted.
+        let usage = codex_usage_from_response(codex_response(
+            "plus",
+            false,
+            codex_window(60, 18000, 9000),
+            None,
+        ));
+        assert_eq!(usage.session_used_pct, 60);
+        assert!(!usage.weekly_known, "no weekly window ⇒ weekly unknown");
+        assert_eq!(usage.weekly_remaining_pct, 100, "unknown weekly assumed available");
     }
 
     fn fake_jwt(exp: i64) -> String {

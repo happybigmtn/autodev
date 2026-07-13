@@ -173,16 +173,30 @@ fn selectable_scored_candidates<'a>(
         .collect()
 }
 
+/// True when an account is eligible on the weekly axis: either its weekly
+/// usage is unknown (no weekly window observed — absent ≠ exhausted, so do NOT
+/// gate) or a PRESENT weekly window still has at least the floor remaining.
+fn weekly_axis_eligible(usage: &AccountUsage) -> bool {
+    !usage.weekly_known || usage.weekly_remaining_pct >= WEEKLY_FLOOR_PCT
+}
+
+/// Sort key for "weekly resets soonest". Unknown weekly usage has no
+/// meaningful reset time, so it sorts last and is never falsely preferred over
+/// an account whose weekly window we actually observed.
+fn weekly_reset_key(usage: &AccountUsage) -> u64 {
+    if usage.weekly_known {
+        usage.weekly_resets_in_secs
+    } else {
+        u64::MAX
+    }
+}
+
 fn weekly_floor_candidates<'a>(
     scored: &[(&'a AccountEntry, Option<AccountUsage>)],
 ) -> Vec<(&'a AccountEntry, Option<AccountUsage>)> {
     scored
         .iter()
-        .filter(|(_, usage)| {
-            usage
-                .as_ref()
-                .is_none_or(|usage| usage.weekly_remaining_pct >= WEEKLY_FLOOR_PCT)
-        })
+        .filter(|(_, usage)| usage.as_ref().is_none_or(weekly_axis_eligible))
         .map(|(entry, usage)| (*entry, usage.clone()))
         .collect()
 }
@@ -192,7 +206,7 @@ fn low_weekly_account_summaries(scored: &[(&AccountEntry, Option<AccountUsage>)]
         .iter()
         .filter_map(|(entry, usage)| {
             usage.as_ref().and_then(|usage| {
-                (usage.weekly_remaining_pct < WEEKLY_FLOOR_PCT)
+                (usage.weekly_known && usage.weekly_remaining_pct < WEEKLY_FLOOR_PCT)
                     .then(|| format!("{} ({}%)", entry.name, usage.weekly_remaining_pct))
             })
         })
@@ -311,18 +325,15 @@ fn pick_best_by_weekly<'a>(
 ) -> SelectedAccount<'a> {
     let above_weekly_floor: Vec<_> = candidates
         .iter()
-        .filter(|(_, u)| {
-            u.as_ref()
-                .is_some_and(|u| u.weekly_remaining_pct >= WEEKLY_FLOOR_PCT)
-        })
+        .filter(|(_, u)| u.as_ref().is_some_and(weekly_axis_eligible))
         .collect();
 
     if !above_weekly_floor.is_empty() {
         let (entry, _) = above_weekly_floor
             .iter()
             .min_by(|a, b| {
-                let ra = a.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
-                let rb = b.1.as_ref().map_or(u64::MAX, |u| u.weekly_resets_in_secs);
+                let ra = a.1.as_ref().map_or(u64::MAX, weekly_reset_key);
+                let rb = b.1.as_ref().map_or(u64::MAX, weekly_reset_key);
                 ra.cmp(&rb)
                     .then_with(|| compare_preferred(a.0, b.0, preferred_name).reverse())
                     .then_with(|| compare_lru_asc(a.0, b.0, state))
@@ -409,7 +420,9 @@ fn with_active_leases<'a, 'b>(
 }
 
 fn usage_has_remaining(usage: &AccountUsage) -> bool {
-    usage.session_remaining_pct > 0 && usage.weekly_remaining_pct > 0
+    // Unknown weekly usage must not read as "no weekly remaining" — that would
+    // drop a healthy account out of the primary `known_usable` tier.
+    usage.session_remaining_pct > 0 && (!usage.weekly_known || usage.weekly_remaining_pct > 0)
 }
 
 fn log_selection(chosen: &AccountEntry, scored: &[(&AccountEntry, Option<AccountUsage>)]) {
@@ -459,6 +472,24 @@ mod tests {
             weekly_used_pct,
             weekly_remaining_pct: 100u32.saturating_sub(weekly_used_pct),
             weekly_resets_in_secs,
+            weekly_known: true,
+            limit_reached: false,
+        }
+    }
+
+    /// Usage with an observed session window but no weekly window (e.g. the
+    /// Codex Pro plan when its single window is classified as session, or any
+    /// response that omits the weekly budget). Weekly usage is unknown.
+    fn make_usage_unknown_weekly(session_used_pct: u32, session_resets_in_secs: u64) -> AccountUsage {
+        AccountUsage {
+            plan: "test".into(),
+            session_used_pct,
+            session_remaining_pct: 100u32.saturating_sub(session_used_pct),
+            session_resets_in_secs,
+            weekly_used_pct: 0,
+            weekly_remaining_pct: 100,
+            weekly_resets_in_secs: 0,
+            weekly_known: false,
             limit_reached: false,
         }
     }
@@ -493,6 +524,65 @@ mod tests {
 
         let selected = pick_best(&scored, &state, None);
         assert_eq!(selected.entry.name, "fast-reset");
+    }
+
+    #[test]
+    fn unknown_weekly_accounts_are_eligible_not_gated() {
+        // Regression: Codex Pro accounts expose no weekly window, so weekly is
+        // unknown. Such accounts MUST NOT be excluded from selection.
+        let config = QuotaConfig {
+            accounts: vec![
+                make_account("happy", Provider::Codex),
+                make_account("reachy", Provider::Codex),
+            ],
+            selected_codex_account: None,
+            selected_claude_account: None,
+        };
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&config.accounts[0], Some(make_usage_unknown_weekly(8, 574224))),
+            (&config.accounts[1], Some(make_usage_unknown_weekly(0, 604800))),
+        ];
+
+        // Must not bail with "no selectable account has ... weekly quota".
+        let selected =
+            select_account_from_scores(&config, &state, Provider::Codex, &scored).unwrap();
+        assert!(selected.entry.name == "happy" || selected.entry.name == "reachy");
+    }
+
+    #[test]
+    fn unknown_weekly_is_not_flagged_as_low_weekly() {
+        let a = make_account("pro", Provider::Codex);
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
+            vec![(&a, Some(make_usage_unknown_weekly(50, 600)))];
+        assert!(low_weekly_account_summaries(&scored).is_empty());
+    }
+
+    #[test]
+    fn unknown_weekly_stays_in_known_usable_tier() {
+        // usage_has_remaining must not read unknown weekly as "0% weekly left".
+        let usage = make_usage_unknown_weekly(20, 600);
+        assert!(usage_has_remaining(&usage));
+    }
+
+    #[test]
+    fn known_weekly_preferred_over_unknown_weekly_when_both_eligible() {
+        // Among eligible accounts, the one whose weekly window we actually
+        // observed (finite reset) should win over an unknown-weekly account,
+        // rather than the unknown account being falsely treated as
+        // "resets soonest" (reset 0).
+        let known = make_account("known", Provider::Codex);
+        let unknown = make_account("unknown", Provider::Codex);
+        let state = QuotaState::default();
+
+        let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
+            (&known, Some(make_usage(50, 600, 40, 86400))),
+            (&unknown, Some(make_usage_unknown_weekly(50, 600))),
+        ];
+
+        let selected = pick_best(&scored, &state, None);
+        assert_eq!(selected.entry.name, "known");
     }
 
     #[test]
