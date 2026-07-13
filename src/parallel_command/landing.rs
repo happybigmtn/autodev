@@ -4186,6 +4186,39 @@ mod tests {
     }
 
     #[test]
+    fn workspace_test_not_applicable_preserves_done_without_recording_failure() {
+        let root = unique_temp_dir("workspace-gate-not-applicable");
+        init_git_repo(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-WNA-1` non-Rust workspace passes through\n",
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed plan"]);
+
+        let mut assignment =
+            review_gate_assignment(&root, "TASK-WNA-1", "non-Rust workspace passes through");
+        let status = apply_workspace_test_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            WorkspaceTestOutcome::Skipped {
+                reason: "no Cargo.toml found; workspace cargo test gate is not applicable"
+                    .to_string(),
+            },
+        );
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        assert!(!root.join("REVIEW.md").exists());
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("closeout log");
+        assert!(log.contains("workspace-test: gate not applicable"));
+        assert!(log.contains("pass-through"));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn owned_inputs_gate_trusts_matching_fingerprint() {
         // Stored == current owned-inputs fingerprint -> trust the receipt.
         assert_eq!(
