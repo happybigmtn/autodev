@@ -21,7 +21,7 @@ pub(crate) struct CorpusArgs {
     pub(crate) reference_repos: Vec<PathBuf>,
 
     /// Model used for corpus authoring
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort used for corpus authoring
@@ -29,7 +29,7 @@ pub(crate) struct CorpusArgs {
     pub(crate) reasoning_effort: String,
 
     /// Model used for the independent review pass after corpus authoring
-    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.5")]
+    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.6-sol")]
     pub(crate) codex_review_model: String,
 
     /// Reasoning effort used for the independent review pass
@@ -85,7 +85,7 @@ pub(crate) struct GenerationArgs {
     pub(crate) output_dir: Option<PathBuf>,
 
     /// Model used for spec and plan authoring
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort used for spec and plan authoring
@@ -93,7 +93,7 @@ pub(crate) struct GenerationArgs {
     pub(crate) reasoning_effort: String,
 
     /// Model used for the independent review pass after generation
-    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.5")]
+    #[arg(long, visible_alias = "review-model", default_value = "gpt-5.6-sol")]
     pub(crate) codex_review_model: String,
 
     /// Reasoning effort used for the independent review pass
@@ -211,7 +211,7 @@ pub(crate) struct DesignArgs {
     pub(crate) max_iterations: Option<usize>,
 
     /// Model used by implementation workers during --resolve.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) worker_model: String,
 
     /// Reasoning effort used by implementation workers during --resolve.
@@ -231,7 +231,7 @@ pub(crate) struct DesignArgs {
     pub(crate) skip_qa: bool,
 
     /// Model used for design analysis
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort used for design analysis
@@ -278,7 +278,7 @@ pub(crate) struct SuperArgs {
     pub(crate) reference_repos: Vec<PathBuf>,
 
     /// Model used for corpus, generation, and super review gates
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort used for corpus, generation, and super review gates
@@ -310,7 +310,7 @@ pub(crate) struct SuperArgs {
     pub(crate) max_iterations: Option<usize>,
 
     /// Model used by implementation workers after the gates pass
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) worker_model: String,
 
     /// Reasoning effort used by implementation workers after the gates pass
@@ -375,7 +375,7 @@ pub(crate) struct AuditHarvestArgs {
     pub(crate) run_id: Option<String>,
 
     /// Codex model used to translate findings into IMPLEMENTATION_PLAN.md rows.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Codex reasoning effort.
@@ -424,7 +424,7 @@ pub(crate) struct BookArgs {
     pub(crate) output_dir: Option<PathBuf>,
 
     /// Codex model used to rewrite the narrative book.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Codex reasoning effort used to rewrite the narrative book.

@@ -1787,7 +1787,7 @@ pub(crate) async fn refresh_parallel_plan(
                     repo_root: Some(repo_root.to_path_buf()),
                     project_slug: None,
                     todo_state: "Todo".to_string(),
-                    planner_model: "gpt-5.5".to_string(),
+                    planner_model: "gpt-5.6-sol".to_string(),
                     planner_reasoning_effort: "high".to_string(),
                     codex_bin: PathBuf::from("codex"),
                     no_ai_planner: true,

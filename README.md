@@ -56,14 +56,14 @@ need to pass directories in the normal case.
   `GBRAIN-CONTEXT.md` unless `--no-gbrain-context` is supplied
 - Bug pipeline output defaults to `<repo>/bug`
 - Nemesis audit output defaults to `<repo>/nemesis`
-- `auto bug` runs `gpt-5.5` `low` finder and skeptic passes, then `gpt-5.5`
+- `auto bug` runs `gpt-5.6-sol` `low` finder and skeptic passes, then `gpt-5.6-sol`
   `high` fixer, reviewer, and finalizer passes by default
-- `auto loop` runs on the repo's primary branch by default with `gpt-5.5` and `high`
+- `auto loop` runs on the repo's primary branch by default with `gpt-5.6-sol` and `high`
 - `auto parallel` runs on the repo's primary branch by default with five workers; outside tmux it
   launches a detached `<repo>-parallel` tmux session automatically
-- `auto design` runs with `gpt-5.5` `high`, writes `.auto/design/<run-id>/`, and is report-only
+- `auto design` runs with `gpt-5.6-sol` `high`, writes `.auto/design/<run-id>/`, and is report-only
   unless `--apply` is supplied
-- `auto super` runs corpus and generation with `gpt-5.5` `xhigh`, runs additional
+- `auto super` runs corpus and generation with `gpt-5.6-sol` `xhigh`, runs additional
   design-perfection, functional-review, production-readiness, and execution-gate reviews, then
   leaves a reviewable `gen-*` snapshot for explicit promotion before any parallel implementation
 - `auto parallel status` summarizes the active tmux session, host process, lane task IDs, lane git
@@ -71,19 +71,19 @@ need to pass directories in the normal case.
 - `auto parallel` treats root queue files, receipt-drift triage, and operator-action files as
   host-owned state. Lane workers preserve evidence in commits and logs, while the host reconciles
   shared queue truth.
-- `auto qa` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and the
+- `auto qa` runs on the currently checked-out branch by default with `gpt-5.6-sol`, `high`, and the
   `standard` tier
-- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.5`, `high`, and
+- `auto qa-only` runs on the currently checked-out branch by default with `gpt-5.6-sol`, `high`, and
   the `standard` tier
-- `auto health` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
+- `auto health` runs on the currently checked-out branch by default with `gpt-5.6-sol` and `high`
 - `auto doctor` is read-only and no-model. Baseline readiness covers checkout layout, binary
   provenance, and help surfaces. Execution readiness reports planning root, queue, and generated
   snapshot state. Missing `codex`, `claude`, `pi`, and `gh` are model-tool capability warnings
   rather than baseline first-run failures.
-- `auto review` runs on the currently checked-out branch by default with `gpt-5.5` and `high`
-- `auto ship` runs on the currently checked-out branch by default with `gpt-5.5` and `high`,
+- `auto review` runs on the currently checked-out branch by default with `gpt-5.6-sol` and `high`
+- `auto ship` runs on the currently checked-out branch by default with `gpt-5.6-sol` and `high`,
   targeting the repo's resolved base branch
-- `auto nemesis` runs `gpt-5.5` `high` audit, synthesis, fixer, and finalizer
+- `auto nemesis` runs `gpt-5.6-sol` `high` audit, synthesis, fixer, and finalizer
   passes by default unless `--report-only` is used
 - All mutating branch commands (`auto loop`, `auto qa`, `auto review`, `auto ship`, `auto bug`,
   and `auto nemesis`) now rebase onto `origin/<branch>` when that remote branch exists before
@@ -107,7 +107,7 @@ can set `MODEL=kimi`; a Codex agent can leave the defaults alone.
 Recommended shell setup:
 
 ```bash
-MODEL="${MODEL:-gpt-5.5}"
+MODEL="${MODEL:-gpt-5.6-sol}"
 PLAN_EFFORT="${PLAN_EFFORT:-xhigh}"
 WORK_EFFORT="${WORK_EFFORT:-high}"
 AUDIT_FIRST_PASS_EFFORT="${AUDIT_FIRST_PASS_EFFORT:-low}"
@@ -223,15 +223,15 @@ auto doctor
 auto corpus \
   --idea "$PROMPT" \
   --focus "$FOCUS" \
-  --model "${MODEL:-gpt-5.5}" \
+  --model "${MODEL:-gpt-5.6-sol}" \
   --reasoning-effort "${PLAN_EFFORT:-xhigh}" \
-  --review-model "${MODEL:-gpt-5.5}" \
+  --review-model "${MODEL:-gpt-5.6-sol}" \
   --review-effort "${PLAN_EFFORT:-xhigh}"
 auto gen \
   --snapshot-only \
-  --model "${MODEL:-gpt-5.5}" \
+  --model "${MODEL:-gpt-5.6-sol}" \
   --reasoning-effort "${PLAN_EFFORT:-xhigh}" \
-  --review-model "${MODEL:-gpt-5.5}" \
+  --review-model "${MODEL:-gpt-5.6-sol}" \
   --review-effort "${PLAN_EFFORT:-xhigh}"
 ```
 
@@ -478,7 +478,7 @@ What it actually does:
 
 - Archives the previous `genesis/` snapshot under `.auto/fresh-input/`
 - Rebuilds `genesis/` from scratch
-- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.6-sol` with `xhigh` by default unless you override it
 - Writes `GBRAIN-CONTEXT.md` before prompt authoring and tells the model to read it as advisory
   operator/project memory, while still verifying code facts against the live checkout
 - Gives Codex-backed authoring and independent review passes the maximum Codex model context
@@ -577,7 +577,7 @@ What it writes:
 What it actually does:
 
 - Generates fresh specs from the planning corpus
-- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.6-sol` with `xhigh` by default unless you override it
 - Writes `GBRAIN-CONTEXT.md` into the `gen-*` snapshot and threads it into both spec and plan
   prompts as advisory shared memory
 - Gives Codex-backed authoring and independent review passes the maximum Codex model context
@@ -857,7 +857,7 @@ What it does not write:
 What it actually does:
 
 - Produces specs grounded in current behavior
-- Runs Codex `gpt-5.5` with `xhigh` by default unless you override it
+- Runs Codex `gpt-5.6-sol` with `xhigh` by default unless you override it
 - Uses the same stronger spec format as `auto gen`
 - Surfaces assumptions and spec/code conflicts instead of silently reconciling them
 - Writes the results into the root `specs/` snapshot directory and replaces same-day same-topic
@@ -916,11 +916,11 @@ What it actually does:
 
 Default model layout:
 
-- finder: Codex `gpt-5.5` with `low`
-- skeptic: Codex `gpt-5.5` with `low`
-- reviewer: Codex `gpt-5.5` with `high`
-- fixer: Codex `gpt-5.5` with `high`
-- finalizer: Codex `gpt-5.5` with `high`
+- finder: Codex `gpt-5.6-sol` with `low`
+- skeptic: Codex `gpt-5.6-sol` with `low`
+- reviewer: Codex `gpt-5.6-sol` with `high`
+- fixer: Codex `gpt-5.6-sol` with `high`
+- finalizer: Codex `gpt-5.6-sol` with `high`
 - all Codex bug phases request the maximum model context window
 
 Profiles:
@@ -986,7 +986,7 @@ What it actually does:
 - Archives the previous `nemesis/` folder under `.auto/fresh-input/`, unless `--resume` is used
 - Runs a draft audit pass to maximize evidence-backed recall
 - Runs a synthesis pass to tighten or discard weak claims
-- Runs a final `gpt-5.5` `high` implementation pass against the synthesized Nemesis plan by
+- Runs a final `gpt-5.6-sol` `high` implementation pass against the synthesized Nemesis plan by
   default
 - Treats the Nemesis plan as the execution contract for bounded hardening work
 - Writes implementation results under `nemesis/`
@@ -1004,10 +1004,10 @@ Important rule:
 
 Backend selection:
 
-- Draft auditor default: Codex `gpt-5.5` with `high`
-- Final reviewer default: Codex `gpt-5.5` with `high`
-- Final implementer default: Codex `gpt-5.5` with `high`
-- Finalizer default: Codex `gpt-5.5` with `high`
+- Draft auditor default: Codex `gpt-5.6-sol` with `high`
+- Final reviewer default: Codex `gpt-5.6-sol` with `high`
+- Final implementer default: Codex `gpt-5.6-sol` with `high`
+- Finalizer default: Codex `gpt-5.6-sol` with `high`
 - all Codex Nemesis phases request the maximum model context window
 - `--profile fast|balanced|max-quality` applies the same effort presets as `auto bug`
 - `--kimi` switches the draft pass to the current Kimi coding model
@@ -1173,7 +1173,7 @@ Purpose:
 
 What it actually does:
 
-- Defaults to five workers with `gpt-5.5` and `high`
+- Defaults to five workers with `gpt-5.6-sol` and `high`
 - Auto-checkpoints stageable canonical repo changes with an `auto parallel checkpoint` commit
   before dispatch, then refuses to launch only if checkpointing cannot clear dirty dispatch paths
 - When run outside tmux, starts a detached `<repo>-parallel` tmux session running the same command
@@ -1507,8 +1507,8 @@ What it produces:
 Defaults:
 
 - Output directory defaults to `<repo>/steward`
-- The first steward pass defaults to Codex `gpt-5.5` with `high`
-- The finalizer pass defaults to Codex `gpt-5.5` with `high`
+- The first steward pass defaults to Codex `gpt-5.6-sol` with `high`
+- The finalizer pass defaults to Codex `gpt-5.6-sol` with `high`
 - It uses the current checked-out branch unless you pass `--branch`
 - It runs through `codex` unless you override `--codex-bin`
 - `--skip-finalizer` leaves the six stewardship deliverables in place without the review/apply
@@ -1549,8 +1549,8 @@ Defaults:
 - Doctrine prompt defaults to `audit/DOCTRINE.md`
 - Output directory defaults to `<repo>/audit`
 - Resume mode defaults to `resume`
-- The primary auditor defaults to Codex `gpt-5.5` with `low`
-- Escalations default to Codex `gpt-5.5` with `high`
+- The primary auditor defaults to Codex `gpt-5.6-sol` with `low`
+- Escalations default to Codex `gpt-5.6-sol` with `high`
 - Verdicts are `CLEAN`, `DRIFT-SMALL`, `DRIFT-LARGE`, `SLOP`, `RETIRE`, and `REFACTOR`
 
 Closure verification:
@@ -1591,13 +1591,13 @@ What it does:
 - Writes and injects `CODEBASE-IMPROVEMENT-POLICY.md` so the audit treats orphaned code,
   deprecated paths, accumulated technical debt, weak architecture, and AI-slop as first-class
   remediation targets
-- Runs first-pass per-file analysis with Codex `gpt-5.5` `low`
-- Runs synthesis with Codex `gpt-5.5` `high`
+- Runs first-pass per-file analysis with Codex `gpt-5.6-sol` `low`
+- Runs synthesis with Codex `gpt-5.6-sol` `high`
 - Generates `REMEDIATION-PLAN.md` / `REMEDIATION-PLAN.json` from the synthesized reports, with
   dependency-ready tasks and lane ownership
-- Runs remediation as isolated worktree lanes with Codex `gpt-5.5` `high`, then host-lands lane
+- Runs remediation as isolated worktree lanes with Codex `gpt-5.6-sol` `high`, then host-lands lane
   commits back onto the audit branch
-- Runs final review with Codex `gpt-5.5` `xhigh`
+- Runs final review with Codex `gpt-5.6-sol` `xhigh`
 - If final review writes `Verdict: NO-GO` with actionable required blockers, runs a bounded
   repair pass and reruns final review before merge judgment
 - For non-report runs, successful completion requires both a `Verdict: GO` final review and a
@@ -1727,10 +1727,10 @@ Subcommands:
 
 Defaults:
 
-- `sync` defaults `--todo-state` to `Todo`, planner model to `gpt-5.5`, planner effort to
+- `sync` defaults `--todo-state` to `Todo`, planner model to `gpt-5.6-sol`, planner effort to
   `high`, and planner binary to `codex`
 - `workflow` defaults to `.auto/symphony/WORKFLOW.md`, `max_concurrent_agents = 1`,
-  `poll_interval_ms = 5000`, model `gpt-5.5`, effort `high`, `In Progress`, and `Done`
+  `poll_interval_ms = 5000`, model `gpt-5.6-sol`, effort `high`, `In Progress`, and `Done`
 - `run` reuses the workflow defaults, can `--sync-first` before launch, and writes logs under
   `.auto/symphony/logs/` unless you override `--logs-root`
 

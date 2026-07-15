@@ -46,7 +46,7 @@ const DEFAULT_REVIEW_EFFORT: &str = "high";
 #[derive(Clone, Debug)]
 pub(crate) struct LaneReviewConfig {
     /// Model for the independent review. Defaults to the run's worker model
-    /// (gpt-5.5 unless overridden).
+    /// (gpt-5.6-sol unless overridden).
     pub(crate) model: String,
     /// Reasoning effort. Defaults to "high".
     pub(crate) reasoning_effort: String,

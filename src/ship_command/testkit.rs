@@ -193,7 +193,7 @@ pub(crate) fn ship_args(repo: &Path, codex_bin: PathBuf) -> ShipArgs {
     ShipArgs {
         max_iterations: 1,
         prompt_file: None,
-        model: "gpt-5.5".to_string(),
+        model: "gpt-5.6-sol".to_string(),
         reasoning_effort: "high".to_string(),
         branch: Some("main".to_string()),
         base_branch: Some("main".to_string()),

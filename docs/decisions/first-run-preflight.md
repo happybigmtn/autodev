@@ -10,7 +10,7 @@ Task: `AD-006`
 
 `auto health` is a model-backed repo health pass today. It writes prompt and run
 artifacts under `.auto/health` and `.auto/logs`, then invokes Codex with default
-model `gpt-5.5`, reasoning effort `high`, and binary `codex`.
+model `gpt-5.6-sol`, reasoning effort `high`, and binary `codex`.
 
 The first-run path needs a different contract: contributors should be able to
 prove the local checkout, installed `auto` binary, help surfaces, and basic

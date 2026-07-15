@@ -81,7 +81,7 @@ pub(crate) enum Command {
     CommandSurface(CommandSurfaceArgs),
     /// Review completed work on the current branch
     Review(ReviewArgs),
-    /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.5)
+    /// Stewardship pass for a mid-flight repo. Two-pass Codex (gpt-5.6-sol)
     /// pipeline: reconciles plan claims against the live code, surfaces
     /// hinge items, and applies approved IMPLEMENTATION_PLAN.md /
     /// WORKLIST.md / LEARNINGS.md updates in-place. Replaces `auto corpus`

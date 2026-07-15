@@ -656,10 +656,10 @@ mod tests {
     fn lane_repo_process_parser_finds_orphaned_codex_descendants() {
         let lane_repo = PathBuf::from("/tmp/repo/.auto/parallel/lanes/lane-3/repo");
         let ps = r#"
-  100 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.5
-  101 node /home/r/.npm-global/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.5
+  100 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.6-sol
+  101 node /home/r/.npm-global/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-3/repo -m gpt-5.6-sol
   102 rg /tmp/repo/.auto/parallel/lanes/lane-3/repo
-  103 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-4/repo -m gpt-5.5
+  103 bash /home/r/.local/bin/codex exec --cd /tmp/repo/.auto/parallel/lanes/lane-4/repo -m gpt-5.6-sol
 "#;
 
         let pids = parse_lane_repo_process_pids(&lane_repo, ps);

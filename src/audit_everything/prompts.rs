@@ -276,7 +276,7 @@ Review all group reports under the report root and the full git diff from `{base
 Selected gstack lenses for final review:
 {skill_policy}
 
-Use `gpt-5.5 xhigh` judgment standards:
+Use `gpt-5.6-sol xhigh` judgment standards:
 - Verify changes correspond to report findings.
 - Reject speculative rewrites not grounded in file reports.
 - Check for broken architecture docs, stale AGENTS instructions, overbroad edits, missing tests, and merge-risk.

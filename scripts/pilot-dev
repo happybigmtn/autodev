@@ -10,7 +10,7 @@ Environment:
   PILOT_PLAN=/path/to/plan.md       Optional authoritative plan file.
   PILOT_RUN_ID=...                  Optional deterministic run id.
   PILOT_FOCUS="..."                 Optional autodev focus override.
-  PILOT_MODEL=gpt-5.5               Codex/autodev model hint.
+  PILOT_MODEL=gpt-5.6-sol               Codex/autodev model hint.
   PILOT_EFFORT=high                 Codex/autodev work effort hint.
   PILOT_PLAN_EFFORT=xhigh           Autodev planning effort hint.
   PILOT_THREADS=3                   Autodev worker lane hint.
@@ -76,7 +76,7 @@ else
   RUN_ROOT="${PILOT_RUN_ROOT:-/home/dev/orchestrator-runs/$RUN_ID}"
 fi
 
-MODEL="${PILOT_MODEL:-gpt-5.5}"
+MODEL="${PILOT_MODEL:-gpt-5.6-sol}"
 EFFORT="${PILOT_EFFORT:-high}"
 PLAN_EFFORT="${PILOT_PLAN_EFFORT:-xhigh}"
 THREADS="${PILOT_THREADS:-3}"

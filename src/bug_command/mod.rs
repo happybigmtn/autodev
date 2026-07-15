@@ -36,7 +36,7 @@ use crate::util::{
 };
 use crate::{BugArgs, HardeningProfile};
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_CODEX_DISCOVERY_REASONING_EFFORT: &str = "low";
 const DEFAULT_CODEX_REASONING_EFFORT: &str = "high";
 const BUG_CHUNK_PHASE_TIMEOUT_SECS: u64 = 30 * 60;
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn bug_pipeline_minimax_alias_defaults_to_m27_highspeed() {
         assert_eq!(
-            PiProvider::Minimax.resolve_model("minimax", "gpt-5.5"),
+            PiProvider::Minimax.resolve_model("minimax", "gpt-5.6-sol"),
             "minimax/MiniMax-M2.7-highspeed"
         );
     }

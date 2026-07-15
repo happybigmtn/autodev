@@ -60,7 +60,7 @@ pub(crate) struct PilotArgs {
     pub(crate) focus: String,
 
     /// Model hint for Codex/autodev execution.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Execution reasoning-effort hint.

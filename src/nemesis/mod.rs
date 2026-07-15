@@ -41,9 +41,9 @@ use crate::util::{
 };
 use crate::{HardeningProfile, NemesisArgs};
 
-pub(crate) const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_CODEX_NEMESIS_MODEL: &str = "gpt-5.6-sol";
 #[allow(dead_code)]
-const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "gpt-5.5";
+const DEFAULT_NEMESIS_AUDIT_MODEL: &str = "gpt-5.6-sol";
 
 #[derive(Clone, Debug)]
 struct PhaseConfig {
@@ -506,7 +506,7 @@ fn ensure_nemesis_fixer_config(config: &PhaseConfig) -> Result<()> {
 fn ensure_nemesis_finalizer_config(config: &PhaseConfig) -> Result<()> {
     if is_kimi_model(&config.model) || PiProvider::detect(&config.model).is_some() {
         bail!(
-            "auto nemesis finalizer must use a Codex model (e.g. `gpt-5.5`); got `{}`",
+            "auto nemesis finalizer must use a Codex model (e.g. `gpt-5.6-sol`); got `{}`",
             config.model
         );
     }
@@ -745,9 +745,9 @@ mod tests {
             report_only: false,
             branch: None,
             dry_run: true,
-            fixer_model: "gpt-5.5".to_string(),
+            fixer_model: "gpt-5.6-sol".to_string(),
             fixer_effort: "high".to_string(),
-            finalizer_model: "gpt-5.5".to_string(),
+            finalizer_model: "gpt-5.6-sol".to_string(),
             finalizer_effort: "high".to_string(),
             audit_passes: 1,
             codex_bin: PathBuf::from("codex"),
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn nemesis_phase_accepts_codex_default_models() {
         let config = PhaseConfig {
-            model: "gpt-5.5".to_string(),
+            model: "gpt-5.6-sol".to_string(),
             effort: "high".to_string(),
         };
         assert!(ensure_nemesis_phase_config("nemesis", &config).is_ok());
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn nemesis_report_only_contract_matches_help() {
-        let args = sample_args("gpt-5.5");
+        let args = sample_args("gpt-5.6-sol");
         validate_nemesis_execution_contract(&args).expect("normal execution accepted");
 
         let mut report_only = args.clone();
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn nemesis_audit_passes_gt_one_is_truthful() {
-        let mut args = sample_args("gpt-5.5");
+        let mut args = sample_args("gpt-5.6-sol");
         args.audit_passes = 2;
         validate_nemesis_execution_contract(&args).expect("multi-pass execution accepted");
 

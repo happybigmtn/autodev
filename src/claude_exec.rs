@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn non_claude_model_defaults_to_opus_alias() {
-        assert_eq!(resolve_claude_model("gpt-5.5"), "opus");
+        assert_eq!(resolve_claude_model("gpt-5.6-sol"), "opus");
         assert_eq!(resolve_claude_model(""), "opus");
     }
 
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn harness_description_uses_resolved_settings() {
         assert_eq!(
-            describe_claude_harness("gpt-5.5", "high"),
+            describe_claude_harness("gpt-5.6-sol", "high"),
             "Claude (opus high)"
         );
     }

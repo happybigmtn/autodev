@@ -240,7 +240,7 @@ fn select_shared_exec_backend(model: &str, codex_bin: &Path) -> SharedExecBacken
     if let Some(provider) = PiProvider::detect(model) {
         return SharedExecBackend::Pi {
             provider_label: provider.provider_label().to_string(),
-            model: provider.resolve_model(model, "gpt-5.5"),
+            model: provider.resolve_model(model, "gpt-5.6-sol"),
             pi_bin: resolve_pi_bin(Path::new("pi")),
         };
     }
@@ -533,11 +533,11 @@ mod tests {
 
     #[test]
     fn shared_exec_leaves_codex_models_on_codex() {
-        let backend = select_shared_exec_backend("gpt-5.5", Path::new("/tmp/codex-test"));
+        let backend = select_shared_exec_backend("gpt-5.6-sol", Path::new("/tmp/codex-test"));
         assert_eq!(
             backend,
             SharedExecBackend::Codex {
-                model: "gpt-5.5".to_string(),
+                model: "gpt-5.6-sol".to_string(),
                 codex_bin: PathBuf::from("/tmp/codex-test"),
             }
         );

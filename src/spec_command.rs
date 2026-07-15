@@ -660,7 +660,7 @@ mod tests {
         assert!(spec_author_uses_claude_model("claude-opus-4-8"));
         assert!(spec_author_uses_claude_model("fable 5"));
         assert!(spec_author_uses_claude_model("fable-5"));
-        assert!(!spec_author_uses_claude_model("gpt-5.5"));
+        assert!(!spec_author_uses_claude_model("gpt-5.6-sol"));
     }
 
     #[test]

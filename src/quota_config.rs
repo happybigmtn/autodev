@@ -925,7 +925,7 @@ provider = "codex"
             .expect("failed to write codex auth");
         fs::write(codex_dir.join("installation_id"), b"active-installation\n")
             .expect("failed to write codex installation id");
-        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.5\"\n")
+        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.6-sol\"\n")
             .expect("failed to write codex config");
 
         let profile_dir = home.profile_dir(Provider::Codex, "work");
@@ -965,7 +965,7 @@ provider = "codex"
         let home = TempQuotaHome::new("quota-config-codex-login-home");
         let codex_dir = home.home().join(".codex");
         fs::create_dir_all(&codex_dir).expect("failed to create active codex dir");
-        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.5\"\n")
+        fs::write(codex_dir.join("config.toml"), b"model = \"gpt-5.6-sol\"\n")
             .expect("failed to write active codex config");
         fs::write(codex_dir.join("installation_id"), b"shared-installation\n")
             .expect("failed to write active codex installation id");

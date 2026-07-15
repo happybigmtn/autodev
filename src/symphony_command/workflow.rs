@@ -675,7 +675,7 @@ mod tests {
             workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "trunk",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high",
         ))
         .expect("workflow should render");
@@ -750,7 +750,7 @@ mod tests {
             workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "main; touch /tmp/pwned",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high",
         ))
         .expect_err("hostile branch should be rejected");
@@ -768,7 +768,7 @@ mod tests {
             workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "trunk",
-            "gpt-5.5 --dangerously-bypass-approvals-and-sandbox",
+            "gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox",
             "high",
         ))
         .expect_err("hostile model should be rejected");
@@ -779,7 +779,7 @@ mod tests {
             workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "trunk",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high\nwritableRoots:",
         ))
         .expect_err("hostile effort should be rejected");
@@ -790,7 +790,7 @@ mod tests {
             workspace_root.as_path(),
             "git@github.com:example/autonomy.git\n  timeout_ms: 1",
             "trunk",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high",
         ))
         .expect_err("hostile remote URL should be rejected");
@@ -802,7 +802,7 @@ mod tests {
             hostile_workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "trunk",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high",
         ))
         .expect_err("hostile path should be rejected");
@@ -814,7 +814,7 @@ mod tests {
             quoted_workspace_root.as_path(),
             "git@github.com:example/autonomy.git",
             "trunk",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "high",
         ))
         .expect("paths with spaces and quotes should render safely");

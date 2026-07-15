@@ -30,7 +30,7 @@ pub(crate) struct QaArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the QA worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex QA worker
@@ -61,7 +61,7 @@ pub(crate) struct QaOnlyArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the QA report worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex QA report worker
@@ -92,7 +92,7 @@ pub(crate) struct HealthArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the health worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex health worker
@@ -123,7 +123,7 @@ pub(crate) struct ShipArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the ship worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex ship worker
@@ -178,7 +178,7 @@ pub(crate) struct StewardArgs {
 
     /// Codex model for the first steward pass — writes drift + hinge + retire +
     /// hazard artifacts and promotes active plan/spec work.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Codex reasoning effort for the first steward pass.
@@ -187,7 +187,7 @@ pub(crate) struct StewardArgs {
 
     /// Codex model for the finalizer pass — reviews the first pass's proposed
     /// edits against the live tree and applies the ones that hold.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) finalizer_model: String,
 
     /// Codex finalizer reasoning effort.
@@ -241,7 +241,7 @@ pub(crate) struct AuditArgs {
     pub(crate) remediation_threads: usize,
 
     /// Model for professional audit first-pass file analysis.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) first_pass_model: String,
 
     /// Reasoning effort for professional audit first-pass file analysis.
@@ -256,7 +256,7 @@ pub(crate) struct AuditArgs {
     pub(crate) first_pass_retries: usize,
 
     /// Model for professional audit cross-file synthesis.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) synthesis_model: String,
 
     /// Reasoning effort for professional audit cross-file synthesis.
@@ -264,7 +264,7 @@ pub(crate) struct AuditArgs {
     pub(crate) synthesis_effort: String,
 
     /// Model for professional audit crate-by-crate remediation.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) remediation_model: String,
 
     /// Reasoning effort for professional audit crate-by-crate remediation.
@@ -272,7 +272,7 @@ pub(crate) struct AuditArgs {
     pub(crate) remediation_effort: String,
 
     /// Model for professional audit final review.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) final_review_model: String,
 
     /// Reasoning effort for professional audit final review.
@@ -385,7 +385,7 @@ pub(crate) struct AuditArgs {
     pub(crate) branch: Option<String>,
 
     /// Auditor model.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Auditor reasoning effort / thinking.
@@ -394,7 +394,7 @@ pub(crate) struct AuditArgs {
 
     /// Escalation model for DRIFT-LARGE / REFACTOR verdicts that write
     /// worklist entries. Codex gives a second-opinion on high-impact calls.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) escalation_model: String,
 
     /// Escalation reasoning effort.
@@ -489,7 +489,7 @@ pub(crate) struct SymphonySyncArgs {
     pub(crate) todo_state: String,
 
     /// Codex model used for sync planning analysis
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) planner_model: String,
 
     /// Codex reasoning effort used for sync planning analysis
@@ -536,7 +536,7 @@ pub(crate) struct SymphonyWorkflowArgs {
     pub(crate) poll_interval_ms: u64,
 
     /// Model passed to Codex app-server through quota routing
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
@@ -587,7 +587,7 @@ pub(crate) struct SymphonyRunArgs {
     pub(crate) poll_interval_ms: u64,
 
     /// Model passed to Codex app-server through quota routing
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort passed to Codex app-server through quota routing
@@ -603,7 +603,7 @@ pub(crate) struct SymphonyRunArgs {
     pub(crate) todo_state: String,
 
     /// Codex model used for sync planning analysis when --sync-first is set
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) planner_model: String,
 
     /// Codex reasoning effort used for sync planning analysis when --sync-first is set

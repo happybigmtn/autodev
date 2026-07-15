@@ -42,7 +42,7 @@ pub(crate) async fn run_logged_codex_review(
 ) -> Result<CodexReviewRunSummary> {
     // The function name is historical: it now routes to Claude when the
     // operator picks an opus/sonnet/claude alias for `--review-model`. The
-    // codex path still applies for gpt-5.5 and explicit codex models.
+    // codex path still applies for gpt-5.6-sol and explicit codex models.
     if author_phase_uses_claude_model(model) {
         return run_logged_claude_review(
             repo_root,
@@ -395,7 +395,7 @@ mod tests {
         assert!(author_phase_uses_claude_model("sonnet"));
         assert!(author_phase_uses_claude_model("fable 5"));
         assert!(author_phase_uses_claude_model("fable-5"));
-        assert!(!author_phase_uses_claude_model("gpt-5.5"));
+        assert!(!author_phase_uses_claude_model("gpt-5.6-sol"));
         assert!(!author_phase_uses_claude_model("o3"));
     }
 }

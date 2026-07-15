@@ -161,7 +161,7 @@ Commands:
 ```bash
 cd "$REPO"
 export PROMPT="<operator intent>"
-export MODEL="${MODEL:-gpt-5.5}"
+export MODEL="${MODEL:-gpt-5.6-sol}"
 export PLAN_EFFORT="${PLAN_EFFORT:-xhigh}"
 
 auto doctor
@@ -204,7 +204,7 @@ Commands:
 cd "$REPO"
 export PROMPT="<operator intent>"
 export FOCUS="${FOCUS:-repo-wide production improvement}"
-export MODEL="${MODEL:-gpt-5.5}"
+export MODEL="${MODEL:-gpt-5.6-sol}"
 export PLAN_EFFORT="${PLAN_EFFORT:-xhigh}"
 
 auto doctor
@@ -258,7 +258,7 @@ Commands:
 ```bash
 cd "$REPO"
 export PROMPT="<operator intent>"
-export MODEL="${MODEL:-gpt-5.5}"
+export MODEL="${MODEL:-gpt-5.6-sol}"
 export WORK_EFFORT="${WORK_EFFORT:-high}"
 
 auto design "$PROMPT" \
@@ -311,7 +311,7 @@ Commands:
 
 ```bash
 cd "$REPO"
-export MODEL="${MODEL:-gpt-5.5}"
+export MODEL="${MODEL:-gpt-5.6-sol}"
 export WORK_EFFORT="${WORK_EFFORT:-high}"
 export THREADS="${THREADS:-8}"
 
@@ -348,7 +348,7 @@ Commands:
 
 ```bash
 cd "$REPO"
-export MODEL="${MODEL:-gpt-5.5}"
+export MODEL="${MODEL:-gpt-5.6-sol}"
 export WORK_EFFORT="${WORK_EFFORT:-high}"
 
 auto review \
@@ -799,13 +799,13 @@ cd "$REPO"
 auto audit --everything \
   --everything-threads 15 \
   --remediation-threads "${THREADS:-8}" \
-  --first-pass-model "${MODEL:-gpt-5.5}" \
+  --first-pass-model "${MODEL:-gpt-5.6-sol}" \
   --first-pass-effort "${AUDIT_FIRST_PASS_EFFORT:-low}" \
-  --synthesis-model "${MODEL:-gpt-5.5}" \
+  --synthesis-model "${MODEL:-gpt-5.6-sol}" \
   --synthesis-effort "${WORK_EFFORT:-high}"
 
 auto ship \
-  --model "${MODEL:-gpt-5.5}" \
+  --model "${MODEL:-gpt-5.6-sol}" \
   --reasoning-effort "${WORK_EFFORT:-high}"
 ```
 

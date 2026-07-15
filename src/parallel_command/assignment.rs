@@ -1289,7 +1289,7 @@ mod tests {
         LaneRunConfig {
             claude: false,
             max_turns: None,
-            model: "gpt-5.5".to_string(),
+            model: "gpt-5.6-sol".to_string(),
             reasoning_effort: ceiling.to_string(),
             codex_bin: std::path::PathBuf::from("codex"),
             extra_env: Vec::new(),
@@ -1379,11 +1379,11 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--skip-git-repo-check".to_string(),
                 "-m".to_string(),
-                "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
                 "-c".to_string(),
                 "model_reasoning_effort=\"high\"".to_string(),
             ],
-            model: "gpt-5.5".to_string(),
+            model: "gpt-5.6-sol".to_string(),
             reasoning_effort: "high".to_string(),
             max_turns: None,
         }

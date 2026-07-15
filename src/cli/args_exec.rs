@@ -48,7 +48,7 @@ pub(crate) struct BugArgs {
     pub(crate) dry_run: bool,
 
     /// Model for the initial finder pass
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) finder_model: String,
 
     /// Effort / variant for the initial finder pass
@@ -56,7 +56,7 @@ pub(crate) struct BugArgs {
     pub(crate) finder_effort: String,
 
     /// Model for the adversarial skeptic pass
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) skeptic_model: String,
 
     /// Effort / variant for the skeptic pass
@@ -64,7 +64,7 @@ pub(crate) struct BugArgs {
     pub(crate) skeptic_effort: String,
 
     /// Model for the implementation pass after review verification
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) fixer_model: String,
 
     /// Effort / variant for the implementation pass after review verification
@@ -72,15 +72,15 @@ pub(crate) struct BugArgs {
     pub(crate) fixer_effort: String,
 
     /// Model for the verification review pass
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) reviewer_model: String,
 
     /// Effort / variant for the verification review pass
     #[arg(long, default_value = "high")]
     pub(crate) reviewer_effort: String,
 
-    /// Model for the final Codex review pass. This stays pinned to gpt-5.5.
-    #[arg(long, default_value = "gpt-5.5")]
+    /// Model for the final Codex review pass. This stays pinned to gpt-5.6-sol.
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) finalizer_model: String,
 
     /// Effort / variant for the final Codex review pass. This stays pinned to high.
@@ -115,7 +115,7 @@ pub(crate) struct LoopArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the implementation worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex worker
@@ -178,7 +178,7 @@ pub(crate) struct OrchestrateArgs {
     pub(crate) dashboard: Option<PathBuf>,
 
     /// Model used by execution workers (passed through to `auto loop`).
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort used by execution workers.
@@ -234,7 +234,7 @@ pub(crate) struct ParallelArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the implementation worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the Codex worker
@@ -311,7 +311,7 @@ pub(crate) struct ReviewArgs {
     pub(crate) prompt_file: Option<PathBuf>,
 
     /// Model to use for the review worker
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort to pass through to the review worker
@@ -374,7 +374,7 @@ pub(crate) struct NemesisArgs {
     pub(crate) profile: HardeningProfile,
 
     /// Model for the initial Nemesis audit pass.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) model: String,
 
     /// Reasoning effort / variant for the initial Nemesis audit pass
@@ -382,7 +382,7 @@ pub(crate) struct NemesisArgs {
     pub(crate) reasoning_effort: String,
 
     /// Model for the Nemesis synthesis pass.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) reviewer_model: String,
 
     /// Reasoning effort / variant for the final Nemesis synthesis pass
@@ -411,15 +411,15 @@ pub(crate) struct NemesisArgs {
     pub(crate) dry_run: bool,
 
     /// Model to use for the Nemesis implementation / fixer pass.
-    #[arg(long, default_value = "gpt-5.5")]
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) fixer_model: String,
 
     /// Reasoning effort / variant for the Nemesis implementation pass
     #[arg(long, default_value = "high")]
     pub(crate) fixer_effort: String,
 
-    /// Model used by the final Codex review pass. Stays on gpt-5.5.
-    #[arg(long, default_value = "gpt-5.5")]
+    /// Model used by the final Codex review pass. Stays on gpt-5.6-sol.
+    #[arg(long, default_value = "gpt-5.6-sol")]
     pub(crate) finalizer_model: String,
 
     /// Reasoning effort / variant for the Codex finalizer pass
