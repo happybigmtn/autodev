@@ -1,5 +1,6 @@
 //! Plan-completion harvest: move finished IMPLEMENTATION_PLAN.md rows into the review queue.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -11,7 +12,7 @@ use crate::review_command::queue::{
     ensure_trailing_blank_line, EMPTY_COMPLETED_DOC, REVIEW_HEADER,
 };
 use crate::task_parser::{
-    parse_task_header as parse_shared_task_header, validate_execution_rows, TaskStatus,
+    parse_task_header as parse_shared_task_header, parse_tasks, validate_execution_rows, TaskStatus,
 };
 use crate::util::{atomic_write, git_stdout};
 use crate::verification_lint::verify_commands_are_runnable;
@@ -114,27 +115,42 @@ pub(crate) fn extract_completed_plan_items(plan_text: &str) -> (String, Vec<Comp
         pending: &mut Option<PendingBlock>,
         kept_lines: &mut Vec<String>,
         completed_items: &mut Vec<CompletedPlanItem>,
+        retained_dependency_ids: &HashSet<String>,
     ) {
         let Some(block) = pending.take() else {
             return;
         };
         if let Some(task_id) = block.completed_task_id {
-            completed_items.push(CompletedPlanItem {
-                task_id,
-                markdown: block.lines.join("\n"),
-            });
+            if retained_dependency_ids.contains(&task_id) {
+                kept_lines.extend(block.lines);
+            } else {
+                completed_items.push(CompletedPlanItem {
+                    task_id,
+                    markdown: block.lines.join("\n"),
+                });
+            }
         } else {
             kept_lines.extend(block.lines);
         }
     }
 
+    let retained_dependency_ids: HashSet<String> = parse_tasks(plan_text)
+        .into_iter()
+        .filter(|task| task.status != TaskStatus::Done)
+        .flat_map(|task| task.dependencies)
+        .collect();
     let mut kept_lines = Vec::new();
     let mut completed_items = Vec::new();
     let mut pending = None::<PendingBlock>;
 
     for line in plan_text.lines() {
         if is_top_level_plan_task_header(line) {
-            flush(&mut pending, &mut kept_lines, &mut completed_items);
+            flush(
+                &mut pending,
+                &mut kept_lines,
+                &mut completed_items,
+                &retained_dependency_ids,
+            );
             pending = Some(PendingBlock {
                 completed_task_id: completed_plan_task_id(line),
                 lines: vec![line.to_string()],
@@ -148,7 +164,12 @@ pub(crate) fn extract_completed_plan_items(plan_text: &str) -> (String, Vec<Comp
             kept_lines.push(line.to_string());
         }
     }
-    flush(&mut pending, &mut kept_lines, &mut completed_items);
+    flush(
+        &mut pending,
+        &mut kept_lines,
+        &mut completed_items,
+        &retained_dependency_ids,
+    );
 
     let mut updated = kept_lines.join("\n");
     if plan_text.ends_with('\n') {
@@ -293,6 +314,16 @@ mod tests {
         assert_eq!(completed[0].task_id, "TASK-1");
         assert!(completed[0].markdown.contains("Verification"));
         assert!(!updated.contains("TASK-1"));
+        assert!(updated.contains("TASK-2"));
+    }
+
+    #[test]
+    fn keeps_completed_tasks_referenced_by_unfinished_dependencies() {
+        let plan = "# Plan\n\n- [x] `TASK-1` Required foundation\n  Verification: `cargo test one`\n\n- [ ] `TASK-2` Open dependent\n  Dependencies: `TASK-1`\n  Verification: `cargo test two`\n";
+        let (updated, completed) = extract_completed_plan_items(plan);
+
+        assert!(completed.is_empty());
+        assert!(updated.contains("TASK-1"));
         assert!(updated.contains("TASK-2"));
     }
 
