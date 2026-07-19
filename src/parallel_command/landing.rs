@@ -1,5 +1,8 @@
 use super::*;
 
+pub(crate) const LANDING_REBASE_RETRY_LIMIT: usize = 5;
+pub(crate) const LANDING_PUSH_RETRY_LIMIT: usize = 5;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_spawn_lane_recovery_attempt(
     join_set: &mut JoinSet<LaneAttemptResult>,
@@ -782,7 +785,7 @@ pub(crate) async fn land_parallel_lane_result(
     review_config: &LaneReviewConfig,
 ) -> Result<LaneLandingOutcome> {
     let mut auto_repaired = false;
-    let mut canonical_checkpointed = false;
+    let mut rebase_retries = 0usize;
     let (final_lane_head, final_range_base) = loop {
         let lane_head = git_stdout(&assignment.lane_repo_root, ["rev-parse", "HEAD"])?;
         let lane_head = lane_head.trim().to_string();
@@ -801,8 +804,7 @@ pub(crate) async fn land_parallel_lane_result(
                 "FETCH_HEAD",
                 CherryPickFailurePolicy::Abort,
             ) {
-                if !canonical_checkpointed
-                    && landing_error_suggests_dirty_canonical_worktree(&err)
+                if landing_error_suggests_dirty_canonical_worktree(&err)
                     && try_auto_checkpoint_canonical_for_landing(
                         repo_root,
                         target_branch,
@@ -810,17 +812,16 @@ pub(crate) async fn land_parallel_lane_result(
                         "before retrying lane landing against local canonical changes",
                     )?
                 {
-                    canonical_checkpointed = true;
                     continue;
                 }
-                if auto_repaired {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "failed landing lane-{} task `{}` from {} after host auto-repair",
+                if rebase_retries >= LANDING_REBASE_RETRY_LIMIT {
+                    return Ok(LaneLandingOutcome::DivergenceExhausted {
+                        detail: format!(
+                            "landing-divergence: lane-{} `{}` still could not land after {} fresh canonical rebase retries: {err:#}",
                             assignment.lane_index,
                             assignment.task.id,
-                            assignment.lane_repo_root.display()
-                        )
+                            LANDING_REBASE_RETRY_LIMIT,
+                        ),
                     });
                 }
                 match prepare_lane_landing_recovery(
@@ -836,11 +837,34 @@ pub(crate) async fn land_parallel_lane_result(
                     )
                 })? {
                     LaneLandingRecoveryPrep::RebasedCleanly => {
+                        rebase_retries += 1;
                         auto_repaired = true;
+                        let event = format!(
+                            "landing-rebase-retry: rebased committed lane work onto fresh canonical HEAD {} and retrying landing ({}/{})",
+                            assignment.base_commit,
+                            rebase_retries,
+                            LANDING_REBASE_RETRY_LIMIT
+                        );
+                        eprintln!(
+                            "lane-{} `{}`: {event}",
+                            assignment.lane_index, assignment.task.id
+                        );
+                        append_lane_host_event(
+                            &assignment.stdout_log_path,
+                            assignment.lane_index,
+                            &assignment.task.id,
+                            &event,
+                        );
                         continue;
                     }
-                    LaneLandingRecoveryPrep::NeedsWorkerResolution(recovery_note) => {
-                        return Ok(LaneLandingOutcome::NeedsRecovery(recovery_note));
+                    LaneLandingRecoveryPrep::NeedsWorkerResolution {
+                        recovery_note,
+                        conflict_paths,
+                    } => {
+                        return Ok(LaneLandingOutcome::NeedsRecovery {
+                            recovery_note,
+                            conflict_paths,
+                        });
                     }
                 }
             }
@@ -950,8 +974,24 @@ pub(crate) async fn land_parallel_lane_result(
         );
         commit_task_closeout(repo_root, &assignment.task.id, &message, false)?;
     }
-    if push_branch_with_remote_sync(repo_root, target_branch)? {
-        println!("remote sync: rebased onto origin/{}", target_branch);
+    match push_parallel_landing_with_divergence_retries(
+        repo_root,
+        target_branch,
+        assignment,
+    ) {
+        Ok(true) => println!("remote sync: rebased onto origin/{}", target_branch),
+        Ok(false) => {}
+        Err(err) if landing_error_suggests_retryable_divergence(&err) => {
+            return Ok(LaneLandingOutcome::DivergenceExhausted {
+                detail: format!(
+                    "landing-divergence: lane-{} `{}` landed locally but remote synchronization still diverged after {} fresh fetch/rebase retries: {err:#}",
+                    assignment.lane_index,
+                    assignment.task.id,
+                    LANDING_PUSH_RETRY_LIMIT,
+                ),
+            });
+        }
+        Err(err) => return Err(err),
     }
     Ok(LaneLandingOutcome::Landed {
         auto_repaired,
@@ -2214,6 +2254,58 @@ pub(crate) fn recover_shelved_tasks_from_canonical_evidence(
     Ok(recovered.len())
 }
 
+/// Re-examine only shelves explicitly classified as landing divergence. These
+/// tasks were not rejected by a completion gate, so a passing host re-execution
+/// at the current canonical HEAD is sufficient to remove the stale scheduling
+/// poison. Conflict and legacy/gate-failure shelves are deliberately ignored.
+pub(crate) async fn auto_unshelve_landing_divergence_tasks(
+    repo_root: &Path,
+    state: &mut ParallelRunState,
+    parallel_logger: &ParallelEventLogger,
+) -> usize {
+    let candidates = state
+        .shelved_tasks
+        .iter()
+        .filter_map(|(task_id, entry)| {
+            entry.details().and_then(|details| {
+                (details.failure_reason == ShelvedTaskFailureReason::LandingDivergence)
+                    .then(|| (task_id.clone(), details.markdown.clone()))
+            })
+        })
+        .collect::<Vec<_>>();
+    let current_head = current_repo_head(repo_root).unwrap_or_else(|| "unknown".to_string());
+    let mut recovered = 0usize;
+
+    for (task_id, markdown) in candidates {
+        parallel_logger.info(format!(
+            "resume: re-verifying landing-divergence shelf `{task_id}` against canonical HEAD {current_head}"
+        ));
+        match run_lane_verify_gate(repo_root, &task_id, &markdown).await {
+            LaneVerifyOutcome::AllPassed => {
+                state.shelved_tasks.remove(&task_id);
+                state.unblock_attempt_counts.remove(&task_id);
+                state.attempted_partial_followups.remove(&task_id);
+                recovered += 1;
+                parallel_logger.info(format!(
+                    "auto-unshelve: `{task_id}` was shelved only for landing-divergence; current-HEAD verification passed, so it is dependency-ready again"
+                ));
+            }
+            LaneVerifyOutcome::Failed { detail } => {
+                parallel_logger.warn(format!(
+                    "resume: keeping landing-divergence shelf `{task_id}` because current-HEAD verification failed: {detail}"
+                ));
+            }
+            LaneVerifyOutcome::Skipped { reason } => {
+                parallel_logger.warn(format!(
+                    "resume: keeping landing-divergence shelf `{task_id}` because current-HEAD verification could not produce a pass: {reason}"
+                ));
+            }
+        }
+    }
+
+    recovered
+}
+
 pub(crate) fn write_clean_no_commit_verdict(
     assignment: &ActiveLaneAssignment,
     verdict: &str,
@@ -2356,9 +2448,14 @@ pub(crate) fn prepare_lane_landing_recovery(
         CherryPickFailurePolicy::LeaveInProgress,
     ) {
         Ok(()) => Ok(LaneLandingRecoveryPrep::RebasedCleanly),
-        Err(err) => Ok(LaneLandingRecoveryPrep::NeedsWorkerResolution(
-            prepared_landing_recovery_note(target_branch, landing_error, &format!("{err:#}")),
-        )),
+        Err(err) => Ok(LaneLandingRecoveryPrep::NeedsWorkerResolution {
+            recovery_note: prepared_landing_recovery_note(
+                target_branch,
+                landing_error,
+                &format!("{err:#}"),
+            ),
+            conflict_paths: unmerged_conflict_paths(&assignment.lane_repo_root),
+        }),
     }
 }
 
@@ -2422,6 +2519,98 @@ pub(crate) fn cherry_pick_lane_range(
         repo_root.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
+}
+
+pub(crate) fn unmerged_conflict_paths(repo_root: &Path) -> Vec<String> {
+    let Ok(paths) = git_stdout(repo_root, ["diff", "--name-only", "--diff-filter=U"]) else {
+        return Vec::new();
+    };
+    let mut paths = paths
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Remote branch movement can race the post-landing push even after the lane
+/// commits were integrated locally. Each retry goes through
+/// `push_branch_with_remote_sync`, which fetches/rebases onto a fresh remote
+/// branch before pushing. Real rebase conflicts are not considered retryable.
+pub(crate) fn push_parallel_landing_with_divergence_retries(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+) -> Result<bool> {
+    let mut retries = 0usize;
+    loop {
+        match push_branch_with_remote_sync(repo_root, target_branch) {
+            Ok(synced) => return Ok(synced),
+            Err(err)
+                if landing_error_suggests_retryable_divergence(&err)
+                    && retries < LANDING_PUSH_RETRY_LIMIT =>
+            {
+                retries += 1;
+                let event = format!(
+                    "landing-push-retry: canonical remote moved; fetched/rebased fresh HEAD and retrying push ({retries}/{LANDING_PUSH_RETRY_LIMIT}): {err:#}"
+                );
+                eprintln!(
+                    "lane-{} `{}`: {event}",
+                    assignment.lane_index, assignment.task.id
+                );
+                append_lane_host_event(
+                    &assignment.stdout_log_path,
+                    assignment.lane_index,
+                    &assignment.task.id,
+                    &event,
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+pub(crate) fn landing_error_suggests_retryable_divergence(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    (message.contains("non-fast-forward")
+        || message.contains("fetch first")
+        || message.contains("failed to push some refs")
+        || message.contains("cannot lock ref")
+        || message.contains("stale info")
+        || message.contains("failed to update ref"))
+        && !message.contains("aborted conflicted rebase")
+        && !message.contains("merge conflict")
+        && !message.contains("could not apply")
+}
+
+/// Best-effort extraction for conflicts reported by a failed remote rebase.
+/// The normal lane recovery path reads unmerged paths directly from Git; this
+/// parser covers errors whose rebase was already aborted by the sync helper.
+pub(crate) fn conflict_paths_from_landing_error(err: &anyhow::Error) -> Vec<String> {
+    let message = format!("{err:#}");
+    let mut paths = Vec::new();
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if let Some((_, path)) = trimmed.rsplit_once("Merge conflict in ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+        } else if let Some(path) = trimmed.strip_prefix("CONFLICT ") {
+            if let Some((_, path)) = path.rsplit_once(": ") {
+                let path = path.trim();
+                if !path.is_empty() {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Whether `AUTO_PARALLEL_LANDING_AUTOSTASH=1` is set (opt-in dirty-tree landing).
@@ -3392,6 +3581,88 @@ mod tests {
     }
 
     #[test]
+    fn landing_rebase_retry_budget_refreshes_canonical_head_five_times() {
+        let (root, remote, upstream, _worker) =
+            init_remote_and_clones("parallel-landing-recovery-five", "main");
+        let lane = root.join("lane-five");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane, ["config", "user.email", "autodev@example.com"]);
+        run_git_in(&lane, ["remote", "rename", "origin", "canonical"]);
+
+        let base_commit = git_output(&lane, ["rev-parse", "HEAD"]);
+        fs::write(lane.join("lane.txt"), "task result\n").expect("write lane task file");
+        run_git_in(&lane, ["add", "lane.txt"]);
+        run_git_in(&lane, ["commit", "-m", "lane task"]);
+
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: "TASK-FIVE".to_string(),
+                title: "five fresh rebases".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: "- [ ] `TASK-FIVE` five fresh rebases\n".to_string(),
+            },
+            resumed: false,
+            lane_root: root.join("lane-five-root"),
+            lane_repo_root: lane.clone(),
+            base_commit,
+            stdout_log_path: root.join("lane-five.stdout.log"),
+            stderr_log_path: root.join("lane-five.stderr.log"),
+            worker_pid_path: root.join("lane-five.worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+
+        assert_eq!(LANDING_REBASE_RETRY_LIMIT, 5);
+        for retry in 1..=LANDING_REBASE_RETRY_LIMIT {
+            let canonical_file = format!("canonical-{retry}.txt");
+            fs::write(upstream.join(&canonical_file), format!("canonical {retry}\n"))
+                .expect("write canonical file");
+            run_git_in(&upstream, ["add", canonical_file.as_str()]);
+            run_git_in(
+                &upstream,
+                ["commit", "-m", format!("canonical move {retry}").as_str()],
+            );
+            run_git_in(&upstream, ["push", "origin", "main"]);
+            let fresh_head = git_output(&upstream, ["rev-parse", "HEAD"]);
+            let range_base = assignment.base_commit.clone();
+
+            let prep = prepare_lane_landing_recovery(
+                &mut assignment,
+                "main",
+                &range_base,
+                "canonical moved during landing",
+            )
+            .expect("fresh landing rebase should prepare");
+            assert_eq!(prep, LaneLandingRecoveryPrep::RebasedCleanly);
+            assert_eq!(assignment.base_commit, fresh_head);
+            assert_eq!(
+                fs::read_to_string(lane.join("lane.txt")).expect("read lane task file"),
+                "task result\n"
+            );
+            assert_eq!(run_git_in(&lane, ["status", "--short"]), "");
+        }
+
+        fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[test]
     fn cherry_pick_lane_range_treats_empty_tree_diff_as_already_applied() {
         let (root, remote, _upstream, worker) =
             init_remote_and_clones("parallel-empty-lane-commit", "main");
@@ -3502,8 +3773,11 @@ mod tests {
             "git cherry-pick failed",
         )
         .expect("landing recovery should prepare");
-        let note = match prep {
-            LaneLandingRecoveryPrep::NeedsWorkerResolution(note) => note,
+        let (note, conflict_paths) = match prep {
+            LaneLandingRecoveryPrep::NeedsWorkerResolution {
+                recovery_note,
+                conflict_paths,
+            } => (recovery_note, conflict_paths),
             other => panic!("expected worker-resolution prep, got {other:?}"),
         };
         assert_eq!(assignment.base_commit, remote_head);
@@ -3513,12 +3787,88 @@ mod tests {
         assert!(lane_repo_status_summary(&lane).contains("cherry-pick recovery"));
         assert!(note.contains("landing-recovery mode"));
         assert!(note.contains("cherry-pick --continue"));
+        assert_eq!(conflict_paths, vec!["shared.txt".to_string()]);
 
         let resumed = lane_repo_recovery_note(&lane, "main", status.trim());
         assert!(resumed.contains("in-progress landing-recovery cherry-pick"));
         assert!(resumed.contains("shared.txt"));
 
         fs::remove_dir_all(&root).expect("failed to remove temp repo");
+    }
+
+    #[tokio::test]
+    async fn startup_auto_unshelves_only_passing_landing_divergence_tasks() {
+        let repo_root = unique_temp_dir("parallel-auto-unshelve-repo");
+        let run_root = unique_temp_dir("parallel-auto-unshelve-run");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
+
+        let passing_markdown =
+            "- [~] `TASK-PASS` pass\n\nVerification:\n- Run `bash -c true`\n".to_string();
+        let failing_markdown =
+            "- [~] `TASK-FAIL` fail\n\nVerification:\n- Run `bash -c false`\n".to_string();
+        let conflict_markdown =
+            "- [~] `TASK-CONFLICT` conflict\n\nVerification:\n- Run `bash -c true`\n"
+                .to_string();
+        let legacy_markdown =
+            "- [~] `TASK-GATE` gate failure\n\nVerification:\n- Run `bash -c true`\n"
+                .to_string();
+        let mut state = ParallelRunState::default();
+        state.shelved_tasks.insert(
+            "TASK-PASS".to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown: passing_markdown,
+                failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                conflict_paths: Vec::new(),
+                detail: Some("canonical moved".to_string()),
+            }),
+        );
+        state.shelved_tasks.insert(
+            "TASK-FAIL".to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown: failing_markdown,
+                failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                conflict_paths: Vec::new(),
+                detail: Some("canonical moved".to_string()),
+            }),
+        );
+        state.shelved_tasks.insert(
+            "TASK-CONFLICT".to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown: conflict_markdown,
+                failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                conflict_paths: vec!["src/lib.rs".to_string()],
+                detail: Some("same hunk".to_string()),
+            }),
+        );
+        state.shelved_tasks.insert(
+            "TASK-GATE".to_string(),
+            ShelvedTaskState::Legacy(legacy_markdown),
+        );
+        state.unblock_attempt_counts.insert("TASK-PASS".to_string(), 3);
+        state
+            .attempted_partial_followups
+            .insert("TASK-PASS".to_string(), 2);
+
+        let recovered =
+            auto_unshelve_landing_divergence_tasks(&repo_root, &mut state, &logger).await;
+
+        assert_eq!(recovered, 1);
+        assert!(!state.shelved_tasks.contains_key("TASK-PASS"));
+        assert!(!state.unblock_attempt_counts.contains_key("TASK-PASS"));
+        assert!(!state
+            .attempted_partial_followups
+            .contains_key("TASK-PASS"));
+        assert!(state.shelved_tasks.contains_key("TASK-FAIL"));
+        assert!(state.shelved_tasks.contains_key("TASK-CONFLICT"));
+        assert!(state.shelved_tasks.contains_key("TASK-GATE"));
+        let log = fs::read_to_string(run_root.join("live.log")).expect("read live log");
+        assert!(log.contains("auto-unshelve: `TASK-PASS`"));
+        assert!(log.contains("keeping landing-divergence shelf `TASK-FAIL`"));
+
+        fs::remove_dir_all(&repo_root).expect("remove repo root");
+        fs::remove_dir_all(&run_root).expect("remove run root");
     }
 
     #[test]

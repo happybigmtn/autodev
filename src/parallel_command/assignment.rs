@@ -474,13 +474,22 @@ pub(crate) enum LaneLandingOutcome {
         auto_repaired: bool,
         completion_status: LoopTaskStatus,
     },
-    NeedsRecovery(String),
+    NeedsRecovery {
+        recovery_note: String,
+        conflict_paths: Vec<String>,
+    },
+    DivergenceExhausted {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum LaneLandingRecoveryPrep {
     RebasedCleanly,
-    NeedsWorkerResolution(String),
+    NeedsWorkerResolution {
+        recovery_note: String,
+        conflict_paths: Vec<String>,
+    },
 }
 
 pub(crate) fn next_free_lane_index(
@@ -929,10 +938,19 @@ pub(crate) async fn harvest_resumable_lane_results(
                     landed
                 ));
             }
-            Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+            Ok(LaneLandingOutcome::NeedsRecovery {
+                recovery_note,
+                conflict_paths,
+            }) => {
                 parallel_logger.warn(format!(
-                    "warning: resume harvest for lane-{} `{}` prepared a landing-recovery attempt instead of landing; keeping lane resumable",
-                    assignment.lane_index, assignment.task.id
+                    "warning: resume harvest for lane-{} `{}` prepared a landing-recovery attempt instead of landing; keeping lane resumable; conflict paths: {}",
+                    assignment.lane_index,
+                    assignment.task.id,
+                    if conflict_paths.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        conflict_paths.join(", ")
+                    }
                 ));
                 resumable_lanes.insert(
                     lane_index,
@@ -946,6 +964,26 @@ pub(crate) async fn harvest_resumable_lane_results(
                         stderr_log_path: assignment.stderr_log_path,
                         worker_pid_path: assignment.worker_pid_path,
                         host_recovery_note: Some(recovery_note),
+                    },
+                );
+            }
+            Ok(LaneLandingOutcome::DivergenceExhausted { detail }) => {
+                parallel_logger.warn(format!(
+                    "warning: resume harvest for lane-{} `{}` exhausted bounded landing-divergence retries; keeping lane resumable: {}",
+                    assignment.lane_index, assignment.task.id, detail
+                ));
+                resumable_lanes.insert(
+                    lane_index,
+                    LaneResumeCandidate {
+                        lane_index: assignment.lane_index,
+                        task: assignment.task,
+                        lane_root: assignment.lane_root,
+                        lane_repo_root: assignment.lane_repo_root,
+                        base_commit: assignment.base_commit,
+                        stdout_log_path: assignment.stdout_log_path,
+                        stderr_log_path: assignment.stderr_log_path,
+                        worker_pid_path: assignment.worker_pid_path,
+                        host_recovery_note: Some(landing_recovery_note(target_branch, &detail)),
                     },
                 );
             }

@@ -149,11 +149,61 @@ pub(crate) fn clear_completed_sweep_fingerprint(run_root: &Path) {
 /// Snapshot of the host's per-run scheduling bookkeeping. Field names are stable
 /// (serialized to disk); add new fields with `#[serde(default)]` to stay
 /// backward-compatible with ledgers written by older binaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum ShelvedTaskFailureReason {
+    #[serde(rename = "landing-divergence")]
+    LandingDivergence,
+    #[serde(rename = "landing-conflict")]
+    LandingConflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ShelvedTaskDetails {
+    pub(crate) markdown: String,
+    pub(crate) failure_reason: ShelvedTaskFailureReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) conflict_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+/// Old ledgers stored `task id -> markdown string`. Keep accepting and emitting
+/// that shape for every unclassified/gate/worker shelf so their behavior and
+/// operator surface remain unchanged. Only classified landing failures use the
+/// detailed object form needed for safe startup recovery and conflict diagnosis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ShelvedTaskState {
+    Legacy(String),
+    Detailed(ShelvedTaskDetails),
+}
+
+impl ShelvedTaskState {
+    pub(crate) fn markdown(&self) -> &str {
+        match self {
+            Self::Legacy(markdown) => markdown,
+            Self::Detailed(details) => &details.markdown,
+        }
+    }
+
+    pub(crate) fn details(&self) -> Option<&ShelvedTaskDetails> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Detailed(details) => Some(details),
+        }
+    }
+
+    fn is_classified_landing_failure(&self) -> bool {
+        self.details().is_some()
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ParallelRunState {
-    /// task id -> task markdown at shelve time ("don't redispatch this run").
+    /// task id -> task markdown/details at shelve time ("don't redispatch this run").
+    /// Legacy string values remain valid for backward compatibility.
     #[serde(default)]
-    pub(crate) shelved_tasks: BTreeMap<String, String>,
+    pub(crate) shelved_tasks: BTreeMap<String, ShelvedTaskState>,
     /// Partial tasks parked for the run after exhausting in-run follow-ups.
     #[serde(default)]
     pub(crate) deferred_partial_tasks: BTreeSet<String>,
@@ -275,12 +325,41 @@ pub(crate) fn auto_clear_shelved_on_head_change(
     if prev == now {
         return 0;
     }
-    let cleared = state.shelved_tasks.len() + state.deferred_partial_tasks.len();
-    state.shelved_tasks.clear();
+    let prior_shelved = state.shelved_tasks.len();
+    let prior_deferred = state.deferred_partial_tasks.len();
+    // Preserve classified landing shelves for the reason-aware startup pass:
+    // divergence entries must prove their gate before unshelving, while real
+    // conflicts must remain shelved for operator/worker resolution. Legacy
+    // entries retain the pre-existing HEAD-advanced auto-clear behavior.
+    state
+        .shelved_tasks
+        .retain(|_, entry| entry.is_classified_landing_failure());
+    let retained_ids = state.shelved_tasks.keys().cloned().collect::<BTreeSet<_>>();
     state.deferred_partial_tasks.clear();
-    state.unblock_attempt_counts.clear();
-    state.attempted_partial_followups.clear();
-    cleared
+    state
+        .unblock_attempt_counts
+        .retain(|task_id, _| retained_ids.contains(task_id));
+    state
+        .attempted_partial_followups
+        .retain(|task_id, _| retained_ids.contains(task_id));
+    prior_shelved - state.shelved_tasks.len() + prior_deferred
+}
+
+pub(crate) fn split_shelved_task_state(
+    entries: BTreeMap<String, ShelvedTaskState>,
+) -> (
+    BTreeMap<String, String>,
+    BTreeMap<String, ShelvedTaskDetails>,
+) {
+    let mut markdown = BTreeMap::new();
+    let mut details = BTreeMap::new();
+    for (task_id, entry) in entries {
+        markdown.insert(task_id.clone(), entry.markdown().to_string());
+        if let ShelvedTaskState::Detailed(entry_details) = entry {
+            details.insert(task_id, entry_details);
+        }
+    }
+    (markdown, details)
 }
 
 /// Persist the current scheduling bookkeeping. Best-effort: a write error is
@@ -293,10 +372,12 @@ pub(crate) fn auto_clear_shelved_on_head_change(
 /// crash-safety — every REAL state transition (a shelve, a follow-up attempt, a
 /// landed commit advancing HEAD) changes the serialization and is written
 /// immediately. Returns `true` when a write happened.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_parallel_run_state_if_changed(
     last_serialized: &mut Option<String>,
     run_root: &Path,
     shelved_tasks: &BTreeMap<String, String>,
+    shelved_task_details: &BTreeMap<String, ShelvedTaskDetails>,
     deferred_partial_tasks: &BTreeSet<String>,
     unblock_attempt_counts: &BTreeMap<String, usize>,
     attempted_partial_followups: &BTreeMap<String, usize>,
@@ -304,6 +385,7 @@ pub(crate) fn save_parallel_run_state_if_changed(
 ) -> bool {
     let Some(json) = serialize_run_state(
         shelved_tasks,
+        shelved_task_details,
         deferred_partial_tasks,
         unblock_attempt_counts,
         attempted_partial_followups,
@@ -324,13 +406,28 @@ pub(crate) fn save_parallel_run_state_if_changed(
 
 fn serialize_run_state(
     shelved_tasks: &BTreeMap<String, String>,
+    shelved_task_details: &BTreeMap<String, ShelvedTaskDetails>,
     deferred_partial_tasks: &BTreeSet<String>,
     unblock_attempt_counts: &BTreeMap<String, usize>,
     attempted_partial_followups: &BTreeMap<String, usize>,
     head_at_save: Option<&str>,
 ) -> Option<String> {
+    let shelved_tasks = shelved_tasks
+        .iter()
+        .map(|(task_id, markdown)| {
+            let state = match shelved_task_details.get(task_id) {
+                Some(details) => {
+                    let mut details = details.clone();
+                    details.markdown.clone_from(markdown);
+                    ShelvedTaskState::Detailed(details)
+                }
+                None => ShelvedTaskState::Legacy(markdown.clone()),
+            };
+            (task_id.clone(), state)
+        })
+        .collect();
     let state = ParallelRunState {
-        shelved_tasks: shelved_tasks.clone(),
+        shelved_tasks,
         deferred_partial_tasks: deferred_partial_tasks.clone(),
         unblock_attempt_counts: unblock_attempt_counts.clone(),
         attempted_partial_followups: attempted_partial_followups.clone(),
@@ -495,13 +592,17 @@ mod tests {
             &mut None,
             &dir,
             &shelved,
+            &BTreeMap::new(),
             &deferred,
             &unblock,
             &followups,
             Some("abc123"),
         );
         let restored = load_parallel_run_state(&dir);
-        assert_eq!(restored.shelved_tasks, shelved);
+        let (restored_shelved, restored_details) =
+            split_shelved_task_state(restored.shelved_tasks.clone());
+        assert_eq!(restored_shelved, shelved);
+        assert!(restored_details.is_empty());
         assert_eq!(restored.deferred_partial_tasks, deferred);
         assert_eq!(restored.unblock_attempt_counts, unblock);
         assert_eq!(restored.attempted_partial_followups, followups);
@@ -509,6 +610,44 @@ mod tests {
 
         clear_parallel_run_state(&dir);
         assert!(load_parallel_run_state(&dir).shelved_tasks.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detailed_landing_conflict_shelf_round_trips_paths_in_shelf_entry() {
+        let dir = temp_dir("landing-conflict-roundtrip");
+        let markdown = "- [~] `TASK-CONFLICT` conflict\n".to_string();
+        let shelved = BTreeMap::from([("TASK-CONFLICT".to_string(), markdown.clone())]);
+        let details = BTreeMap::from([(
+            "TASK-CONFLICT".to_string(),
+            ShelvedTaskDetails {
+                markdown: markdown.clone(),
+                failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                conflict_paths: vec!["src/lib.rs".to_string(), "src/state.rs".to_string()],
+                detail: Some("same-hunk conflict".to_string()),
+            },
+        )]);
+
+        assert!(save_parallel_run_state_if_changed(
+            &mut None,
+            &dir,
+            &shelved,
+            &details,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some("abc123"),
+        ));
+
+        let raw = std::fs::read_to_string(run_state_path(&dir)).expect("read ledger");
+        assert!(raw.contains("\"failure_reason\": \"landing-conflict\""));
+        assert!(raw.contains("\"src/lib.rs\""));
+        let restored = load_parallel_run_state(&dir);
+        let (restored_shelved, restored_details) =
+            split_shelved_task_state(restored.shelved_tasks);
+        assert_eq!(restored_shelved, shelved);
+        assert_eq!(restored_details, details);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -525,25 +664,47 @@ mod tests {
 
         // First call writes and records the serialization.
         let wrote = save_parallel_run_state_if_changed(
-            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h1"),
+            &mut cache,
+            &dir,
+            &shelved,
+            &BTreeMap::new(),
+            &deferred,
+            &unblock,
+            &followups,
+            Some("h1"),
         );
         assert!(wrote, "first persist must write");
         assert!(path.exists());
 
         // Identical state: no write, cache unchanged.
         let wrote = save_parallel_run_state_if_changed(
-            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h1"),
+            &mut cache,
+            &dir,
+            &shelved,
+            &BTreeMap::new(),
+            &deferred,
+            &unblock,
+            &followups,
+            Some("h1"),
         );
         assert!(!wrote, "unchanged state must not rewrite the ledger");
 
         // A real change (HEAD advanced) writes again and round-trips.
         let wrote = save_parallel_run_state_if_changed(
-            &mut cache, &dir, &shelved, &deferred, &unblock, &followups, Some("h2"),
+            &mut cache,
+            &dir,
+            &shelved,
+            &BTreeMap::new(),
+            &deferred,
+            &unblock,
+            &followups,
+            Some("h2"),
         );
         assert!(wrote, "changed HEAD must rewrite the ledger");
         let restored = load_parallel_run_state(&dir);
         assert_eq!(restored.head_at_save.as_deref(), Some("h2"));
-        assert_eq!(restored.shelved_tasks, shelved);
+        let (restored_shelved, _) = split_shelved_task_state(restored.shelved_tasks);
+        assert_eq!(restored_shelved, shelved);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -619,7 +780,10 @@ mod tests {
         let mut state = ParallelRunState::default();
         state
             .shelved_tasks
-            .insert("TASK-006".to_string(), "task md".to_string());
+            .insert(
+                "TASK-006".to_string(),
+                ShelvedTaskState::Legacy("task md".to_string()),
+            );
         state.deferred_partial_tasks.insert("TASK-001".to_string());
         state.unblock_attempt_counts.insert("TASK-006".to_string(), 4);
         state
@@ -647,7 +811,10 @@ mod tests {
         };
         state
             .shelved_tasks
-            .insert("TASK-9".to_string(), "task md".to_string());
+            .insert(
+                "TASK-9".to_string(),
+                ShelvedTaskState::Legacy("task md".to_string()),
+            );
         state.deferred_partial_tasks.insert("TASK-8".to_string());
         state.unblock_attempt_counts.insert("TASK-9".to_string(), 3);
         state
@@ -665,6 +832,35 @@ mod tests {
         assert!(state.deferred_partial_tasks.is_empty());
         assert!(state.unblock_attempt_counts.is_empty());
         assert!(state.attempted_partial_followups.is_empty());
+    }
+
+    #[test]
+    fn autoclear_preserves_reason_aware_landing_shelves_for_startup_gate() {
+        let mut state = shelved_state_at("oldsha");
+        state.shelved_tasks.insert(
+            "TASK-DIVERGED".to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown: "- [~] `TASK-DIVERGED` t\n".to_string(),
+                failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                conflict_paths: Vec::new(),
+                detail: Some("retry budget exhausted".to_string()),
+            }),
+        );
+        state.shelved_tasks.insert(
+            "TASK-CONFLICT".to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown: "- [~] `TASK-CONFLICT` t\n".to_string(),
+                failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                conflict_paths: vec!["src/lib.rs".to_string()],
+                detail: None,
+            }),
+        );
+
+        let cleared = auto_clear_shelved_on_head_change(&mut state, Some("newsha"), false);
+        assert_eq!(cleared, 2, "legacy shelf + deferred task retain old behavior");
+        assert_eq!(state.shelved_tasks.len(), 2);
+        assert!(state.shelved_tasks.contains_key("TASK-DIVERGED"));
+        assert!(state.shelved_tasks.contains_key("TASK-CONFLICT"));
     }
 
     #[test]

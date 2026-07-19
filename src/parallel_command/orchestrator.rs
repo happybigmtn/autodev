@@ -420,7 +420,19 @@ pub(crate) async fn run_parallel_loop(
             "resume: HEAD advanced since the last run; auto-retrying {auto_cleared} shelved/deferred task(s) whose transient blocker plausibly resolved (set AUTO_PARALLEL_AUTOCLEAR_SHELVED=0 to disable)"
         ));
     }
-    let mut shelved_tasks = restored_run_state.shelved_tasks;
+    let auto_unshelved = auto_unshelve_landing_divergence_tasks(
+        repo_root,
+        &mut restored_run_state,
+        parallel_logger,
+    )
+    .await;
+    if auto_unshelved > 0 {
+        parallel_logger.info(format!(
+            "resume: auto-unshelved {auto_unshelved} landing-divergence task(s) after current-HEAD verification passed"
+        ));
+    }
+    let (mut shelved_tasks, mut shelved_task_details) =
+        split_shelved_task_state(restored_run_state.shelved_tasks);
     let mut attempted_partial_followups = restored_run_state.attempted_partial_followups;
     let mut deferred_partial_tasks = restored_run_state.deferred_partial_tasks;
     let mut unblock_attempt_counts = restored_run_state.unblock_attempt_counts;
@@ -525,6 +537,11 @@ pub(crate) async fn run_parallel_loop(
                 .find(|task| task.id == *task_id)
                 .is_some_and(|task| task.markdown == *markdown)
         });
+        shelved_task_details.retain(|task_id, details| {
+            shelved_tasks
+                .get(task_id)
+                .is_some_and(|markdown| markdown == &details.markdown)
+        });
         attempted_partial_followups.retain(|task_id, _count| {
             plan.tasks
                 .iter()
@@ -551,6 +568,7 @@ pub(crate) async fn run_parallel_loop(
             &mut last_persisted_run_state,
             run_root,
             &shelved_tasks,
+            &shelved_task_details,
             &deferred_partial_tasks,
             &unblock_attempt_counts,
             &attempted_partial_followups,
@@ -716,6 +734,12 @@ pub(crate) async fn run_parallel_loop(
                             }
                         }
                         continue;
+                    }
+                    if candidate.kind == ParallelUnblockCandidateKind::ShelvedResume {
+                        // This is now a genuine fresh attempt. Do not let the
+                        // prior landing classification leak into a later,
+                        // unrelated worker/gate shelf outcome.
+                        shelved_task_details.remove(&candidate.task.id);
                     }
                     active_tasks.insert(assignment.task.id.clone());
                     active_lanes.insert(assignment.lane_index, assignment);
@@ -1211,7 +1235,10 @@ pub(crate) async fn run_parallel_loop(
                             last_idle_summary = None;
                             continue;
                         }
-                        Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+                        Ok(LaneLandingOutcome::NeedsRecovery {
+                            recovery_note,
+                            conflict_paths,
+                        }) => {
                             match try_spawn_lane_recovery_attempt(
                                 &mut join_set,
                                 &lane_config,
@@ -1231,8 +1258,14 @@ pub(crate) async fn run_parallel_loop(
                                 }
                                 Ok(false) => {
                                     parallel_logger.warn(format!(
-                                        "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain",
-                                        assignment.lane_index, assignment.task.id
+                                        "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain; conflict paths: {}",
+                                        assignment.lane_index,
+                                        assignment.task.id,
+                                        if conflict_paths.is_empty() {
+                                            "unknown".to_string()
+                                        } else {
+                                            conflict_paths.join(", ")
+                                        }
                                     ));
                                     if let Err(salvage_err) = write_parallel_salvage_record(
                                         &assignment,
@@ -1246,11 +1279,57 @@ pub(crate) async fn run_parallel_loop(
                                 }
                                 Err(retry_err) => {
                                     parallel_logger.warn(format!(
-                                        "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}",
-                                        assignment.lane_index, assignment.task.id
+                                        "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; conflict paths: {}",
+                                        assignment.lane_index,
+                                        assignment.task.id,
+                                        if conflict_paths.is_empty() {
+                                            "unknown".to_string()
+                                        } else {
+                                            conflict_paths.join(", ")
+                                        }
                                     ));
                                 }
                             }
+                            shelved_task_details.insert(
+                                assignment.task.id.clone(),
+                                ShelvedTaskDetails {
+                                    markdown: assignment.task.markdown.clone(),
+                                    failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                                    conflict_paths,
+                                    detail: Some(
+                                        "committed lane work conflicts with current canonical hunks"
+                                            .to_string(),
+                                    ),
+                                },
+                            );
+                            shelved_tasks.insert(
+                                assignment.task.id.clone(),
+                                assignment.task.markdown.clone(),
+                            );
+                            continue;
+                        }
+                        Ok(LaneLandingOutcome::DivergenceExhausted { detail }) => {
+                            parallel_logger.warn(format!(
+                                "warning: failed landing lane-{} `{}` after non-zero worker exit and bounded fresh-HEAD retries; shelving as landing-divergence: {}",
+                                assignment.lane_index, assignment.task.id, detail
+                            ));
+                            if let Err(salvage_err) =
+                                write_parallel_salvage_record(&assignment, &detail)
+                            {
+                                parallel_logger.warn(format!(
+                                    "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                    assignment.lane_index, assignment.task.id
+                                ));
+                            }
+                            shelved_task_details.insert(
+                                assignment.task.id.clone(),
+                                ShelvedTaskDetails {
+                                    markdown: assignment.task.markdown.clone(),
+                                    failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                                    conflict_paths: Vec::new(),
+                                    detail: Some(detail),
+                                },
+                            );
                             shelved_tasks.insert(
                                 assignment.task.id.clone(),
                                 assignment.task.markdown.clone(),
@@ -1269,6 +1348,21 @@ pub(crate) async fn run_parallel_loop(
                                     "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
                                     assignment.lane_index, assignment.task.id
                                 ));
+                            }
+                            let conflict_paths = conflict_paths_from_landing_error(&err);
+                            if !conflict_paths.is_empty() {
+                                shelved_task_details.insert(
+                                    assignment.task.id.clone(),
+                                    ShelvedTaskDetails {
+                                        markdown: assignment.task.markdown.clone(),
+                                        failure_reason:
+                                            ShelvedTaskFailureReason::LandingConflict,
+                                        conflict_paths,
+                                        detail: Some(format!("{err:#}")),
+                                    },
+                                );
+                            } else {
+                                shelved_task_details.remove(&assignment.task.id);
                             }
                             shelved_tasks.insert(
                                 assignment.task.id.clone(),
@@ -1603,7 +1697,10 @@ pub(crate) async fn run_parallel_loop(
                         );
                         last_idle_summary = None;
                     }
-                    Ok(LaneLandingOutcome::NeedsRecovery(recovery_note)) => {
+                    Ok(LaneLandingOutcome::NeedsRecovery {
+                        recovery_note,
+                        conflict_paths,
+                    }) => {
                         match try_spawn_lane_recovery_attempt(
                             &mut join_set,
                             &lane_config,
@@ -1622,9 +1719,14 @@ pub(crate) async fn run_parallel_loop(
                                 continue;
                             }
                             Ok(false) => {
+                                let conflict_suffix = if conflict_paths.is_empty() {
+                                    "unknown".to_string()
+                                } else {
+                                    conflict_paths.join(", ")
+                                };
                                 parallel_logger.warn(format!(
-                                    "warning: failed landing lane-{} `{}` and no recovery attempts remain",
-                                    assignment.lane_index, assignment.task.id
+                                    "warning: failed landing lane-{} `{}` and no recovery attempts remain; conflict paths: {}",
+                                    assignment.lane_index, assignment.task.id, conflict_suffix
                                 ));
                                 if let Err(salvage_err) = write_parallel_salvage_record(
                                     &assignment,
@@ -1638,11 +1740,58 @@ pub(crate) async fn run_parallel_loop(
                             }
                             Err(retry_err) => {
                                 parallel_logger.warn(format!(
-                                    "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}",
-                                    assignment.lane_index, assignment.task.id
+                                    "warning: failed restarting lane-{} `{}` after landing failure: {retry_err:#}; conflict paths: {}",
+                                    assignment.lane_index,
+                                    assignment.task.id,
+                                    if conflict_paths.is_empty() {
+                                        "unknown".to_string()
+                                    } else {
+                                        conflict_paths.join(", ")
+                                    }
                                 ));
                             }
                         }
+                        shelved_task_details.insert(
+                            assignment.task.id.clone(),
+                            ShelvedTaskDetails {
+                                markdown: assignment.task.markdown.clone(),
+                                failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                                conflict_paths,
+                                detail: Some(
+                                    "committed lane work conflicts with current canonical hunks"
+                                        .to_string(),
+                                ),
+                            },
+                        );
+                        shelved_tasks
+                            .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
+                        continue;
+                    }
+                    Ok(LaneLandingOutcome::DivergenceExhausted { detail }) => {
+                        parallel_logger.warn(format!(
+                            "warning: failed landing lane-{} `{}` after {} bounded fresh-HEAD retries; shelving as landing-divergence: {}",
+                            assignment.lane_index,
+                            assignment.task.id,
+                            LANDING_REBASE_RETRY_LIMIT,
+                            detail
+                        ));
+                        if let Err(salvage_err) =
+                            write_parallel_salvage_record(&assignment, &detail)
+                        {
+                            parallel_logger.warn(format!(
+                                "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
+                                assignment.lane_index, assignment.task.id
+                            ));
+                        }
+                        shelved_task_details.insert(
+                            assignment.task.id.clone(),
+                            ShelvedTaskDetails {
+                                markdown: assignment.task.markdown.clone(),
+                                failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                                conflict_paths: Vec::new(),
+                                detail: Some(detail),
+                            },
+                        );
                         shelved_tasks
                             .insert(assignment.task.id.clone(), assignment.task.markdown.clone());
                         continue;
@@ -1659,6 +1808,20 @@ pub(crate) async fn run_parallel_loop(
                                 "warning: failed writing salvage record for lane-{} `{}`: {salvage_err:#}",
                                 assignment.lane_index, assignment.task.id
                             ));
+                        }
+                        let conflict_paths = conflict_paths_from_landing_error(&err);
+                        if !conflict_paths.is_empty() {
+                            shelved_task_details.insert(
+                                assignment.task.id.clone(),
+                                ShelvedTaskDetails {
+                                    markdown: assignment.task.markdown.clone(),
+                                    failure_reason: ShelvedTaskFailureReason::LandingConflict,
+                                    conflict_paths,
+                                    detail: Some(format!("{err:#}")),
+                                },
+                            );
+                        } else {
+                            shelved_task_details.remove(&assignment.task.id);
                         }
                         shelved_tasks
                             .insert(assignment.task.id.clone(), assignment.task.markdown.clone());

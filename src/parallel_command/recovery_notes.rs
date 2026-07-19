@@ -908,7 +908,7 @@ mod tests {
         .expect("landing recovery should prepare");
         assert!(matches!(
             prep,
-            LaneLandingRecoveryPrep::NeedsWorkerResolution(_)
+            LaneLandingRecoveryPrep::NeedsWorkerResolution { .. }
         ));
         assert_eq!(assignment.base_commit, recovery_base);
         assert!(lane_repo_has_active_cherry_pick(&lane));
