@@ -544,9 +544,8 @@ pub(crate) fn quota_backoff_wait(
         return None;
     }
     let reset = soonest_session_reset_secs?;
-    let target = Duration::from_secs(reset).saturating_add(Duration::from_secs(
-        QUOTA_BACKOFF_MARGIN_SECS,
-    ));
+    let target =
+        Duration::from_secs(reset).saturating_add(Duration::from_secs(QUOTA_BACKOFF_MARGIN_SECS));
     let remaining = cap.checked_sub(already_waited).filter(|r| !r.is_zero())?;
     if target > remaining {
         return None;
@@ -558,7 +557,10 @@ pub(crate) fn quota_backoff_wait(
 /// live usage this pass — the earliest moment ANY account should be usable
 /// again. `None` when no account reported usage data.
 fn soonest_session_reset(
-    scored: &[(&crate::quota_config::AccountEntry, Option<crate::quota_usage::AccountUsage>)],
+    scored: &[(
+        &crate::quota_config::AccountEntry,
+        Option<crate::quota_usage::AccountUsage>,
+    )],
 ) -> Option<u64> {
     scored
         .iter()
@@ -699,7 +701,9 @@ pub(crate) async fn probe_session_exhaustion(provider: Provider) -> Option<(bool
     if config.accounts_for_provider(provider).is_empty() {
         return None;
     }
-    let scored = quota_selector::score_accounts(&config, provider).await.ok()?;
+    let scored = quota_selector::score_accounts(&config, provider)
+        .await
+        .ok()?;
     let mut any_usage = false;
     let mut all_exhausted = true;
     let mut soonest: Option<u64> = None;
@@ -821,9 +825,12 @@ where
                     });
                 }
                 Err(e) => {
-                    restore_and_update_state(provider, &account_name, &mut guard, |_state, _now| {
-                        Ok(())
-                    })?;
+                    restore_and_update_state(
+                        provider,
+                        &account_name,
+                        &mut guard,
+                        |_state, _now| Ok(()),
+                    )?;
                     return Err(e);
                 }
             }
@@ -1051,12 +1058,7 @@ mod tests {
     #[test]
     fn backoff_waits_for_soonest_session_reset_within_cap() {
         // Transient session window: reset in 933s, 20-min cap -> wait reset+margin.
-        let wait = quota_backoff_wait(
-            Duration::from_secs(1200),
-            Duration::ZERO,
-            true,
-            Some(933),
-        );
+        let wait = quota_backoff_wait(Duration::from_secs(1200), Duration::ZERO, true, Some(933));
         assert_eq!(wait, Some(Duration::from_secs(933 + 15)));
     }
 
@@ -1283,11 +1285,7 @@ mod tests {
         fs::write(&stderr_log, b"").expect("write stderr log");
 
         assert_eq!(
-            lane_output_quota_verdict(
-                Provider::Codex,
-                Some(&stdout_log),
-                Some(&stderr_log),
-            ),
+            lane_output_quota_verdict(Provider::Codex, Some(&stdout_log), Some(&stderr_log),),
             QuotaVerdict::Exhausted
         );
     }

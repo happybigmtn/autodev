@@ -281,8 +281,9 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         };
         println!(
             "{}",
-            serde_json::to_string_pretty(&report)
-                .unwrap_or_else(|err| format!("{{\"error\":\"failed to serialize status: {err}\"}}"))
+            serde_json::to_string_pretty(&report).unwrap_or_else(|err| format!(
+                "{{\"error\":\"failed to serialize status: {err}\"}}"
+            ))
         );
     }
     Ok(())

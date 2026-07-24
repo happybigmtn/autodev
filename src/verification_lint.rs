@@ -32,7 +32,10 @@ fn verify_command_is_runnable(task_id: &str, field: &str, command: &str) -> Resu
             "task `{task_id}` `{field}` verification command `{command}` needs a shell (found `{operator}`); write one exec-able command per proof and use dedicated flags instead of pipes/`&&`/redirection (a leading VAR=value env prefix is allowed)"
         );
     }
-    let argv = argv.into_iter().filter(|arg| !arg.is_empty()).collect::<Vec<_>>();
+    let argv = argv
+        .into_iter()
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
     if argv.is_empty() {
         return Ok(());
     }

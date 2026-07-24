@@ -6,11 +6,12 @@ use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
-use crate::backend_process::{clear_worker_pid, log_stderr, read_stream, write_worker_pid};
+use crate::backend_process::{log_stderr, read_stream, WorkerPidGuard};
 use crate::codex_stream;
 use crate::codex_stream::capture_pi_output;
 use crate::kimi_backend::{kimi_exec_args, parse_kimi_error, resolve_kimi_bin};
 use crate::pi_backend::{parse_pi_error, resolve_pi_bin, PiProvider};
+use crate::process_group::{AbortOnDropTask, ContainedChild};
 use crate::prompt_ethos::with_autodev_prompt_ethos;
 use crate::quota_config::Provider;
 use crate::quota_exec;
@@ -56,7 +57,7 @@ pub(crate) async fn run_codex_exec_max_context(
     stdout_log_path: Option<&Path>,
     context_label: &str,
 ) -> Result<std::process::ExitStatus> {
-    run_codex_exec_with_env(
+    run_codex_exec_max_context_with_env(
         repo_root,
         full_prompt,
         model,
@@ -66,6 +67,32 @@ pub(crate) async fn run_codex_exec_max_context(
         stdout_log_path,
         context_label,
         &[],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_exec_max_context_with_env(
+    repo_root: &Path,
+    full_prompt: &str,
+    model: &str,
+    reasoning_effort: &str,
+    codex_bin: &Path,
+    stderr_log_path: &Path,
+    stdout_log_path: Option<&Path>,
+    context_label: &str,
+    extra_env: &[(String, String)],
+) -> Result<std::process::ExitStatus> {
+    run_codex_exec_with_env(
+        repo_root,
+        full_prompt,
+        model,
+        reasoning_effort,
+        codex_bin,
+        stderr_log_path,
+        stdout_log_path,
+        context_label,
+        extra_env,
         None,
         Some(MAX_CODEX_MODEL_CONTEXT_WINDOW),
     )
@@ -90,7 +117,7 @@ pub(crate) async fn run_codex_exec_with_env(
     let backend = select_shared_exec_backend(model, codex_bin);
     let (status, stderr_text) = match backend {
         SharedExecBackend::Codex { model, codex_bin } => {
-            if quota_exec::is_quota_available(Provider::Codex) {
+            if codex_quota_routing_enabled(&codex_bin) {
                 let repo_root = repo_root.to_owned();
                 let full_prompt = full_prompt.to_owned();
                 let model = model.to_owned();
@@ -213,6 +240,15 @@ pub(crate) async fn run_codex_exec_with_env(
     Ok(status)
 }
 
+fn codex_quota_routing_enabled(codex_bin: &Path) -> bool {
+    if cfg!(test) && codex_bin != Path::new("codex") {
+        // Unit tests inject fake executables by absolute path. They must never
+        // inspect, refresh, or swap real operator credential profiles.
+        return false;
+    }
+    quota_exec::is_quota_available(Provider::Codex)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SharedExecBackend {
     Codex {
@@ -279,35 +315,37 @@ async fn spawn_kimi_cli(
         command.env(key, value);
     }
 
-    let mut child = command.spawn().with_context(|| {
+    let mut child = ContainedChild::spawn(&mut command).with_context(|| {
         format!(
             "failed to launch kimi-cli at {} from {}",
             kimi_bin.display(),
             repo_root.display()
         )
     })?;
-    write_worker_pid(worker_pid_path, child.id())?;
+    let worker_pid_guard = WorkerPidGuard::new(worker_pid_path, child.id())?;
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .with_context(|| format!("kimi-cli stdout should be piped for {context_label}"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .with_context(|| format!("kimi-cli stderr should be piped for {context_label}"))?;
 
     let heartbeat_label = context_label.to_string();
     let stdout_task =
-        tokio::spawn(async move { capture_pi_output(stdout, &heartbeat_label, 15).await });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+        AbortOnDropTask::spawn(
+            async move { capture_pi_output(stdout, &heartbeat_label, 15).await },
+        );
+    let stderr_task = AbortOnDropTask::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for kimi-cli")?;
-    clear_worker_pid(worker_pid_path)?;
+    worker_pid_guard.clear()?;
     let stdout = stdout_task
+        .join()
         .await
         .context("kimi-cli stdout capture task panicked")??;
     let stderr_text = stderr_task
+        .join()
         .await
         .context("kimi-cli stderr capture task panicked")??;
     write_stdout_log(stdout_log_path, &stdout)?;
@@ -352,38 +390,40 @@ async fn spawn_pi(
         command.env(key, value);
     }
 
-    let mut child = command.spawn().with_context(|| {
+    let mut child = ContainedChild::spawn(&mut command).with_context(|| {
         format!(
             "failed to launch {provider_label} at {} from {}",
             pi_bin.display(),
             repo_root.display()
         )
     })?;
-    write_worker_pid(worker_pid_path, child.id())?;
+    let worker_pid_guard = WorkerPidGuard::new(worker_pid_path, child.id())?;
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .with_context(|| format!("{provider_label} stdout should be piped for {context_label}"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .with_context(|| format!("{provider_label} stderr should be piped for {context_label}"))?;
 
     let heartbeat_label = context_label.to_string();
     let stdout_task =
-        tokio::spawn(async move { capture_pi_output(stdout, &heartbeat_label, 15).await });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+        AbortOnDropTask::spawn(
+            async move { capture_pi_output(stdout, &heartbeat_label, 15).await },
+        );
+    let stderr_task = AbortOnDropTask::spawn(async move { read_stream(stderr).await });
 
     let status = child
         .wait()
         .await
         .with_context(|| format!("failed waiting for {provider_label}"))?;
-    clear_worker_pid(worker_pid_path)?;
+    worker_pid_guard.clear()?;
     let stdout = stdout_task
+        .join()
         .await
         .with_context(|| format!("{provider_label} stdout capture task panicked"))??;
     let stderr_text = stderr_task
+        .join()
         .await
         .with_context(|| format!("{provider_label} stderr capture task panicked"))??;
     write_stdout_log(stdout_log_path, &stdout)?;
@@ -449,18 +489,17 @@ async fn spawn_codex(
         command.env(key, value);
     }
 
-    let mut child = command.spawn().with_context(|| {
+    let mut child = ContainedChild::spawn(&mut command).with_context(|| {
         format!(
             "failed to launch Codex at {} from {}",
             codex_bin.display(),
             repo_root.display()
         )
     })?;
-    write_worker_pid(worker_pid_path, child.id())?;
+    let worker_pid_guard = WorkerPidGuard::new(worker_pid_path, child.id())?;
 
     let mut stdin = child
-        .stdin
-        .take()
+        .take_stdin()
         .with_context(|| format!("Codex stdin should be piped for {context_label}"))?;
     stdin
         .write_all(full_prompt.as_bytes())
@@ -469,17 +508,15 @@ async fn spawn_codex(
     drop(stdin);
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .with_context(|| format!("Codex stdout should be piped for {context_label}"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .with_context(|| format!("Codex stderr should be piped for {context_label}"))?;
 
     let stream_label = context_label.to_string();
     let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
-    let stdout_task = tokio::spawn(async move {
+    let stdout_task = AbortOnDropTask::spawn(async move {
         codex_stream::capture_codex_output_prefixed(
             stdout,
             Some(stream_label.as_str()),
@@ -487,14 +524,16 @@ async fn spawn_codex(
         )
         .await
     });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+    let stderr_task = AbortOnDropTask::spawn(async move { read_stream(stderr).await });
 
     let status = child.wait().await.context("failed waiting for Codex")?;
-    clear_worker_pid(worker_pid_path)?;
+    worker_pid_guard.clear()?;
     stdout_task
+        .join()
         .await
         .context("Codex stdout streaming task panicked")??;
     let stderr_text = stderr_task
+        .join()
         .await
         .context("Codex stderr capture task panicked")??;
 

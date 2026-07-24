@@ -5,14 +5,29 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 OUTPUT_TAIL_BYTES = 16 * 1024
 REDACTION_VERSION = 1
+FINGERPRINT_PATHS = [
+    "--",
+    ".",
+    ":(exclude)IMPLEMENTATION_PLAN.md",
+    ":(exclude)COMPLETED.md",
+    ":(exclude)WORKLIST.md",
+    ":(exclude)REVIEW.md",
+    ":(exclude)AGENTS.md",
+    ":(exclude)ARCHIVED.md",
+    ":(exclude)RECEIPTS-DRIFT.md",
+    ":(exclude).auto",
+    ":(exclude).auto/**",
+]
 
 
 def fail(message: str) -> None:
@@ -83,18 +98,121 @@ def current_commit(root: Path) -> str | None:
     return output.strip() if isinstance(output, str) and output.strip() else None
 
 
+def hash_fingerprint_field(hasher: object, label: bytes, value: bytes) -> None:
+    hasher.update(len(label).to_bytes(8, "big"))
+    hasher.update(label)
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+
+def hash_worktree_path(
+    hasher: object, root: Path, namespace: bytes, relative_path: bytes
+) -> None:
+    relative_text = relative_path.decode("utf-8", errors="replace")
+    path = root / relative_text
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        mode = (0).to_bytes(4, "big")
+        kind = b"missing"
+        content_hash = hashlib.sha256(b"").digest()
+    else:
+        mode = stat.S_IMODE(metadata.st_mode).to_bytes(4, "big")
+        if stat.S_ISLNK(metadata.st_mode):
+            kind = b"symlink"
+            target = os.readlink(path).encode("utf-8", errors="replace")
+            content_hash = hashlib.sha256(target).digest()
+        elif stat.S_ISREG(metadata.st_mode):
+            kind = b"file"
+            content_hasher = hashlib.sha256()
+            with path.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    content_hasher.update(chunk)
+            content_hash = content_hasher.digest()
+        else:
+            kind = b"other"
+            content_hash = hashlib.sha256(b"").digest()
+
+    hash_fingerprint_field(hasher, b"namespace", namespace)
+    hash_fingerprint_field(hasher, b"path", relative_path)
+    hash_fingerprint_field(hasher, b"mode", mode)
+    hash_fingerprint_field(hasher, b"kind", kind)
+    hash_fingerprint_field(hasher, b"content-sha256", content_hash)
+
+
 def dirty_state(root: Path) -> dict | None:
-    output = git_output(root, ["status", "--porcelain=v1", "-z"], text=False)
-    if not isinstance(output, bytes):
+    status_output = git_output(
+        root,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            *FINGERPRINT_PATHS,
+        ],
+        text=False,
+    )
+    unstaged = git_output(
+        root,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            *FINGERPRINT_PATHS,
+        ],
+        text=False,
+    )
+    staged = git_output(
+        root,
+        [
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            *FINGERPRINT_PATHS,
+        ],
+        text=False,
+    )
+    untracked = git_output(
+        root,
+        ["ls-files", "--others", "--exclude-standard", "-z", *FINGERPRINT_PATHS],
+        text=False,
+    )
+    if not all(
+        isinstance(value, bytes)
+        for value in (status_output, unstaged, staged, untracked)
+    ):
         return None
+
+    hasher = hashlib.sha256()
+    hasher.update(b"autodev-dirty-state-v2\0")
+    hash_fingerprint_field(hasher, b"status", status_output)
+    hash_fingerprint_field(hasher, b"unstaged", unstaged)
+    hash_fingerprint_field(hasher, b"staged", staged)
+    for relative_path in sorted(path for path in untracked.split(b"\0") if path):
+        hash_worktree_path(hasher, root, b"untracked", relative_path)
+
     entries = [
         entry.decode("utf-8", errors="replace")
-        for entry in output.split(b"\0")
+        for entry in status_output.split(b"\0")
         if entry
     ]
     return {
         "status": "clean" if not entries else "dirty",
-        "fingerprint": sha256_bytes(output),
+        "fingerprint": hasher.hexdigest(),
         "entries": entries,
     }
 

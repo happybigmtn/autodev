@@ -22,6 +22,7 @@ mod orchestrate_command;
 mod parallel_command;
 mod pi_backend;
 mod pilot_command;
+mod process_group;
 mod prompt_ethos;
 mod qa_command;
 mod qa_only_command;

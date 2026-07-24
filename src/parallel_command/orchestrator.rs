@@ -127,263 +127,49 @@ pub(crate) fn append_idle_status_to_free_lanes(
     }
 }
 
-pub(crate) async fn run_serial_loop(
-    repo_root: &Path,
-    reference_repos: &[PathBuf],
-    args: &ParallelArgs,
-    target_branch: &str,
-    prompt_template: &str,
-    run_root: &Path,
-    worker_env: &LoopWorkerEnv,
-) -> Result<()> {
-    let stderr_log_path = run_root.join("stderr.log");
-    let stdout_log_path = run_root.join("stdout.log");
-    fs::write(&stdout_log_path, b"")
-        .with_context(|| format!("failed to initialize {}", stdout_log_path.display()))?;
-    let harness = if args.claude { "Claude" } else { "Codex" };
-    let mut iteration = 0usize;
-    let mut consecutive_failures = 0usize;
-
-    loop {
-        if args.max_iterations.is_some_and(|limit| iteration >= limit) {
-            println!(
-                "reached max iterations: {}",
-                args.max_iterations.unwrap_or_default()
-            );
-            break;
-        }
-
-        let plan = inspect_loop_plan(repo_root)?;
-        let queue = plan.queue_snapshot();
-        if queue.pending_ids.is_empty() {
-            if queue.blocked_ids.is_empty() {
-                println!("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
-            } else {
-                println!(
-                    "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
-                    queue.blocked_ids.join(", ")
-                );
-            }
-            break;
-        }
-
-        let ready = plan.ready_tasks(&BTreeSet::new());
-        if ready.is_empty() {
-            println!(
-                "no dependency-ready `- [ ]` tasks remain; stopping. blocked: {}",
-                if queue.blocked_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    queue.blocked_ids.join(", ")
-                }
-            );
-            break;
-        }
-
-        let current_task = ready[0].clone();
-        println!("next task:   {}", current_task.id);
-        if !queue.blocked_ids.is_empty() {
-            println!("blocked:     {}", queue.blocked_ids.join(", "));
-        }
-
-        let full_prompt = build_iteration_prompt(
-            prompt_template,
-            &LoopQueueSnapshot {
-                pending_ids: ready.iter().map(|task| task.id.clone()).collect(),
-                blocked_ids: queue.blocked_ids.clone(),
-            },
-        );
-
-        let prompt_path = repo_root
-            .join(".auto")
-            .join("logs")
-            .join(format!("loop-{}-prompt.md", timestamp_slug()));
-        atomic_write(&prompt_path, full_prompt.as_bytes())
-            .with_context(|| format!("failed to write {}", prompt_path.display()))?;
-        println!("prompt log:  {}", prompt_path.display());
-
-        let state_before = collect_tracked_repo_states(repo_root, reference_repos)?;
-        println!();
-        println!("running {harness} iteration {}", iteration + 1);
-
-        let exit_status = if args.claude {
-            run_claude_exec_with_env(
-                repo_root,
-                &full_prompt,
-                &args.model,
-                &args.reasoning_effort,
-                args.max_turns,
-                &stderr_log_path,
-                Some(&stdout_log_path),
-                "auto parallel",
-                &worker_env.extra_env,
-                None,
-                None,
-            )
-            .await?
-        } else {
-            run_codex_exec_with_env(
-                repo_root,
-                &full_prompt,
-                &args.model,
-                &args.reasoning_effort,
-                &args.codex_bin,
-                &stderr_log_path,
-                Some(&stdout_log_path),
-                "auto parallel",
-                &worker_env.extra_env,
-                None,
-                None,
-            )
-            .await?
-        };
-        if let Some(violation) = detect_forbidden_worker_remote_git_command(&stdout_log_path)? {
-            bail!(
-                "{harness} worker attempted forbidden remote git command `{}` in {}; lanes must leave remote sync to the host",
-                violation.command,
-                stdout_log_path.display()
-            );
-        }
-        if !exit_status.success() {
-            let exit_code = exit_status.code().unwrap_or(-1);
-            let is_futility = exit_code == FUTILITY_EXIT_MARKER;
-            consecutive_failures += 1;
-
-            if let Some(commit) = auto_checkpoint_if_needed(
-                repo_root,
-                target_branch,
-                &format!(
-                    "auto parallel checkpoint (pre-retry {})",
-                    consecutive_failures
-                ),
-            )? {
-                println!("checkpoint:  committed partial changes at {commit}");
-            }
-
-            if consecutive_failures > args.max_retries {
-                bail!(
-                    "{harness} exited with status {} after {} consecutive failures; see {}",
-                    if is_futility {
-                        "futility".to_string()
-                    } else {
-                        exit_code.to_string()
-                    },
-                    consecutive_failures,
-                    stderr_log_path.display()
-                );
-            }
-
-            println!(
-                "warning: {harness} exited non-zero ({}), retrying ({}/{})",
-                if is_futility {
-                    "futility spiral".to_string()
-                } else {
-                    format!("code {exit_code}")
-                },
-                consecutive_failures,
-                args.max_retries
-            );
-            continue;
-        }
-        consecutive_failures = 0;
-
-        println!();
-        println!("{harness} iteration complete");
-
-        let state_after = collect_tracked_repo_states(repo_root, reference_repos)?;
-        match summarize_repo_progress(&state_before, &state_after) {
-            RepoProgress::NewCommits => {
-                let mut task_for_reconciliation = current_task.clone();
-                let changed_files =
-                    primary_repo_changed_files(repo_root, &state_before, &state_after)?;
-                let completion_status = reconcile_parallel_landed_task_state(
-                    repo_root,
-                    &mut task_for_reconciliation,
-                    &changed_files,
-                )?;
-                if repo_has_staged_queue_updates(repo_root)? {
-                    let message = format!(
-                        "{}: {} queue sync",
-                        repo_name(repo_root),
-                        task_for_reconciliation.id
-                    );
-                    commit_task_closeout(repo_root, &task_for_reconciliation.id, &message, false)?;
-                }
-                println!(
-                    "host sync:   {} -> {}",
-                    task_for_reconciliation.id,
-                    loop_task_status_label(completion_status)
-                );
-            }
-            RepoProgress::DirtyChanges(repos) => {
-                bail!(
-                    "tracked repo changes were left uncommitted in: {}; commit or revert them before continuing",
-                    repos.join(", ")
-                );
-            }
-            RepoProgress::None => {
-                if let Some(commit) =
-                    auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
-                {
-                    iteration += 1;
-                    println!("checkpoint:  committed iteration changes at {commit}");
-                    println!();
-                    println!("================ LOOP {} ================", iteration);
-                    continue;
-                }
-                println!("no new commit detected; stopping.");
-                break;
-            }
-        }
-
-        if push_branch_with_remote_sync(repo_root, target_branch)? {
-            println!("remote sync: rebased onto origin/{}", target_branch);
-        }
-        if let Some(commit) =
-            auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
-        {
-            println!("checkpoint:  committed trailing changes at {commit}");
-        }
-        iteration += 1;
-        println!();
-        println!("================ LOOP {} ================", iteration);
-    }
-
-    Ok(())
+fn partition_ready_tasks_for_worker_dispatch(
+    ready: Vec<LoopTask>,
+) -> (Vec<LoopTask>, Vec<LoopTask>) {
+    ready.into_iter().partition(is_operator_task)
 }
 
-fn primary_repo_changed_files(
+/// Restore the completion transaction to a dependency-blocking Partial state
+/// after any lane-processing error that may have happened after reconciliation
+/// wrote or staged a candidate Done row.
+///
+/// Other lanes can remain active while the host processes one completed lane.
+/// The scheduler must therefore recover synchronously in the error arm, before
+/// its next queue refresh can observe the candidate row and dispatch dependents.
+/// Any recovery or post-recovery assertion failure aborts the host loop.
+fn recover_failed_parallel_lane_completion(
     repo_root: &Path,
-    before: &[TrackedRepoState],
-    after: &[TrackedRepoState],
+    task_id: &str,
+    remaining_active_lanes: usize,
+    parallel_logger: &ParallelEventLogger,
+    failure_context: &str,
 ) -> Result<Vec<String>> {
-    let Some(before_state) = before.iter().find(|state| state.path == repo_root) else {
-        return Ok(Vec::new());
-    };
-    let Some(after_state) = after.iter().find(|state| state.path == repo_root) else {
-        return Ok(Vec::new());
-    };
-    if before_state.head == after_state.head {
-        return Ok(Vec::new());
+    let recovered = recover_unsealed_task_completion_transitions(repo_root).with_context(|| {
+        format!(
+                "failed to recover candidate completion for `{task_id}` after {failure_context}; \
+                 refusing to continue scheduling with {remaining_active_lanes} other active lane(s)"
+            )
+    })?;
+    refuse_unsealed_task_completion_checkpoint(repo_root).with_context(|| {
+        format!(
+            "candidate completion for `{task_id}` remained unsealed after recovery from \
+             {failure_context}; refusing to continue scheduling with {remaining_active_lanes} \
+             other active lane(s)"
+        )
+    })?;
+    if !recovered.is_empty() {
+        parallel_logger.warn(format!(
+            "fail-closed recovery: demoted unsealed candidate completion(s) to [~] before \
+             continuing with {remaining_active_lanes} other active lane(s) after `{task_id}` \
+             failed: {}",
+            recovered.join(", ")
+        ));
     }
-
-    let range = format!("{}..{}", before_state.head, after_state.head);
-    let output = git_stdout(repo_root, ["diff", "--name-only", range.as_str()])?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn loop_task_status_label(status: LoopTaskStatus) -> &'static str {
-    match status {
-        LoopTaskStatus::Pending => "[ ]",
-        LoopTaskStatus::Blocked => "[!]",
-        LoopTaskStatus::Partial => "[~]",
-        LoopTaskStatus::Done => "[x]",
-    }
+    Ok(recovered)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -420,12 +206,9 @@ pub(crate) async fn run_parallel_loop(
             "resume: HEAD advanced since the last run; auto-retrying {auto_cleared} shelved/deferred task(s) whose transient blocker plausibly resolved (set AUTO_PARALLEL_AUTOCLEAR_SHELVED=0 to disable)"
         ));
     }
-    let auto_unshelved = auto_unshelve_landing_divergence_tasks(
-        repo_root,
-        &mut restored_run_state,
-        parallel_logger,
-    )
-    .await;
+    let auto_unshelved =
+        auto_unshelve_landing_divergence_tasks(repo_root, &mut restored_run_state, parallel_logger)
+            .await;
     if auto_unshelved > 0 {
         parallel_logger.info(format!(
             "resume: auto-unshelved {auto_unshelved} landing-divergence task(s) after current-HEAD verification passed"
@@ -609,7 +392,8 @@ pub(crate) async fn run_parallel_loop(
             // Gate-held partials failed a real gate; their landed code is known
             // to not pass, so dependents built on them would rework. Hold those
             // dependents until the hold clears (task lands cleanly).
-            let gate_held = gate_held_task_ids(repo_root);
+            let gate_held = gate_held_task_ids(repo_root)
+                .context("failed to read durable gate holds before dependency dispatch")?;
             let ready = prioritize_ready_parallel_tasks(
                 repo_root,
                 ready_parallel_tasks_with_gate_holds(
@@ -771,50 +555,7 @@ pub(crate) async fn run_parallel_loop(
                 }
                 break;
             }
-            let mut operator_ready = Vec::new();
-            let mut evidence_ready = Vec::new();
-            let mut executable_ready = Vec::new();
-            for task in ready {
-                if is_operator_task(&task) {
-                    operator_ready.push(task);
-                } else if is_evidence_lane_task(&task) {
-                    evidence_ready.push(task);
-                } else {
-                    executable_ready.push(task);
-                }
-            }
-            let mut reconciled_evidence = false;
-            for task in &evidence_ready {
-                match reconcile_ready_evidence_task_from_canonical_evidence(repo_root, task) {
-                    Ok(Some(status)) => {
-                        parallel_logger.info(format!(
-                            "evidence-sync: {} reconciled from canonical evidence as {:?}",
-                            task.id, status
-                        ));
-                        reconciled_evidence = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        parallel_logger.warn(format!(
-                            "warning: evidence reconciliation for `{}` failed: {err:#}",
-                            task.id
-                        ));
-                    }
-                }
-            }
-            if reconciled_evidence {
-                plan = refresh_parallel_plan_or_last_good(
-                    repo_root,
-                    target_branch,
-                    linear_tracker,
-                    &mut linear_auto_sync_state,
-                    &plan,
-                    parallel_logger,
-                )
-                .await?;
-                last_idle_summary = None;
-                continue;
-            }
+            let (operator_ready, worker_ready) = partition_ready_tasks_for_worker_dispatch(ready);
             if !operator_ready.is_empty() {
                 match write_operator_actions_for_ready_tasks(run_root, &operator_ready) {
                     Ok(path) => parallel_logger.info(format!(
@@ -829,14 +570,9 @@ pub(crate) async fn run_parallel_loop(
             } else {
                 clear_stale_operator_actions(run_root, parallel_logger);
             }
-            if executable_ready.is_empty() {
+            if worker_ready.is_empty() {
                 let message = format!(
-                    "no executable dependency-ready code tasks remain; evidence queue: {} operator queue: {}",
-                    evidence_ready
-                        .iter()
-                        .map(|task| task.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    "no dependency-ready worker tasks remain; operator queue: {}",
                     operator_ready
                         .iter()
                         .map(|task| task.id.as_str())
@@ -847,7 +583,7 @@ pub(crate) async fn run_parallel_loop(
                 break;
             }
 
-            let task = executable_ready[0].clone();
+            let task = worker_ready[0].clone();
 
             // Pre-dispatch self-heal: a `[~]` (partial) task whose canonical
             // evidence is already complete does not need a worker. This happens
@@ -1015,7 +751,8 @@ pub(crate) async fn run_parallel_loop(
             // that has never compiled this run. Without this, the stop message
             // above reads as an inscrutable scheduler giving up, when the true
             // fix is a broken build (e.g. a swept/missing `include_str!` fixture).
-            if let Some(diag) = workspace_compile_block_diagnostic(&load_workspace_baseline(run_root))
+            if let Some(diag) =
+                workspace_compile_block_diagnostic(&load_workspace_baseline(run_root))
             {
                 parallel_logger.warn(format!("workspace-compile-block: {diag}"));
             }
@@ -1337,6 +1074,27 @@ pub(crate) async fn run_parallel_loop(
                             continue;
                         }
                         Err(err) => {
+                            let review_input_integrity_fatal =
+                                landing_error_is_review_input_integrity_fatal(&err);
+                            if review_input_integrity_fatal
+                                && landing_error_has_unpersisted_review_quarantine(&err)
+                            {
+                                return Err(err).context(
+                                    "independent reviewer mutated canonical inputs and durable quarantine persistence failed; preserving the restart-visible unsealed completion interlock",
+                                );
+                            }
+                            recover_failed_parallel_lane_completion(
+                                repo_root,
+                                &assignment.task.id,
+                                active_lanes.len(),
+                                parallel_logger,
+                                &format!("landing error after non-zero worker exit: {err:#}"),
+                            )?;
+                            if review_input_integrity_fatal {
+                                return Err(err).context(
+                                    "independent reviewer mutated canonical inputs; aborting the host loop before any checkpoint, dispatch, or push",
+                                );
+                            }
                             parallel_logger.warn(format!(
                                 "warning: failed landing lane-{} `{}` after non-zero worker exit and no recovery attempts remain: {err:#}",
                                 assignment.lane_index, assignment.task.id
@@ -1355,8 +1113,7 @@ pub(crate) async fn run_parallel_loop(
                                     assignment.task.id.clone(),
                                     ShelvedTaskDetails {
                                         markdown: assignment.task.markdown.clone(),
-                                        failure_reason:
-                                            ShelvedTaskFailureReason::LandingConflict,
+                                        failure_reason: ShelvedTaskFailureReason::LandingConflict,
                                         conflict_paths,
                                         detail: Some(format!("{err:#}")),
                                     },
@@ -1576,10 +1333,23 @@ pub(crate) async fn run_parallel_loop(
                 match reconcile_parallel_clean_no_commit(
                     repo_root,
                     target_branch,
-                    &assignment,
+                    &mut assignment,
                     parallel_logger,
-                ) {
+                    &review_config,
+                )
+                .await
+                {
                     Ok(true) => {
+                        if push_parallel_landing_with_divergence_retries(
+                            repo_root,
+                            target_branch,
+                            &assignment,
+                        )? {
+                            parallel_logger.info(format!(
+                                "remote sync: rebased onto origin/{} after clean-no-commit closeout",
+                                target_branch
+                            ));
+                        }
                         if let Some(tracker) = linear_tracker.as_mut() {
                             if let Err(err) = tracker.note_done(&assignment.task.id).await {
                                 eprintln!(
@@ -1610,6 +1380,27 @@ pub(crate) async fn run_parallel_loop(
                     }
                     Ok(false) => {}
                     Err(err) => {
+                        let review_input_integrity_fatal =
+                            landing_error_is_review_input_integrity_fatal(&err);
+                        if review_input_integrity_fatal
+                            && landing_error_has_unpersisted_review_quarantine(&err)
+                        {
+                            return Err(err).context(
+                                "independent reviewer mutated canonical inputs and durable quarantine persistence failed; preserving the restart-visible unsealed completion interlock",
+                            );
+                        }
+                        recover_failed_parallel_lane_completion(
+                            repo_root,
+                            &assignment.task.id,
+                            active_lanes.len(),
+                            parallel_logger,
+                            &format!("clean-no-commit reconciliation error: {err:#}"),
+                        )?;
+                        if review_input_integrity_fatal {
+                            return Err(err).context(
+                                "independent reviewer mutated canonical inputs; aborting the host loop before any checkpoint, dispatch, or push",
+                            );
+                        }
                         parallel_logger.warn(format!(
                             "warning: failed checking canonical evidence for clean no-commit lane-{} `{}`: {err:#}",
                             assignment.lane_index, assignment.task.id
@@ -1797,6 +1588,27 @@ pub(crate) async fn run_parallel_loop(
                         continue;
                     }
                     Err(err) => {
+                        let review_input_integrity_fatal =
+                            landing_error_is_review_input_integrity_fatal(&err);
+                        if review_input_integrity_fatal
+                            && landing_error_has_unpersisted_review_quarantine(&err)
+                        {
+                            return Err(err).context(
+                                "independent reviewer mutated canonical inputs and durable quarantine persistence failed; preserving the restart-visible unsealed completion interlock",
+                            );
+                        }
+                        recover_failed_parallel_lane_completion(
+                            repo_root,
+                            &assignment.task.id,
+                            active_lanes.len(),
+                            parallel_logger,
+                            &format!("landing error: {err:#}"),
+                        )?;
+                        if review_input_integrity_fatal {
+                            return Err(err).context(
+                                "independent reviewer mutated canonical inputs; aborting the host loop before any checkpoint, dispatch, or push",
+                            );
+                        }
                         parallel_logger.warn(format!(
                             "warning: failed landing lane-{} `{}` and no recovery attempts remain; shelving for the rest of this run: {err:#}",
                             assignment.lane_index, assignment.task.id
@@ -1890,8 +1702,7 @@ pub(crate) async fn refresh_parallel_plan(
         .unwrap_or(false);
     if already_swept {
         parallel_logger.info(
-            "drift-reverify: inputs unchanged since last exhaustive sweep; skipping re-verification"
-                .to_string(),
+            "drift-reverify: inputs unchanged since last exhaustive sweep; skipping re-verification",
         );
     } else {
         let (audited, exhaustive) =
@@ -2666,6 +2477,148 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    fn ready_task(id: &str, lane_kind: LaneKind, markdown: &str) -> LoopTask {
+        LoopTask {
+            id: id.to_string(),
+            title: format!("{id} title"),
+            status: LoopTaskStatus::Pending,
+            dependencies: Vec::new(),
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind,
+            markdown: markdown.to_string(),
+        }
+    }
+
+    fn init_parallel_scheduler_repo(label: &str, plan: &str) -> PathBuf {
+        let repo = unique_temp_dir(label);
+        fs::create_dir_all(&repo).expect("failed to create scheduler repo");
+        run_git(&repo, ["init"]).expect("failed to initialize scheduler repo");
+        run_git(&repo, ["config", "user.name", "autodev tests"])
+            .expect("failed to configure git user");
+        run_git(&repo, ["config", "user.email", "autodev@example.com"])
+            .expect("failed to configure git email");
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), plan).expect("failed to write seed plan");
+        run_git(&repo, ["add", "IMPLEMENTATION_PLAN.md"]).expect("failed to stage seed plan");
+        run_git(&repo, ["commit", "-m", "seed scheduler plan"])
+            .expect("failed to commit seed plan");
+        repo
+    }
+
+    #[test]
+    fn post_stage_landing_error_with_second_lane_recovers_before_dependent_dispatch() {
+        let partial_plan = "\
+# IMPLEMENTATION_PLAN
+
+- [~] `TASK-A` Candidate closeout
+  Dependencies: none
+
+- [ ] `TASK-B` Already active second lane
+  Dependencies: none
+
+- [ ] `TASK-C` Must wait for candidate closeout
+  Dependencies: `TASK-A`
+";
+        let repo = init_parallel_scheduler_repo("parallel-post-stage-failure", partial_plan);
+        let run_root = unique_temp_dir("parallel-post-stage-failure-run");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("failed to initialize logger");
+
+        // Inject the exact failed-landing state: lane A wrote and staged its
+        // candidate Done row, then host processing failed while lane B was
+        // still active.
+        let candidate_done = partial_plan.replacen(
+            "- [~] `TASK-A` Candidate closeout",
+            "- [x] `TASK-A` Candidate closeout",
+            1,
+        );
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), candidate_done)
+            .expect("failed to write candidate Done plan");
+        run_git(&repo, ["add", "IMPLEMENTATION_PLAN.md"])
+            .expect("failed to stage candidate Done plan");
+
+        let recovered = recover_failed_parallel_lane_completion(
+            &repo,
+            "TASK-A",
+            1,
+            &logger,
+            "injected failure after candidate Done was staged",
+        )
+        .expect("scheduler must recover before continuing with lane B");
+
+        assert_eq!(recovered, vec!["TASK-A".to_string()]);
+        let worktree = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md"))
+            .expect("failed to read recovered worktree plan");
+        let indexed = git_stdout(&repo, ["show", ":IMPLEMENTATION_PLAN.md"])
+            .expect("failed to read recovered index plan");
+        assert!(worktree.contains("- [~] `TASK-A` Candidate closeout"));
+        assert!(indexed.contains("- [~] `TASK-A` Candidate closeout"));
+
+        let plan = parse_loop_plan(&worktree);
+        let active_tasks = BTreeSet::from(["TASK-B".to_string()]);
+        let shelved_tasks = BTreeMap::from([(
+            "TASK-A".to_string(),
+            plan.task("TASK-A")
+                .expect("TASK-A should remain in plan")
+                .markdown
+                .clone(),
+        )]);
+        let ready = ready_parallel_tasks_with_gate_holds(
+            &plan,
+            &active_tasks,
+            &shelved_tasks,
+            &BTreeSet::new(),
+            &gate_held_task_ids(&repo).expect("gate holds should be readable"),
+        );
+        assert!(
+            ready.iter().all(|task| task.id != "TASK-C"),
+            "dependent TASK-C must not dispatch while lane B remains active: {ready:#?}"
+        );
+
+        fs::remove_dir_all(repo).expect("failed to clean scheduler repo");
+        fs::remove_dir_all(run_root).expect("failed to clean run root");
+    }
+
+    #[test]
+    fn evidence_tasks_dispatch_through_worker_pipeline_while_operator_tasks_stay_host_queued() {
+        let ready = vec![
+            ready_task("CODE", LaneKind::Code, "- [ ] `CODE` Code work\n"),
+            ready_task(
+                "EVIDENCE",
+                LaneKind::Evidence,
+                "- [ ] `EVIDENCE` Collect evidence\n",
+            ),
+            ready_task(
+                "VERIFY-ONLY",
+                LaneKind::Code,
+                "- [ ] `VERIFY-ONLY` Re-run proof\n  Scope boundary: verification only; do not modify code\n  Acceptance criteria: receipt exists\n",
+            ),
+            ready_task(
+                "OPERATOR",
+                LaneKind::Operator,
+                "- [ ] `OPERATOR` Deposit funds\n",
+            ),
+        ];
+
+        let (operator, worker) = partition_ready_tasks_for_worker_dispatch(ready);
+
+        assert_eq!(
+            operator
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OPERATOR"]
+        );
+        assert_eq!(
+            worker
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CODE", "EVIDENCE", "VERIFY-ONLY"],
+            "all non-operator tasks must enter normal dispatch so clean-no-commit can run every definition-of-done gate"
+        );
     }
 
     #[test]

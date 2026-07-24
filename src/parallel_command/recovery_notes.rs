@@ -538,16 +538,20 @@ pub(crate) fn retry_failure_recovery_note(
         diffstat
     };
 
-    let stderr_tail =
-        clamp_recovery_section(&recovery_log_tail(stderr_log_path, MAX_TAIL_LINES), MAX_SECTION_CHARS);
+    let stderr_tail = clamp_recovery_section(
+        &recovery_log_tail(stderr_log_path, MAX_TAIL_LINES),
+        MAX_SECTION_CHARS,
+    );
     let stderr_block = if stderr_tail.trim().is_empty() {
         "(empty)".to_string()
     } else {
         stderr_tail
     };
 
-    let stdout_tail =
-        clamp_recovery_section(&recovery_log_tail(stdout_log_path, MAX_TAIL_LINES), MAX_SECTION_CHARS);
+    let stdout_tail = clamp_recovery_section(
+        &recovery_log_tail(stdout_log_path, MAX_TAIL_LINES),
+        MAX_SECTION_CHARS,
+    );
     let stdout_block = if stdout_tail.trim().is_empty() {
         "(empty)".to_string()
     } else {
@@ -701,8 +705,11 @@ mod tests {
 
         let stdout_log = dir.join("stdout.log");
         let stderr_log = dir.join("stderr.log");
-        fs::write(&stdout_log, "worker stdout line one\nworker stdout line two\n")
-            .expect("write stdout");
+        fs::write(
+            &stdout_log,
+            "worker stdout line one\nworker stdout line two\n",
+        )
+        .expect("write stdout");
         fs::write(
             &stderr_log,
             "error[E0433]: failed to resolve: use of undeclared crate `foo`\n",
@@ -714,7 +721,10 @@ mod tests {
         assert!(note.contains("M committed.txt"), "git status tail: {note}");
         assert!(note.contains("committed.txt"), "diff stat: {note}");
         assert!(note.contains("error[E0433]"), "stderr tail: {note}");
-        assert!(note.contains("worker stdout line two"), "stdout tail: {note}");
+        assert!(
+            note.contains("worker stdout line two"),
+            "stdout tail: {note}"
+        );
 
         // Futility disposition renders its own description.
         let futile = retry_failure_recovery_note(&repo, &stdout_log, &stderr_log, -9, true);
@@ -744,7 +754,10 @@ mod tests {
 
         let note = retry_failure_recovery_note(&repo, &stdout_log, &stderr_log, 1, false);
         assert!(note.contains("line-499"), "keeps the most recent line");
-        assert!(!note.contains("line-400"), "drops old lines beyond the tail");
+        assert!(
+            !note.contains("line-400"),
+            "drops old lines beyond the tail"
+        );
         assert!(
             note.contains("Last 40 non-empty stderr lines from the failed attempt:\n(empty)"),
             "empty stderr renders as (empty): {note}"

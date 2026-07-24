@@ -14,9 +14,13 @@ pub(crate) use fsutil::{
     truncate_file_to_max_bytes, write_0o600_if_unix,
 };
 pub(crate) use git::{
-    auto_checkpoint_if_needed, git_branch_exists, git_cherry_pick_empty_arg, git_repo_root,
-    git_status_short_filtered, git_stdout, parse_origin_head_branch, push_branch_with_remote_sync,
-    run_git, sync_branch_with_remote, KNOWN_PRIMARY_BRANCHES,
+    auto_checkpoint_if_needed, capture_validated_task_closeout_tree, commit_staged_checkpoint_cas,
+    commit_staged_queue_checkpoint_cas, commit_validated_task_closeout_tree_cas, git_branch_exists,
+    git_cherry_pick_empty_arg, git_repo_root, git_status_short_filtered, git_stdout,
+    parse_origin_head_branch, push_branch_with_remote_sync,
+    refuse_unsealed_task_completion_checkpoint, refuse_unsealed_task_completion_transitions_except,
+    refuse_worktree_paths_outside, run_git, sync_branch_with_remote, unsealed_task_completion_ids,
+    KNOWN_PRIMARY_BRANCHES,
 };
 #[cfg(test)]
 pub(crate) use spawn::output_retrying_etxtbsy;

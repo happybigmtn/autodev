@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend_process::{retire_worker_pid_lease, worker_pid_lease_target};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LaneRepoProgress {
@@ -16,6 +17,32 @@ pub(crate) fn git_commit_exists(repo_root: &Path, commit: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Return the first incoming lane commit that uses the host-reserved durable
+/// verification-receipt trailer namespace. Receipt footers are minted only by
+/// canonical host closeout commits; accepting one from a lane would let worker
+/// output manufacture future completion authority.
+pub(crate) fn lane_range_reserved_verification_receipt_commit(
+    repo_root: &Path,
+    base_commit: &str,
+    head_ref: &str,
+) -> Result<Option<String>> {
+    let range = format!("{base_commit}..{head_ref}");
+    let commits = git_stdout(repo_root, ["rev-list", "--reverse", &range])
+        .with_context(|| format!("failed to enumerate incoming lane range {range}"))?;
+    for commit in commits
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let body = git_stdout(repo_root, ["show", "-s", "--format=%B", commit])
+            .with_context(|| format!("failed to inspect incoming lane commit {commit}"))?;
+        if commit_message_has_reserved_verification_receipt_footer(&body) {
+            return Ok(Some(commit.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn git_path(repo_root: &Path, path: &str) -> Option<PathBuf> {
@@ -202,11 +229,13 @@ pub(crate) fn path_modified_elapsed(path: &Path) -> Result<Option<Duration>> {
 }
 
 pub(crate) fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -218,13 +247,21 @@ pub(crate) fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
 }
 
 pub(crate) fn clear_stale_worker_pid(path: &Path) -> Result<()> {
-    let Some(pid) = read_worker_pid(path)? else {
+    let lease_path = worker_pid_lease_target(path)?;
+    let pid_path = lease_path.as_deref().unwrap_or(path);
+    let Some(pid) = read_worker_pid(pid_path)? else {
         return Ok(());
     };
     if worker_pid_is_alive(pid)? {
         return Ok(());
     }
-    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+    if let Some(lease_path) = lease_path {
+        retire_worker_pid_lease(&lease_path)?;
+    }
+    // Legacy regular worker.pid files are intentionally left for the next
+    // atomic lease publication to replace. Unlinking the shared path after a
+    // liveness check could delete a newer owner that won the intervening race.
+    Ok(())
 }
 
 pub(crate) fn lane_repo_process_pids(lane_repo_root: &Path) -> Result<Vec<u32>> {
@@ -497,6 +534,7 @@ pub(crate) fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend_process::WorkerPidGuard;
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -547,6 +585,32 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_worker_cleanup_retires_the_lease_without_unlinking_its_publication() {
+        let root = unique_temp_dir("stale-worker-lease");
+        fs::create_dir_all(&root).expect("create worker pid root");
+        let path = root.join("worker.pid");
+        let guard =
+            WorkerPidGuard::new(Some(&path), Some(999_999)).expect("publish stale worker pid");
+        let lease_path = root.join(fs::read_link(&path).expect("read worker pid lease"));
+
+        clear_stale_worker_pid(&path).expect("clear stale worker pid");
+
+        assert!(fs::symlink_metadata(&path)
+            .expect("shared worker pid publication should remain")
+            .file_type()
+            .is_symlink());
+        assert!(!lease_path.exists());
+        assert_eq!(
+            read_worker_pid(&path).expect("dangling publication should be readable as state"),
+            None
+        );
+
+        drop(guard);
+        fs::remove_dir_all(&root).expect("remove worker pid root");
     }
 
     #[test]
@@ -602,8 +666,11 @@ mod tests {
         // Canonical has a gitignored build oracle and a config naming it.
         fs::create_dir_all(canonical.join("target").join("oracle"))
             .expect("failed to create canonical oracle dir");
-        fs::write(canonical.join("target").join("oracle").join("Ludii.jar"), b"jar")
-            .expect("failed to write oracle jar");
+        fs::write(
+            canonical.join("target").join("oracle").join("Ludii.jar"),
+            b"jar",
+        )
+        .expect("failed to write oracle jar");
         fs::create_dir_all(canonical.join(".auto")).expect("failed to create .auto");
         fs::write(
             canonical.join(".auto").join("lane-shared-paths"),
@@ -627,9 +694,18 @@ mod tests {
             "symlinked oracle should expose the shared jar"
         );
         // The absolute path, the `..` escape, and the missing path must be skipped.
-        assert!(!lane.join("etc").exists(), "absolute paths must be rejected");
-        assert!(!lane.join("escape").exists(), "parent escapes must be rejected");
-        assert!(!lane.join("missing").exists(), "absent sources must be skipped");
+        assert!(
+            !lane.join("etc").exists(),
+            "absolute paths must be rejected"
+        );
+        assert!(
+            !lane.join("escape").exists(),
+            "parent escapes must be rejected"
+        );
+        assert!(
+            !lane.join("missing").exists(),
+            "absent sources must be skipped"
+        );
 
         fs::remove_dir_all(&base).expect("failed to clean temp dir");
     }
@@ -645,7 +721,10 @@ mod tests {
         share_configured_lane_paths(&canonical, &lane);
 
         assert!(
-            fs::read_dir(&lane).expect("lane should be readable").next().is_none(),
+            fs::read_dir(&lane)
+                .expect("lane should be readable")
+                .next()
+                .is_none(),
             "no config means the lane is left untouched"
         );
 

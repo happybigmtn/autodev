@@ -26,10 +26,12 @@ pub(crate) use crate::completion_artifacts::verification::verification_step_look
 
 pub(crate) use owned_inputs::compute_task_owned_inputs_fingerprint;
 pub(crate) use receipt::{
-    footer_task_owned_inputs, git_verification_receipt_footers,
-    legacy_verification_receipt_backfill_footer, normalized_plan_hash_bytes,
-    shared_footer_receipt_freshness_problem, shared_receipt_freshness_problem,
-    verification_receipt_commit_footer, VerificationReceiptFooter,
+    clear_verified_source_attestation, commit_message_has_reserved_verification_receipt_footer,
+    current_dirty_state_fingerprint, direct_verification_receipt_freshness_problem,
+    direct_verification_receipt_problem, footer_task_owned_inputs,
+    git_verification_receipt_footers, normalized_plan_hash_bytes,
+    record_verified_source_attestation, verification_receipt_commit_footer,
+    VerificationReceiptFooter,
 };
 pub(crate) use verification::verification_plan;
 
@@ -411,8 +413,8 @@ mod tests {
 
     use super::{
         assess_task_completion_gap, ensure_host_review_handoff, inspect_task_completion_evidence,
-        review_contains_task, verification_receipt_commit_footer, CompletionGapKind,
-        TaskCompletionEvidence,
+        normalized_plan_hash_bytes, record_verified_source_attestation, review_contains_task,
+        verification_receipt_commit_footer, CompletionGapKind, TaskCompletionEvidence,
     };
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -487,9 +489,40 @@ mod tests {
         );
     }
 
+    fn current_receipt_metadata(root: &std::path::Path) -> (String, String, String) {
+        let commit = git_head(root);
+        let dirty = super::current_dirty_state_fingerprint(root)
+            .expect("dirty-state fingerprint should compute");
+        let plan = fs::read(root.join("IMPLEMENTATION_PLAN.md")).expect("plan should be readable");
+        (commit, dirty, normalized_plan_hash_bytes(&plan))
+    }
+
+    fn receipt_with_current_metadata(root: &std::path::Path, receipt_text: &str) -> String {
+        if !root.join(".git").exists() {
+            init_git_repo(root);
+        }
+        let (commit, dirty, plan_hash) = current_receipt_metadata(root);
+        let mut receipt =
+            serde_json::from_str::<serde_json::Value>(receipt_text).expect("valid receipt fixture");
+        let receipt = receipt
+            .as_object_mut()
+            .expect("receipt fixture should be an object");
+        receipt.insert("commit".to_string(), serde_json::Value::String(commit));
+        receipt.insert(
+            "dirty_state".to_string(),
+            serde_json::json!({"fingerprint": dirty, "entries": []}),
+        );
+        receipt.insert(
+            "plan_hash".to_string(),
+            serde_json::Value::String(plan_hash),
+        );
+        serde_json::to_string(receipt).expect("serialize receipt fixture")
+    }
+
     #[test]
     fn inspect_task_completion_evidence_requires_review_and_receipts() {
         let root = temp_dir("evidence");
+        init_git_repo(&root);
         fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
         fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
             .expect("failed to write wrapper");
@@ -502,9 +535,12 @@ mod tests {
         .expect("failed to write review");
         fs::create_dir_all(root.join("docs/ops")).expect("failed to create docs dir");
         fs::write(root.join("docs/ops/proof.md"), "proof\n").expect("failed to write proof");
+        let (commit, dirty, plan_hash) = current_receipt_metadata(&root);
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-1.json"),
-            r#"{"declared_artifacts":[{"path":"docs/ops/proof.md","sha256":"f6ed42a9d765eeb230a069bbc3d5dc346b2669594bb0b83cc6d14d5d967b8961"}],"commands":[{"command":"cargo test -p demo receipt_example","exit_code":0,"status":"passed"}]}"#,
+            format!(
+                r#"{{"task_id":"TASK-1","commit":"{commit}","dirty_state":{{"fingerprint":"{dirty}","entries":[]}},"plan_hash":"{plan_hash}","declared_artifacts":[{{"path":"docs/ops/proof.md","sha256":"f6ed42a9d765eeb230a069bbc3d5dc346b2669594bb0b83cc6d14d5d967b8961"}}],"commands":[{{"command":"cargo test -p demo receipt_example","argv":["cargo","test","-p","demo","receipt_example"],"expected_argv":["cargo","test","-p","demo","receipt_example"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
         )
         .expect("failed to write receipt");
 
@@ -515,6 +551,38 @@ mod tests {
         );
         assert!(evidence.is_fully_evidenced());
         assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn inspect_task_completion_evidence_rejects_receipt_when_git_collection_fails() {
+        let root = temp_dir("evidence-git-collection-failure");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("create receipts dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-GIT-FAIL.json"),
+            r#"{"task_id":"TASK-GIT-FAIL","commands":[{"command":"cargo test -p demo git_failure","argv":["cargo","test","-p","demo","git_failure"],"expected_argv":["cargo","test","-p","demo","git_failure"],"exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-GIT-FAIL",
+            "- [ ] `TASK-GIT-FAIL` Reject unavailable repository state\nVerification:\n  - `cargo test -p demo git_failure`\nCompletion artifacts: none\nDependencies: none\n",
+        );
+        assert!(!evidence.verification_receipt_present);
+        assert!(
+            evidence
+                .verification_receipt_status
+                .as_deref()
+                .is_some_and(|status| status.contains("current Git HEAD")),
+            "{:?}",
+            evidence.verification_receipt_status
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -529,25 +597,52 @@ mod tests {
             "# REVIEW\n\nAwaiting auto review:\n## `TASK-FOOTER`\n",
         )
         .expect("failed to write review");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "- [~] `TASK-FOOTER` Footer evidence\n  Verification:\n    - `cargo test footer_receipt`\n  Completion artifacts: none\n  Dependencies: none\n",
+        )
+        .expect("failed to write plan");
+        git_ok(
+            &root,
+            &[
+                "add",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "scripts/run-task-verification.sh",
+            ],
+        );
+        git_ok(&root, &["commit", "-m", "seed partial footer task"]);
         fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-FOOTER.json"),
-            r#"{"task_id":"TASK-FOOTER","commands":[{"command":"cargo test footer_receipt","exit_code":0,"status":"passed","output_summary":{"stdout_tail":"large transient output","stderr_tail":"","stdout_bytes":22,"stderr_bytes":0}}]}"#,
+            {
+                let (commit, dirty, plan_hash) = current_receipt_metadata(&root);
+                format!(
+                    r#"{{"task_id":"TASK-FOOTER","commit":"{commit}","dirty_state":{{"fingerprint":"{dirty}"}},"plan_hash":"{plan_hash}","commands":[{{"command":"cargo test footer_receipt","argv":["cargo","test","footer_receipt"],"expected_argv":["cargo","test","footer_receipt"],"exit_code":0,"status":"passed","output_summary":{{"stdout_tail":"large transient output","stderr_tail":"","stdout_bytes":22,"stderr_bytes":0}}}}]}}"#
+                )
+            },
         )
         .expect("failed to write receipt");
+        record_verified_source_attestation(&root, "TASK-FOOTER")
+            .expect("host should attest footer source");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-FOOTER` Footer evidence\n  Verification:\n    - `cargo test footer_receipt`\n  Completion artifacts: none\n  Dependencies: none\n",
+        )
+        .expect("mark footer task done");
         let footer = verification_receipt_commit_footer(&root, "TASK-FOOTER")
             .expect("footer generation should succeed")
             .expect("footer should be present");
         assert!(footer.contains("Auto-Verification-Receipt-Task: TASK-FOOTER"));
         assert!(!footer.contains("large transient output"));
+        git_ok(&root, &["add", "IMPLEMENTATION_PLAN.md"]);
         git_ok(
             &root,
             &[
                 "commit",
-                "--allow-empty",
                 "-m",
-                "footer evidence",
+                "repo: TASK-FOOTER queue sync",
                 "-m",
                 &footer,
             ],
@@ -583,24 +678,46 @@ mod tests {
   Dependencies: none
 ";
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), plan).expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-OI`\n",
+        )
+        .expect("write review");
         fs::create_dir_all(root.join("src")).expect("create src");
         fs::write(root.join("src/lib.rs"), "pub fn oi() {}\n").expect("write owned src");
         fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
             .expect("create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-OI.json"),
-            r#"{"task_id":"TASK-OI","commands":[{"command":"cargo test oi","exit_code":0,"status":"passed"}]}"#,
+            r#"{"task_id":"TASK-OI","commands":[{"command":"cargo test oi","argv":["cargo","test","oi"],"expected_argv":["cargo","test","oi"],"exit_code":0,"status":"passed"}]}"#,
         )
         .expect("write receipt");
         git_ok(&root, &["add", "-A"]);
         git_ok(&root, &["commit", "-m", "owned inputs demo"]);
+        let (commit, dirty, plan_hash) = current_receipt_metadata(&root);
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-OI.json"),
+            format!(
+                r#"{{"task_id":"TASK-OI","commit":"{commit}","dirty_state":{{"fingerprint":"{dirty}"}},"plan_hash":"{plan_hash}","commands":[{{"command":"cargo test oi","argv":["cargo","test","oi"],"expected_argv":["cargo","test","oi"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("refresh current receipt metadata");
+        record_verified_source_attestation(&root, "TASK-OI")
+            .expect("host should attest owned source");
 
         let footer = verification_receipt_commit_footer(&root, "TASK-OI")
             .expect("footer generation should succeed")
             .expect("footer should be present");
         git_ok(
             &root,
-            &["commit", "--allow-empty", "-m", "closeout", "-m", &footer],
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "repo: TASK-OI receipt footer backfill",
+                "-m",
+                &footer,
+            ],
         );
 
         let landed = latest_verification_receipt_footer(&root, "TASK-OI")
@@ -616,7 +733,10 @@ mod tests {
             &crate::task_parser::parse_tasks(plan),
         )
         .expect("recompute should succeed");
-        assert_eq!(stamped, recomputed, "stamped fingerprint must match recompute");
+        assert_eq!(
+            stamped, recomputed,
+            "stamped fingerprint must match recompute"
+        );
 
         // Editing the owned source moves the recomputed fingerprint.
         fs::write(root.join("src/lib.rs"), "pub fn oi() { /* changed */ }\n")
@@ -627,7 +747,10 @@ mod tests {
             &crate::task_parser::parse_tasks(plan),
         )
         .expect("recompute should succeed");
-        assert_ne!(stamped, after, "owned-source change must move the fingerprint");
+        assert_ne!(
+            stamped, after,
+            "owned-source change must move the fingerprint"
+        );
     }
 
     #[test]
@@ -646,7 +769,10 @@ mod tests {
             .expect("failed to create host receipt dir");
         fs::write(
             base.join(".auto/symphony/verification-receipts/TASK-LANE.json"),
-            r#"{"commands":[{"command":"cargo test completion_artifacts::tests::lane_receipt","exit_code":0,"status":"passed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-LANE","commands":[{"command":"cargo test completion_artifacts::tests::lane_receipt","argv":["cargo","test","completion_artifacts::tests::lane_receipt"],"expected_argv":["cargo","test","completion_artifacts::tests::lane_receipt"],"exit_code":0,"status":"passed"}]}"#,
+            ),
         )
         .expect("failed to write host receipt");
 
@@ -677,7 +803,10 @@ mod tests {
             .expect("failed to create host receipt dir");
         fs::write(
             base.join(".auto/symphony/verification-receipts/TASK-NESTED-LANE.json"),
-            r#"{"commands":[{"command":"cargo test completion_artifacts::tests::nested_lane_receipt","exit_code":0,"status":"passed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-NESTED-LANE","commands":[{"command":"cargo test completion_artifacts::tests::nested_lane_receipt","argv":["cargo","test","completion_artifacts::tests::nested_lane_receipt"],"expected_argv":["cargo","test","completion_artifacts::tests::nested_lane_receipt"],"exit_code":0,"status":"passed"}]}"#,
+            ),
         )
         .expect("failed to write host receipt");
 
@@ -886,7 +1015,10 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-7.json"),
-            r#"{"commands":[{"command":"cargo test -p demo failed_receipt","exit_code":101,"status":"failed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-7","commands":[{"command":"cargo test -p demo failed_receipt","argv":["cargo","test","-p","demo","failed_receipt"],"expected_argv":["cargo","test","-p","demo","failed_receipt"],"exit_code":101,"status":"failed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -912,7 +1044,10 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-ZERO-CARGO.json"),
-            r#"{"commands":[{"command":"cargo test completion_artifacts::tests::missing_filter","exit_code":0,"status":"passed","runner_summary":{"kind":"cargo-test","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-ZERO-CARGO","commands":[{"command":"cargo test completion_artifacts::tests::missing_filter","argv":["cargo","test","completion_artifacts::tests::missing_filter"],"expected_argv":["cargo","test","completion_artifacts::tests::missing_filter"],"exit_code":0,"status":"passed","runner_summary":{"kind":"cargo-test","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -930,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_task_completion_evidence_accepts_historical_ancestor_json_receipt() {
+    fn inspect_task_completion_evidence_rejects_historical_ancestor_json_receipt() {
         let root = temp_dir("historical-ancestor-json-receipt");
         init_git_repo(&root);
         let historical_commit = git_head(&root);
@@ -956,7 +1091,7 @@ mod tests {
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-HISTORICAL.json"),
             format!(
-                r#"{{"commit":"{historical_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::some_filter","exit_code":0,"status":"passed"}}]}}"#
+                r#"{{"task_id":"TASK-HISTORICAL","commit":"{historical_commit}","commands":[{{"command":"cargo test completion_artifacts::tests::some_filter","argv":["cargo","test","completion_artifacts::tests::some_filter"],"expected_argv":["cargo","test","completion_artifacts::tests::some_filter"],"exit_code":0,"status":"passed"}}]}}"#
             ),
         )
         .expect("failed to write receipt");
@@ -967,7 +1102,11 @@ mod tests {
             "- [ ] `TASK-HISTORICAL` Example\nVerification:\n  - `cargo test completion_artifacts::tests::some_filter`\nDependencies: none\n",
         );
 
-        assert!(evidence.verification_receipt_present);
+        assert!(!evidence.verification_receipt_present);
+        assert!(evidence
+            .missing_reasons()
+            .join("\n")
+            .contains("not current HEAD"));
     }
 
     #[test]
@@ -981,7 +1120,7 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-STALE.json"),
-            r#"{"commit":"1111111111111111111111111111111111111111","commands":[{"command":"cargo test completion_artifacts::tests::some_filter","exit_code":0,"status":"passed"}]}"#,
+            r#"{"task_id":"TASK-STALE","commit":"1111111111111111111111111111111111111111","commands":[{"command":"cargo test completion_artifacts::tests::some_filter","argv":["cargo","test","completion_artifacts::tests::some_filter"],"expected_argv":["cargo","test","completion_artifacts::tests::some_filter"],"exit_code":0,"status":"passed"}]}"#,
         )
         .expect("failed to write receipt");
 
@@ -1073,7 +1212,10 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-ZERO-PYTEST.json"),
-            r#"{"commands":[{"command":"python -m pytest tests/missing.py","argv":["python","-m","pytest","tests/missing.py"],"exit_code":0,"status":"passed","runner_summary":{"kind":"pytest","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-ZERO-PYTEST","commands":[{"command":"python -m pytest tests/missing.py","argv":["python","-m","pytest","tests/missing.py"],"expected_argv":["python","-m","pytest","tests/missing.py"],"exit_code":0,"status":"passed","runner_summary":{"kind":"pytest","tests_discovered":0,"tests_run":0,"zero_test_detected":true}}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1126,7 +1268,10 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-11.json"),
-            r#"{"commands":[{"command":"cargo test -p demo first","exit_code":0,"status":"passed"},{"command":"cargo test -p demo second","exit_code":101,"status":"failed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-11","commands":[{"command":"cargo test -p demo first","argv":["cargo","test","-p","demo","first"],"expected_argv":["cargo","test","-p","demo","first"],"exit_code":0,"status":"passed"},{"command":"cargo test -p demo second","argv":["cargo","test","-p","demo","second"],"expected_argv":["cargo","test","-p","demo","second"],"exit_code":101,"status":"failed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1157,7 +1302,10 @@ mod tests {
         .expect("failed to write review");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-SUPERSEDED.json"),
-            r#"{"commands":[{"command":"rg -n multi-filter WORKLIST.md src","exit_code":2,"status":"failed"},{"command":"rg -n \"multi-filter\" WORKLIST.md src/generation.rs","exit_code":0,"status":"passed","supersedes":["rg -n multi-filter WORKLIST.md src"]}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-SUPERSEDED","commands":[{"command":"rg -n multi-filter WORKLIST.md src","argv":["rg","-n","multi-filter","WORKLIST.md","src"],"expected_argv":["rg","-n","multi-filter","WORKLIST.md","src"],"exit_code":2,"status":"failed"},{"command":"rg -n \"multi-filter\" WORKLIST.md src/generation.rs","argv":["rg","-n","multi-filter","WORKLIST.md","src/generation.rs"],"expected_argv":["rg","-n","multi-filter","WORKLIST.md","src/generation.rs"],"exit_code":0,"status":"passed","supersedes":["rg -n multi-filter WORKLIST.md src"]}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1186,7 +1334,10 @@ mod tests {
         .expect("failed to write review");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-LATER-PASS.json"),
-            r#"{"commands":[{"command":"rg -n HotRoller|crapsHotRollerTotalNumerator contracts/src contracts/tests","exit_code":127,"status":"failed"},{"command":"rg -n \"HotRoller|crapsHotRollerTotalNumerator\" contracts/src contracts/tests","exit_code":0,"status":"passed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-LATER-PASS","commands":[{"command":"rg -n HotRoller|crapsHotRollerTotalNumerator contracts/src contracts/tests","argv":["rg","-n","HotRoller|crapsHotRollerTotalNumerator","contracts/src","contracts/tests"],"expected_argv":["rg","-n","HotRoller|crapsHotRollerTotalNumerator","contracts/src","contracts/tests"],"exit_code":127,"status":"failed"},{"command":"rg -n \"HotRoller|crapsHotRollerTotalNumerator\" contracts/src contracts/tests","argv":["rg","-n","HotRoller|crapsHotRollerTotalNumerator","contracts/src","contracts/tests"],"expected_argv":["rg","-n","HotRoller|crapsHotRollerTotalNumerator","contracts/src","contracts/tests"],"exit_code":0,"status":"passed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1210,7 +1361,10 @@ mod tests {
             .expect("failed to create receipts dir");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-8.json"),
-            r#"{"commands":[{"command":"cargo test -p demo first","exit_code":0,"status":"passed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-8","commands":[{"command":"cargo test -p demo first","argv":["cargo","test","-p","demo","first"],"expected_argv":["cargo","test","-p","demo","first"],"exit_code":0,"status":"passed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1223,7 +1377,7 @@ mod tests {
         assert!(evidence
             .missing_reasons()
             .join("\n")
-            .contains("is missing command(s)"));
+            .contains("missing matching actual argv metadata"));
     }
 
     #[test]
@@ -1241,7 +1395,10 @@ mod tests {
         .expect("failed to write review");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-12.json"),
-            r#"{"commands":[{"command":"sh -c echo \"hello world\"","argv":["sh","-c","echo \"hello world\""],"exit_code":0,"status":"passed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-12","commands":[{"command":"sh -c 'echo \"hello world\"'","argv":["sh","-c","echo \"hello world\""],"expected_argv":["sh","-c","echo \"hello world\""],"exit_code":0,"status":"passed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 
@@ -1270,7 +1427,10 @@ mod tests {
         .expect("failed to write review");
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-10.json"),
-            r#"{"commands":[{"command":"cargo test -p demo current","exit_code":0,"status":"passed"},{"command":"cargo test -p demo old","exit_code":101,"status":"failed"}]}"#,
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-10","commands":[{"command":"cargo test -p demo current","argv":["cargo","test","-p","demo","current"],"expected_argv":["cargo","test","-p","demo","current"],"exit_code":0,"status":"passed"},{"command":"cargo test -p demo old","argv":["cargo","test","-p","demo","old"],"expected_argv":["cargo","test","-p","demo","old"],"exit_code":101,"status":"failed"}]}"#,
+            ),
         )
         .expect("failed to write receipt");
 

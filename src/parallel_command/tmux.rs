@@ -11,6 +11,14 @@ pub(crate) fn prepare_parallel_startup(
     repo_root: &Path,
     target_branch: &str,
 ) -> Result<ParallelStartupPrep> {
+    enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    let recovered = recover_unsealed_task_completion_transitions(repo_root)?;
+    if !recovered.is_empty() {
+        eprintln!(
+            "recovery: demoted interrupted, unsealed task completion(s) to [~] before checkpoint: {}",
+            recovered.join(", ")
+        );
+    }
     if let Some(commit) =
         auto_checkpoint_if_needed(repo_root, target_branch, "auto parallel checkpoint")?
     {
@@ -54,13 +62,8 @@ pub(crate) fn setup_parallel_tmux_windows(
     // bare `-t <name>` ambiguous: tmux parses `new-window -t 0` as window index
     // 0 and fails with "create window failed: index 0 in use". The `$<id>` form
     // is always unambiguous as a session target, in every position below.
-    let session_target = tmux_stdout([
-        "display-message",
-        "-p",
-        "-t",
-        &pane_target,
-        "#{session_id}",
-    ])?;
+    let session_target =
+        tmux_stdout(["display-message", "-p", "-t", &pane_target, "#{session_id}"])?;
 
     for window_name in tmux_window_names(&session_target)? {
         if window_name.starts_with("loop-lane-") || window_name.starts_with("parallel-lane-") {
@@ -194,8 +197,15 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         .and_then(|path| path.into_os_string().into_string().ok())
         .or_else(|| env::args().next())
         .context("failed to resolve current executable")?;
+    let skip_remote_sync = match env::var_os("AUTO_SKIP_REMOTE_SYNC") {
+        Some(value) if !value.is_empty() => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("AUTO_SKIP_REMOTE_SYNC contained invalid UTF-8"))?,
+        _ => String::new(),
+    };
     let mut parts = vec![
         "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
+        format!("AUTO_SKIP_REMOTE_SYNC={}", shell_quote(&skip_remote_sync)),
         shell_quote(&executable),
         "parallel".to_string(),
     ];
@@ -482,6 +492,86 @@ mod tests {
 
         assert!(command.contains(" parallel "));
         assert!(command.contains(" status"));
+    }
+
+    #[test]
+    fn parallel_tmux_command_pins_local_only_mode_to_the_calling_environment() {
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("failed to lock process env");
+        let previous = std::env::var_os("AUTO_SKIP_REMOTE_SYNC");
+        struct RestoreSkipRemoteSync(Option<std::ffi::OsString>);
+        impl Drop for RestoreSkipRemoteSync {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("AUTO_SKIP_REMOTE_SYNC", value),
+                    None => std::env::remove_var("AUTO_SKIP_REMOTE_SYNC"),
+                }
+            }
+        }
+        let _restore = RestoreSkipRemoteSync(previous);
+        let args = ParallelArgs {
+            action: Some(ParallelAction::Status),
+            apply_receipt_backfill_handoffs: false,
+            json: false,
+            max_iterations: None,
+            max_concurrent_workers: 2,
+            cargo_build_jobs: None,
+            cargo_target: ParallelCargoTarget::Auto,
+            prompt_file: None,
+            model: "gpt-5.6-sol".to_string(),
+            reasoning_effort: "high".to_string(),
+            branch: None,
+            reference_repos: Vec::new(),
+            include_siblings: false,
+            run_root: None,
+            codex_bin: PathBuf::from("codex"),
+            claude: false,
+            max_turns: None,
+            max_retries: 2,
+        };
+        let render_script = || {
+            let command = parallel_tmux_command(&PathBuf::from("/tmp/auto-parallel"), &args)
+                .expect("tmux command should render");
+            let parser =
+                format!("set -- {command}; [ \"$#\" -eq 3 ] || exit 91; printf '%s' \"$3\"");
+            let output = Command::new("bash")
+                .args(["-c", &parser])
+                .output()
+                .expect("failed to parse rendered tmux command");
+            assert!(
+                output.status.success(),
+                "rendered command should remain valid shell: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("rendered script should be UTF-8")
+        };
+
+        std::env::set_var(
+            "AUTO_SKIP_REMOTE_SYNC",
+            "local only ' $HOME; touch /tmp/must-not-run",
+        );
+        let local_only = render_script();
+        assert!(
+            local_only.contains(
+                "AUTO_SKIP_REMOTE_SYNC='local only '\"'\"' $HOME; touch /tmp/must-not-run'"
+            ),
+            "{local_only}"
+        );
+
+        std::env::set_var("AUTO_SKIP_REMOTE_SYNC", "");
+        let explicitly_empty = render_script();
+        assert!(
+            explicitly_empty.contains("AUTO_SKIP_REMOTE_SYNC=''"),
+            "{explicitly_empty}"
+        );
+
+        std::env::remove_var("AUTO_SKIP_REMOTE_SYNC");
+        let unset = render_script();
+        assert!(
+            unset.contains("AUTO_SKIP_REMOTE_SYNC=''"),
+            "an existing tmux server must not leak a stale local-only value: {unset}"
+        );
     }
 
     #[test]

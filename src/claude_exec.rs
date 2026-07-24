@@ -1,4 +1,3 @@
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -7,8 +6,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 
-use crate::backend_process::{clear_worker_pid, log_stderr, read_stream, write_worker_pid};
+use crate::backend_process::{log_stderr, read_stream, WorkerPidGuard};
 use crate::codex_stream;
+use crate::process_group::{AbortOnDropTask, ContainedChild};
 use crate::quota_config::Provider;
 use crate::quota_exec;
 
@@ -205,14 +205,12 @@ async fn spawn_claude(
         command.env(key, value);
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = ContainedChild::spawn(&mut command)
         .with_context(|| format!("failed to launch Claude from {}", repo_root.display()))?;
-    write_worker_pid(worker_pid_path, child.id())?;
+    let worker_pid_guard = WorkerPidGuard::new(worker_pid_path, child.id())?;
 
     let mut stdin = child
-        .stdin
-        .take()
+        .take_stdin()
         .with_context(|| format!("Claude stdin should be piped for {context_label}"))?;
     stdin
         .write_all(full_prompt.as_bytes())
@@ -221,19 +219,17 @@ async fn spawn_claude(
     drop(stdin);
 
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .with_context(|| format!("Claude stdout should be piped for {context_label}"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .with_context(|| format!("Claude stderr should be piped for {context_label}"))?;
 
     let (futility_tx, futility_rx) = oneshot::channel::<()>();
     let stream_label = context_label.to_string();
     let stdout_log_path = stdout_log_path.map(Path::to_path_buf);
     let resolved_threshold = futility_threshold.unwrap_or(codex_stream::CLAUDE_FUTILITY_THRESHOLD);
-    let stdout_task = tokio::spawn(async move {
+    let stdout_task = AbortOnDropTask::spawn(async move {
         codex_stream::stream_claude_output_with_threshold(
             stdout,
             Some(futility_tx),
@@ -243,7 +239,7 @@ async fn spawn_claude(
         )
         .await
     });
-    let stderr_task = tokio::spawn(async move { read_stream(stderr).await });
+    let stderr_task = AbortOnDropTask::spawn(async move { read_stream(stderr).await });
 
     let status = tokio::select! {
         result = child.wait() => {
@@ -254,24 +250,38 @@ async fn spawn_claude(
                 "\nfutility spiral detected: killing Claude after {} consecutive empty tool results",
                 codex_stream::CLAUDE_FUTILITY_THRESHOLD,
             );
-            let _ = child.start_kill();
             // Return a synthetic non-zero exit status so the loop can retry
-            let _ = child.wait().await;
+            let _ = child.terminate().await;
             // Raw wait status: exit code in upper byte, lower byte is signal.
             // Shift left by 8 so .code() returns FUTILITY_EXIT_MARKER.
-            std::process::ExitStatus::from_raw(FUTILITY_EXIT_MARKER << 8)
+            futility_exit_status()
         }
     };
-    clear_worker_pid(worker_pid_path)?;
+    worker_pid_guard.clear()?;
 
     stdout_task
+        .join()
         .await
         .context("Claude stdout streaming task panicked")??;
     let stderr_text = stderr_task
+        .join()
         .await
         .context("Claude stderr capture task panicked")??;
 
     Ok((status, stderr_text))
+}
+
+fn futility_exit_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(FUTILITY_EXIT_MARKER << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(FUTILITY_EXIT_MARKER as u32)
+    }
 }
 
 pub(crate) fn resolve_claude_model(model: &str) -> String {

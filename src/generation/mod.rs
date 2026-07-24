@@ -27,6 +27,7 @@ use crate::state::{load_state, save_state, AutoState};
 use crate::util::{binary_provenance_line, ensure_repo_layout, git_repo_root, timestamp_slug};
 use crate::{CorpusArgs, GenerationArgs};
 
+use crate::codex_exec::run_codex_exec;
 use crate::generation::corpus_verify::{
     sanitize_and_verify_corpus_outputs, verify_corpus_outputs, verify_corpus_outputs_read_only,
     CorpusOutputSummary,
@@ -35,7 +36,6 @@ use crate::generation::gbrain_context::{collect_gbrain_context, GBRAIN_CONTEXT_F
 use crate::generation::phase_runner::{
     codex_review_report_path, run_logged_author_phase, run_logged_codex_review,
 };
-use crate::codex_exec::run_codex_exec;
 use crate::generation::plan_verify::verify_generated_implementation_plan;
 use crate::generation::planning_root::{
     discover_active_plan_surface, ensure_planning_root_exists,

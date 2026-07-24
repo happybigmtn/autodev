@@ -20,14 +20,45 @@ Auto-Verification-Receipt-JSON: <base64url-json>
 
 The footer JSON omits bulky `stdout_tail` and `stderr_tail` fields while keeping
 the command, argv, exit status, runner summary, artifact hashes, plan hash, and
-dirty-state metadata. Readers prefer reachable commit footers and keep JSON
-receipts as a compatibility/staging fallback.
+dirty-state metadata. Before creating that footer, the host writes
+`.auto/parallel/verified-source/<TASK>.json` only after host verification
+passes. This local attestation binds the task, exact proof payload, command set,
+and a content-addressed source-state fingerprint. `source_state_v2` binds the
+root index identity and working tree plus every initialized submodule's gitlink
+index object, checked-out HEAD, child index, tracked and untracked contents,
+filesystem modes, and symlink targets recursively. The collector uses direct
+Git index/path enumeration, so `diff.ignoreSubmodules`,
+`submodule.<name>.ignore`, and `core.fileMode` cannot hide source drift.
+Tracked, content-bound per-directory `.gitignore` files remain authoritative
+for declared build outputs, but mutable `.git/info/exclude`,
+`core.excludesFile`, and untracked `.gitignore` files cannot hide source.
+Mutable host queue files remain excluded only at the root, allowing the scoped
+closeout transition without allowing source drift. Plan input, Git inventories,
+paths, metadata, and file contents share one streaming collection budget.
+The public host-attestation and footer-generation paths apply that budget
+before parsing their plan, receipt, or verified-source-attestation inputs and
+carry it through freshness HEAD/status/diff collection and source hashing; an
+oversized subprocess is killed and waited before the path fails closed.
+Receipt freshness and inspection likewise report any unavailable or bounded-out
+current `HEAD`, dirty state, plan input, or source-state collection as an
+explicit stale-evidence problem; absence never skips the corresponding check.
+Collection fails closed before draining an oversized inventory on a submodule
+cycle, an uninitialized or misdirected gitlink, nesting deeper than 8, more
+than 200,000 state entries, or more than 1 GiB of inventory/content.
+The footer embeds the fingerprint as `source_state_v2`; project-owned staging
+receipt schemas do not need to accept the field. Attestation schema version 2
+is required, so version-1 attestations and `source_state_v1` footers are
+historical-only and require host re-execution. Readers prefer reachable commit
+footers and keep JSON receipts as a compatibility/staging fallback.
 
 ## Required Metadata
 
 - `commit`: current `HEAD` for the checkout that ran the command.
-- `dirty_state.fingerprint`: fingerprint of tracked and untracked dirty state
-  when the command ran.
+- `dirty_state.fingerprint`: `autodev-dirty-state-v2`, a content-sensitive
+  fingerprint of porcelain state, staged and unstaged binary diffs, and
+  untracked file paths, modes, and contents when the command ran. Mutable host
+  queue files and `.auto/` runtime state are excluded so closeout bookkeeping
+  cannot invalidate verified source.
 - `plan_hash`: SHA-256 of the active `IMPLEMENTATION_PLAN.md`.
 - `commands[].command`: exact command text from the task row.
 - `commands[].expected_argv`: shell-split argv for the expected command.
@@ -120,8 +151,12 @@ For JSON staging receipts, `commit`, `dirty_state.fingerprint`, and `plan_hash`
 are compared with the current checkout because the file can drift independently
 from the work. For commit-footer receipts, the containing commit is the durable
 source. Footer freshness therefore validates command argv/status, zero-test
-guards, superseded failures, and declared artifact hashes without requiring the
-embedded pre-closeout `commit` to equal the current `HEAD`.
+guards, superseded failures, declared artifact hashes, and the embedded
+`source_state_v2` without requiring the embedded pre-closeout `commit` to equal
+the current `HEAD`. A legacy footer with only `source_state_v1` (or no
+source-state field) remains historical audit evidence, but it cannot authorize
+a new `Done` transition; host re-execution must create a fresh version-2
+verified-source attestation and footer.
 
 ## Parallel Drift Triage
 

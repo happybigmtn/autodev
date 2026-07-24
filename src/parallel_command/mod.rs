@@ -19,11 +19,13 @@ pub(crate) use crate::claude_exec::{
 };
 pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
-    assess_task_completion_gap, compute_task_owned_inputs_fingerprint, ensure_host_review_handoff,
-    footer_task_owned_inputs, git_verification_receipt_footers, inspect_task_completion_evidence,
-    legacy_verification_receipt_backfill_footer, unresolved_review_findings_for_task,
-    verification_plan, verification_receipt_commit_footer, CompletionGapKind,
-    VerificationReceiptFooter,
+    assess_task_completion_gap, clear_verified_source_attestation,
+    commit_message_has_reserved_verification_receipt_footer, compute_task_owned_inputs_fingerprint,
+    current_dirty_state_fingerprint, direct_verification_receipt_problem,
+    ensure_host_review_handoff, footer_task_owned_inputs, git_verification_receipt_footers,
+    inspect_task_completion_evidence, record_verified_source_attestation,
+    unresolved_review_findings_for_task, verification_plan, verification_receipt_commit_footer,
+    CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
@@ -32,9 +34,13 @@ pub(crate) use crate::task_parser::{
     PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, ensure_repo_layout, ensure_writable_run_root,
-    git_cherry_pick_empty_arg, git_repo_root, git_status_short_filtered, git_stdout,
-    push_branch_with_remote_sync, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
+    atomic_write, auto_checkpoint_if_needed, capture_validated_task_closeout_tree,
+    commit_staged_checkpoint_cas, commit_staged_queue_checkpoint_cas,
+    commit_validated_task_closeout_tree_cas, ensure_repo_layout, ensure_writable_run_root,
+    git_cherry_pick_empty_arg, git_repo_root, git_stdout, push_branch_with_remote_sync,
+    refuse_unsealed_task_completion_checkpoint, refuse_unsealed_task_completion_transitions_except,
+    refuse_worktree_paths_outside, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
+    unsealed_task_completion_ids,
 };
 pub(crate) use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
@@ -45,12 +51,12 @@ mod orchestrator;
 mod plan;
 mod preflight;
 mod prompt;
+mod purge;
 mod receipt_backfill;
 mod recovery_notes;
 mod review_gate;
 mod run_state;
 mod scheduling;
-mod purge;
 mod status;
 mod tmux;
 mod verify_gate;
@@ -63,12 +69,12 @@ pub(crate) use orchestrator::*;
 pub(crate) use plan::*;
 pub(crate) use preflight::*;
 pub(crate) use prompt::*;
+pub(crate) use purge::*;
 pub(crate) use receipt_backfill::*;
 pub(crate) use recovery_notes::*;
 pub(crate) use review_gate::*;
 pub(crate) use run_state::*;
 pub(crate) use scheduling::*;
-pub(crate) use purge::*;
 pub(crate) use status::*;
 pub(crate) use tmux::*;
 pub(crate) use verify_gate::*;
@@ -261,30 +267,21 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         target_branch.as_str(),
     );
 
-    if args.max_concurrent_workers > 1 {
-        run_parallel_loop(
-            &repo_root,
-            &args,
-            &target_branch,
-            &prompt_template,
-            &run_root,
-            &worker_env,
-            &mut linear_tracker,
-            &parallel_logger,
-        )
-        .await
-    } else {
-        run_serial_loop(
-            &repo_root,
-            &reference_repos,
-            &args,
-            &target_branch,
-            &prompt_template,
-            &run_root,
-            &worker_env,
-        )
-        .await
-    }
+    // Every worker count, including one, uses an isolated lane and the same
+    // host-owned verify -> workspace -> independent-review -> closeout gates.
+    // A direct-in-canonical serial worker could otherwise bypass those gates
+    // and mint commits that the host never adjudicated.
+    run_parallel_loop(
+        &repo_root,
+        &args,
+        &target_branch,
+        &prompt_template,
+        &run_root,
+        &worker_env,
+        &mut linear_tracker,
+        &parallel_logger,
+    )
+    .await
 }
 
 pub(crate) async fn run_parallel_inline(args: ParallelArgs) -> Result<()> {

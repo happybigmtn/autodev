@@ -75,8 +75,8 @@ fn classify_codex_windows<'a>(
     primary: &'a CodexWindow,
     secondary: Option<&'a CodexWindow>,
 ) -> CodexWindows<'a> {
-    let durations_known = primary.limit_window_seconds > 0
-        || secondary.is_some_and(|w| w.limit_window_seconds > 0);
+    let durations_known =
+        primary.limit_window_seconds > 0 || secondary.is_some_and(|w| w.limit_window_seconds > 0);
 
     if !durations_known {
         return CodexWindows {
@@ -662,7 +662,11 @@ mod tests {
         dir
     }
 
-    fn codex_window(used_percent: u32, limit_window_seconds: u64, reset_after_seconds: u64) -> CodexWindow {
+    fn codex_window(
+        used_percent: u32,
+        limit_window_seconds: u64,
+        reset_after_seconds: u64,
+    ) -> CodexWindow {
         CodexWindow {
             used_percent,
             limit_window_seconds,
@@ -698,7 +702,10 @@ mod tests {
             None,
         ));
 
-        assert!(usage.weekly_known, "the 7-day primary window IS the weekly budget");
+        assert!(
+            usage.weekly_known,
+            "the 7-day primary window IS the weekly budget"
+        );
         assert_eq!(usage.weekly_used_pct, 8);
         assert_eq!(usage.weekly_remaining_pct, 92);
         assert_eq!(usage.weekly_resets_in_secs, 574224);
@@ -747,7 +754,10 @@ mod tests {
             codex_window(50, 18000, 9000),
             Some(codex_window(100, 604800, 200000)),
         ));
-        assert!(usage.weekly_known, "a real exhausted weekly window is PRESENT");
+        assert!(
+            usage.weekly_known,
+            "a real exhausted weekly window is PRESENT"
+        );
         assert_eq!(usage.weekly_remaining_pct, 0);
     }
 
@@ -778,7 +788,10 @@ mod tests {
         ));
         assert_eq!(usage.session_used_pct, 60);
         assert!(!usage.weekly_known, "no weekly window ⇒ weekly unknown");
-        assert_eq!(usage.weekly_remaining_pct, 100, "unknown weekly assumed available");
+        assert_eq!(
+            usage.weekly_remaining_pct, 100,
+            "unknown weekly assumed available"
+        );
     }
 
     fn fake_jwt(exp: i64) -> String {

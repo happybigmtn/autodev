@@ -480,7 +480,10 @@ mod tests {
     /// Usage with an observed session window but no weekly window (e.g. the
     /// Codex Pro plan when its single window is classified as session, or any
     /// response that omits the weekly budget). Weekly usage is unknown.
-    fn make_usage_unknown_weekly(session_used_pct: u32, session_resets_in_secs: u64) -> AccountUsage {
+    fn make_usage_unknown_weekly(
+        session_used_pct: u32,
+        session_resets_in_secs: u64,
+    ) -> AccountUsage {
         AccountUsage {
             plan: "test".into(),
             session_used_pct,
@@ -541,8 +544,14 @@ mod tests {
         let state = QuotaState::default();
 
         let scored: Vec<(&AccountEntry, Option<AccountUsage>)> = vec![
-            (&config.accounts[0], Some(make_usage_unknown_weekly(8, 574224))),
-            (&config.accounts[1], Some(make_usage_unknown_weekly(0, 604800))),
+            (
+                &config.accounts[0],
+                Some(make_usage_unknown_weekly(8, 574224)),
+            ),
+            (
+                &config.accounts[1],
+                Some(make_usage_unknown_weekly(0, 604800)),
+            ),
         ];
 
         // Must not bail with "no selectable account has ... weekly quota".

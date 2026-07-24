@@ -93,7 +93,9 @@ fn parse_lane_cargo_incremental_enabled(raw: Option<&str>) -> bool {
 }
 
 fn lane_cargo_incremental_enabled() -> bool {
-    parse_lane_cargo_incremental_enabled(std::env::var("AUTO_LANE_CARGO_INCREMENTAL").ok().as_deref())
+    parse_lane_cargo_incremental_enabled(
+        std::env::var("AUTO_LANE_CARGO_INCREMENTAL").ok().as_deref(),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -756,15 +758,11 @@ pub(crate) fn discover_resume_candidates(
                     );
                     continue;
                 }
-                Ok(false) => {
-                    if let Err(err) = fs::remove_file(&worker_pid_path) {
-                        eprintln!(
-                            "warning: skipping resumable lane-{} because stale worker pid cleanup failed: {err:#}",
-                            lane_index
-                        );
-                        continue;
-                    }
-                }
+                // A stale legacy regular file is safe to leave in place: the
+                // next worker atomically replaces it with its lease
+                // publication. Never unlink the shared path after a
+                // check-to-delete window.
+                Ok(false) => {}
                 Err(err) => {
                     eprintln!(
                         "warning: skipping resumable lane-{} because worker pid liveness check failed: {err:#}",
@@ -1746,7 +1744,11 @@ mod tests {
             LaneCachePrune::UnderCap
         );
         assert!(target.join("debug").join("incremental").exists());
-        assert!(target.join("debug").join("deps").join("libfoo.rlib").exists());
+        assert!(target
+            .join("debug")
+            .join("deps")
+            .join("libfoo.rlib")
+            .exists());
 
         fs::remove_dir_all(&target).expect("cleanup");
     }
@@ -1761,10 +1763,7 @@ mod tests {
             64 * 1024,
         );
         write_blob(
-            &target
-                .join("release")
-                .join("incremental")
-                .join("state.bin"),
+            &target.join("release").join("incremental").join("state.bin"),
             64 * 1024,
         );
 
@@ -1782,7 +1781,11 @@ mod tests {
             "release incremental should be pruned"
         );
         assert!(
-            target.join("debug").join("deps").join("libfoo.rlib").exists(),
+            target
+                .join("debug")
+                .join("deps")
+                .join("libfoo.rlib")
+                .exists(),
             "warm deps rlibs must survive an incremental prune"
         );
 
@@ -1854,7 +1857,10 @@ mod tests {
             .join("lane-caches")
             .join("lane-2")
             .join("cargo-target");
-        write_blob(&target.join("debug").join("deps").join("big.rlib"), 64 * 1024);
+        write_blob(
+            &target.join("debug").join("deps").join("big.rlib"),
+            64 * 1024,
+        );
 
         // enforce reads AUTO_LANE_PERSISTENT_TARGET via lane_persistent_cargo_target_for,
         // but with the cap disabled it returns before consulting the target at all,

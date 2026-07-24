@@ -6,6 +6,7 @@ pub(crate) struct LoopQueueSnapshot {
     pub(crate) blocked_ids: Vec<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSnapshot) -> String {
     let blocked_clause = if queue.blocked_ids.is_empty() {
         "Blocked tasks marked `- [!]`: none".to_string()
@@ -153,8 +154,7 @@ impl LoopPlanSnapshot {
                 matches!(
                     task.status,
                     LoopTaskStatus::Pending | LoopTaskStatus::Blocked
-                ) || (task.status == LoopTaskStatus::Partial
-                    && gate_held.contains(&task.id))
+                ) || (task.status == LoopTaskStatus::Partial && gate_held.contains(&task.id))
             })
             .filter(|task| !self.is_completion_path_placeholder(task))
             .map(|task| task.id.clone())

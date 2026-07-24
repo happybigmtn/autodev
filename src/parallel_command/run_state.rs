@@ -246,10 +246,7 @@ pub(crate) fn load_parallel_run_state(run_root: &Path) -> ParallelRunState {
 
 /// Whether the operator asked to retry shelved/deferred tasks this run.
 fn retry_shelved_requested() -> bool {
-    std::env::var("AUTO_PARALLEL_RETRY_SHELVED")
-        .ok()
-        .as_deref()
-        == Some("1")
+    std::env::var("AUTO_PARALLEL_RETRY_SHELVED").ok().as_deref() == Some("1")
 }
 
 /// Operator escape hatch. When a task was shelved or deferred during a prior run
@@ -506,7 +503,9 @@ pub(crate) fn lane_run_id(lane_root: &Path) -> Option<String> {
 /// behavior rather than over-hiding lanes.
 pub(crate) fn lane_is_from_previous_run(run_root: &Path, lane_root: &Path) -> bool {
     match current_parallel_run_id(run_root) {
-        Some(current) => lane_run_id(lane_root).map(|id| id != current).unwrap_or(true),
+        Some(current) => lane_run_id(lane_root)
+            .map(|id| id != current)
+            .unwrap_or(true),
         None => false,
     }
 }
@@ -643,8 +642,7 @@ mod tests {
         assert!(raw.contains("\"failure_reason\": \"landing-conflict\""));
         assert!(raw.contains("\"src/lib.rs\""));
         let restored = load_parallel_run_state(&dir);
-        let (restored_shelved, restored_details) =
-            split_shelved_task_state(restored.shelved_tasks);
+        let (restored_shelved, restored_details) = split_shelved_task_state(restored.shelved_tasks);
         assert_eq!(restored_shelved, shelved);
         assert_eq!(restored_details, details);
 
@@ -752,8 +750,7 @@ mod tests {
             .contains("ludii_core::board::stable"));
         assert!(restored.ever_compiled_crates.contains("ludii_core"));
         assert_eq!(
-            restored.compile_error_excerpt,
-            baseline.compile_error_excerpt,
+            restored.compile_error_excerpt, baseline.compile_error_excerpt,
             "compile-error excerpt round-trips through the persisted baseline"
         );
         assert_eq!(
@@ -778,14 +775,14 @@ mod tests {
     #[test]
     fn retry_shelved_override_clears_shelved_and_deferred_when_requested() {
         let mut state = ParallelRunState::default();
-        state
-            .shelved_tasks
-            .insert(
-                "TASK-006".to_string(),
-                ShelvedTaskState::Legacy("task md".to_string()),
-            );
+        state.shelved_tasks.insert(
+            "TASK-006".to_string(),
+            ShelvedTaskState::Legacy("task md".to_string()),
+        );
         state.deferred_partial_tasks.insert("TASK-001".to_string());
-        state.unblock_attempt_counts.insert("TASK-006".to_string(), 4);
+        state
+            .unblock_attempt_counts
+            .insert("TASK-006".to_string(), 4);
         state
             .attempted_partial_followups
             .insert("TASK-001".to_string(), 1);
@@ -809,12 +806,10 @@ mod tests {
             head_at_save: Some(head.to_string()),
             ..Default::default()
         };
-        state
-            .shelved_tasks
-            .insert(
-                "TASK-9".to_string(),
-                ShelvedTaskState::Legacy("task md".to_string()),
-            );
+        state.shelved_tasks.insert(
+            "TASK-9".to_string(),
+            ShelvedTaskState::Legacy("task md".to_string()),
+        );
         state.deferred_partial_tasks.insert("TASK-8".to_string());
         state.unblock_attempt_counts.insert("TASK-9".to_string(), 3);
         state
@@ -857,7 +852,10 @@ mod tests {
         );
 
         let cleared = auto_clear_shelved_on_head_change(&mut state, Some("newsha"), false);
-        assert_eq!(cleared, 2, "legacy shelf + deferred task retain old behavior");
+        assert_eq!(
+            cleared, 2,
+            "legacy shelf + deferred task retain old behavior"
+        );
         assert_eq!(state.shelved_tasks.len(), 2);
         assert!(state.shelved_tasks.contains_key("TASK-DIVERGED"));
         assert!(state.shelved_tasks.contains_key("TASK-CONFLICT"));

@@ -444,8 +444,7 @@ mod tests {
     use super::{
         atomic_write, atomic_write_0o600_if_unix, chmod_0o600_if_unix, ensure_repo_layout_with,
         ensure_writable_run_root, prune_old_entries, test_process_env_lock,
-        truncate_file_to_max_bytes,
-        write_0o600_if_unix,
+        truncate_file_to_max_bytes, write_0o600_if_unix,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -526,7 +525,10 @@ mod tests {
         let err = ensure_writable_run_root(&run_root).expect_err("file root should fail");
         let message = format!("{err:#}");
         assert!(message.contains("AUTO_RUN_ROOT"), "{message}");
-        assert!(message.contains(&run_root.display().to_string()), "{message}");
+        assert!(
+            message.contains(&run_root.display().to_string()),
+            "{message}"
+        );
         assert!(
             message.contains("Unset AUTO_RUN_ROOT") || message.contains("update it"),
             "{message}"

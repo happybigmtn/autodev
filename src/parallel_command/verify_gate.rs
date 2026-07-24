@@ -30,6 +30,7 @@ use super::*;
 // `verification_plan` and `Duration` arrive via `super::*`; only the external-
 // step classifier needs an explicit import.
 use crate::completion_artifacts::verification_step_looks_external;
+use crate::process_group::ContainedChild;
 use shlex::split as shell_split;
 
 /// Env toggle. `"0"` skips the gate entirely (legacy behavior: trust the receipt).
@@ -92,6 +93,15 @@ pub(crate) async fn run_lane_verify_gate(
     task_id: &str,
     task_markdown: &str,
 ) -> LaneVerifyOutcome {
+    run_lane_verify_gate_with_timeout(repo_root, task_id, task_markdown, verify_timeout()).await
+}
+
+async fn run_lane_verify_gate_with_timeout(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    deadline: Duration,
+) -> LaneVerifyOutcome {
     let verification = verification_plan(task_markdown);
     if verification
         .steps
@@ -108,7 +118,6 @@ pub(crate) async fn run_lane_verify_gate(
             reason: "no host-reproducible verification commands to re-run".to_string(),
         };
     }
-    let deadline = verify_timeout();
     match tokio::time::timeout(
         deadline,
         run_verify_commands(repo_root.to_path_buf(), task_id.to_string(), commands),
@@ -133,7 +142,7 @@ async fn run_verify_commands(
     let wrapper = repo_root.join("scripts/run-task-verification.sh");
     let wrapper_present = wrapper.is_file();
     for command in &commands {
-        let result = if wrapper_present {
+        let mut process = if wrapper_present {
             let Some(argv) = shell_split(command) else {
                 return LaneVerifyOutcome::Failed {
                     detail: format!(
@@ -141,22 +150,25 @@ async fn run_verify_commands(
                     ),
                 };
             };
-            tokio::process::Command::new("scripts/run-task-verification.sh")
+            let mut process = tokio::process::Command::new("scripts/run-task-verification.sh");
+            process
                 .arg(&task_id)
                 .arg("--")
                 .args(&argv)
-                .current_dir(&repo_root)
-                .kill_on_drop(true)
-                .output()
-                .await
+                .current_dir(&repo_root);
+            process
         } else {
-            tokio::process::Command::new("bash")
-                .arg("-lc")
-                .arg(command)
-                .current_dir(&repo_root)
-                .kill_on_drop(true)
-                .output()
-                .await
+            let mut process = tokio::process::Command::new("bash");
+            process.arg("-lc").arg(command).current_dir(&repo_root);
+            process
+        };
+        process
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let result = match ContainedChild::spawn(&mut process) {
+            Ok(child) => child.output().await,
+            Err(err) => Err(err),
         };
         match result {
             Ok(output) if output.status.success() => {}
@@ -203,6 +215,7 @@ fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
 pub(crate) enum WorkspaceTestOutcome {
     Passed,
     Failed { detail: String },
+    NotApplicable { reason: String },
     Skipped { reason: String },
 }
 
@@ -218,12 +231,9 @@ fn workspace_test_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// STRICT-mode gate: the legacy "whole workspace must be green" behavior,
-/// preserved verbatim behind `AUTO_PARALLEL_WORKSPACE_GATE_MODE=strict`. Derives
-/// its coarse pass/fail from the same structured probe the baseline gate uses so
-/// there is a single source of truth for how the workspace is exercised.
-pub(crate) async fn run_workspace_test_gate(repo_root: &Path) -> WorkspaceTestOutcome {
-    match run_workspace_probe(repo_root).await {
+pub(crate) fn workspace_test_outcome_from_probe(probe: WorkspaceProbe) -> WorkspaceTestOutcome {
+    match probe {
+        WorkspaceProbe::NotApplicable { reason } => WorkspaceTestOutcome::NotApplicable { reason },
         WorkspaceProbe::Skipped { reason } => WorkspaceTestOutcome::Skipped { reason },
         WorkspaceProbe::Ran(obs) => {
             if obs.compiled && obs.failing_tests.is_empty() {
@@ -288,10 +298,12 @@ pub(crate) struct WorkspaceObservation {
 /// Maximum number of `error` lines retained in [`WorkspaceObservation::compile_error_excerpt`].
 const MAX_COMPILE_ERROR_EXCERPT_LINES: usize = 12;
 
-/// Either a parsed observation, or an infra-level skip (non-Rust repo, spawn
-/// error, timeout, or an ambiguous non-zero exit with no parseable signal).
+/// Either a parsed observation, a typed non-Rust not-applicable result, or an
+/// infra-level skip (spawn error, timeout, or an ambiguous non-zero exit with no
+/// parseable signal).
 pub(crate) enum WorkspaceProbe {
     Ran(WorkspaceObservation),
+    NotApplicable { reason: String },
     Skipped { reason: String },
 }
 
@@ -301,21 +313,35 @@ pub(crate) enum WorkspaceProbe {
 /// essential: it lets us enumerate EVERY passing test across all binaries, so a
 /// later failure of any of them is recognized as a regression instead of being
 /// missed because cargo stopped at the first red binary.
-pub(crate) async fn run_workspace_probe(repo_root: &Path) -> WorkspaceProbe {
+pub(crate) async fn run_workspace_probe_with_cargo(
+    repo_root: &Path,
+    cargo_bin: Option<PathBuf>,
+) -> WorkspaceProbe {
+    run_workspace_probe_with_timeout_and_cargo(repo_root, workspace_test_timeout(), cargo_bin).await
+}
+
+async fn run_workspace_probe_with_timeout_and_cargo(
+    repo_root: &Path,
+    deadline: Duration,
+    cargo_bin: Option<PathBuf>,
+) -> WorkspaceProbe {
     if !repo_root.join("Cargo.toml").is_file() {
-        return WorkspaceProbe::Skipped {
+        return WorkspaceProbe::NotApplicable {
             reason: "no Cargo.toml found; workspace cargo test gate is not applicable".to_string(),
         };
     }
-    let deadline = workspace_test_timeout();
-    match tokio::time::timeout(deadline, run_workspace_test_capture(repo_root.to_path_buf())).await
+    match tokio::time::timeout(
+        deadline,
+        run_workspace_test_capture(repo_root.to_path_buf(), cargo_bin),
+    )
+    .await
     {
         Ok(Some((success, text))) => {
             let obs = parse_workspace_test_output(&text);
             // A non-zero exit with neither a compile break nor a failing test is
             // an ambiguous infra failure (e.g. cargo/rustup misconfig). Do not
             // manufacture a phantom regression from it; surface it as a skip so
-            // the baseline gate fails OPEN rather than holding a task hostage.
+            // the caller can hold completion without inventing a test failure.
             if !success
                 && obs.compiled
                 && obs.failing_tests.is_empty()
@@ -342,14 +368,30 @@ pub(crate) async fn run_workspace_probe(repo_root: &Path) -> WorkspaceProbe {
     }
 }
 
-async fn run_workspace_test_capture(repo_root: PathBuf) -> Option<(bool, String)> {
-    let result = tokio::process::Command::new("bash")
-        .arg("-lc")
-        .arg("cargo test --workspace --no-fail-fast 2>&1")
+async fn run_workspace_test_capture(
+    repo_root: PathBuf,
+    cargo_bin: Option<PathBuf>,
+) -> Option<(bool, String)> {
+    let mut command = if let Some(cargo_bin) = cargo_bin {
+        let mut command = tokio::process::Command::new(cargo_bin);
+        command.args(["test", "--workspace", "--no-fail-fast"]);
+        command
+    } else {
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg("cargo test --workspace --no-fail-fast 2>&1");
+        command
+    };
+    command
         .current_dir(&repo_root)
-        .kill_on_drop(true)
-        .output()
-        .await;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let result = match ContainedChild::spawn(&mut command) {
+        Ok(child) => child.output().await,
+        Err(err) => Err(err),
+    };
     match result {
         Ok(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -460,8 +502,7 @@ fn running_line_target_stem(rest: &str) -> Option<String> {
     // Strip the trailing `-<hash>` (hex) cargo appends to deps binaries.
     let stem = match file.rfind('-') {
         Some(idx)
-            if idx + 1 < file.len()
-                && file[idx + 1..].chars().all(|c| c.is_ascii_hexdigit()) =>
+            if idx + 1 < file.len() && file[idx + 1..].chars().all(|c| c.is_ascii_hexdigit()) =>
         {
             &file[..idx]
         }
@@ -627,9 +668,7 @@ pub(crate) fn classify_workspace_regressions(
         if !baseline.ever_compiled_crates.contains(crate_name) {
             continue; // never compiled this run -> not a regression (pre-existing break)
         }
-        let msg = format!(
-            "crate `{crate_name}` compiled earlier this run but no longer compiles"
-        );
+        let msg = format!("crate `{crate_name}` compiled earlier this run but no longer compiles");
         if touched_crates.contains(crate_name) {
             decision
                 .blocking
@@ -804,7 +843,9 @@ pub(crate) fn classify_workspace_regressions_strict(
         let msg = if baseline.ever_compiled_crates.contains(crate_name) {
             format!("crate `{crate_name}` compiled earlier this run but no longer compiles")
         } else {
-            format!("crate `{crate_name}` fails to compile and was not a pre-existing baseline break")
+            format!(
+                "crate `{crate_name}` fails to compile and was not a pre-existing baseline break"
+            )
         };
         if touched_crates.contains(crate_name) {
             decision
@@ -990,6 +1031,43 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::time::Instant;
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "autodev-{label}-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_slug()
+        ))
+    }
+
+    fn make_executable(path: &Path) {
+        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    async fn assert_recorded_pid_gone(pid_path: &Path) {
+        let pid = fs::read_to_string(pid_path)
+            .expect("read process pid")
+            .trim()
+            .to_string();
+        for _ in 0..50 {
+            let alive = Command::new("kill")
+                .arg("-0")
+                .arg(&pid)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("verification descendant {pid} was still alive");
+    }
 
     fn install_test_wrapper(dir: &Path) {
         let scripts = dir.join("scripts");
@@ -1140,6 +1218,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_wrapper_cannot_leave_delayed_descendant_or_hold_output_open() {
+        let dir = unique_test_dir("verify-contained-success");
+        let scripts = dir.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\necho $$ > direct.pid\n(sleep 2; touch delayed-sentinel) &\necho $! > descendant.pid\nexit 0\n",
+        )
+        .expect("write wrapper");
+        make_executable(&wrapper);
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
+        let started = Instant::now();
+
+        assert_eq!(
+            run_lane_verify_gate(&dir, "TASK-1", markdown).await,
+            LaneVerifyOutcome::AllPassed
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an inherited output pipe must not delay successful verification"
+        );
+        assert_recorded_pid_gone(&dir.join("direct.pid")).await;
+        assert_recorded_pid_gone(&dir.join("descendant.pid")).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!dir.join("delayed-sentinel").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_bash_fallback_cannot_leave_delayed_descendant() {
+        let dir = unique_test_dir("verify-fallback-contained-success");
+        fs::create_dir_all(&dir).expect("create repo dir");
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c 'echo $$ > fallback.pid; (sleep 2; touch delayed-sentinel) & echo $! > descendant.pid'`\n";
+        let started = Instant::now();
+
+        assert_eq!(
+            run_lane_verify_gate(&dir, "TASK-1", markdown).await,
+            LaneVerifyOutcome::AllPassed
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fallback shell must not await a descendant-held output pipe"
+        );
+        assert_recorded_pid_gone(&dir.join("fallback.pid")).await;
+        assert_recorded_pid_gone(&dir.join("descendant.pid")).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!dir.join("delayed-sentinel").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapper_timeout_kills_descendant_before_it_can_mutate() {
+        let dir = unique_test_dir("verify-contained-timeout");
+        let scripts = dir.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\necho $$ > direct.pid\n(sleep 2; touch delayed-sentinel) &\necho $! > descendant.pid\nsleep 30\n",
+        )
+        .expect("write wrapper");
+        make_executable(&wrapper);
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
+
+        let result =
+            run_lane_verify_gate_with_timeout(&dir, "TASK-1", markdown, Duration::from_secs(1))
+                .await;
+        assert!(
+            matches!(result, LaneVerifyOutcome::Skipped { ref reason } if reason.contains("timed out")),
+            "{result:?}"
+        );
+        assert_recorded_pid_gone(&dir.join("direct.pid")).await;
+        assert_recorded_pid_gone(&dir.join("descendant.pid")).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!dir.join("delayed-sentinel").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_timeout_kills_fake_cargo_descendants() {
+        let dir = unique_test_dir("workspace-contained-timeout");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).expect("create bin dir");
+        fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        let cargo = bin.join("cargo");
+        fs::write(
+            &cargo,
+            "#!/usr/bin/env bash\necho $$ > \"$PWD/cargo.pid\"\n(sleep 2; touch \"$PWD/delayed-sentinel\") &\necho $! > \"$PWD/descendant.pid\"\nsleep 30\n",
+        )
+        .expect("write fake cargo");
+        make_executable(&cargo);
+        let result =
+            run_workspace_probe_with_timeout_and_cargo(&dir, Duration::from_secs(1), Some(cargo))
+                .await;
+        assert!(
+            matches!(result, WorkspaceProbe::Skipped { ref reason } if reason.contains("timed out"))
+        );
+        assert_recorded_pid_gone(&dir.join("cargo.pid")).await;
+        assert_recorded_pid_gone(&dir.join("descendant.pid")).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!dir.join("delayed-sentinel").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn baseline_with(
         ever_passed: &[&str],
         ever_compiled: &[&str],
@@ -1229,8 +1417,7 @@ error: could not compile `boardlab-tui` (lib test) due to 1 previous error
             ..Default::default()
         };
         assert!(!has_candidate_regression(&baseline, &obs));
-        let decision =
-            classify_workspace_regressions(&baseline, &obs, &set_of(&["ludii_core"]));
+        let decision = classify_workspace_regressions(&baseline, &obs, &set_of(&["ludii_core"]));
         assert!(!decision.is_blocked(), "{decision:?}");
     }
 
@@ -1244,8 +1431,7 @@ error: could not compile `boardlab-tui` (lib test) due to 1 previous error
             ..Default::default()
         };
         assert!(has_candidate_regression(&baseline, &obs));
-        let decision =
-            classify_workspace_regressions(&baseline, &obs, &set_of(&["ludii_core"]));
+        let decision = classify_workspace_regressions(&baseline, &obs, &set_of(&["ludii_core"]));
         assert!(decision.is_blocked(), "{decision:?}");
         assert!(decision.blocking[0].contains("board::stable"));
     }
@@ -1289,8 +1475,7 @@ error: could not compile `boardlab-tui` (lib test) due to 1 previous error
             ..Default::default()
         };
         assert!(has_candidate_regression(&baseline, &refail));
-        let decision =
-            classify_workspace_regressions(&baseline, &refail, &set_of(&["ludii_core"]));
+        let decision = classify_workspace_regressions(&baseline, &refail, &set_of(&["ludii_core"]));
         assert!(
             decision.is_blocked(),
             "re-failing an ever-passed test is a regression even if in baseline: {decision:?}"
@@ -1342,7 +1527,10 @@ error: could not compile `boardlab-tui` (lib test) due to 1 previous error
 error: couldn't read crates/ludii-core/src/../Cannon.lud: No such file or directory (os error 2)\n\
 error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         let obs = parse_workspace_test_output(out);
-        assert!(!obs.compiled, "missing include_str! target breaks the build");
+        assert!(
+            !obs.compiled,
+            "missing include_str! target breaks the build"
+        );
         assert!(obs.broken_crates.contains("ludii_core"));
         assert!(
             obs.compile_error_excerpt
@@ -1369,8 +1557,14 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         };
         let diag = workspace_compile_block_diagnostic(&baseline)
             .expect("a persistent compile break must produce a diagnostic");
-        assert!(diag.contains("ludii_core"), "names the broken crate: {diag}");
-        assert!(diag.contains("Cannon.lud"), "echoes the real compiler error: {diag}");
+        assert!(
+            diag.contains("ludii_core"),
+            "names the broken crate: {diag}"
+        );
+        assert!(
+            diag.contains("Cannon.lud"),
+            "echoes the real compiler error: {diag}"
+        );
         assert!(
             diag.contains("AUTO_PARALLEL_RETRY_SHELVED=1"),
             "points at the shelved-task recovery: {diag}"
@@ -1379,7 +1573,9 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         // Once the crate is observed compiling later in the run, it is no longer a
         // blocker and the diagnostic goes silent (best-observed monotonicity).
         let mut recovered = baseline.clone();
-        recovered.ever_compiled_crates.insert("ludii_core".to_string());
+        recovered
+            .ever_compiled_crates
+            .insert("ludii_core".to_string());
         assert!(
             workspace_compile_block_diagnostic(&recovered).is_none(),
             "a crate that compiled later this run is not a persistent blocker"
@@ -1454,7 +1650,10 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, "0");
         assert!(!workspace_strict_baseline_enabled());
         std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, " 0 ");
-        assert!(!workspace_strict_baseline_enabled(), "trimmed 0 still disables");
+        assert!(
+            !workspace_strict_baseline_enabled(),
+            "trimmed 0 still disables"
+        );
         std::env::set_var(WORKSPACE_STRICT_BASELINE_ENV, "1");
         assert!(workspace_strict_baseline_enabled());
         match prev {
@@ -1475,7 +1674,10 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             "my_custom_live_probe, another_env_case",
         );
         let extended = env_failure_patterns();
-        assert!(extended.iter().any(|p| p == "multiprocess"), "default retained");
+        assert!(
+            extended.iter().any(|p| p == "multiprocess"),
+            "default retained"
+        );
         assert!(extended.iter().any(|p| p == "my_custom_live_probe"));
         assert!(extended.iter().any(|p| p == "another_env_case"));
         match prev {
@@ -1498,7 +1700,10 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             "rsociety_node::task_008c_wbs5_live_readpath",
             &patterns
         ));
-        assert!(is_environmental_failure("tui::table_conductor_ticks", &patterns));
+        assert!(is_environmental_failure(
+            "tui::table_conductor_ticks",
+            &patterns
+        ));
         assert!(is_environmental_failure(
             "node::high_height_restart_recovers",
             &patterns
@@ -1575,9 +1780,7 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         );
         let obs = WorkspaceObservation {
             compiled: true,
-            failing_tests: set_of(&[
-                "rsociety_full_port::full_port_labor_multiprocess::settles",
-            ]),
+            failing_tests: set_of(&["rsociety_full_port::full_port_labor_multiprocess::settles"]),
             compiled_targets: set_of(&["rsociety_full_port"]),
             ..Default::default()
         };
@@ -1639,15 +1842,14 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             failing_tests: set_of(&[
                 "c::full_port_labor_multiprocess_flap", // environmental
                 "c::new_deterministic_red",             // NEW non-env
-                "c::pre_red",                            // persistent pre-existing
+                "c::pre_red",                           // persistent pre-existing
             ]),
             passing_tests: set_of(&["c::fresh_green"]),
             compiled_targets: set_of(&["c"]),
             ..Default::default()
         };
         let patterns = env_failure_patterns_defaults();
-        let recapture =
-            recapture_workspace_baseline_on_drift(&old, &obs, &patterns, "newhead");
+        let recapture = recapture_workspace_baseline_on_drift(&old, &obs, &patterns, "newhead");
 
         assert_eq!(
             recapture.newly_tolerated_environmental,
@@ -1659,9 +1861,18 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             "a new non-environmental red is surfaced, not swallowed"
         );
         // Fresh green folded in; head advanced.
-        assert!(recapture.baseline.ever_passed_tests.contains("c::fresh_green"));
-        assert!(recapture.baseline.ever_passed_tests.contains("c::was_green"));
-        assert_eq!(recapture.baseline.head_at_capture.as_deref(), Some("newhead"));
+        assert!(recapture
+            .baseline
+            .ever_passed_tests
+            .contains("c::fresh_green"));
+        assert!(recapture
+            .baseline
+            .ever_passed_tests
+            .contains("c::was_green"));
+        assert_eq!(
+            recapture.baseline.head_at_capture.as_deref(),
+            Some("newhead")
+        );
         // Crucially: the surfaced non-env red was NOT folded into tolerance, so
         // the strict gate still blocks on it after recapture.
         assert!(
@@ -1671,7 +1882,11 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
                 .contains("c::new_deterministic_red"),
             "recapture must not absorb a new non-env regression"
         );
-        assert!(strict_workspace_has_blocking(&recapture.baseline, &obs, &patterns));
+        assert!(strict_workspace_has_blocking(
+            &recapture.baseline,
+            &obs,
+            &patterns
+        ));
     }
 
     fn env_failure_patterns_defaults() -> Vec<String> {

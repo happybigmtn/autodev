@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
-
+use crate::completion_artifacts::{current_dirty_state_fingerprint, normalized_plan_hash_bytes};
 use crate::util::git_stdout;
 use crate::ShipArgs;
 
@@ -42,10 +41,13 @@ pub(crate) fn init_git_repo(repo_root: &Path) {
         .args(["config", "user.name", "Test User"])
         .output()
         .expect("git config name failed");
+    fs::write(repo_root.join("IMPLEMENTATION_PLAN.md"), "# plan\n")
+        .expect("failed to write implementation plan");
+    command_ok(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]);
     Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["commit", "--allow-empty", "-m", "initial"])
+        .args(["commit", "-m", "initial"])
         .output()
         .expect("git commit failed");
 }
@@ -111,27 +113,38 @@ pub(crate) fn write_receipts(repo_root: &Path, commands: &[&str]) {
     fs::create_dir_all(&receipt_dir).expect("failed to create receipt dir");
     let commands = commands
         .iter()
-        .map(|command| format!(r#"{{"command":"{command}","exit_code":0,"status":"passed"}}"#))
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|command| {
+            let argv = shlex::split(command).expect("release command should be valid shell syntax");
+            serde_json::json!({
+                "command": command,
+                "argv": argv,
+                "expected_argv": argv,
+                "exit_code": 0,
+                "status": "passed",
+            })
+        })
+        .collect::<Vec<_>>();
     fs::write(
         receipt_dir.join("release.json"),
-        format!(r#"{{"commands":[{commands}]}}"#),
+        serde_json::to_vec(&serde_json::json!({
+            "task_id": "release",
+            "commands": commands,
+        }))
+        .expect("serialize release receipt"),
     )
     .expect("failed to write receipt");
 }
 
 pub(crate) fn write_passing_release_receipts(repo_root: &Path) {
-    write_receipts(
-        repo_root,
-        &[
-            "cargo fmt --check",
-            "cargo clippy --all-targets --all-features -- -D warnings",
-            "cargo test",
-            "cargo install --path . --root /tmp/autodev-install-proof",
-            "auto --version",
-        ],
-    );
+    if git_stdout(repo_root, ["rev-parse", "HEAD"]).is_err() {
+        init_git_repo(repo_root);
+        let dirty = git_stdout(repo_root, ["status", "--porcelain"])
+            .expect("git status failed after fixture initialization");
+        if !dirty.trim().is_empty() {
+            commit_all(repo_root, "release proof fixture");
+        }
+    }
+    write_passing_release_receipts_for_head(repo_root);
 }
 
 pub(crate) fn write_passing_release_receipts_for_head(repo_root: &Path) {
@@ -139,39 +152,113 @@ pub(crate) fn write_passing_release_receipts_for_head(repo_root: &Path) {
         .expect("git rev-parse failed")
         .trim()
         .to_string();
-    write_receipt_json(repo_root, &passing_release_receipt_json(&head, "pending"));
+    let short_head = git_stdout(repo_root, ["rev-parse", "--short", "HEAD"])
+        .expect("git short rev-parse failed")
+        .trim()
+        .to_string();
+    let plan_hash = plan_hash(repo_root);
+    write_receipt_json(
+        repo_root,
+        &passing_release_receipt_json(&head, &short_head, "pending", &plan_hash),
+    );
     let dirty_fingerprint = dirty_state_fingerprint(repo_root);
     write_receipt_json(
         repo_root,
-        &passing_release_receipt_json(&head, &dirty_fingerprint),
+        &passing_release_receipt_json(&head, &short_head, &dirty_fingerprint, &plan_hash),
     );
 }
 
-pub(crate) fn passing_release_receipt_json(head: &str, dirty_fingerprint: &str) -> String {
-    format!(
-        r#"{{"commit":"{head}","dirty_state":{{"fingerprint":"{dirty_fingerprint}"}},"commands":[
-{{"command":"cargo fmt --check","expected_argv":["cargo","fmt","--check"],"exit_code":0,"status":"passed"}},
-{{"command":"cargo clippy --all-targets --all-features -- -D warnings","expected_argv":["cargo","clippy","--all-targets","--all-features","--","-D","warnings"],"exit_code":0,"status":"passed"}},
-{{"command":"cargo test","expected_argv":["cargo","test"],"exit_code":0,"status":"passed"}},
-{{"command":"cargo install --path . --root /tmp/autodev-install-proof","expected_argv":["cargo","install","--path",".","--root","/tmp/autodev-install-proof"],"exit_code":0,"status":"passed"}},
-{{"command":"auto --version","expected_argv":["auto","--version"],"exit_code":0,"status":"passed"}}
-]}}"#
-    )
+pub(crate) fn passing_release_receipt_json(
+    head: &str,
+    short_head: &str,
+    dirty_fingerprint: &str,
+    plan_hash: &str,
+) -> String {
+    let install_root = "/tmp/autodev-install-proof";
+    let install_command = "cargo install --path . --locked --root /tmp/autodev-install-proof";
+    let install_argv = [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--root",
+        install_root,
+    ];
+    let smoke_command = "env PATH=/tmp/autodev-install-proof/bin auto --version";
+    let smoke_argv = [
+        "env",
+        "PATH=/tmp/autodev-install-proof/bin",
+        "auto",
+        "--version",
+    ];
+    let version_output = format!(
+        "auto {}\ncommit: {short_head}\ndirty: clean\nprofile: release\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    serde_json::to_string(&serde_json::json!({
+        "task_id": "release",
+        "commit": head,
+        "dirty_state": {"fingerprint": dirty_fingerprint},
+        "plan_hash": plan_hash,
+        "commands": [
+            {
+                "command": "cargo fmt --check",
+                "argv": ["cargo", "fmt", "--check"],
+                "expected_argv": ["cargo", "fmt", "--check"],
+                "exit_code": 0,
+                "status": "passed",
+            },
+            {
+                "command": "cargo clippy --all-targets --all-features -- -D warnings",
+                "argv": ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+                "expected_argv": ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+                "exit_code": 0,
+                "status": "passed",
+            },
+            {
+                "command": "cargo test",
+                "argv": ["cargo", "test"],
+                "expected_argv": ["cargo", "test"],
+                "exit_code": 0,
+                "status": "passed",
+            },
+            {
+                "command": install_command,
+                "argv": install_argv,
+                "expected_argv": install_argv,
+                "exit_code": 0,
+                "status": "passed",
+            },
+            {
+                "command": smoke_command,
+                "argv": smoke_argv,
+                "expected_argv": smoke_argv,
+                "exit_code": 0,
+                "status": "passed",
+                "output_summary": {
+                    "stdout_tail": version_output,
+                    "stderr_tail": "",
+                    "stdout_bytes": version_output.len(),
+                    "stderr_bytes": 0,
+                    "stdout_truncated": false,
+                    "stderr_truncated": false,
+                    "redaction_version": 1,
+                },
+            },
+        ],
+    }))
+    .expect("serialize passing release receipt")
 }
 
 pub(crate) fn dirty_state_fingerprint(repo_root: &Path) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain=v1", "-z"])
-        .output()
-        .expect("git status failed");
-    assert!(
-        output.status.success(),
-        "git status failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    format!("{:x}", Sha256::digest(&output.stdout))
+    current_dirty_state_fingerprint(repo_root).expect("dirty fingerprint should be available")
+}
+
+pub(crate) fn plan_hash(repo_root: &Path) -> String {
+    let plan = fs::read(repo_root.join("IMPLEMENTATION_PLAN.md"))
+        .expect("implementation plan should be readable");
+    normalized_plan_hash_bytes(&plan)
 }
 
 pub(crate) fn write_receipt_json(repo_root: &Path, json: &str) {

@@ -395,6 +395,9 @@ pub(crate) fn parse_parallel_status_path(line: &str) -> Option<String> {
 }
 
 pub(crate) fn parallel_dispatch_path_is_ignored(path: &str) -> bool {
+    if path == ".auto-review-input-quarantine.json" {
+        return true;
+    }
     if path.starts_with(".auto/symphony/verification-receipts/")
         || path.starts_with("auto/symphony/verification-receipts/")
     {
@@ -749,7 +752,11 @@ pub(crate) fn is_verification_only_task(task: &LoopTask) -> bool {
     // was already fixed for; an incidental mention previously forced a real code
     // task onto the non-dispatchable evidence lane and stalled the frontier.
     task_field_body(&task.markdown, "Scope boundary:", "Acceptance criteria:")
-        .map(|body| body.trim().to_ascii_lowercase().starts_with("verification only"))
+        .map(|body| {
+            body.trim()
+                .to_ascii_lowercase()
+                .starts_with("verification only")
+        })
         .unwrap_or(false)
 }
 
@@ -1185,8 +1192,7 @@ mod tests {
         let ids = ready.into_iter().map(|task| task.id).collect::<Vec<_>>();
         assert_eq!(ids.first().map(String::as_str), Some("TASK-Q"));
         assert!(
-            ids.iter().position(|id| id == "TASK-Q")
-                < ids.iter().position(|id| id == "TASK-P"),
+            ids.iter().position(|id| id == "TASK-Q") < ids.iter().position(|id| id == "TASK-P"),
             "pending must precede backlog partial: {ids:?}"
         );
     }

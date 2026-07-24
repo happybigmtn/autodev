@@ -134,8 +134,8 @@ fn content_address_paths(repo_root: &Path, paths: &BTreeSet<String>) -> Option<S
             continue;
         }
         if declared.starts_with("refs/") {
-            let resolved = git_rev_parse_ref(repo_root, declared)
-                .unwrap_or_else(|| "absent".to_string());
+            let resolved =
+                git_rev_parse_ref(repo_root, declared).unwrap_or_else(|| "absent".to_string());
             entries.insert(("ref".to_string(), declared.clone(), resolved));
             continue;
         }
@@ -156,8 +156,8 @@ fn content_address_paths(repo_root: &Path, paths: &BTreeSet<String>) -> Option<S
             if mode == "160000" {
                 // Submodule gitlink: the ls-files object hash IS the recorded
                 // submodule commit. Fold it in without descending.
-                let sub_commit = git_ls_tracked_object(repo_root, &rel)
-                    .unwrap_or_else(|| "gitlink".to_string());
+                let sub_commit =
+                    git_ls_tracked_object(repo_root, &rel).unwrap_or_else(|| "gitlink".to_string());
                 entries.insert((mode, rel, sub_commit));
             } else {
                 let content = worktree_content_hash(repo_root, &rel);
@@ -210,7 +210,11 @@ fn git_ls_tracked(repo_root: &Path, pathspec: &str) -> Option<Vec<(String, Strin
         let Some((meta, path)) = text.split_once('\t') else {
             continue;
         };
-        let mode = meta.split_whitespace().next().unwrap_or_default().to_string();
+        let mode = meta
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
         entries.push((mode, path.to_string()));
     }
     Some(entries)
@@ -228,7 +232,10 @@ fn git_ls_tracked_object(repo_root: &Path, pathspec: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let record = output.stdout.split(|byte| *byte == 0).find(|r| !r.is_empty())?;
+    let record = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .find(|r| !r.is_empty())?;
     let text = String::from_utf8_lossy(record);
     let meta = text.split_once('\t')?.0;
     meta.split_whitespace().nth(1).map(str::to_string)
@@ -322,7 +329,10 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("autodev-owned-inputs-{name}-{}", std::process::id()));
+        path.push(format!(
+            "autodev-owned-inputs-{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("failed to create temp dir");
         path
@@ -398,16 +408,26 @@ mod tests {
         fs::create_dir_all(root.join("crates/c/src")).unwrap();
         fs::write(root.join("crates/c/src/lib.rs"), "pub fn c() {}\n").unwrap();
         let after = fingerprint(&root, "TASK-B");
-        assert_eq!(before, after, "unrelated changes must not move the fingerprint");
+        assert_eq!(
+            before, after,
+            "unrelated changes must not move the fingerprint"
+        );
     }
 
     #[test]
     fn fingerprint_changes_when_owned_file_changes() {
         let root = seed_repo("owned-change");
         let before = fingerprint(&root, "TASK-B");
-        fs::write(root.join("crates/b/src/lib.rs"), "pub fn b() { /* edit */ }\n").unwrap();
+        fs::write(
+            root.join("crates/b/src/lib.rs"),
+            "pub fn b() { /* edit */ }\n",
+        )
+        .unwrap();
         let after = fingerprint(&root, "TASK-B");
-        assert_ne!(before, after, "an owned-file change must move the fingerprint");
+        assert_ne!(
+            before, after,
+            "an owned-file change must move the fingerprint"
+        );
     }
 
     #[test]
@@ -416,11 +436,17 @@ mod tests {
         let before = fingerprint(&root, "TASK-B");
         fs::write(root.join("crates/b/src/extra.rs"), "pub fn extra() {}\n").unwrap();
         let with_untracked = fingerprint(&root, "TASK-B");
-        assert_ne!(before, with_untracked, "untracked owned file must move fingerprint");
+        assert_ne!(
+            before, with_untracked,
+            "untracked owned file must move fingerprint"
+        );
         fs::remove_file(root.join("crates/b/src/extra.rs")).unwrap();
         fs::remove_file(root.join("crates/b/src/lib.rs")).unwrap();
         let with_deletion = fingerprint(&root, "TASK-B");
-        assert_ne!(before, with_deletion, "deleting an owned file must move fingerprint");
+        assert_ne!(
+            before, with_deletion,
+            "deleting an owned file must move fingerprint"
+        );
     }
 
     #[test]
@@ -428,9 +454,16 @@ mod tests {
         let root = seed_repo("dep-output");
         let before = fingerprint(&root, "TASK-B");
         // Change TASK-A's owned file — TASK-B depends on TASK-A.
-        fs::write(root.join("crates/a/src/lib.rs"), "pub fn a() { /* v2 */ }\n").unwrap();
+        fs::write(
+            root.join("crates/a/src/lib.rs"),
+            "pub fn a() { /* v2 */ }\n",
+        )
+        .unwrap();
         let after = fingerprint(&root, "TASK-B");
-        assert_ne!(before, after, "a dependency's owned-output change must move the dependent's fingerprint");
+        assert_ne!(
+            before, after,
+            "a dependency's owned-output change must move the dependent's fingerprint"
+        );
     }
 
     #[test]
@@ -442,12 +475,18 @@ mod tests {
         let flipped = plan.replace("- [x] `TASK-B`", "- [~] `TASK-B`");
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), &flipped).unwrap();
         let partial = fingerprint(&root, "TASK-B");
-        assert_eq!(done, partial, "a checkbox flip must not move the fingerprint");
+        assert_eq!(
+            done, partial,
+            "a checkbox flip must not move the fingerprint"
+        );
         // A genuine spec edit must move it.
         let edited = flipped.replace("consume the lib", "consume the lib carefully");
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), &edited).unwrap();
         let after_edit = fingerprint(&root, "TASK-B");
-        assert_ne!(partial, after_edit, "a contract edit must move the fingerprint");
+        assert_ne!(
+            partial, after_edit,
+            "a contract edit must move the fingerprint"
+        );
     }
 
     #[test]
