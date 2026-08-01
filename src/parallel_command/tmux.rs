@@ -11,8 +11,21 @@ pub(crate) fn prepare_parallel_startup(
     repo_root: &Path,
     target_branch: &str,
 ) -> Result<ParallelStartupPrep> {
-    enforce_review_input_quarantine_before_dispatch(repo_root)?;
-    let recovered = recover_unsealed_task_completion_transitions(repo_root)?;
+    prepare_parallel_startup_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+    )
+}
+
+pub(crate) fn prepare_parallel_startup_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+) -> Result<ParallelStartupPrep> {
+    enforce_review_input_quarantine_before_dispatch_at(repo_root, authority_root)?;
+    let recovered =
+        recover_unsealed_task_completion_transitions_at(repo_root, authority_root)?;
     if !recovered.is_empty() {
         eprintln!(
             "recovery: demoted interrupted, unsealed task completion(s) to [~] before checkpoint: {}",
@@ -123,14 +136,6 @@ pub(crate) fn should_launch_parallel_tmux(args: &ParallelArgs) -> bool {
         && !inside_tmux
 }
 
-pub(crate) fn parallel_host_stdout_log_path(run_root: &Path) -> PathBuf {
-    run_root.join("host.stdout.log")
-}
-
-pub(crate) fn parallel_host_stderr_log_path(run_root: &Path) -> PathBuf {
-    run_root.join("host.stderr.log")
-}
-
 pub(crate) fn launch_parallel_tmux_session(
     session_name: &str,
     run_root: &Path,
@@ -191,7 +196,7 @@ pub(crate) fn parallel_tmux_session_name(repo_root: &Path) -> String {
     format!("{slug}-parallel")
 }
 
-pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Result<String> {
+pub(crate) fn parallel_tmux_command(_run_root: &Path, args: &ParallelArgs) -> Result<String> {
     let executable = env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
@@ -255,19 +260,9 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         );
     }
     let host_command = parts.join(" ");
-    let stdout_log_path = parallel_host_stdout_log_path(run_root);
-    let stderr_log_path = parallel_host_stderr_log_path(run_root);
-    let run_root = shell_quote(&run_root.display().to_string());
-    let stdout_log = shell_quote(&stdout_log_path.display().to_string());
-    let stderr_log = shell_quote(&stderr_log_path.display().to_string());
     let script = format!(
-        "mkdir -p {run_root}; touch {stdout_log} {stderr_log}; ({host_command}) > >(tee -a {stdout_log}) 2> >(tee -a {stderr_log} >&2); status=$?; printf '\\n[auto parallel host] exited with status %s. stdout: %s stderr: %s\\n' \"$status\" {stdout_label} {stderr_label} | tee -a {stdout_log}; exec bash",
-        run_root = run_root,
-        stdout_log = stdout_log,
-        stderr_log = stderr_log,
+        "({host_command}); status=$?; printf '\\n[auto parallel host] exited with status %s. See the secured live.log after startup.\\n' \"$status\"; exec bash",
         host_command = host_command,
-        stdout_label = shell_quote(&stdout_log_path.display().to_string()),
-        stderr_label = shell_quote(&stderr_log_path.display().to_string()),
     );
     Ok(format!("bash -lc {}", shell_quote(&script)))
 }
@@ -428,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tmux_command_persists_host_logs_and_keeps_shell_open() {
+    fn parallel_tmux_command_defers_all_run_root_logging_until_the_host_holds_its_lease() {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
@@ -452,9 +447,11 @@ mod tests {
         let command = parallel_tmux_command(&PathBuf::from("/tmp/auto-parallel"), &args)
             .expect("tmux command should render");
 
-        assert!(command.contains("host.stdout.log"));
-        assert!(command.contains("host.stderr.log"));
-        assert!(command.contains("tee -a"));
+        assert!(!command.contains("host.stdout.log"));
+        assert!(!command.contains("host.stderr.log"));
+        assert!(!command.contains("tee -a"));
+        assert!(!command.contains("touch "));
+        assert!(!command.contains("mkdir -p"));
         assert!(command.contains("exec bash"));
         assert!(command.contains(" parallel "));
         assert!(command.contains("--threads 8"));

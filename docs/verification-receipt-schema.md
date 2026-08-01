@@ -158,6 +158,25 @@ source-state field) remains historical audit evidence, but it cannot authorize
 a new `Done` transition; host re-execution must create a fresh version-2
 verified-source attestation and footer.
 
+When the parallel host propagates a repository-owned staging receipt across
+worktrees, the only cross-schema dirty-state value it may project is the
+schema-complete clean tuple
+`{"status":"clean","fingerprint":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","entries":[]}`.
+The fingerprint is the historical empty-porcelain marker. The tuple is emitted
+only after a bounded, configuration-resistant proof checks the root checkout
+and initialized submodules recursively, including index-to-HEAD state,
+worktree content and mode, untracked-source inventory, checked-out submodule
+HEADs, and the content-sensitive source-state identity. Immediately before the
+atomic write, the host repeats that proof and requires both HEAD and
+source-state identity to match the first capture. Substantive dirt, collection
+failure, or intervening identity change withholds the handoff. Nested
+repository-owned command source records remain unchanged: only canonical host
+re-execution may claim that a command ran against canonical source. When source
+and destination resolve to the same checkout, propagation is a byte-preserving
+no-op; native receipts are never rewritten into the cross-worktree shape. This
+narrow staging compatibility does not replace the durable `source_state_v2`
+attestation.
+
 ## Parallel Drift Triage
 
 `auto parallel` does not rewrite completed plan rows solely because receipt

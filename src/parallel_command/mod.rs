@@ -19,13 +19,15 @@ pub(crate) use crate::claude_exec::{
 };
 pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
-    assess_task_completion_gap, clear_verified_source_attestation,
+    assess_task_completion_gap, clean_receipt_handoff_source_state,
+    clear_verified_source_attestation, clear_verified_source_attestation_at,
     commit_message_has_reserved_verification_receipt_footer, compute_task_owned_inputs_fingerprint,
-    current_dirty_state_fingerprint, direct_verification_receipt_problem,
-    ensure_host_review_handoff, footer_task_owned_inputs, git_verification_receipt_footers,
-    inspect_task_completion_evidence, record_verified_source_attestation,
-    unresolved_review_findings_for_task, verification_plan, verification_receipt_commit_footer,
-    CompletionGapKind, VerificationReceiptFooter,
+    direct_verification_receipt_problem, ensure_host_review_handoff, footer_task_owned_inputs,
+    git_verification_receipt_footers, inspect_task_completion_evidence,
+    record_verified_source_attestation, record_verified_source_attestation_at,
+    revalidate_clean_receipt_handoff_source_state, unresolved_review_findings_for_task,
+    verification_plan, verification_receipt_commit_footer,
+    verification_receipt_commit_footer_at, CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
@@ -55,6 +57,7 @@ mod purge;
 mod receipt_backfill;
 mod recovery_notes;
 mod review_gate;
+mod run_root_authority;
 mod run_state;
 mod scheduling;
 mod status;
@@ -73,6 +76,7 @@ pub(crate) use purge::*;
 pub(crate) use receipt_backfill::*;
 pub(crate) use recovery_notes::*;
 pub(crate) use review_gate::*;
+pub(crate) use run_root_authority::*;
 pub(crate) use run_state::*;
 pub(crate) use scheduling::*;
 pub(crate) use status::*;
@@ -157,12 +161,16 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         );
     }
     if args.max_concurrent_workers > 1 && should_launch_parallel_tmux(&args) {
-        ensure_writable_run_root(&run_root)?;
-        purge_previous_parallel_run_artifacts(&repo_root, &run_root);
+        let run_root_authority = ParallelRunRootAuthority::acquire(&repo_root, &run_root)?;
+        validate_parallel_startup_roots(&run_root_authority)?;
         log_parallel_startup_prep(
-            prepare_parallel_startup(&repo_root, target_branch.as_str())?,
+            prepare_parallel_startup_at(&repo_root, &run_root, target_branch.as_str())?,
             target_branch.as_str(),
         );
+        // The launcher never purges, prunes, or opens runtime logs. The
+        // bootstrapped host reacquires and retains the lease before doing any
+        // destructive startup work.
+        drop(run_root_authority);
         let session_name = parallel_tmux_session_name(&repo_root);
         match launch_parallel_tmux_session(&session_name, &run_root, &args)? {
             TmuxLaunchStatus::Launched => {
@@ -187,15 +195,15 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if repo_forbids_legacy_review_trackers(&repo_root) {
         prompt_template.push_str(DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE);
     }
-    ensure_writable_run_root(&run_root)?;
-    purge_previous_parallel_run_artifacts(&repo_root, &run_root);
+    let run_root_authority = ParallelRunRootAuthority::acquire(&repo_root, &run_root)?;
+    purge_previous_parallel_run_artifacts(&repo_root, &run_root_authority)?;
     // Reclaim persistent lane-caches for lane indices this run will never use
     // (e.g. after dialing lanes down). Safe at startup: those indices are never
     // active this run. A purge above (clean run) already removed lane-caches
     // wholesale; this catches the resuming-run case where the purge is skipped.
-    prune_orphan_lane_caches(&run_root, args.max_concurrent_workers);
+    prune_orphan_lane_caches(&run_root, args.max_concurrent_workers)?;
     stamp_current_parallel_run_id(&run_root);
-    let parallel_logger = ParallelEventLogger::new(&run_root)?;
+    let parallel_logger = ParallelEventLogger::new_with_authority(&run_root_authority)?;
     if args.max_concurrent_workers > 1 {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;
     }
@@ -263,7 +271,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     );
 
     log_parallel_startup_prep(
-        prepare_parallel_startup(&repo_root, target_branch.as_str())?,
+        prepare_parallel_startup_at(&repo_root, &run_root, target_branch.as_str())?,
         target_branch.as_str(),
     );
 
@@ -271,7 +279,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     // host-owned verify -> workspace -> independent-review -> closeout gates.
     // A direct-in-canonical serial worker could otherwise bypass those gates
     // and mint commits that the host never adjudicated.
-    run_parallel_loop(
+    let run_result = run_parallel_loop(
         &repo_root,
         &args,
         &target_branch,
@@ -281,7 +289,9 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         &mut linear_tracker,
         &parallel_logger,
     )
-    .await
+    .await;
+    run_root_authority.revalidate_authority()?;
+    run_result
 }
 
 pub(crate) async fn run_parallel_inline(args: ParallelArgs) -> Result<()> {

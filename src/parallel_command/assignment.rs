@@ -106,68 +106,58 @@ pub(crate) enum LaneCachePrune {
     /// brought it back under. Warm `deps/` rlibs preserved.
     PrunedIncremental,
     /// Over the cap even without incremental (bulk is `deps/`); removed the
-    /// whole target. The next task on this lane recompiles cold once — the
-    /// accepted worst case that guarantees the hard bound.
+    /// target's contents while preserving the secured target directory inode.
+    /// The next task on this lane recompiles cold once — the accepted worst
+    /// case that guarantees the hard bound.
     Reset,
 }
 
-/// Delete every `incremental` directory anywhere under `target` (typically
-/// `<target>/debug/incremental` and `<target>/release/incremental`, plus any
-/// target-triple-nested variants). Fully regenerable; preserves `deps/` rlibs.
-/// Returns bytes reclaimed.
-fn prune_incremental_dirs(target: &Path) -> u64 {
-    let mut freed = 0u64;
-    let mut stack = vec![target.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_name() == "incremental" {
-                freed += dir_size_bytes(&path);
-                if let Err(err) = fs::remove_dir_all(&path) {
-                    eprintln!(
-                        "warning: lane-cache: failed pruning incremental {}: {err:#}",
-                        path.display()
-                    );
-                }
-            } else {
-                stack.push(path);
-            }
-        }
-    }
-    freed
+/// Pure, testable core of the size cap: given a lane's cargo-target and a byte
+/// cap, prune tiered so warm dependency artifacts survive when possible. The
+/// target is secured component-by-component before its existence, size, or
+/// contents are inspected.
+pub(crate) fn prune_lane_cache_over_cap(
+    target: &Path,
+    owned_root: &Path,
+    cap: u64,
+) -> Result<LaneCachePrune> {
+    let secured = secure_private_cargo_target_dir(target, owned_root)?;
+    secured.validate_safe_tree()?;
+    prune_secured_lane_cache_over_cap(&secured, cap)
 }
 
-/// Pure, testable core of the size cap: given a lane's cargo-target and a byte
-/// cap, prune tiered so warm dependency artifacts survive when possible.
-pub(crate) fn prune_lane_cache_over_cap(target: &Path, cap: u64) -> LaneCachePrune {
-    if !target.exists() {
-        return LaneCachePrune::UnderCap;
-    }
-    if dir_size_bytes(target) <= cap {
-        return LaneCachePrune::UnderCap;
+#[cfg(unix)]
+fn prune_secured_lane_cache_over_cap(
+    target: &SecuredCargoTargetDir,
+    cap: u64,
+) -> Result<LaneCachePrune> {
+    let before = target.size_bytes()?;
+    if before <= cap {
+        return Ok(LaneCachePrune::UnderCap);
     }
     // Tier 1: drop incremental (fastest-growing, fully regenerable); keep deps warm.
-    prune_incremental_dirs(target);
-    if dir_size_bytes(target) <= cap {
-        return LaneCachePrune::PrunedIncremental;
+    target.prune_incremental_dirs()?;
+    let after_incremental = target.size_bytes()?;
+    if after_incremental <= cap {
+        return Ok(LaneCachePrune::PrunedIncremental);
     }
-    // Tier 2: the bulk is deps/ (accumulated stale artifacts) — reset the target.
-    if let Err(err) = fs::remove_dir_all(target) {
-        eprintln!(
-            "warning: lane-cache: failed resetting over-cap target {}: {err:#}",
-            target.display()
-        );
+    // Tier 2: the bulk is deps/ (accumulated stale artifacts). Clear through
+    // the held target descriptor and preserve the secured target inode so a
+    // path replacement can never redirect the reset.
+    target.clear_contents()?;
+    if target.size_bytes()? != 0 {
+        bail!("secured Cargo-target reset did not produce an empty directory");
     }
-    LaneCachePrune::Reset
+    Ok(LaneCachePrune::Reset)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn prune_lane_cache_over_cap(
+    _target: &Path,
+    _owned_root: &Path,
+    _cap: u64,
+) -> Result<LaneCachePrune> {
+    bail!("persistent Cargo-cache pruning requires Unix descriptor-relative no-follow support")
 }
 
 /// Bound the persistent lane-cache for `lane_root` at (re)assignment time.
@@ -179,35 +169,39 @@ pub(crate) fn prune_lane_cache_over_cap(target: &Path, cap: u64) -> LaneCachePru
 /// into this lane's persistent target, so pruning it cannot corrupt a live
 /// build. No-ops when the persistent-target feature is off (`None` target) or
 /// the cap is disabled (`AUTO_LANE_CACHE_MAX_GB=0`).
-pub(crate) fn enforce_lane_cache_size_cap(lane_root: &Path) {
+pub(crate) fn enforce_lane_cache_size_cap(lane_root: &Path) -> Result<()> {
     let Some(cap) = lane_cache_max_bytes() else {
-        return;
+        return Ok(());
     };
     let Some(target) = lane_persistent_cargo_target_for(lane_root) else {
-        return;
+        return Ok(());
     };
-    if !target.exists() {
-        return;
-    }
-    let before = dir_size_bytes(&target);
-    match prune_lane_cache_over_cap(&target, cap) {
-        LaneCachePrune::UnderCap => {}
-        LaneCachePrune::PrunedIncremental => {
+    let Some(run_root) = lane_root.parent().and_then(Path::parent) else {
+        bail!(
+            "refusing to prune target for malformed lane root {}",
+            lane_root.display()
+        );
+    };
+    match prune_lane_cache_over_cap(&target, run_root, cap) {
+        Ok(LaneCachePrune::UnderCap) => Ok(()),
+        Ok(LaneCachePrune::PrunedIncremental) => {
             println!(
-                "lane-cache: {} over cap {} — pruned incremental, now {} (warm deps kept)",
+                "lane-cache: {} over cap {} — pruned incremental below cap (warm deps kept)",
                 target.display(),
-                human_bytes(cap),
-                human_bytes(dir_size_bytes(&target))
-            );
-        }
-        LaneCachePrune::Reset => {
-            println!(
-                "lane-cache: {} was {} over cap {} — reset (cold recompile next task)",
-                target.display(),
-                human_bytes(before),
                 human_bytes(cap)
             );
+            Ok(())
         }
+        Ok(LaneCachePrune::Reset) => {
+            println!(
+                "lane-cache: {} exceeded cap {} — reset (cold recompile next task)",
+                target.display(),
+                human_bytes(cap)
+            );
+            Ok(())
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("refusing unsafe cache prune for {}", target.display())),
     }
 }
 
@@ -216,38 +210,48 @@ pub(crate) fn enforce_lane_cache_size_cap(lane_root: &Path) {
 /// dialing 8 lanes down to 6, `lane-7`/`lane-8` linger); the current run never
 /// assigns those indices, so their persistent targets are pure dead weight.
 /// Always safe: no lane with index > `max_concurrent_workers` is ever active
-/// this run. Best-effort; failures are logged and never block the run.
-pub(crate) fn prune_orphan_lane_caches(run_root: &Path, max_concurrent_workers: usize) {
+/// this run. Unsafe or unverifiable cache state fails startup closed.
+pub(crate) fn prune_orphan_lane_caches(
+    run_root: &Path,
+    max_concurrent_workers: usize,
+) -> Result<()> {
     let caches = run_root.join("lane-caches");
-    let Ok(entries) = fs::read_dir(&caches) else {
-        return;
-    };
-    let mut freed = 0u64;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(index) = parse_lane_index(name) else {
-            continue;
-        };
-        if index > max_concurrent_workers {
-            let path = entry.path();
-            freed += dir_size_bytes(&path);
-            if let Err(err) = fs::remove_dir_all(&path) {
-                eprintln!(
-                    "warning: lane-cache: failed removing orphan {}: {err:#}",
-                    path.display()
-                );
-            }
+    #[cfg(unix)]
+    let result = secure_private_cargo_target_dir(&caches, run_root).and_then(|secured| {
+        secured.validate_child_directories_matching(
+            |name| name.to_str().and_then(parse_lane_index).is_some(),
+            Some("cargo-target"),
+        )?;
+        secured.clear_children_matching(|name| {
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(index) = parse_lane_index(name) else {
+                return false;
+            };
+            index > max_concurrent_workers
+        })
+    });
+    #[cfg(not(unix))]
+    let result: Result<u64> = Err(anyhow!(
+        "orphan Cargo-cache pruning is unsupported on this platform"
+    ));
+    match result {
+        Ok(freed) if freed > 0 => {
+            println!(
+                "lane-cache: reclaimed {} from orphan lane-caches (lanes > {})",
+                human_bytes(freed),
+                max_concurrent_workers
+            );
+            Ok(())
         }
-    }
-    if freed > 0 {
-        println!(
-            "lane-cache: reclaimed {} from orphan lane-caches (lanes > {})",
-            human_bytes(freed),
-            max_concurrent_workers
-        );
+        Ok(_) => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "refusing unsafe active orphan-cache path {}",
+                caches.display()
+            )
+        }),
     }
 }
 
@@ -340,11 +344,18 @@ impl LaneRunConfig {
         }
     }
 
-    pub(crate) fn env_for_lane(&self, lane_root: &Path) -> Vec<(String, String)> {
+    pub(crate) fn env_for_lane(&self, lane_root: &Path) -> Result<Vec<(String, String)>> {
         let mut extra_env = self.extra_env.clone();
         if self.lane_local_cargo_target {
             let target = lane_persistent_cargo_target_for(lane_root)
                 .unwrap_or_else(|| lane_root.join("cargo-target"));
+            let run_root = lane_root.parent().and_then(Path::parent).with_context(|| {
+                format!(
+                    "lane root {} is not under <run-root>/lanes/",
+                    lane_root.display()
+                )
+            })?;
+            ensure_safe_private_cargo_target_dir(&target, run_root)?;
             extra_env.push((
                 "CARGO_TARGET_DIR".to_string(),
                 target.to_string_lossy().into_owned(),
@@ -356,7 +367,7 @@ impl LaneRunConfig {
                 extra_env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
             }
         }
-        extra_env
+        Ok(extra_env)
     }
 
     pub(crate) fn assignment_worker_metadata(&self) -> LaneWorkerMetadata {
@@ -512,6 +523,13 @@ pub(crate) fn prepare_parallel_lane_assignment(
 ) -> Result<ActiveLaneAssignment> {
     let worker_metadata = lane_config.assignment_worker_metadata();
     if let Some(candidate) = resume_candidate {
+        // Resume candidates have already passed the dead-worker check and are
+        // idle before dispatch. Bound their retained persistent target just as
+        // we do for a fresh assignment; otherwise an unfinished over-cap lane
+        // can bypass the hard cache limit indefinitely.
+        if lane_config.lane_local_cargo_target {
+            enforce_lane_cache_size_cap(&candidate.lane_root)?;
+        }
         write_lane_task_id(&candidate.lane_root, &task.id)?;
         write_lane_assignment_metadata(
             &candidate.lane_root,
@@ -542,7 +560,7 @@ pub(crate) fn prepare_parallel_lane_assignment(
     // The lane is idle here (index just freed, previous worker done), so this
     // only ever prunes a cache no build is using. See enforce_lane_cache_size_cap.
     if lane_config.lane_local_cargo_target {
-        enforce_lane_cache_size_cap(&lane_root);
+        enforce_lane_cache_size_cap(&lane_root)?;
     }
     reset_parallel_lane_root(&lane_root)?;
     let lane_repo_root = lane_root.join("repo");
@@ -574,49 +592,13 @@ pub(crate) fn prepare_parallel_lane_assignment(
 }
 
 pub(crate) fn reset_parallel_lane_root(lane_root: &Path) -> Result<()> {
-    if lane_root.exists() {
-        let stale_root = reserve_stale_lane_root_path(lane_root)?;
-        fs::rename(lane_root, &stale_root).with_context(|| {
-            format!(
-                "failed to move stale lane root {} aside",
-                lane_root.display()
-            )
-        })?;
-        if let Err(err) = fs::remove_dir_all(&stale_root) {
-            eprintln!(
-                "warning: failed removing stale lane root {} after reset: {err}",
-                stale_root.display()
-            );
-        }
-    }
-    fs::create_dir_all(lane_root)
-        .with_context(|| format!("failed to create {}", lane_root.display()))?;
-    Ok(())
-}
-
-pub(crate) fn reserve_stale_lane_root_path(lane_root: &Path) -> Result<PathBuf> {
-    let parent = lane_root
-        .parent()
-        .with_context(|| format!("lane root {} had no parent", lane_root.display()))?;
-    let stem = lane_root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .with_context(|| format!("lane root {} had no file name", lane_root.display()))?;
-    for attempt in 0..100usize {
-        let candidate = if attempt == 0 {
-            format!("{stem}.stale-{}", timestamp_slug())
-        } else {
-            format!("{stem}.stale-{}-{attempt}", timestamp_slug())
-        };
-        let path = parent.join(candidate);
-        if !path.exists() {
-            return Ok(path);
-        }
-    }
-    bail!(
-        "failed reserving stale lane root path near {}",
-        lane_root.display()
-    );
+    let run_root = lane_root.parent().and_then(Path::parent).with_context(|| {
+        format!(
+            "lane root {} is not under <run-root>/lanes/",
+            lane_root.display()
+        )
+    })?;
+    reset_managed_lane_root(lane_root, run_root)
 }
 
 pub(crate) fn prepare_parallel_lane_assignment_with_fallback(
@@ -853,6 +835,7 @@ pub(crate) async fn harvest_resumable_lane_results(
     linear_tracker: &mut Option<LinearTracker>,
     parallel_logger: &ParallelEventLogger,
     review_config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<usize> {
     let mut landed = 0usize;
     let lane_indexes = resumable_lanes.keys().copied().collect::<Vec<_>>();
@@ -899,8 +882,14 @@ pub(crate) async fn harvest_resumable_lane_results(
             terminate_requested_at: None,
             host_recovery_note: candidate.host_recovery_note,
         };
-        match land_parallel_lane_result(repo_root, target_branch, &mut assignment, review_config)
-            .await
+        match land_parallel_lane_result(
+            repo_root,
+            target_branch,
+            &mut assignment,
+            review_config,
+            host_cargo_env,
+        )
+        .await
         {
             Ok(LaneLandingOutcome::Landed {
                 auto_repaired,
@@ -1319,6 +1308,8 @@ mod tests {
         DEFAULT_LANE_CACHE_MAX_GIB, GIB,
     };
     use crate::parallel_command::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::UNIX_EPOCH;
 
     fn effort_config(ceiling: &str) -> LaneRunConfig {
@@ -1369,7 +1360,20 @@ mod tests {
     fn lane_local_cargo_target_persists_outside_disposable_worktree() {
         // AUTO_LANE_PERSISTENT_TARGET is process-global; drive all phases
         // sequentially in one test to avoid racing on it.
-        let lane_root = PathBuf::from("/srv/run/lanes/lane-3");
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("process env lock poisoned");
+        let run_root = unique_temp_dir("lane-private-cargo-target");
+        let lane_root = run_root.join("lanes/lane-3");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&run_root)
+                .expect("stat run root")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&run_root, permissions).expect("secure selected run root");
+        }
         let mut lane_local = effort_config("high");
         lane_local.lane_local_cargo_target = true;
 
@@ -1379,21 +1383,43 @@ mod tests {
         std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "1");
         let target = lane_local
             .env_for_lane(&lane_root)
+            .expect("prepare persistent lane env")
             .into_iter()
             .find(|(key, _)| key == "CARGO_TARGET_DIR")
             .map(|(_, value)| value)
             .expect("lane-local run must set CARGO_TARGET_DIR");
-        assert_eq!(target, "/srv/run/lane-caches/lane-3/cargo-target");
+        let persistent_target = run_root.join("lane-caches/lane-3/cargo-target");
+        assert_eq!(target, persistent_target.to_string_lossy());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&persistent_target)
+                .expect("stat persistent target")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
 
         // Disabled: legacy in-worktree target, deleted with every fresh clone.
         std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "0");
         let target = lane_local
             .env_for_lane(&lane_root)
+            .expect("prepare legacy lane env")
             .into_iter()
             .find(|(key, _)| key == "CARGO_TARGET_DIR")
             .map(|(_, value)| value)
             .expect("lane-local run must still set CARGO_TARGET_DIR when disabled");
-        assert_eq!(target, "/srv/run/lanes/lane-3/cargo-target");
+        let legacy_target = lane_root.join("cargo-target");
+        assert_eq!(target, legacy_target.to_string_lossy());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&legacy_target)
+                .expect("stat legacy target")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         std::env::remove_var("AUTO_LANE_PERSISTENT_TARGET");
 
         // A non-lane-local config never sets CARGO_TARGET_DIR: Fixed/None layouts
@@ -1401,8 +1427,11 @@ mod tests {
         let shared = effort_config("high"); // lane_local_cargo_target: false
         assert!(shared
             .env_for_lane(&lane_root)
+            .expect("prepare non-lane env")
             .iter()
             .all(|(key, _)| key != "CARGO_TARGET_DIR"));
+
+        fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
     fn sample_worker_metadata() -> LaneWorkerMetadata {
@@ -1649,9 +1678,22 @@ mod tests {
     }
 
     #[test]
-    fn reset_parallel_lane_root_rehomes_existing_contents() {
-        let lane_root = unique_temp_dir("parallel-lane-reset");
+    fn reset_parallel_lane_root_clears_existing_contents() {
+        let root = unique_temp_dir("parallel-lane-reset");
+        let run_root = root.join("run");
+        let lane_root = run_root.join("lanes/lane-1");
         fs::create_dir_all(lane_root.join("repo")).expect("failed to create lane repo");
+        #[cfg(unix)]
+        {
+            let mut root_permissions = fs::metadata(&root).expect("stat root").permissions();
+            root_permissions.set_mode(0o755);
+            fs::set_permissions(&root, root_permissions).expect("secure root");
+            let mut run_permissions = fs::metadata(&run_root)
+                .expect("stat run root")
+                .permissions();
+            run_permissions.set_mode(0o755);
+            fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        }
         fs::write(lane_root.join("repo").join("stale.txt"), "stale")
             .expect("failed to write stale file");
 
@@ -1689,12 +1731,94 @@ mod tests {
             "stale lane roots should be pruned after reset"
         );
 
-        fs::remove_dir_all(&lane_root).expect("failed to remove lane root");
+        fs::remove_dir_all(&root).expect("failed to remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_parallel_lane_root_rejects_symlinked_lanes_parent_without_touching_outside() {
+        let root = unique_temp_dir("parallel-lane-reset-parent-symlink");
+        let run_root = root.join("run");
+        let outside = root.join("outside");
+        let lane_root = run_root.join("lanes/lane-1");
+        fs::create_dir_all(outside.join("lane-1/repo")).expect("create outside lane");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let mut root_permissions = fs::metadata(&root).expect("stat root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        fs::write(outside.join("lane-1/repo/sentinel"), b"outside")
+            .expect("write outside sentinel");
+        std::os::unix::fs::symlink(&outside, run_root.join("lanes")).expect("symlink lanes parent");
+
+        let error = reset_parallel_lane_root(&lane_root)
+            .expect_err("symlinked lanes parent must fail closed");
+
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(
+            fs::read(outside.join("lane-1/repo/sentinel")).expect("outside sentinel survives"),
+            b"outside"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_parallel_lane_root_unlinks_internal_symlink_without_touching_outside() {
+        let root = unique_temp_dir("parallel-lane-reset-internal-symlink");
+        let run_root = root.join("run");
+        let outside = root.join("outside");
+        let lane_root = run_root.join("lanes/lane-1");
+        fs::create_dir_all(lane_root.join("repo")).expect("create lane");
+        fs::create_dir_all(&outside).expect("create outside");
+        let mut root_permissions = fs::metadata(&root).expect("stat root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        fs::write(outside.join("sentinel"), b"outside").expect("write outside sentinel");
+        std::os::unix::fs::symlink(&outside, lane_root.join("repo/pivot"))
+            .expect("create internal lane symlink");
+
+        reset_parallel_lane_root(&lane_root).expect("internal symlink should be unlinked safely");
+
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("outside sentinel survives"),
+            b"outside"
+        );
+        assert!(
+            fs::read_dir(&lane_root)
+                .expect("read reset lane")
+                .next()
+                .is_none(),
+            "lane must be empty after descriptor-relative reset"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     fn write_blob(path: &Path, bytes: usize) {
         fs::create_dir_all(path.parent().expect("blob parent")).expect("create blob parent");
         fs::write(path, vec![0u8; bytes]).expect("write blob");
+    }
+
+    #[cfg(unix)]
+    fn lane_cache_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let run_root = unique_temp_dir(label);
+        fs::create_dir_all(&run_root).expect("create cache run root");
+        let mut permissions = fs::metadata(&run_root)
+            .expect("stat cache run root")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, permissions).expect("secure cache run root");
+        let target = run_root.join("lane-caches/lane-1/cargo-target");
+        (run_root, target)
     }
 
     #[test]
@@ -1729,9 +1853,10 @@ mod tests {
         assert!(parse_lane_cargo_incremental_enabled(Some(" 1 ")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_lane_cache_keeps_warm_cache_under_cap() {
-        let target = unique_temp_dir("lane-cache-under");
+        let (run_root, target) = lane_cache_fixture("lane-cache-under");
         write_blob(&target.join("debug").join("deps").join("libfoo.rlib"), 4096);
         write_blob(
             &target.join("debug").join("incremental").join("state.bin"),
@@ -1740,7 +1865,7 @@ mod tests {
 
         // 1 GiB cap, ~8 KiB of content -> nothing pruned.
         assert_eq!(
-            prune_lane_cache_over_cap(&target, GIB),
+            prune_lane_cache_over_cap(&target, &run_root, GIB).expect("secure under-cap prune"),
             LaneCachePrune::UnderCap
         );
         assert!(target.join("debug").join("incremental").exists());
@@ -1750,12 +1875,13 @@ mod tests {
             .join("libfoo.rlib")
             .exists());
 
-        fs::remove_dir_all(&target).expect("cleanup");
+        fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_lane_cache_drops_incremental_first_and_keeps_deps() {
-        let target = unique_temp_dir("lane-cache-incremental");
+        let (run_root, target) = lane_cache_fixture("lane-cache-incremental");
         // deps: 4 KiB, incremental: 64 KiB. Cap between the two.
         write_blob(&target.join("debug").join("deps").join("libfoo.rlib"), 4096);
         write_blob(
@@ -1769,7 +1895,8 @@ mod tests {
 
         // Cap = 16 KiB: over cap with incremental, under cap once it's gone.
         assert_eq!(
-            prune_lane_cache_over_cap(&target, 16 * 1024),
+            prune_lane_cache_over_cap(&target, &run_root, 16 * 1024)
+                .expect("secure incremental prune"),
             LaneCachePrune::PrunedIncremental
         );
         assert!(
@@ -1789,31 +1916,182 @@ mod tests {
             "warm deps rlibs must survive an incremental prune"
         );
 
-        fs::remove_dir_all(&target).expect("cleanup");
+        fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_lane_cache_resets_whole_target_when_deps_exceed_cap() {
-        let target = unique_temp_dir("lane-cache-reset");
+        use std::os::unix::fs::MetadataExt;
+
+        let (run_root, target) = lane_cache_fixture("lane-cache-reset");
         // deps alone (no incremental) exceeds the cap -> only the nuke bounds it.
         write_blob(
             &target.join("debug").join("deps").join("big.rlib"),
             64 * 1024,
         );
+        let target_inode = fs::metadata(&target)
+            .expect("stat target before reset")
+            .ino();
 
         assert_eq!(
-            prune_lane_cache_over_cap(&target, 16 * 1024),
+            prune_lane_cache_over_cap(&target, &run_root, 16 * 1024).expect("secure full reset"),
             LaneCachePrune::Reset
         );
         assert!(
-            !target.exists(),
-            "over-cap deps-heavy target must be fully removed"
+            target.exists(),
+            "tier-2 reset must preserve the secured target directory"
         );
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("stat target after reset")
+                .ino(),
+            target_inode,
+            "tier-2 reset must preserve the target inode"
+        );
+        assert!(
+            fs::read_dir(&target)
+                .expect("read reset target")
+                .next()
+                .is_none(),
+            "over-cap deps-heavy target contents must be fully removed"
+        );
+        fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prune_lane_cache_rejects_target_symlink_without_touching_external_directory() {
+        let root = unique_temp_dir("lane-cache-target-symlink");
+        let run_root = root.join("run");
+        let target_parent = run_root.join("lane-caches/lane-1");
+        let outside = root.join("outside");
+        fs::create_dir_all(&target_parent).expect("create target parent");
+        fs::create_dir_all(&outside).expect("create external directory");
+        let mut root_permissions = fs::metadata(&root).expect("stat test root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure test root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        write_blob(&outside.join("sentinel.bin"), 64 * 1024);
+        let target = target_parent.join("cargo-target");
+        std::os::unix::fs::symlink(&outside, &target).expect("symlink target externally");
+
+        let error = prune_lane_cache_over_cap(&target, &run_root, 1)
+            .expect_err("symlinked target must fail closed");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(
+            fs::metadata(outside.join("sentinel.bin"))
+                .expect("external sentinel survives")
+                .len(),
+            64 * 1024
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_lane_cache_rejects_internal_symlink_without_traversing_external_directory() {
+        let root = unique_temp_dir("lane-cache-internal-symlink");
+        let run_root = root.join("run");
+        let target = run_root.join("lane-caches/lane-1/cargo-target");
+        let outside = root.join("outside");
+        fs::create_dir_all(target.join("debug")).expect("create target debug");
+        fs::create_dir_all(&outside).expect("create external directory");
+        let mut root_permissions = fs::metadata(&root).expect("stat test root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure test root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        write_blob(&target.join("debug/deps/big.rlib"), 64 * 1024);
+        write_blob(&outside.join("sentinel.bin"), 64 * 1024);
+        std::os::unix::fs::symlink(&outside, target.join("debug/incremental"))
+            .expect("create internal symlink");
+        let error = prune_lane_cache_over_cap(&target, &run_root, 16 * 1024)
+            .expect_err("internal symlink must fail closed before cache reset");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert!(target.join("debug/deps/big.rlib").exists());
+        assert!(target.join("debug/incremental").is_symlink());
+        assert_eq!(
+            fs::metadata(outside.join("sentinel.bin"))
+                .expect("external sentinel survives")
+                .len(),
+            64 * 1024
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_lane_cache_rejects_internal_symlink_even_when_under_cap() {
+        let root = unique_temp_dir("lane-cache-under-cap-internal-symlink");
+        let run_root = root.join("run");
+        let target = run_root.join("lane-caches/lane-1/cargo-target");
+        let outside = root.join("outside");
+        fs::create_dir_all(target.join("debug")).expect("create target debug");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        let mut root_permissions = fs::metadata(&root).expect("stat root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        fs::write(outside.join("sentinel"), b"outside").expect("write outside sentinel");
+        std::os::unix::fs::symlink(&outside, target.join("debug/deps"))
+            .expect("create internal cache symlink");
+
+        let error = prune_lane_cache_over_cap(&target, &run_root, GIB)
+            .expect_err("under-cap internal symlink must fail closed");
+
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("outside sentinel survives"),
+            b"outside"
+        );
+        assert!(target.join("debug/deps").is_symlink());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_lane_cache_rejects_internal_socket_even_when_under_cap() {
+        // Unix-domain socket paths have a much smaller platform limit than
+        // ordinary filesystem paths, so keep this fixture label deliberately
+        // short while still placing the socket inside the secured target.
+        let (run_root, target) = lane_cache_fixture("sock");
+        fs::create_dir_all(&target).expect("create target");
+        let socket_path = target.join("cargo-artifact.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind internal socket");
+
+        let error = prune_lane_cache_over_cap(&target, &run_root, GIB)
+            .expect_err("internal socket must fail closed");
+
+        assert!(format!("{error:#}").contains("special file"), "{error:#}");
+        assert!(socket_path.exists());
+        fs::remove_dir_all(&run_root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn prune_orphan_lane_caches_removes_higher_indexed_lanes_only() {
         let run_root = unique_temp_dir("orphan-lane-caches");
+        fs::create_dir_all(&run_root).expect("create orphan run root");
+        let mut permissions = fs::metadata(&run_root)
+            .expect("stat orphan run root")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, permissions).expect("secure orphan run root");
         let caches = run_root.join("lane-caches");
         for lane in 1..=8usize {
             write_blob(
@@ -1827,7 +2105,7 @@ mod tests {
         // A non-lane dir must be ignored, not deleted.
         write_blob(&caches.join("scratch").join("keep"), 1024);
 
-        prune_orphan_lane_caches(&run_root, 6);
+        prune_orphan_lane_caches(&run_root, 6).expect("prune safe orphan caches");
 
         for lane in 1..=6usize {
             assert!(
@@ -1846,11 +2124,58 @@ mod tests {
         fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prune_orphan_lane_cache_symlink_cannot_touch_external_directory() {
+        let root = unique_temp_dir("orphan-lane-cache-symlink");
+        let run_root = root.join("run");
+        let caches = run_root.join("lane-caches");
+        let outside = root.join("outside");
+        fs::create_dir_all(&caches).expect("create caches");
+        fs::create_dir_all(&outside).expect("create outside");
+        let mut root_permissions = fs::metadata(&root).expect("stat test root").permissions();
+        root_permissions.set_mode(0o755);
+        fs::set_permissions(&root, root_permissions).expect("secure test root");
+        let mut run_permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        run_permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, run_permissions).expect("secure run root");
+        write_blob(&outside.join("sentinel.bin"), 4096);
+        std::os::unix::fs::symlink(&outside, caches.join("lane-9")).expect("create orphan symlink");
+
+        let error =
+            prune_orphan_lane_caches(&run_root, 6).expect_err("orphan symlink must fail closed");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+
+        assert!(
+            caches.join("lane-9").is_symlink(),
+            "unsafe orphan symlink must be left untouched"
+        );
+        assert_eq!(
+            fs::metadata(outside.join("sentinel.bin"))
+                .expect("external sentinel survives")
+                .len(),
+            4096
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn enforce_lane_cache_size_cap_noops_when_disabled() {
         // AUTO_LANE_CACHE_MAX_GB=0 disables the cap: an over-sized cache is kept.
         // Env is process-global, so isolate the whole assertion in one test.
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("process env lock poisoned");
         let run_root = unique_temp_dir("lane-cache-disabled");
+        fs::create_dir_all(&run_root).expect("create disabled-cap run root");
+        let mut permissions = fs::metadata(&run_root)
+            .expect("stat disabled-cap run root")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, permissions).expect("secure disabled-cap run root");
         let lane_root = run_root.join("lanes").join("lane-2");
         fs::create_dir_all(&lane_root).expect("create lane root");
         let target = run_root
@@ -1866,7 +2191,7 @@ mod tests {
         // but with the cap disabled it returns before consulting the target at all,
         // so this assertion is robust regardless of that (parallel-test-shared) env.
         std::env::set_var("AUTO_LANE_CACHE_MAX_GB", "0");
-        enforce_lane_cache_size_cap(&lane_root);
+        enforce_lane_cache_size_cap(&lane_root).expect("disabled cap should be a clean no-op");
         assert!(
             target.join("debug").join("deps").join("big.rlib").exists(),
             "disabled cap (=0) must leave the cache untouched"
@@ -1875,11 +2200,139 @@ mod tests {
 
         // With a real cap below the content, the pure core bounds the same cache.
         assert_eq!(
-            prune_lane_cache_over_cap(&target, 16 * 1024),
+            prune_lane_cache_over_cap(&target, &run_root, 16 * 1024)
+                .expect("secure explicit cache prune"),
             LaneCachePrune::Reset
         );
 
         fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enforce_lane_cache_size_cap_propagates_unsafe_cache_error() {
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("process env lock poisoned");
+        let run_root = unique_temp_dir("lane-cache-enforce-error");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let mut permissions = fs::metadata(&run_root)
+            .expect("stat run root")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, permissions).expect("secure run root");
+        let lane_root = run_root.join("lanes/lane-2");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let target = run_root.join("lane-caches/lane-2/cargo-target");
+        fs::create_dir_all(&target).expect("create target");
+        let _listener = std::os::unix::net::UnixListener::bind(target.join("unsafe.sock"))
+            .expect("bind unsafe cache socket");
+        let prior_persistent = std::env::var_os("AUTO_LANE_PERSISTENT_TARGET");
+        let prior_cap = std::env::var_os("AUTO_LANE_CACHE_MAX_GB");
+        std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "1");
+        std::env::remove_var("AUTO_LANE_CACHE_MAX_GB");
+
+        let error = enforce_lane_cache_size_cap(&lane_root)
+            .expect_err("unsafe cache inspection must block assignment");
+
+        assert!(format!("{error:#}").contains("special file"), "{error:#}");
+        match prior_persistent {
+            Some(value) => std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", value),
+            None => std::env::remove_var("AUTO_LANE_PERSISTENT_TARGET"),
+        }
+        match prior_cap {
+            Some(value) => std::env::set_var("AUTO_LANE_CACHE_MAX_GB", value),
+            None => std::env::remove_var("AUTO_LANE_CACHE_MAX_GB"),
+        }
+        fs::remove_dir_all(&run_root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_idle_lane_enforces_persistent_cache_cap_before_dispatch() {
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("process env lock poisoned");
+        let run_root = unique_temp_dir("resumed-lane-cache-cap");
+        let lane_root = run_root.join("lanes/lane-2");
+        let lane_repo_root = lane_root.join("repo");
+        fs::create_dir_all(&lane_repo_root).expect("create resumable lane repo");
+        let mut permissions = fs::metadata(&run_root)
+            .expect("stat resume run root")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&run_root, permissions).expect("secure resume run root");
+        let target = run_root.join("lane-caches/lane-2/cargo-target");
+        fs::create_dir_all(target.join("debug/deps")).expect("create persistent target");
+        let over_cap = target.join("debug/deps/oversized.rlib");
+        fs::File::create(&over_cap)
+            .expect("create sparse over-cap artifact")
+            .set_len(GIB + 1)
+            .expect("size sparse over-cap artifact");
+
+        let prior_persistent = std::env::var_os("AUTO_LANE_PERSISTENT_TARGET");
+        let prior_cap = std::env::var_os("AUTO_LANE_CACHE_MAX_GB");
+        std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", "1");
+        std::env::set_var("AUTO_LANE_CACHE_MAX_GB", "1");
+
+        let mut lane_config = effort_config("high");
+        lane_config.lane_local_cargo_target = true;
+        let task = LoopTask {
+            id: "TASK-RESUME-CAP".to_string(),
+            title: "Resume bounded cache".to_string(),
+            status: LoopTaskStatus::Pending,
+            dependencies: vec![],
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [ ] `TASK-RESUME-CAP` Resume bounded cache\nVerification: `cargo test`\nRequired tests: `cargo test`\nDependencies: none\n".to_string(),
+        };
+        let candidate = LaneResumeCandidate {
+            lane_index: 2,
+            task: task.clone(),
+            lane_root: lane_root.clone(),
+            lane_repo_root: lane_repo_root.clone(),
+            base_commit: "abc123".to_string(),
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            host_recovery_note: None,
+        };
+
+        let assignment = prepare_parallel_lane_assignment(
+            &run_root,
+            &run_root,
+            "main",
+            &lane_config,
+            2,
+            task,
+            Some(candidate),
+        )
+        .expect("resume assignment should prune before dispatch");
+
+        assert!(assignment.resumed);
+        assert_eq!(assignment.lane_repo_root, lane_repo_root);
+        assert!(
+            !over_cap.exists(),
+            "resumed lane must not dispatch with its retained cache over cap"
+        );
+        assert!(
+            fs::read_dir(&target)
+                .expect("read reset persistent target")
+                .next()
+                .is_none(),
+            "over-cap resumed target must be reset cold"
+        );
+
+        match prior_persistent {
+            Some(value) => std::env::set_var("AUTO_LANE_PERSISTENT_TARGET", value),
+            None => std::env::remove_var("AUTO_LANE_PERSISTENT_TARGET"),
+        }
+        match prior_cap {
+            Some(value) => std::env::set_var("AUTO_LANE_CACHE_MAX_GB", value),
+            None => std::env::remove_var("AUTO_LANE_CACHE_MAX_GB"),
+        }
+        fs::remove_dir_all(&run_root).expect("cleanup");
     }
 
     #[test]
