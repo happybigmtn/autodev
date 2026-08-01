@@ -26,13 +26,22 @@ pub(crate) use crate::completion_artifacts::verification::verification_step_look
 
 pub(crate) use owned_inputs::compute_task_owned_inputs_fingerprint;
 pub(crate) use receipt::{
-    clear_verified_source_attestation, commit_message_has_reserved_verification_receipt_footer,
-    current_dirty_state_fingerprint, direct_verification_receipt_freshness_problem,
-    direct_verification_receipt_problem, footer_task_owned_inputs,
-    git_verification_receipt_footers, normalized_plan_hash_bytes,
-    record_verified_source_attestation, verification_receipt_commit_footer,
+    clean_receipt_handoff_source_state, clear_verified_source_attestation,
+    commit_message_has_reserved_verification_receipt_footer,
+    direct_verification_receipt_freshness_problem, direct_verification_receipt_problem,
+    footer_task_owned_inputs, git_verification_receipt_footers, record_verified_source_attestation,
+    revalidate_clean_receipt_handoff_source_state, verification_receipt_commit_footer,
     VerificationReceiptFooter,
 };
+// Explicit authority-root entry points are consumed only by parallel hosts;
+// keep legacy/non-parallel builds warning-clean while exporting that boundary.
+#[allow(unused_imports)]
+pub(crate) use receipt::{
+    clear_verified_source_attestation_at, record_verified_source_attestation_at,
+    verification_receipt_commit_footer_at,
+};
+#[cfg(test)]
+pub(crate) use receipt::{current_dirty_state_fingerprint, normalized_plan_hash_bytes};
 pub(crate) use verification::verification_plan;
 
 const REVIEW_HEADER: &str = "# REVIEW\n\nAwaiting auto review:\n";

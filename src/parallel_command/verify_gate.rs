@@ -88,12 +88,30 @@ pub(crate) fn host_reproducible_commands(task_markdown: &str) -> Vec<String> {
 /// Re-run the task's declared verification commands at canonical HEAD, bounded
 /// by a total timeout. Never returns `Err`; classifies every path into a
 /// [`LaneVerifyOutcome`].
+#[cfg(test)]
 pub(crate) async fn run_lane_verify_gate(
     repo_root: &Path,
     task_id: &str,
     task_markdown: &str,
 ) -> LaneVerifyOutcome {
-    run_lane_verify_gate_with_timeout(repo_root, task_id, task_markdown, verify_timeout()).await
+    let host_cargo_env = HostCargoEnv::default();
+    run_lane_verify_gate_with_env(repo_root, task_id, task_markdown, &host_cargo_env).await
+}
+
+pub(crate) async fn run_lane_verify_gate_with_env(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    host_cargo_env: &HostCargoEnv,
+) -> LaneVerifyOutcome {
+    run_lane_verify_gate_with_timeout(
+        repo_root,
+        task_id,
+        task_markdown,
+        verify_timeout(),
+        host_cargo_env,
+    )
+    .await
 }
 
 async fn run_lane_verify_gate_with_timeout(
@@ -101,6 +119,7 @@ async fn run_lane_verify_gate_with_timeout(
     task_id: &str,
     task_markdown: &str,
     deadline: Duration,
+    host_cargo_env: &HostCargoEnv,
 ) -> LaneVerifyOutcome {
     let verification = verification_plan(task_markdown);
     if verification
@@ -120,7 +139,12 @@ async fn run_lane_verify_gate_with_timeout(
     }
     match tokio::time::timeout(
         deadline,
-        run_verify_commands(repo_root.to_path_buf(), task_id.to_string(), commands),
+        run_verify_commands(
+            repo_root.to_path_buf(),
+            task_id.to_string(),
+            commands,
+            host_cargo_env.clone(),
+        ),
     )
     .await
     {
@@ -138,6 +162,7 @@ async fn run_verify_commands(
     repo_root: PathBuf,
     task_id: String,
     commands: Vec<String>,
+    host_cargo_env: HostCargoEnv,
 ) -> LaneVerifyOutcome {
     let wrapper = repo_root.join("scripts/run-task-verification.sh");
     let wrapper_present = wrapper.is_file();
@@ -166,6 +191,7 @@ async fn run_verify_commands(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        host_cargo_env.apply_to_tokio(&mut process);
         let result = match ContainedChild::spawn(&mut process) {
             Ok(child) => child.output().await,
             Err(err) => Err(err),
@@ -313,17 +339,36 @@ pub(crate) enum WorkspaceProbe {
 /// essential: it lets us enumerate EVERY passing test across all binaries, so a
 /// later failure of any of them is recognized as a regression instead of being
 /// missed because cargo stopped at the first red binary.
-pub(crate) async fn run_workspace_probe_with_cargo(
+pub(crate) async fn run_workspace_probe_with_cargo_env(
     repo_root: &Path,
     cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> WorkspaceProbe {
-    run_workspace_probe_with_timeout_and_cargo(repo_root, workspace_test_timeout(), cargo_bin).await
+    run_workspace_probe_with_timeout_cargo_and_env(
+        repo_root,
+        workspace_test_timeout(),
+        cargo_bin,
+        host_cargo_env,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn run_workspace_probe_with_timeout_and_cargo(
     repo_root: &Path,
     deadline: Duration,
     cargo_bin: Option<PathBuf>,
+) -> WorkspaceProbe {
+    let host_cargo_env = HostCargoEnv::default();
+    run_workspace_probe_with_timeout_cargo_and_env(repo_root, deadline, cargo_bin, &host_cargo_env)
+        .await
+}
+
+async fn run_workspace_probe_with_timeout_cargo_and_env(
+    repo_root: &Path,
+    deadline: Duration,
+    cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> WorkspaceProbe {
     if !repo_root.join("Cargo.toml").is_file() {
         return WorkspaceProbe::NotApplicable {
@@ -332,7 +377,7 @@ async fn run_workspace_probe_with_timeout_and_cargo(
     }
     match tokio::time::timeout(
         deadline,
-        run_workspace_test_capture(repo_root.to_path_buf(), cargo_bin),
+        run_workspace_test_capture(repo_root.to_path_buf(), cargo_bin, host_cargo_env.clone()),
     )
     .await
     {
@@ -371,6 +416,7 @@ async fn run_workspace_probe_with_timeout_and_cargo(
 async fn run_workspace_test_capture(
     repo_root: PathBuf,
     cargo_bin: Option<PathBuf>,
+    host_cargo_env: HostCargoEnv,
 ) -> Option<(bool, String)> {
     let mut command = if let Some(cargo_bin) = cargo_bin {
         let mut command = tokio::process::Command::new(cargo_bin);
@@ -388,6 +434,7 @@ async fn run_workspace_test_capture(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    host_cargo_env.apply_to_tokio(&mut command);
     let result = match ContainedChild::spawn(&mut command) {
         Ok(child) => child.output().await,
         Err(err) => Err(err),
@@ -1218,6 +1265,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn host_verify_applies_only_the_selected_cargo_environment() {
+        let dir = unique_test_dir("verify-host-cargo-env");
+        let scripts = dir.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n%s\\n%s\\n' \"${CARGO_TARGET_DIR-}\" \"${CARGO_BUILD_JOBS-}\" \"${AUTO_PARALLEL_GIT_GUARD-}\" > host-env.txt\nshift\nif [[ ${1:-} == \"--\" ]]; then shift; fi\n\"$@\"\n",
+        )
+        .expect("write wrapper");
+        make_executable(&wrapper);
+        let host_env = HostCargoEnv::from_vars(vec![
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                dir.join("private-target").to_string_lossy().into_owned(),
+            ),
+            ("CARGO_BUILD_JOBS".to_string(), "2".to_string()),
+        ]);
+        let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
+
+        assert_eq!(
+            run_lane_verify_gate_with_env(&dir, "TASK-1", markdown, &host_env).await,
+            LaneVerifyOutcome::AllPassed
+        );
+        let marker = fs::read_to_string(dir.join("host-env.txt")).expect("read env marker");
+        let lines = marker.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                dir.join("private-target").to_string_lossy().as_ref(),
+                "2",
+                ""
+            ],
+            "host verification must receive Cargo settings without worker git-guard state"
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn workspace_probe_applies_selected_target_and_jobs_to_cargo() {
+        let dir = unique_test_dir("workspace-host-cargo-env");
+        fs::create_dir_all(&dir).expect("create repo dir");
+        fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        let cargo = dir.join("fake-cargo");
+        fs::write(
+            &cargo,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n%s\\n' \"${CARGO_TARGET_DIR-}\" \"${CARGO_BUILD_JOBS-}\" > workspace-env.txt\n",
+        )
+        .expect("write fake cargo");
+        make_executable(&cargo);
+        let target = dir.join("host-target");
+        let host_env = HostCargoEnv::from_vars(vec![
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_BUILD_JOBS".to_string(), "3".to_string()),
+        ]);
+
+        let probe = run_workspace_probe_with_timeout_cargo_and_env(
+            &dir,
+            Duration::from_secs(2),
+            Some(cargo),
+            &host_env,
+        )
+        .await;
+        assert!(matches!(probe, WorkspaceProbe::Ran(_)));
+        let marker = fs::read_to_string(dir.join("workspace-env.txt")).expect("read env marker");
+        assert_eq!(
+            marker.lines().collect::<Vec<_>>(),
+            vec![target.to_string_lossy().as_ref(), "3"]
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_wrapper_cannot_leave_delayed_descendant_or_hold_output_open() {
@@ -1287,9 +1412,14 @@ mod tests {
         make_executable(&wrapper);
         let markdown = "- [ ] `TASK-1` t\n\nVerification:\n- Run `bash -c true`\n";
 
-        let result =
-            run_lane_verify_gate_with_timeout(&dir, "TASK-1", markdown, Duration::from_secs(1))
-                .await;
+        let result = run_lane_verify_gate_with_timeout(
+            &dir,
+            "TASK-1",
+            markdown,
+            Duration::from_secs(1),
+            &HostCargoEnv::default(),
+        )
+        .await;
         assert!(
             matches!(result, LaneVerifyOutcome::Skipped { ref reason } if reason.contains("timed out")),
             "{result:?}"

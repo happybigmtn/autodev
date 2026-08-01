@@ -44,14 +44,30 @@ pub(crate) fn verification_receipt_path(repo_root: &Path, task_id: &str) -> Path
     verification_receipt_root(repo_root).join(format!("{task_id}.json"))
 }
 
-fn verified_source_attestation_path(repo_root: &Path, task_id: &str) -> PathBuf {
-    repo_root
-        .join(".auto/parallel/verified-source")
+fn legacy_verified_source_authority_root(repo_root: &Path) -> PathBuf {
+    repo_root.join(".auto/parallel")
+}
+
+fn verified_source_attestation_path_at(authority_root: &Path, task_id: &str) -> PathBuf {
+    authority_root
+        .join("verified-source")
         .join(format!("{task_id}.json"))
 }
 
+#[cfg(test)]
+fn verified_source_attestation_path(repo_root: &Path, task_id: &str) -> PathBuf {
+    verified_source_attestation_path_at(&legacy_verified_source_authority_root(repo_root), task_id)
+}
+
 pub(crate) fn clear_verified_source_attestation(repo_root: &Path, task_id: &str) -> Result<()> {
-    let path = verified_source_attestation_path(repo_root, task_id);
+    clear_verified_source_attestation_at(&legacy_verified_source_authority_root(repo_root), task_id)
+}
+
+pub(crate) fn clear_verified_source_attestation_at(
+    authority_root: &Path,
+    task_id: &str,
+) -> Result<()> {
+    let path = verified_source_attestation_path_at(authority_root, task_id);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -60,15 +76,43 @@ pub(crate) fn clear_verified_source_attestation(repo_root: &Path, task_id: &str)
 }
 
 pub(crate) fn record_verified_source_attestation(repo_root: &Path, task_id: &str) -> Result<()> {
-    record_verified_source_attestation_with_source_limits(
+    record_verified_source_attestation_at(
         repo_root,
+        &legacy_verified_source_authority_root(repo_root),
+        task_id,
+    )
+}
+
+pub(crate) fn record_verified_source_attestation_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+) -> Result<()> {
+    record_verified_source_attestation_at_with_source_limits(
+        repo_root,
+        authority_root,
         task_id,
         SourceStateLimits::default(),
     )
 }
 
+#[cfg(test)]
 fn record_verified_source_attestation_with_source_limits(
     repo_root: &Path,
+    task_id: &str,
+    source_limits: SourceStateLimits,
+) -> Result<()> {
+    record_verified_source_attestation_at_with_source_limits(
+        repo_root,
+        &legacy_verified_source_authority_root(repo_root),
+        task_id,
+        source_limits,
+    )
+}
+
+fn record_verified_source_attestation_at_with_source_limits(
+    repo_root: &Path,
+    authority_root: &Path,
     task_id: &str,
     source_limits: SourceStateLimits,
 ) -> Result<()> {
@@ -144,7 +188,7 @@ fn record_verified_source_attestation_with_source_limits(
     };
     let rendered = serde_json::to_vec_pretty(&attestation)
         .context("failed to serialize verified-source attestation")?;
-    let path = verified_source_attestation_path(repo_root, task_id);
+    let path = verified_source_attestation_path_at(authority_root, task_id);
     atomic_write(&path, &rendered).with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -152,15 +196,43 @@ pub(crate) fn verification_receipt_commit_footer(
     repo_root: &Path,
     task_id: &str,
 ) -> Result<Option<String>> {
-    verification_receipt_commit_footer_with_source_limits(
+    verification_receipt_commit_footer_at(
         repo_root,
+        &legacy_verified_source_authority_root(repo_root),
+        task_id,
+    )
+}
+
+pub(crate) fn verification_receipt_commit_footer_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+) -> Result<Option<String>> {
+    verification_receipt_commit_footer_at_with_source_limits(
+        repo_root,
+        authority_root,
         task_id,
         SourceStateLimits::default(),
     )
 }
 
+#[cfg(test)]
 fn verification_receipt_commit_footer_with_source_limits(
     repo_root: &Path,
+    task_id: &str,
+    source_limits: SourceStateLimits,
+) -> Result<Option<String>> {
+    verification_receipt_commit_footer_at_with_source_limits(
+        repo_root,
+        &legacy_verified_source_authority_root(repo_root),
+        task_id,
+        source_limits,
+    )
+}
+
+fn verification_receipt_commit_footer_at_with_source_limits(
+    repo_root: &Path,
+    authority_root: &Path,
     task_id: &str,
     source_limits: SourceStateLimits,
 ) -> Result<Option<String>> {
@@ -230,6 +302,7 @@ fn verification_receipt_commit_footer_with_source_limits(
     };
     let verified_source_state = require_current_source_attestation_for_footer(
         repo_root,
+        authority_root,
         task_id,
         &path,
         &receipt,
@@ -1351,72 +1424,63 @@ fn verification_receipt_freshness_problem_for_source(
         }
     }
 
-    let (current_commit, current_dirty_fingerprint, current_dirty_is_clean, current_plan_hash) =
-        if let Some(context) = bounded.as_mut() {
-            let current_commit =
-                match current_git_commit_with_budget(repo_root, context.limits, context.budget) {
-                    Ok(commit) => Some(commit),
-                    Err(err) => {
-                        return Some(format!("cannot collect bounded current Git HEAD: {err:#}"))
-                    }
-                };
-            let dirty = match current_dirty_state_snapshot_with_budget(
-                repo_root,
-                context.limits,
-                context.budget,
-            ) {
-                Ok(snapshot) => snapshot,
+    let (current_commit, current_dirty_fingerprint, current_plan_hash) = if let Some(context) =
+        bounded.as_mut()
+    {
+        let current_commit =
+            match current_git_commit_with_budget(repo_root, context.limits, context.budget) {
+                Ok(commit) => Some(commit),
                 Err(err) => {
-                    return Some(format!(
-                        "cannot collect bounded current dirty state: {err:#}"
-                    ))
+                    return Some(format!("cannot collect bounded current Git HEAD: {err:#}"))
                 }
             };
-            (
-                current_commit,
-                Some(dirty.fingerprint),
-                dirty.is_clean,
-                Some(normalized_plan_hash_bytes(context.plan_input)),
-            )
-        } else {
-            let mut budget = SourceStateBudget::default();
-            let current_commit =
-                match current_git_commit_with_budget(repo_root, limits, &mut budget) {
-                    Ok(commit) => Some(commit),
-                    Err(err) => {
-                        return Some(format!("cannot collect bounded current Git HEAD: {err:#}"))
-                    }
-                };
-            let dirty =
-                match current_dirty_state_snapshot_with_budget(repo_root, limits, &mut budget) {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        return Some(format!(
-                            "cannot collect bounded current dirty state: {err:#}"
-                        ))
-                    }
-                };
-            let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
-            let current_plan_hash = match read_bounded_file_bytes(
-                &plan_path,
-                limits,
-                &mut budget,
-                "freshness IMPLEMENTATION_PLAN.md input",
-            ) {
-                Ok(plan) => Some(normalized_plan_hash_bytes(&plan)),
-                Err(err) => {
-                    return Some(format!(
-                        "cannot collect bounded current plan input: {err:#}"
-                    ))
-                }
-            };
-            (
-                current_commit,
-                Some(dirty.fingerprint),
-                dirty.is_clean,
-                current_plan_hash,
-            )
+        let dirty = match current_dirty_state_snapshot_with_budget(
+            repo_root,
+            context.limits,
+            context.budget,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Some(format!(
+                    "cannot collect bounded current dirty state: {err:#}"
+                ))
+            }
         };
+        (
+            current_commit,
+            Some(dirty.fingerprint),
+            Some(normalized_plan_hash_bytes(context.plan_input)),
+        )
+    } else {
+        let mut budget = SourceStateBudget::default();
+        let current_commit = match current_git_commit_with_budget(repo_root, limits, &mut budget) {
+            Ok(commit) => Some(commit),
+            Err(err) => return Some(format!("cannot collect bounded current Git HEAD: {err:#}")),
+        };
+        let dirty = match current_dirty_state_snapshot_with_budget(repo_root, limits, &mut budget) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Some(format!(
+                    "cannot collect bounded current dirty state: {err:#}"
+                ))
+            }
+        };
+        let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+        let current_plan_hash = match read_bounded_file_bytes(
+            &plan_path,
+            limits,
+            &mut budget,
+            "freshness IMPLEMENTATION_PLAN.md input",
+        ) {
+            Ok(plan) => Some(normalized_plan_hash_bytes(&plan)),
+            Err(err) => {
+                return Some(format!(
+                    "cannot collect bounded current plan input: {err:#}"
+                ))
+            }
+        };
+        (current_commit, Some(dirty.fingerprint), current_plan_hash)
+    };
     let mut json_receipt_commit_is_current = false;
 
     if source == VerificationReceiptSource::JsonFile {
@@ -1444,14 +1508,30 @@ fn verification_receipt_freshness_problem_for_source(
                 Some(recorded) if recorded == current => {}
                 Some(recorded)
                     if recorded == LEGACY_CLEAN_PORCELAIN_SHA256
-                        && dirty_state.entries.is_empty()
-                        && current_dirty_is_clean => {}
+                        && dirty_state.entries.is_empty() =>
+                {
+                    if let Err(err) =
+                        clean_receipt_handoff_source_state_with_limits(repo_root, limits)
+                    {
+                        return Some(format!(
+                            "dirty-state fingerprint mismatch: legacy clean projection is invalid: {err:#}"
+                        ));
+                    }
+                }
                 Some(recorded) => {
                     return Some(format!(
                         "dirty-state fingerprint mismatch, recorded `{recorded}` but current fingerprint is `{current}`"
                     ))
                 }
-                None if dirty_state.entries.is_empty() && current_dirty_is_clean => {}
+                None if dirty_state.entries.is_empty() => {
+                    if let Err(err) =
+                        clean_receipt_handoff_source_state_with_limits(repo_root, limits)
+                    {
+                        return Some(format!(
+                            "dirty-state fingerprint mismatch: legacy empty dirty-state projection is invalid: {err:#}"
+                        ));
+                    }
+                }
                 None => return Some("missing dirty-state fingerprint".to_string()),
             }
         }
@@ -1613,6 +1693,7 @@ fn current_git_commit_with_budget(
     Ok(commit.trim().to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn current_dirty_state_fingerprint(repo_root: &Path) -> Option<String> {
     let mut budget = SourceStateBudget::default();
     current_dirty_state_snapshot_with_budget(repo_root, SourceStateLimits::default(), &mut budget)
@@ -1620,9 +1701,126 @@ pub(crate) fn current_dirty_state_fingerprint(repo_root: &Path) -> Option<String
         .map(|snapshot| snapshot.fingerprint)
 }
 
+/// Source identity captured while authorizing a cross-worktree staging-receipt
+/// handoff.
+///
+/// `legacy_dirty_fingerprint` is intentionally not stored here. Foreign
+/// receipt schemas receive the schema-complete clean state carrying the
+/// historical empty-porcelain marker; the stronger commit and source-state
+/// fields are host-side revalidation inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanReceiptHandoffSourceState {
+    pub(crate) commit: String,
+    pub(crate) normalized_plan_hash: String,
+    pub(crate) source_state_v2: String,
+}
+
+impl CleanReceiptHandoffSourceState {
+    pub(crate) fn legacy_dirty_fingerprint(&self) -> &'static str {
+        LEGACY_CLEAN_PORCELAIN_SHA256
+    }
+}
+
+/// Prove that the source-bearing portion of a checkout is clean and return the
+/// identity that a cross-worktree receipt handoff must remain bound to.
+///
+/// This is deliberately stronger than `git status`: it uses bounded raw
+/// index/worktree comparisons with configuration overrides, inventories
+/// untracked paths without repository/global excludes, rejects index flags that
+/// can suppress worktree inspection, walks initialized submodules recursively,
+/// and compares checked-out submodule HEADs and filesystem modes directly.
+/// The content-sensitive source-state identity then binds the exact recursive
+/// contents and modes used by the handoff.
+pub(crate) fn clean_receipt_handoff_source_state(
+    repo_root: &Path,
+) -> Result<CleanReceiptHandoffSourceState> {
+    clean_receipt_handoff_source_state_with_limits(repo_root, SourceStateLimits::default())
+}
+
+fn clean_receipt_handoff_source_state_with_limits(
+    repo_root: &Path,
+    limits: SourceStateLimits,
+) -> Result<CleanReceiptHandoffSourceState> {
+    let mut clean_budget = SourceStateBudget::default();
+    let commit_before = current_git_commit_with_budget(repo_root, limits, &mut clean_budget)
+        .context(
+            "failed to collect bounded current Git HEAD for receipt handoff cleanliness proof",
+        )?;
+    ensure_repository_source_clean(repo_root, "", 0, limits, &mut clean_budget)
+        .context("recursive receipt handoff cleanliness proof failed")?;
+    let commit_after_clean = current_git_commit_with_budget(repo_root, limits, &mut clean_budget)
+        .context(
+        "failed to re-read bounded current Git HEAD after receipt handoff cleanliness proof",
+    )?;
+    if commit_before != commit_after_clean {
+        bail!(
+            "Git HEAD changed during receipt handoff cleanliness proof: `{commit_before}` -> `{commit_after_clean}`"
+        );
+    }
+
+    let mut identity_budget = SourceStateBudget::default();
+    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_input = read_bounded_file_bytes(
+        &plan_path,
+        limits,
+        &mut identity_budget,
+        "receipt handoff IMPLEMENTATION_PLAN.md input",
+    )
+    .with_context(|| format!("failed to bind receipt handoff to {}", plan_path.display()))?;
+    let normalized_plan_hash = normalized_plan_hash_bytes(&plan_input);
+    let source_state_v2 = current_source_state_fingerprint_with_budget_and_plan(
+        repo_root,
+        &plan_input,
+        limits,
+        &mut identity_budget,
+    )
+    .context("failed to collect bounded recursive source identity for receipt handoff")?;
+    let commit_after_identity =
+        current_git_commit_with_budget(repo_root, limits, &mut identity_budget).context(
+            "failed to re-read bounded current Git HEAD after receipt handoff source identity",
+        )?;
+    if commit_before != commit_after_identity {
+        bail!(
+            "Git HEAD changed while collecting receipt handoff source identity: `{commit_before}` -> `{commit_after_identity}`"
+        );
+    }
+
+    Ok(CleanReceiptHandoffSourceState {
+        commit: commit_before,
+        normalized_plan_hash,
+        source_state_v2,
+    })
+}
+
+/// Repeat the complete clean-source proof immediately before publication and
+/// require the original HEAD and recursive source identity to be unchanged.
+pub(crate) fn revalidate_clean_receipt_handoff_source_state(
+    repo_root: &Path,
+    expected: &CleanReceiptHandoffSourceState,
+) -> Result<()> {
+    let current = clean_receipt_handoff_source_state(repo_root)
+        .context("failed second receipt handoff clean-source proof")?;
+    if current.commit != expected.commit {
+        bail!(
+            "receipt handoff Git HEAD changed before publication: expected `{}`, found `{}`",
+            expected.commit,
+            current.commit
+        );
+    }
+    if current.normalized_plan_hash != expected.normalized_plan_hash
+        || current.source_state_v2 != expected.source_state_v2
+    {
+        bail!(
+            "receipt handoff source-state identity changed before publication: expected `{}`, found `{}`",
+            expected.source_state_v2,
+            current.source_state_v2
+        );
+    }
+    Ok(())
+}
+
 struct DirtyStateSnapshot {
     fingerprint: String,
-    is_clean: bool,
 }
 
 fn current_dirty_state_snapshot_with_budget(
@@ -1751,7 +1949,6 @@ fn current_dirty_state_snapshot_with_budget(
     }
     Ok(DirtyStateSnapshot {
         fingerprint: format!("{:x}", hasher.finalize()),
-        is_clean: status.is_empty(),
     })
 }
 
@@ -1815,6 +2012,297 @@ impl SourceStateBudget {
         }
         self.consume_bytes(state_path.len(), limits, "state path")
     }
+}
+
+fn ensure_repository_source_clean(
+    repo_root: &Path,
+    state_prefix: &str,
+    depth: usize,
+    limits: SourceStateLimits,
+    budget: &mut SourceStateBudget,
+) -> Result<()> {
+    if depth > limits.max_submodule_depth {
+        bail!(
+            "receipt handoff submodule nesting exceeded depth bound {} at {}",
+            limits.max_submodule_depth,
+            repo_root.display()
+        );
+    }
+    let canonical_repo = fs::canonicalize(repo_root).with_context(|| {
+        format!(
+            "failed to canonicalize receipt handoff source repository {}",
+            repo_root.display()
+        )
+    })?;
+    if !budget.visited_repositories.insert(canonical_repo.clone()) {
+        bail!(
+            "receipt handoff submodule cycle or duplicate canonical repository detected at {}",
+            canonical_repo.display()
+        );
+    }
+
+    let mut staged_args = receipt_handoff_git_args("diff");
+    staged_args.extend([
+        "--cached",
+        "--raw",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "HEAD",
+        "--",
+        ".",
+    ]);
+    append_source_state_exclusion_pathspecs(&mut staged_args, depth);
+    let staged = required_git_output_bounded(
+        repo_root,
+        &staged_args,
+        "receipt handoff staged source comparison",
+        limits,
+        budget,
+    )?;
+    if !staged.is_empty() {
+        bail!(
+            "receipt handoff source is dirty: index differs from HEAD in {}",
+            repo_root.display()
+        );
+    }
+
+    let mut unstaged_args = receipt_handoff_git_args("diff");
+    unstaged_args.extend([
+        "--raw",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--",
+        ".",
+    ]);
+    append_source_state_exclusion_pathspecs(&mut unstaged_args, depth);
+    let unstaged = required_git_output_bounded(
+        repo_root,
+        &unstaged_args,
+        "receipt handoff worktree source comparison",
+        limits,
+        budget,
+    )?;
+    if !unstaged.is_empty() {
+        bail!(
+            "receipt handoff source is dirty: worktree differs from index in {}",
+            repo_root.display()
+        );
+    }
+
+    let mut ignored_control_args = receipt_handoff_git_args("ls-files");
+    ignored_control_args.extend([
+        "--others",
+        "--ignored",
+        "--exclude-per-directory=.gitignore",
+        "-z",
+        "--",
+        ":(top,glob).gitignore",
+        ":(top,glob)**/.gitignore",
+    ]);
+    append_source_state_exclusion_pathspecs(&mut ignored_control_args, depth);
+    let ignored_controls = required_git_nul_records_bounded(
+        repo_root,
+        &ignored_control_args,
+        "receipt handoff ignored untracked .gitignore inventory",
+        limits,
+        budget,
+    )?;
+    if let Some(path) = ignored_controls.first() {
+        bail!(
+            "receipt handoff source is dirty: untracked ignore control `{}` cannot exclude source",
+            String::from_utf8_lossy(path)
+        );
+    }
+
+    let mut untracked_args = receipt_handoff_git_args("ls-files");
+    untracked_args.extend([
+        "--others",
+        "--exclude-per-directory=.gitignore",
+        "-z",
+        "--",
+        ".",
+    ]);
+    append_source_state_exclusion_pathspecs(&mut untracked_args, depth);
+    let untracked = required_git_nul_records_bounded(
+        repo_root,
+        &untracked_args,
+        "receipt handoff untracked source inventory",
+        limits,
+        budget,
+    )?;
+    if let Some(path) = untracked.first() {
+        bail!(
+            "receipt handoff source is dirty: untracked source `{}` is present",
+            String::from_utf8_lossy(path)
+        );
+    }
+
+    // Assume-unchanged and skip-worktree flags can suppress ordinary worktree
+    // comparisons. Refuse such an index rather than treating it as proof.
+    let mut flag_args = receipt_handoff_git_args("ls-files");
+    flag_args.extend(["-v", "-z", "--", "."]);
+    append_source_state_exclusion_pathspecs(&mut flag_args, depth);
+    let flag_records = required_git_nul_records_bounded(
+        repo_root,
+        &flag_args,
+        "receipt handoff index flag inventory",
+        limits,
+        budget,
+    )?;
+    let mut index_flags = BTreeMap::<String, u8>::new();
+    for record in flag_records {
+        if record.len() < 3 || record[1] != b' ' {
+            bail!("receipt handoff index flag inventory contained a malformed record");
+        }
+        let path = std::str::from_utf8(&record[2..])
+            .context("receipt handoff index flag path was not UTF-8")?;
+        if source_state_path_is_excluded_at_depth(path, depth) {
+            continue;
+        }
+        if index_flags.insert(path.to_string(), record[0]).is_some() {
+            bail!("receipt handoff index flag inventory repeated `{path}`");
+        }
+    }
+
+    let mut index_args = receipt_handoff_git_args("ls-files");
+    index_args.extend(["--stage", "-z", "--", "."]);
+    append_source_state_exclusion_pathspecs(&mut index_args, depth);
+    let index = required_git_nul_records_bounded(
+        repo_root,
+        &index_args,
+        "receipt handoff git index inventory",
+        limits,
+        budget,
+    )?;
+    for raw_record in index {
+        let record = std::str::from_utf8(&raw_record)
+            .context("receipt handoff git index entry was not UTF-8")?;
+        let (metadata, path) = record
+            .split_once('\t')
+            .context("receipt handoff git index entry lacked a path separator")?;
+        if source_state_path_is_excluded_at_depth(path, depth) {
+            continue;
+        }
+        let mut fields = metadata.split_whitespace();
+        let mode = fields
+            .next()
+            .context("receipt handoff git index entry lacked a mode")?;
+        let object_id = fields
+            .next()
+            .context("receipt handoff git index entry lacked an object id")?;
+        let stage = fields
+            .next()
+            .context("receipt handoff git index entry lacked a stage")?;
+        if fields.next().is_some() || stage != "0" {
+            bail!("receipt handoff source is dirty: unmerged index entry `{path}`");
+        }
+        match index_flags.get(path) {
+            Some(b'H') => {}
+            Some(flag) => {
+                bail!(
+                    "receipt handoff source cannot be proven clean: index flag `{}` suppresses inspection of `{path}`",
+                    char::from(*flag)
+                )
+            }
+            None => bail!("receipt handoff index flag inventory omitted `{path}`"),
+        }
+
+        let state_path = prefixed_source_state_path(state_prefix, path);
+        budget.consume_entry(limits, &state_path)?;
+        let absolute = repo_root.join(path);
+        ensure_receipt_handoff_worktree_mode(&absolute, &state_path, mode)?;
+        if mode == "160000" {
+            let checked_out_head = current_git_commit_with_budget(&absolute, limits, budget)
+                .with_context(|| {
+                    format!("failed to read checked-out submodule HEAD for `{state_path}`")
+                })?;
+            if checked_out_head != object_id {
+                bail!(
+                    "receipt handoff source is dirty: submodule `{state_path}` is at `{checked_out_head}`, expected `{object_id}`"
+                );
+            }
+            ensure_repository_source_clean(&absolute, &state_path, depth + 1, limits, budget)
+                .with_context(|| {
+                    format!("failed recursive receipt handoff proof for `{state_path}`")
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn receipt_handoff_git_args(command: &'static str) -> Vec<&'static str> {
+    vec![
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "core.ignoreStat=false",
+        "-c",
+        "core.trustctime=true",
+        "-c",
+        "diff.ignoreSubmodules=none",
+        "-c",
+        "core.excludesFile=/dev/null",
+        command,
+    ]
+}
+
+fn ensure_receipt_handoff_worktree_mode(
+    absolute: &Path,
+    state_path: &str,
+    index_mode: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(absolute).with_context(|| {
+        format!("receipt handoff indexed source `{state_path}` is missing from the worktree")
+    })?;
+    match index_mode {
+        "100644" | "100755" => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "receipt handoff source is dirty: `{state_path}` is not the indexed regular-file type"
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let executable = metadata.permissions().mode() & 0o111 != 0;
+                let expected_executable = index_mode == "100755";
+                if executable != expected_executable {
+                    bail!(
+                        "receipt handoff source is dirty: executable mode drift at `{state_path}`"
+                    );
+                }
+            }
+        }
+        "120000" => {
+            if !metadata.file_type().is_symlink() {
+                bail!(
+                    "receipt handoff source is dirty: `{state_path}` is not the indexed symlink type"
+                );
+            }
+        }
+        "160000" => {
+            if !metadata.is_dir() || !absolute.join(".git").exists() {
+                bail!(
+                    "receipt handoff source is dirty: gitlink `{state_path}` is not an initialized submodule"
+                );
+            }
+        }
+        other => bail!(
+            "receipt handoff source cannot be proven clean: unsupported index mode `{other}` at `{state_path}`"
+        ),
+    }
+    Ok(())
 }
 
 fn current_source_state_fingerprint(repo_root: &Path) -> Result<String> {
@@ -2323,9 +2811,7 @@ fn required_git_output_bounded(
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
 ) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let mut child = strict_source_git_command(repo_root)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2359,9 +2845,7 @@ fn required_git_nul_records_bounded(
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let mut child = strict_source_git_command(repo_root)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2388,6 +2872,30 @@ fn required_git_nul_records_bounded(
     Ok(records)
 }
 
+/// Build a Git subprocess for source identity and cleanliness proofs without
+/// inheriting caller-controlled repository, worktree, index, object database,
+/// quarantine, namespace, replacement-ref, pathspec, or config selection.
+///
+/// These commands are read-only and must describe `repo_root`, not whatever
+/// repository view happened to be present in the host process environment.
+fn strict_source_git_command(repo_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(repo_root);
+    command
+}
+
 fn verification_proof_payload_sha256(receipt: &VerificationReceipt) -> Result<String> {
     let payload = VerifiedReceiptProofPayload {
         task_id: &receipt.task_id,
@@ -2401,13 +2909,14 @@ fn verification_proof_payload_sha256(receipt: &VerificationReceipt) -> Result<St
 
 fn require_current_source_attestation_for_footer(
     repo_root: &Path,
+    authority_root: &Path,
     task_id: &str,
     receipt_path: &Path,
     receipt: &VerificationReceipt,
     expected_commands: &[String],
     source_context: &mut BoundedFreshnessContext<'_>,
 ) -> Result<String> {
-    let attestation_path = verified_source_attestation_path(repo_root, task_id);
+    let attestation_path = verified_source_attestation_path_at(authority_root, task_id);
     let attestation_text = read_bounded_utf8_file(
         &attestation_path,
         source_context.limits,
@@ -2863,6 +3372,7 @@ fn verification_wrapper_binding_problem(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -2874,6 +3384,7 @@ mod tests {
     use super::{
         normalized_plan_hash_bytes, verification_receipt_freshness_problem, VerificationDirtyState,
         VerificationReceipt, VerificationReceiptArtifact, VerificationReceiptCommand,
+        LEGACY_CLEAN_PORCELAIN_SHA256,
     };
 
     #[test]
@@ -3206,6 +3717,102 @@ mod tests {
         )
         .expect("clear root review");
         root
+    }
+
+    #[test]
+    fn external_authority_root_records_reads_and_clears_without_legacy_repo_writes() {
+        let root = source_bound_root_footer_fixture("external-authority-root-roundtrip");
+        let authority_root = temp_dir("external-authority-root-private");
+        super::clear_verified_source_attestation(&root, "TASK-SOURCE")
+            .expect("remove fixture legacy attestation");
+
+        super::record_verified_source_attestation_at(&root, &authority_root, "TASK-SOURCE")
+            .expect("record attestation in explicit authority root");
+        let external = super::verified_source_attestation_path_at(&authority_root, "TASK-SOURCE");
+        let legacy = super::verified_source_attestation_path(&root, "TASK-SOURCE");
+        assert!(
+            external.is_file(),
+            "explicit authority root must own the attestation"
+        );
+        assert!(
+            !legacy.exists(),
+            "explicit authority recording must not recreate repo-local legacy state"
+        );
+
+        assert!(
+            super::verification_receipt_commit_footer_at(&root, &authority_root, "TASK-SOURCE",)
+                .expect("footer should read explicit authority attestation")
+                .is_some(),
+            "explicit authority attestation should authorize the footer"
+        );
+        super::clear_verified_source_attestation_at(&authority_root, "TASK-SOURCE")
+            .expect("clear explicit authority attestation");
+        assert!(
+            !external.exists(),
+            "explicit clear must remove external state"
+        );
+        assert!(
+            !legacy.exists(),
+            "explicit clear must leave the legacy repo tree untouched"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(authority_root);
+    }
+
+    #[test]
+    fn external_authority_footer_does_not_fall_back_to_legacy_attestation_when_missing() {
+        let root = source_bound_root_footer_fixture("external-authority-root-missing");
+        let authority_root = temp_dir("external-authority-root-missing-private");
+        let legacy = super::verified_source_attestation_path(&root, "TASK-SOURCE");
+        assert!(
+            legacy.is_file(),
+            "fixture must retain a valid legacy attestation"
+        );
+
+        let error =
+            super::verification_receipt_commit_footer_at(&root, &authority_root, "TASK-SOURCE")
+                .expect_err("missing explicit authority attestation must fail closed");
+        assert!(
+            format!("{error:#}").contains(&authority_root.display().to_string()),
+            "{error:#}"
+        );
+        assert!(
+            legacy.is_file(),
+            "failed explicit lookup must not mutate legacy state"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(authority_root);
+    }
+
+    #[test]
+    fn external_authority_footer_rejects_wrong_attestation_identity() {
+        let root = source_bound_root_footer_fixture("external-authority-root-wrong");
+        let authority_root = temp_dir("external-authority-root-wrong-private");
+        super::record_verified_source_attestation_at(&root, &authority_root, "TASK-SOURCE")
+            .expect("record explicit authority attestation");
+        let external = super::verified_source_attestation_path_at(&authority_root, "TASK-SOURCE");
+        let mut attestation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&external).expect("read external attestation"))
+                .expect("parse external attestation");
+        attestation["task_id"] = serde_json::Value::String("TASK-WRONG".to_string());
+        fs::write(
+            &external,
+            serde_json::to_vec_pretty(&attestation).expect("serialize wrong attestation"),
+        )
+        .expect("write wrong attestation identity");
+
+        let error =
+            super::verification_receipt_commit_footer_at(&root, &authority_root, "TASK-SOURCE")
+                .expect_err("wrong explicit authority identity must fail closed");
+        assert!(
+            format!("{error:#}").contains("does not match `TASK-SOURCE`"),
+            "{error:#}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(authority_root);
     }
 
     #[test]
@@ -3668,6 +4275,275 @@ mod tests {
         )
         .expect("clear nested submodule review");
         (root, child_source, deep_source)
+    }
+
+    #[test]
+    fn receipt_handoff_clean_proof_accepts_unchanged_recursive_submodules() {
+        let (root, child_source) =
+            source_bound_submodule_footer_fixture("handoff-clean-recursive-submodule");
+
+        let proof = super::clean_receipt_handoff_source_state(&root)
+            .expect("unchanged recursive source should produce a handoff proof");
+        assert_eq!(
+            proof.commit,
+            git_stdout(&root, ["rev-parse", "HEAD"]),
+            "handoff proof must bind the current canonical HEAD"
+        );
+        assert!(!proof.source_state_v2.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(child_source);
+    }
+
+    #[test]
+    fn receipt_handoff_clean_proof_ignores_alternate_index_environment() {
+        let root = temp_dir("handoff-alternate-index-environment");
+        init_git_repo(&root);
+        let source = root.join("source.rs");
+        fs::write(&source, "pub fn value() -> u8 { 1 }\n").expect("write tracked source");
+        git_ok(&root, ["add", "source.rs"]);
+        git_ok(&root, ["commit", "-m", "add tracked source"]);
+
+        let alternate_index = root.join(".git/clean-index");
+        fs::copy(root.join(".git/index"), &alternate_index).expect("copy clean alternate index");
+        fs::write(&source, "pub fn value() -> u8 { 2 }\n").expect("write staged mutation");
+        git_ok(&root, ["add", "source.rs"]);
+        fs::write(&source, "pub fn value() -> u8 { 1 }\n")
+            .expect("restore worktree while leaving real index dirty");
+        assert!(
+            !git_stdout(&root, ["status", "--porcelain=v1"]).is_empty(),
+            "fixture must leave the repository's real index dirty"
+        );
+
+        run_receipt_handoff_environment_child(
+            &root,
+            "alternate-index",
+            &[("GIT_INDEX_FILE", &alternate_index)],
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_handoff_clean_proof_ignores_object_database_environment() {
+        let root = temp_dir("handoff-object-database-environment");
+        init_git_repo(&root);
+        let poison_objects = root.join(".git/poison-objects");
+        fs::create_dir_all(&poison_objects).expect("create empty alternate object database");
+
+        run_receipt_handoff_environment_child(
+            &root,
+            "object-database",
+            &[
+                ("GIT_OBJECT_DIRECTORY", &poison_objects),
+                ("GIT_QUARANTINE_PATH", &poison_objects),
+            ],
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn run_receipt_handoff_environment_child(
+        root: &Path,
+        mode: &str,
+        git_environment: &[(&str, &Path)],
+    ) {
+        let mut child = Command::new(std::env::current_exe().expect("locate current test binary"));
+        child
+            .args([
+                "--exact",
+                "completion_artifacts::receipt::tests::receipt_handoff_environment_child",
+                "--nocapture",
+            ])
+            .env("AUTODEV_RECEIPT_HANDOFF_ENV_TEST_ROOT", root)
+            .env("AUTODEV_RECEIPT_HANDOFF_ENV_TEST_MODE", mode);
+        for (key, value) in git_environment {
+            child.env(key, value);
+        }
+        let output = child.output().expect("launch isolated environment test");
+        assert!(
+            output.status.success(),
+            "isolated receipt handoff environment test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn receipt_handoff_environment_child() {
+        let Some(root) = std::env::var_os("AUTODEV_RECEIPT_HANDOFF_ENV_TEST_ROOT") else {
+            return;
+        };
+        let mode =
+            std::env::var("AUTODEV_RECEIPT_HANDOFF_ENV_TEST_MODE").expect("environment test mode");
+        let root = PathBuf::from(root);
+        match mode.as_str() {
+            "alternate-index" => {
+                let error = super::clean_receipt_handoff_source_state(&root)
+                    .expect_err("an inherited alternate index must not hide staged source");
+                assert!(format!("{error:#}").contains("dirty"), "{error:#}");
+            }
+            "object-database" => {
+                super::clean_receipt_handoff_source_state(&root)
+                    .expect("strict source proof must ignore inherited object database selection");
+            }
+            unexpected => panic!("unexpected environment test mode `{unexpected}`"),
+        }
+    }
+
+    #[test]
+    fn receipt_handoff_clean_proof_rejects_content_hidden_by_submodule_ignore_all() {
+        let (root, child_source) =
+            source_bound_submodule_footer_fixture("handoff-hidden-submodule-content");
+        git_ok(&root, ["config", "diff.ignoreSubmodules", "all"]);
+        git_ok(&root, ["config", "submodule.vendor/sub.ignore", "all"]);
+        let checkout = root.join("vendor/sub");
+        git_ok(&checkout, ["config", "core.fileMode", "false"]);
+        fs::write(checkout.join("tracked.txt"), "hidden child mutation\n")
+            .expect("mutate checked-out child source");
+
+        let error = super::clean_receipt_handoff_source_state(&root)
+            .expect_err("parent ignore configuration must not hide dirty submodule content");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("dirty") || rendered.contains("differs"),
+            "{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(child_source);
+    }
+
+    #[test]
+    fn legacy_clean_receipt_freshness_rejects_new_hidden_submodule_dirt() {
+        let (root, child_source) =
+            source_bound_submodule_footer_fixture("handoff-legacy-freshness-submodule");
+        let receipt_path = root.join(".auto/symphony/verification-receipts/TASK-SUBMODULE.json");
+        let mut receipt: super::VerificationReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).expect("read source-bound receipt"))
+                .expect("parse source-bound receipt");
+        receipt.dirty_state = Some(super::VerificationDirtyState {
+            fingerprint: Some(super::LEGACY_CLEAN_PORCELAIN_SHA256.to_string()),
+            entries: Vec::new(),
+        });
+        let expected_commands = vec!["cargo test source_binding".to_string()];
+        assert_eq!(
+            super::verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &receipt,
+                &expected_commands,
+                &[],
+            ),
+            None,
+            "a recursively clean checkout should accept the staging projection"
+        );
+        let shallow_before = super::current_dirty_state_fingerprint(&root)
+            .expect("capture status-derived fingerprint");
+
+        git_ok(&root, ["config", "diff.ignoreSubmodules", "all"]);
+        git_ok(&root, ["config", "submodule.vendor/sub.ignore", "all"]);
+        fs::write(
+            root.join("vendor/sub/tracked.txt"),
+            "hidden after receipt handoff\n",
+        )
+        .expect("mutate checked-out child source");
+        let shallow_after = super::current_dirty_state_fingerprint(&root)
+            .expect("capture hidden-dirt status-derived fingerprint");
+        assert_eq!(
+            shallow_before, shallow_after,
+            "fixture must prove the legacy status-only channel is blind"
+        );
+
+        let problem = super::verification_receipt_freshness_problem(
+            &root,
+            &receipt_path,
+            &receipt,
+            &expected_commands,
+            &[],
+        )
+        .expect("hidden recursive dirt must invalidate legacy clean staging evidence");
+        assert!(
+            problem.contains("legacy clean projection is invalid"),
+            "{problem}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(child_source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_handoff_clean_proof_rejects_mode_drift_hidden_by_core_filemode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, child_source) =
+            source_bound_submodule_footer_fixture("handoff-hidden-submodule-mode");
+        git_ok(&root, ["config", "diff.ignoreSubmodules", "all"]);
+        git_ok(&root, ["config", "submodule.vendor/sub.ignore", "all"]);
+        let checkout = root.join("vendor/sub");
+        git_ok(&checkout, ["config", "core.fileMode", "false"]);
+        let tracked = checkout.join("tracked.txt");
+        let mut permissions = fs::metadata(&tracked)
+            .expect("stat checked-out child source")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tracked, permissions).expect("change child executable mode");
+
+        let error = super::clean_receipt_handoff_source_state(&root)
+            .expect_err("explicit clean proof must detect executable mode drift");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("mode") || rendered.contains("dirty"),
+            "{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(child_source);
+    }
+
+    #[test]
+    fn receipt_handoff_revalidation_rejects_clean_head_change() {
+        let root = temp_dir("handoff-revalidate-head-change");
+        init_git_repo(&root);
+        let proof =
+            super::clean_receipt_handoff_source_state(&root).expect("capture clean source proof");
+        git_ok(
+            &root,
+            ["commit", "--allow-empty", "-m", "advance clean HEAD"],
+        );
+
+        let error = super::revalidate_clean_receipt_handoff_source_state(&root, &proof)
+            .expect_err("a clean but different HEAD must invalidate the handoff");
+        assert!(format!("{error:#}").contains("HEAD changed"), "{error:#}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_handoff_revalidation_rejects_source_identity_change_at_same_head() {
+        let root = temp_dir("handoff-revalidate-source-identity");
+        init_git_repo(&root);
+        let proof =
+            super::clean_receipt_handoff_source_state(&root).expect("capture clean source proof");
+
+        // Host-owned plan state is excluded from the clean diff so queue churn
+        // can proceed, but substantive plan identity remains bound through the
+        // normalized source-state fingerprint.
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# plan\n- [ ] `TASK-NEW` Changed task contract\n",
+        )
+        .expect("change host-owned plan specification");
+
+        let error = super::revalidate_clean_receipt_handoff_source_state(&root, &proof)
+            .expect_err("same-HEAD source identity drift must invalidate the handoff");
+        assert!(
+            format!("{error:#}").contains("source-state identity changed"),
+            "{error:#}"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4761,7 +5637,7 @@ mod tests {
     }
 
     #[test]
-    fn verification_receipt_freshness_accepts_legacy_clean_dirty_entries() {
+    fn verification_receipt_freshness_accepts_legacy_empty_dirty_state_only_while_clean() {
         let root = temp_dir("legacy-clean-dirty-entries");
         init_git_repo(&root);
         let receipt_path = root.join(".auto/symphony/verification-receipts/TASK-LEGACY.json");
@@ -4816,7 +5692,73 @@ mod tests {
             &[],
         )
         .expect("dirty repo should reject legacy clean state");
-        assert!(problem.contains("missing dirty-state fingerprint"));
+        assert!(
+            problem.contains("dirty-state fingerprint mismatch"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("legacy empty dirty-state projection is invalid"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn verification_receipt_freshness_accepts_legacy_clean_projection_only_while_clean() {
+        let root = temp_dir("legacy-clean-fingerprint-projection");
+        init_git_repo(&root);
+        let receipt_path = root.join(".auto/symphony/verification-receipts/TASK-LEGACY-FP.json");
+        let expected_command = "npm run typecheck".to_string();
+        let receipt = VerificationReceipt {
+            task_id: Some("TASK-LEGACY-FP".to_string()),
+            commit: super::current_git_commit(&root),
+            dirty_state: Some(VerificationDirtyState {
+                fingerprint: Some(LEGACY_CLEAN_PORCELAIN_SHA256.to_string()),
+                entries: Vec::new(),
+            }),
+            plan_hash: super::current_plan_hash(&root),
+            source_state_v1: None,
+            source_state_v2: None,
+            declared_artifacts: Vec::new(),
+            task_owned_inputs_v1: None,
+            commands: vec![VerificationReceiptCommand {
+                command: expected_command.clone(),
+                argv: vec![
+                    "npm".to_string(),
+                    "run".to_string(),
+                    "typecheck".to_string(),
+                ],
+                expected_argv: Some(vec![
+                    "npm".to_string(),
+                    "run".to_string(),
+                    "typecheck".to_string(),
+                ]),
+                exit_code: Some(0),
+                status: Some("passed".to_string()),
+                ..VerificationReceiptCommand::default()
+            }],
+        };
+
+        assert_eq!(
+            verification_receipt_freshness_problem(
+                &root,
+                &receipt_path,
+                &receipt,
+                std::slice::from_ref(&expected_command),
+                &[],
+            ),
+            None
+        );
+
+        fs::write(root.join("dirty.txt"), "dirty\n").expect("failed to dirty repo");
+        let problem = verification_receipt_freshness_problem(
+            &root,
+            &receipt_path,
+            &receipt,
+            std::slice::from_ref(&expected_command),
+            &[],
+        )
+        .expect("dirty repo should reject legacy clean fingerprint");
+        assert!(problem.contains("dirty-state fingerprint mismatch"));
     }
 
     #[test]

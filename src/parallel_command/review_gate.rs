@@ -42,7 +42,7 @@ pub(crate) const REVIEW_INPUT_MUTATION_FATAL_MARKER: &str =
     "independent-review-input-integrity-fatal";
 pub(crate) const REVIEW_INPUT_QUARANTINE_WRITE_FAILED_MARKER: &str =
     "independent-review-quarantine-persistence-failed";
-const REVIEW_INPUT_QUARANTINE_VERSION: u32 = 1;
+const REVIEW_INPUT_QUARANTINE_VERSION: u32 = 2;
 
 /// Review-model defaults. The model defaults to the parallel run's configured
 /// model (see [`LaneReviewConfig::from_run_config`]); reasoning effort defaults
@@ -118,6 +118,11 @@ enum GateTransactionScope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ReviewInputQuarantine {
     version: u32,
+    authority_root: String,
+    authority_dev: u64,
+    authority_ino: u64,
+    #[serde(default)]
+    authority_marker_nonce: Option<String>,
     #[serde(default)]
     phase: GateTransactionPhase,
     #[serde(default)]
@@ -135,7 +140,17 @@ struct ReviewInputQuarantine {
 }
 
 #[derive(Clone, Debug)]
+struct ReviewAuthorityBinding {
+    root: String,
+    dev: u64,
+    ino: u64,
+    marker_nonce: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ArmedCanonicalGateTransaction {
+    authority_root: PathBuf,
+    selected_authority: bool,
     marker_path: PathBuf,
     marker_bytes: Vec<u8>,
     task_id: String,
@@ -619,7 +634,15 @@ fn review_input_path_states(
     repo_root: &Path,
     task_id: &str,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    repository_input_path_states(repo_root, Some(task_id), false)
+    review_input_path_states_at(repo_root, &repo_root.join(".auto/parallel"), task_id)
+}
+
+fn review_input_path_states_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    repository_input_path_states(repo_root, Some((task_id, authority_root)), false)
 }
 
 fn canonical_gate_source_path_states(repo_root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
@@ -680,7 +703,7 @@ impl RichStateBudget {
 
 fn repository_input_path_states(
     repo_root: &Path,
-    task_id: Option<&str>,
+    task_authority: Option<(&str, &Path)>,
     source_only: bool,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     let mut states = BTreeMap::<String, Vec<String>>::new();
@@ -688,30 +711,60 @@ fn repository_input_path_states(
     collect_repository_input_path_states(
         repo_root,
         "",
-        task_id,
+        task_authority.map(|(task_id, _)| task_id),
         source_only,
         0,
         &mut states,
         &mut budget,
     )?;
-    if let Some(task_id) = task_id {
-        collect_task_authority_path_states(repo_root, task_id, &mut states, &mut budget)?;
+    if let Some((task_id, authority_root)) = task_authority {
+        collect_task_authority_path_states(
+            repo_root,
+            authority_root,
+            task_id,
+            &mut states,
+            &mut budget,
+        )?;
     }
     Ok(states)
 }
 
 fn collect_task_authority_path_states(
     repo_root: &Path,
+    authority_root: &Path,
     task_id: &str,
     states: &mut BTreeMap<String, Vec<String>>,
     budget: &mut RichStateBudget,
 ) -> Result<()> {
-    for relative in [
-        format!(".auto/symphony/verification-receipts/{task_id}.json"),
-        format!(".auto/parallel/verified-source/{task_id}.json"),
-        format!(".auto/parallel/gate-holds/{task_id}.hold"),
-    ] {
-        let absolute = repo_root.join(&relative);
+    let legacy_authority = repo_root.join(".auto/parallel");
+    let authority_label = |relative: &str| {
+        if authority_root == legacy_authority {
+            format!(".auto/parallel/{relative}")
+        } else {
+            format!("@parallel-authority/{relative}")
+        }
+    };
+    let artifacts = [
+        (
+            format!(".auto/symphony/verification-receipts/{task_id}.json"),
+            repo_root
+                .join(".auto/symphony/verification-receipts")
+                .join(format!("{task_id}.json")),
+        ),
+        (
+            authority_label(&format!("verified-source/{task_id}.json")),
+            authority_root
+                .join("verified-source")
+                .join(format!("{task_id}.json")),
+        ),
+        (
+            authority_label(&format!("gate-holds/{task_id}.hold")),
+            authority_root
+                .join("gate-holds")
+                .join(format!("{task_id}.hold")),
+        ),
+    ];
+    for (relative, absolute) in artifacts {
         let component = match fs::symlink_metadata(&absolute) {
             Ok(metadata) if metadata.is_file() => {
                 let bytes = read_rich_state_file(
@@ -986,6 +1039,134 @@ fn review_input_quarantine_paths(repo_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn review_input_quarantine_paths_at(_repo_root: &Path, authority_root: &Path) -> Vec<PathBuf> {
+    vec![authority_root.join("review-input-quarantine.json")]
+}
+
+fn canonical_transaction_quarantine_paths(
+    repo_root: &Path,
+    transaction: &ArmedCanonicalGateTransaction,
+) -> Vec<PathBuf> {
+    if transaction.selected_authority {
+        review_input_quarantine_paths_at(repo_root, &transaction.authority_root)
+    } else {
+        review_input_quarantine_paths(repo_root)
+    }
+}
+
+fn review_authority_binding(
+    authority_root: &Path,
+    selected_authority: bool,
+) -> Result<ReviewAuthorityBinding> {
+    if selected_authority {
+        #[cfg(test)]
+        if !authority_root
+            .join(".autodev-parallel-root.json")
+            .exists()
+        {
+            // Unit-test loggers predate marker-owned run roots. They still use
+            // the selected path layout, but bind to the directory identity
+            // only. Production builds never compile this compatibility branch.
+        } else {
+            let identity = inspect_parallel_run_root_identity(authority_root)?;
+            return Ok(ReviewAuthorityBinding {
+                root: identity.canonical_path.to_string_lossy().into_owned(),
+                dev: identity.root_dev,
+                ino: identity.root_ino,
+                marker_nonce: Some(identity.marker_nonce),
+            });
+        }
+        #[cfg(not(test))]
+        {
+            let identity = inspect_parallel_run_root_identity(authority_root)?;
+            return Ok(ReviewAuthorityBinding {
+                root: identity.canonical_path.to_string_lossy().into_owned(),
+                dev: identity.root_dev,
+                ino: identity.root_ino,
+                marker_nonce: Some(identity.marker_nonce),
+            });
+        }
+    }
+
+    std::fs::create_dir_all(authority_root).with_context(|| {
+        format!(
+            "failed to create independent-review authority root {}",
+            authority_root.display()
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(authority_root).with_context(|| {
+        format!(
+            "failed to inspect independent-review authority root {}",
+            authority_root.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "independent-review authority root must be a real directory: {}",
+            authority_root.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(authority_root).with_context(|| {
+        format!(
+            "failed to resolve independent-review authority root {}",
+            authority_root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = (0, 0);
+
+    Ok(ReviewAuthorityBinding {
+        root: canonical.to_string_lossy().into_owned(),
+        dev,
+        ino,
+        marker_nonce: None,
+    })
+}
+
+fn bind_review_quarantine(
+    quarantine: &mut ReviewInputQuarantine,
+    authority_root: &Path,
+    selected_authority: bool,
+) -> Result<()> {
+    let binding = review_authority_binding(authority_root, selected_authority)?;
+    quarantine.authority_root = binding.root;
+    quarantine.authority_dev = binding.dev;
+    quarantine.authority_ino = binding.ino;
+    quarantine.authority_marker_nonce = binding.marker_nonce;
+    Ok(())
+}
+
+fn validate_review_quarantine_binding(
+    quarantine: &ReviewInputQuarantine,
+    authority_root: &Path,
+    selected_authority: bool,
+) -> Result<()> {
+    let current = review_authority_binding(authority_root, selected_authority)?;
+    if quarantine.authority_root != current.root
+        || quarantine.authority_dev != current.dev
+        || quarantine.authority_ino != current.ino
+        || quarantine.authority_marker_nonce != current.marker_nonce
+    {
+        bail!(
+            "{REVIEW_INPUT_MUTATION_FATAL_MARKER}: independent-review quarantine authority changed; marker was bound to {} (dev {}, ino {}, nonce {:?}) but current authority is {} (dev {}, ino {}, nonce {:?})",
+            quarantine.authority_root,
+            quarantine.authority_dev,
+            quarantine.authority_ino,
+            quarantine.authority_marker_nonce,
+            current.root,
+            current.dev,
+            current.ino,
+            current.marker_nonce
+        );
+    }
+    Ok(())
+}
+
 fn record_review_input_quarantine(
     repo_root: &Path,
     task_id: &str,
@@ -994,8 +1175,59 @@ fn record_review_input_quarantine(
     reviewed_path_states: &BTreeMap<String, Vec<String>>,
     reason: &str,
 ) -> Result<PathBuf> {
-    let quarantine = ReviewInputQuarantine {
+    record_review_input_quarantine_with_paths(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        review_input_quarantine_paths(repo_root),
+        false,
+        task_id,
+        reviewed_head,
+        review_range,
+        reviewed_path_states,
+        reason,
+    )
+}
+
+fn record_review_input_quarantine_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    reviewed_head: &str,
+    review_range: Option<&LaneReviewRange>,
+    reviewed_path_states: &BTreeMap<String, Vec<String>>,
+    reason: &str,
+) -> Result<PathBuf> {
+    record_review_input_quarantine_with_paths(
+        repo_root,
+        authority_root,
+        review_input_quarantine_paths_at(repo_root, authority_root),
+        true,
+        task_id,
+        reviewed_head,
+        review_range,
+        reviewed_path_states,
+        reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_review_input_quarantine_with_paths(
+    _repo_root: &Path,
+    authority_root: &Path,
+    paths: Vec<PathBuf>,
+    selected_authority: bool,
+    task_id: &str,
+    reviewed_head: &str,
+    review_range: Option<&LaneReviewRange>,
+    reviewed_path_states: &BTreeMap<String, Vec<String>>,
+    reason: &str,
+) -> Result<PathBuf> {
+    let mut quarantine = ReviewInputQuarantine {
         version: REVIEW_INPUT_QUARANTINE_VERSION,
+        authority_root: String::new(),
+        authority_dev: 0,
+        authority_ino: 0,
+        authority_marker_nonce: None,
         phase: GateTransactionPhase::Mutation,
         scope: GateTransactionScope::ReviewInputs,
         task_id: task_id.to_string(),
@@ -1006,9 +1238,10 @@ fn record_review_input_quarantine(
         reviewed_path_states: reviewed_path_states.clone(),
         reason: reason.to_string(),
     };
+    bind_review_quarantine(&mut quarantine, authority_root, selected_authority)?;
     let bytes = serde_json::to_vec_pretty(&quarantine)
         .context("failed to serialize independent-review input quarantine")?;
-    persist_review_input_quarantine(&review_input_quarantine_paths(repo_root), &bytes)
+    persist_review_input_quarantine(&paths, &bytes)
 }
 
 fn persist_review_input_quarantine(paths: &[PathBuf], bytes: &[u8]) -> Result<PathBuf> {
@@ -1030,7 +1263,40 @@ pub(crate) fn arm_canonical_gate_transaction(
     task_id: &str,
     gate_label: &str,
 ) -> Result<ArmedCanonicalGateTransaction> {
-    let paths = review_input_quarantine_paths(repo_root);
+    arm_canonical_gate_transaction_with_paths(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        review_input_quarantine_paths(repo_root),
+        false,
+        task_id,
+        gate_label,
+    )
+}
+
+pub(crate) fn arm_canonical_gate_transaction_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    gate_label: &str,
+) -> Result<ArmedCanonicalGateTransaction> {
+    arm_canonical_gate_transaction_with_paths(
+        repo_root,
+        authority_root,
+        review_input_quarantine_paths_at(repo_root, authority_root),
+        true,
+        task_id,
+        gate_label,
+    )
+}
+
+fn arm_canonical_gate_transaction_with_paths(
+    repo_root: &Path,
+    authority_root: &Path,
+    paths: Vec<PathBuf>,
+    selected_authority: bool,
+    task_id: &str,
+    gate_label: &str,
+) -> Result<ArmedCanonicalGateTransaction> {
     for path in &paths {
         match fs::symlink_metadata(path) {
             Ok(_) => {
@@ -1052,8 +1318,12 @@ pub(crate) fn arm_canonical_gate_transaction(
         current_head_commit(repo_root).context("could not capture canonical gate HEAD")?;
     let reviewed_path_states = canonical_gate_source_path_states(repo_root)
         .context("could not capture canonical gate source/index state")?;
-    let marker = ReviewInputQuarantine {
+    let mut marker = ReviewInputQuarantine {
         version: REVIEW_INPUT_QUARANTINE_VERSION,
+        authority_root: String::new(),
+        authority_dev: 0,
+        authority_ino: 0,
+        authority_marker_nonce: None,
         phase: GateTransactionPhase::InProgress,
         scope: GateTransactionScope::CanonicalSource,
         task_id: task_id.to_string(),
@@ -1066,6 +1336,7 @@ pub(crate) fn arm_canonical_gate_transaction(
             "canonical gate transaction `{gate_label}` was durably armed before subprocess launch"
         ),
     };
+    bind_review_quarantine(&mut marker, authority_root, selected_authority)?;
     let marker_bytes = serde_json::to_vec_pretty(&marker)
         .context("failed to serialize canonical gate transaction marker")?;
     let marker_path =
@@ -1076,6 +1347,8 @@ pub(crate) fn arm_canonical_gate_transaction(
             )
         })?;
     Ok(ArmedCanonicalGateTransaction {
+        authority_root: authority_root.to_path_buf(),
+        selected_authority,
         marker_path,
         marker_bytes,
         task_id: task_id.to_string(),
@@ -1092,8 +1365,12 @@ fn preserve_canonical_gate_mutation_quarantine(
     reviewed_path_states: &BTreeMap<String, Vec<String>>,
     reason: &str,
 ) -> Result<PathBuf> {
-    let marker = ReviewInputQuarantine {
+    let mut marker = ReviewInputQuarantine {
         version: REVIEW_INPUT_QUARANTINE_VERSION,
+        authority_root: String::new(),
+        authority_dev: 0,
+        authority_ino: 0,
+        authority_marker_nonce: None,
         phase: GateTransactionPhase::Mutation,
         scope,
         task_id: transaction.task_id.clone(),
@@ -1104,9 +1381,17 @@ fn preserve_canonical_gate_mutation_quarantine(
         reviewed_path_states: reviewed_path_states.clone(),
         reason: reason.to_string(),
     };
+    bind_review_quarantine(
+        &mut marker,
+        &transaction.authority_root,
+        transaction.selected_authority,
+    )?;
     let bytes = serde_json::to_vec_pretty(&marker)
         .context("failed to serialize canonical gate mutation quarantine")?;
-    persist_review_input_quarantine(&review_input_quarantine_paths(repo_root), &bytes)
+    persist_review_input_quarantine(
+        &canonical_transaction_quarantine_paths(repo_root, transaction),
+        &bytes,
+    )
 }
 
 fn reject_canonical_gate_transaction(
@@ -1229,7 +1514,7 @@ fn canonical_gate_transaction_problems(
             transaction.marker_path.display()
         )),
     }
-    for path in review_input_quarantine_paths(repo_root) {
+    for path in canonical_transaction_quarantine_paths(repo_root, transaction) {
         if path != transaction.marker_path && path.exists() {
             problems.push(format!(
                 "an unexpected additional gate quarantine marker appeared at {}",
@@ -1334,14 +1619,71 @@ fn fatal_review_input_mutation(
     reviewed_path_states: &BTreeMap<String, Vec<String>>,
     reason: String,
 ) -> LaneReviewOutcome {
-    let quarantine_note = match record_review_input_quarantine(
+    fatal_review_input_mutation_with_authority(
         repo_root,
+        &repo_root.join(".auto/parallel"),
+        false,
         task_id,
         reviewed_head,
         review_range,
         reviewed_path_states,
-        &reason,
-    ) {
+        reason,
+    )
+}
+
+fn fatal_review_input_mutation_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    reviewed_head: &str,
+    review_range: Option<&LaneReviewRange>,
+    reviewed_path_states: &BTreeMap<String, Vec<String>>,
+    reason: String,
+) -> LaneReviewOutcome {
+    fatal_review_input_mutation_with_authority(
+        repo_root,
+        authority_root,
+        true,
+        task_id,
+        reviewed_head,
+        review_range,
+        reviewed_path_states,
+        reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fatal_review_input_mutation_with_authority(
+    repo_root: &Path,
+    authority_root: &Path,
+    selected_authority: bool,
+    task_id: &str,
+    reviewed_head: &str,
+    review_range: Option<&LaneReviewRange>,
+    reviewed_path_states: &BTreeMap<String, Vec<String>>,
+    reason: String,
+) -> LaneReviewOutcome {
+    let persistence = if selected_authority {
+        record_review_input_quarantine_at(
+            repo_root,
+            authority_root,
+            task_id,
+            reviewed_head,
+            review_range,
+            reviewed_path_states,
+            &reason,
+        )
+    } else {
+        record_review_input_quarantine(
+            repo_root,
+            task_id,
+            reviewed_head,
+            review_range,
+            reviewed_path_states,
+            &reason,
+        )
+    };
+    let quarantine_note = match persistence {
         Ok(path) => format!(
             "canonical dispatch is quarantined at {} until reviewer mutations are removed",
             path.display()
@@ -1372,7 +1714,33 @@ pub(crate) fn landing_error_has_unpersisted_review_quarantine(error: &anyhow::Er
 }
 
 pub(crate) fn enforce_review_input_quarantine_before_dispatch(repo_root: &Path) -> Result<()> {
-    for path in review_input_quarantine_paths(repo_root) {
+    enforce_review_input_quarantine_before_dispatch_with_paths(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        review_input_quarantine_paths(repo_root),
+        false,
+    )
+}
+
+pub(crate) fn enforce_review_input_quarantine_before_dispatch_at(
+    repo_root: &Path,
+    authority_root: &Path,
+) -> Result<()> {
+    enforce_review_input_quarantine_before_dispatch_with_paths(
+        repo_root,
+        authority_root,
+        review_input_quarantine_paths_at(repo_root, authority_root),
+        true,
+    )
+}
+
+fn enforce_review_input_quarantine_before_dispatch_with_paths(
+    repo_root: &Path,
+    authority_root: &Path,
+    paths: Vec<PathBuf>,
+    selected_authority: bool,
+) -> Result<()> {
+    for path in paths {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1389,6 +1757,17 @@ pub(crate) fn enforce_review_input_quarantine_before_dispatch(repo_root: &Path) 
                 path.display()
             );
         }
+        validate_review_quarantine_binding(
+            &quarantine,
+            authority_root,
+            selected_authority,
+        )
+        .with_context(|| {
+            format!(
+                "independent-review quarantine at {} belongs to a different authority",
+                path.display()
+            )
+        })?;
         if quarantine.phase == GateTransactionPhase::InProgress {
             bail!(
                 "{REVIEW_INPUT_MUTATION_FATAL_MARKER}: canonical dispatch is blocked by an \
@@ -1407,7 +1786,7 @@ pub(crate) fn enforce_review_input_quarantine_before_dispatch(repo_root: &Path) 
             .context("cannot validate quarantined canonical HEAD before dispatch")?;
         let current_states = match quarantine.scope {
             GateTransactionScope::ReviewInputs => {
-                review_input_path_states(repo_root, &quarantine.task_id)
+                review_input_path_states_at(repo_root, authority_root, &quarantine.task_id)
                     .context("cannot validate quarantined canonical review inputs")?
             }
             GateTransactionScope::CanonicalSource => {
@@ -1459,6 +1838,7 @@ pub(crate) async fn run_lane_review_gate(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn run_lane_review_gate_for_range(
     repo_root: &Path,
     target_branch: &str,
@@ -1466,6 +1846,51 @@ pub(crate) async fn run_lane_review_gate_for_range(
     changed_files: &[String],
     review_range: Option<&LaneReviewRange>,
     config: &LaneReviewConfig,
+) -> LaneReviewOutcome {
+    let host_cargo_env = HostCargoEnv::default();
+    run_lane_review_gate_for_range_with_env(
+        repo_root,
+        target_branch,
+        assignment,
+        changed_files,
+        review_range,
+        config,
+        &host_cargo_env,
+    )
+    .await
+}
+
+pub(crate) async fn run_lane_review_gate_for_range_with_env(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+    changed_files: &[String],
+    review_range: Option<&LaneReviewRange>,
+    config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
+) -> LaneReviewOutcome {
+    run_lane_review_gate_for_range_with_env_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        assignment,
+        changed_files,
+        review_range,
+        config,
+        host_cargo_env,
+    )
+    .await
+}
+
+pub(crate) async fn run_lane_review_gate_for_range_with_env_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+    changed_files: &[String],
+    review_range: Option<&LaneReviewRange>,
+    config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
 ) -> LaneReviewOutcome {
     let review_text = match read_review_text(repo_root) {
         Ok(text) => text,
@@ -1512,7 +1937,8 @@ pub(crate) async fn run_lane_review_gate_for_range(
             }
         }
     };
-    let reviewed_path_states = match review_input_path_states(repo_root, &assignment.task.id) {
+    let reviewed_path_states =
+        match review_input_path_states_at(repo_root, authority_root, &assignment.task.id) {
         Ok(states) => states,
         Err(err) => {
             return LaneReviewOutcome::SkippedFailOpen {
@@ -1523,7 +1949,7 @@ pub(crate) async fn run_lane_review_gate_for_range(
         }
     };
     let mut reviewer_env = Vec::new();
-    let reviewer_guard_root = repo_root.join(".auto/parallel/reviewer-local-only");
+    let reviewer_guard_root = authority_root.join("reviewer-local-only");
     // Independent review is a local, read-only gate in every host mode. Apply
     // the lane guard unconditionally: this is intentionally stronger than
     // AUTO_SKIP_REMOTE_SYNC=1 and prevents a reviewer from becoming a second
@@ -1533,6 +1959,7 @@ pub(crate) async fn run_lane_review_gate_for_range(
             reason: format!("could not install independent-review local-only git guard: {err:#}"),
         };
     }
+    host_cargo_env.append_to(&mut reviewer_env);
     let report_path = codex_review_report_path(repo_root, "parallel-lane-review");
     let prompt = build_lane_review_prompt(
         repo_root,
@@ -1570,8 +1997,9 @@ pub(crate) async fn run_lane_review_gate_for_range(
     let current_head = match current_head_commit(repo_root) {
         Ok(commit) => commit,
         Err(err) => {
-            return fatal_review_input_mutation(
+            return fatal_review_input_mutation_at(
                 repo_root,
+                authority_root,
                 &assignment.task.id,
                 &reviewed_head,
                 review_range,
@@ -1587,8 +2015,9 @@ pub(crate) async fn run_lane_review_gate_for_range(
                 .to_string(),
             Err(err) => format!("pre-review HEAD restoration also failed: {err:#}"),
         };
-        return fatal_review_input_mutation(
+        return fatal_review_input_mutation_at(
             repo_root,
+            authority_root,
             &assignment.task.id,
             &reviewed_head,
             review_range,
@@ -1601,8 +2030,9 @@ pub(crate) async fn run_lane_review_gate_for_range(
     let current_review_text = match read_review_text(repo_root) {
         Ok(text) => text,
         Err(err) => {
-            return fatal_review_input_mutation(
+            return fatal_review_input_mutation_at(
                 repo_root,
+                authority_root,
                 &assignment.task.id,
                 &reviewed_head,
                 review_range,
@@ -1616,8 +2046,9 @@ pub(crate) async fn run_lane_review_gate_for_range(
     let current_input = match review_input_fingerprint(repo_root, current_review_text.as_bytes()) {
         Ok(fingerprint) => bind_review_range_to_fingerprint(fingerprint, review_range),
         Err(err) => {
-            return fatal_review_input_mutation(
+            return fatal_review_input_mutation_at(
                 repo_root,
+                authority_root,
                 &assignment.task.id,
                 &reviewed_head,
                 review_range,
@@ -1626,11 +2057,13 @@ pub(crate) async fn run_lane_review_gate_for_range(
             );
         }
     };
-    let current_path_states = match review_input_path_states(repo_root, &assignment.task.id) {
+    let current_path_states =
+        match review_input_path_states_at(repo_root, authority_root, &assignment.task.id) {
         Ok(states) => states,
         Err(err) => {
-            return fatal_review_input_mutation(
+            return fatal_review_input_mutation_at(
                 repo_root,
+                authority_root,
                 &assignment.task.id,
                 &reviewed_head,
                 review_range,
@@ -1643,8 +2076,9 @@ pub(crate) async fn run_lane_review_gate_for_range(
         || reviewed_path_states != current_path_states
         || standing_review_findings != current_findings
     {
-        return fatal_review_input_mutation(
+        return fatal_review_input_mutation_at(
             repo_root,
+            authority_root,
             &assignment.task.id,
             &reviewed_head,
             review_range,
@@ -1703,6 +2137,80 @@ mod tests {
         }
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "seed review input"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_authority_quarantine_never_uses_legacy_paths_and_rejects_cross_root_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("selected-authority-binding");
+        let mut permissions = fs::metadata(&root).expect("stat temp root").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&root, permissions).expect("secure temp root");
+        init_git_repo(&root);
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "- [~] `TASK-AUTH` selected authority\n",
+        )
+        .expect("write plan");
+        fs::write(root.join("REVIEW.md"), "# REVIEW\n").expect("write review");
+        run_git(&root, ["add", "IMPLEMENTATION_PLAN.md", "REVIEW.md"])
+            .expect("stage review inputs");
+        run_git(&root, ["commit", "-m", "seed review inputs"]).expect("commit review inputs");
+
+        let stem = root
+            .file_name()
+            .expect("temp root has a name")
+            .to_string_lossy();
+        let authority_a_path = root.with_file_name(format!("{stem}-authority-a"));
+        let authority_b_path = root.with_file_name(format!("{stem}-authority-b"));
+        let _authority_a = ParallelRunRootAuthority::acquire(&root, &authority_a_path)
+            .expect("acquire first selected authority");
+        let _authority_b = ParallelRunRootAuthority::acquire(&root, &authority_b_path)
+            .expect("acquire second selected authority");
+
+        let transaction = arm_canonical_gate_transaction_at(
+            &root,
+            &authority_a_path,
+            "TASK-AUTH",
+            "selected-authority-test",
+        )
+        .expect("arm selected authority quarantine");
+        let quarantine_a = authority_a_path.join("review-input-quarantine.json");
+        assert!(quarantine_a.is_file());
+        assert!(
+            !git_path(&root, "auto-review-input-quarantine.json")
+                .is_some_and(|path| path.exists()),
+            "selected authority must not write a git-local legacy marker"
+        );
+        assert!(!root.join(".auto-review-input-quarantine.json").exists());
+        assert!(
+            !root
+                .join(".auto/parallel/review-input-quarantine.json")
+                .exists()
+        );
+
+        fs::copy(
+            &quarantine_a,
+            authority_b_path.join("review-input-quarantine.json"),
+        )
+        .expect("copy quarantine to the wrong selected authority");
+        let error =
+            enforce_review_input_quarantine_before_dispatch_at(&root, &authority_b_path)
+                .expect_err("cross-root quarantine copy must fail closed");
+        assert!(
+            format!("{error:#}").contains("authority changed"),
+            "{error:#}"
+        );
+
+        fs::remove_file(authority_b_path.join("review-input-quarantine.json"))
+            .expect("remove copied marker");
+        clear_canonical_gate_transaction(&root, &transaction)
+            .expect("clear original selected marker");
+        fs::remove_dir_all(&authority_a_path).ok();
+        fs::remove_dir_all(&authority_b_path).ok();
+        fs::remove_dir_all(&root).ok();
     }
 
     fn test_assignment(root: &Path, task_id: &str) -> ActiveLaneAssignment {
@@ -2056,6 +2564,8 @@ report=$(printf '%s\n' "$prompt" | sed -n 's/^Write your report to `\([^`]*\)` a
 resolved_git=$(command -v git)
 [ -n "${AUTO_REAL_GIT:-}" ] || exit 42
 [ "$resolved_git" != "$AUTO_REAL_GIT" ] || exit 43
+[ "${CARGO_TARGET_DIR:-}" = "$PWD/private-host-target" ] || exit 45
+[ "${CARGO_BUILD_JOBS:-}" = "2" ] || exit 46
 for verb in fetch pull push rebase; do
   git "$verb" >/dev/null 2>&1
   [ "$?" -eq 126 ] || exit 44
@@ -2078,12 +2588,30 @@ printf 'VERDICT: CLEAN\n\n## Summary\nLocal-only review completed.\n' > "$report
             reasoning_effort: "unused".to_string(),
             codex_bin: reviewer,
         };
+        let host_cargo_env = HostCargoEnv::from_vars(vec![
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                root.join("private-host-target")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("CARGO_BUILD_JOBS".to_string(), "2".to_string()),
+        ]);
         assert!(
             matches!(
-                run_lane_review_gate(&root, "main", &assignment, &[], &config).await,
+                run_lane_review_gate_for_range_with_env(
+                    &root,
+                    "main",
+                    &assignment,
+                    &[],
+                    None,
+                    &config,
+                    &host_cargo_env,
+                )
+                .await,
                 LaneReviewOutcome::Clean
             ),
-            "the independent reviewer must receive the same local-only git command environment as lanes"
+            "the independent reviewer must receive local-only git protection plus cargo-only host settings"
         );
 
         let _ = fs::remove_dir_all(&root);

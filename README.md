@@ -1187,6 +1187,11 @@ What it actually does:
 - Defaults `--cargo-target auto`, which uses lane-local Cargo target directories for multi-lane
   Rust repos. This avoids cross-lane artifact contamination and Cargo-lock pileups during final
   proof. Use `--cargo-target shared` only when shared build-cache speed is worth the risk.
+- On Unix, run-owned Cargo targets are opened component-by-component without following symlinks
+  and their managed descendants are kept at mode `0700`; unsupported platforms fail closed.
+  Autodev validates but never chmods the operator-selected `--run-root` / `AUTO_RUN_ROOT`, whose
+  path must use non-symlink, owner/root-controlled ancestors without group/other write permission.
+  `--cargo-target none` and inherited external targets are not chmodded.
 - Lane prompts reject `0 tests` as passing evidence and reject direct target-dir test binaries as
   final proof unless the lane just built that exact artifact from its current sources.
 - Plan rows may declare `Lane kind: code`, `Lane kind: evidence`, or `Lane kind: operator`.

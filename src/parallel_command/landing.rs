@@ -3,6 +3,20 @@ use super::*;
 pub(crate) const LANDING_REBASE_RETRY_LIMIT: usize = 5;
 pub(crate) const LANDING_PUSH_RETRY_LIMIT: usize = 5;
 
+fn assignment_authority_root(assignment: &ActiveLaneAssignment) -> Result<PathBuf> {
+    assignment
+        .lane_root
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "lane root does not have the required <authority>/lanes/lane-N layout: {}",
+                assignment.lane_root.display()
+            )
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_spawn_lane_recovery_attempt(
     join_set: &mut JoinSet<LaneAttemptResult>,
@@ -49,7 +63,21 @@ pub(crate) fn repair_parallel_canonical_before_dispatch(
     target_branch: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<()> {
-    enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    repair_parallel_canonical_before_dispatch_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        parallel_logger,
+    )
+}
+
+pub(crate) fn repair_parallel_canonical_before_dispatch_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<()> {
+    enforce_review_input_quarantine_before_dispatch_at(repo_root, authority_root)?;
     let rebase_merge = git_path(repo_root, "rebase-merge");
     if let Some(path) = rebase_merge.as_ref().filter(|path| path.exists()) {
         let issue = lane_repo_rebase_recovery_issue(repo_root);
@@ -79,8 +107,9 @@ pub(crate) fn repair_parallel_canonical_before_dispatch(
         .collect::<Vec<_>>();
     if !dirty_paths.is_empty() {
         let dirty_summary = dirty_paths.join(", ");
-        if let Some(commit) = checkpoint_parallel_dispatch_paths(
+        if let Some(commit) = checkpoint_parallel_dispatch_paths_at(
             repo_root,
+            authority_root,
             target_branch,
             &dirty_paths,
             "auto parallel checkpoint",
@@ -113,7 +142,23 @@ pub(crate) fn checkpoint_parallel_dispatch_paths(
     dirty_paths: &[String],
     message_suffix: &str,
 ) -> Result<Option<String>> {
-    enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    checkpoint_parallel_dispatch_paths_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        dirty_paths,
+        message_suffix,
+    )
+}
+
+pub(crate) fn checkpoint_parallel_dispatch_paths_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    dirty_paths: &[String],
+    message_suffix: &str,
+) -> Result<Option<String>> {
+    enforce_review_input_quarantine_before_dispatch_at(repo_root, authority_root)?;
     if dirty_paths.is_empty() {
         return Ok(None);
     }
@@ -157,6 +202,16 @@ pub(crate) fn checkpoint_parallel_dispatch_paths(
 pub(crate) fn recover_unsealed_task_completion_transitions(
     repo_root: &Path,
 ) -> Result<Vec<String>> {
+    recover_unsealed_task_completion_transitions_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+    )
+}
+
+pub(crate) fn recover_unsealed_task_completion_transitions_at(
+    repo_root: &Path,
+    authority_root: &Path,
+) -> Result<Vec<String>> {
     let worktree_plan = read_loop_plan(repo_root)?;
     let unsealed = unsealed_task_completion_ids(repo_root)?;
     if unsealed.is_empty() {
@@ -181,8 +236,8 @@ pub(crate) fn recover_unsealed_task_completion_transitions(
             task,
             LoopTaskStatus::Partial,
         );
-        record_gate_hold(
-            repo_root,
+        record_gate_hold_at(
+            authority_root,
             task_id,
             "recovered unsealed Done transition after interrupted host closeout",
         )?;
@@ -200,7 +255,21 @@ pub(crate) fn checkpoint_parallel_host_queue_changes(
     target_branch: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<Option<String>> {
-    enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    checkpoint_parallel_host_queue_changes_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        parallel_logger,
+    )
+}
+
+pub(crate) fn checkpoint_parallel_host_queue_changes_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<Option<String>> {
+    enforce_review_input_quarantine_before_dispatch_at(repo_root, authority_root)?;
     repair_stale_git_index_lock(repo_root, parallel_logger, "before host queue sync")?;
     let queue_files = host_queue_state_files_for_repo(repo_root);
     if queue_files.is_empty() {
@@ -423,11 +492,30 @@ fn stored_owned_inputs(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn audit_parallel_completion_drift(
+    repo_root: &Path,
+    target_branch: &str,
+    plan_text: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<(String, bool)> {
+    let host_cargo_env = HostCargoEnv::default();
+    audit_parallel_completion_drift_with_env(
+        repo_root,
+        target_branch,
+        plan_text,
+        parallel_logger,
+        &host_cargo_env,
+    )
+    .await
+}
+
+pub(crate) async fn audit_parallel_completion_drift_with_env(
     repo_root: &Path,
     _target_branch: &str,
     plan_text: &str,
     parallel_logger: &ParallelEventLogger,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<(String, bool)> {
     let snapshot = parse_loop_plan(plan_text);
     // Parse the plan once for owned-inputs fingerprinting (task contracts, Owns
@@ -508,10 +596,12 @@ pub(crate) async fn audit_parallel_completion_drift(
                 let started = Instant::now();
                 let outcome = run_guarded_lane_verify_gate(
                     repo_root,
+                    &parallel_logger.run_root(),
                     &task.id,
                     &task.markdown,
                     "completion-drift reverify",
                     true,
+                    host_cargo_env,
                 )
                 .await?;
                 reverify_spent += started.elapsed();
@@ -582,10 +672,12 @@ pub(crate) async fn audit_parallel_completion_drift(
                 let started = Instant::now();
                 let outcome = run_guarded_lane_verify_gate(
                     repo_root,
+                    &parallel_logger.run_root(),
                     &task.id,
                     &task.markdown,
                     "partial completion-drift reverify",
                     true,
+                    host_cargo_env,
                 )
                 .await?;
                 reverify_spent += started.elapsed();
@@ -770,7 +862,9 @@ pub(crate) async fn land_parallel_lane_result(
     target_branch: &str,
     assignment: &mut ActiveLaneAssignment,
     review_config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LaneLandingOutcome> {
+    let authority_root = assignment_authority_root(assignment)?;
     let mut auto_repaired = false;
     let mut rebase_retries = 0usize;
     let (final_lane_head, final_range_base, canonical_review_range) = loop {
@@ -879,9 +973,10 @@ pub(crate) async fn land_parallel_lane_result(
     // evidence` cannot see `verification_receipt_present`, so every landing
     // returns Partial and tasks stay [~] forever. Copy the lane's receipts here
     // so the host can read them in the same harvest cycle.
-    if let Err(err) = propagate_lane_receipts(
+    if let Err(err) = propagate_lane_receipts_at(
         &assignment.lane_repo_root,
         repo_root,
+        &authority_root,
         &assignment.task.id,
         &assignment.task.markdown,
     ) {
@@ -929,10 +1024,12 @@ pub(crate) async fn land_parallel_lane_result(
         if repairable_verification_gap {
             let outcome = run_guarded_lane_verify_gate(
                 repo_root,
+                &authority_root,
                 &assignment.task.id,
                 &assignment.task.markdown,
                 "inline landing receipt repair",
                 true,
+                host_cargo_env,
             )
             .await?;
             if outcome == LaneVerifyOutcome::AllPassed {
@@ -953,17 +1050,19 @@ pub(crate) async fn land_parallel_lane_result(
     // holds it at `[~]`, later gates are skipped for this landing.
     completion_status = apply_definition_of_done_gates(
         repo_root,
+        &authority_root,
         target_branch,
         assignment,
         &changed_files,
         canonical_review_range.as_ref(),
         completion_status,
         review_config,
+        host_cargo_env,
     )
     .await?;
     if completion_status == LoopTaskStatus::Done {
-        record_gate_hold(
-            repo_root,
+        record_gate_hold_at(
+            &authority_root,
             &assignment.task.id,
             "all gates passed; durable closeout commit is still pending",
         )?;
@@ -989,8 +1088,9 @@ pub(crate) async fn land_parallel_lane_result(
                 true,
             )
         };
-        let closeout = commit_task_closeout(
+        let closeout = commit_task_closeout_at(
             repo_root,
+            &authority_root,
             &assignment.task.id,
             completion_status,
             &message,
@@ -1001,7 +1101,7 @@ pub(crate) async fn land_parallel_lane_result(
                 return Err(err);
             }
             let reason = format!("durable lane closeout failed: {err:#}");
-            record_gate_hold(repo_root, &assignment.task.id, &reason)?;
+            record_gate_hold_at(&authority_root, &assignment.task.id, &reason)?;
             if let Err(review_err) =
                 append_lane_verify_failure(repo_root, &assignment.task.id, &reason)
             {
@@ -1038,8 +1138,9 @@ pub(crate) async fn land_parallel_lane_result(
                     repo_name(repo_root),
                     assignment.task.id
                 );
-                commit_task_closeout(
+                commit_task_closeout_at(
                     repo_root,
+                    &authority_root,
                     &assignment.task.id,
                     LoopTaskStatus::Partial,
                     &partial_message,
@@ -1048,7 +1149,7 @@ pub(crate) async fn land_parallel_lane_result(
             }
             auto_repaired = true;
         } else if completion_status == LoopTaskStatus::Done {
-            clear_gate_hold(repo_root, &assignment.task.id)?;
+            clear_gate_hold_at(&authority_root, &assignment.task.id)?;
         }
     }
     match push_parallel_landing_with_divergence_retries(repo_root, target_branch, assignment) {
@@ -1100,6 +1201,7 @@ async fn apply_lane_review_gate(
 ) -> Result<LoopTaskStatus> {
     apply_lane_review_gate_in_transaction(
         repo_root,
+        &repo_root.join(".auto/parallel"),
         target_branch,
         assignment,
         changed_files,
@@ -1107,6 +1209,7 @@ async fn apply_lane_review_gate(
         review_config,
         None,
         None,
+        &HostCargoEnv::default(),
     )
     .await
 }
@@ -1114,6 +1217,7 @@ async fn apply_lane_review_gate(
 #[allow(clippy::too_many_arguments)]
 async fn apply_lane_review_gate_in_transaction(
     repo_root: &Path,
+    authority_root: &Path,
     target_branch: &str,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
@@ -1121,10 +1225,12 @@ async fn apply_lane_review_gate_in_transaction(
     review_config: &LaneReviewConfig,
     review_range: Option<&LaneReviewRange>,
     transaction: Option<&ArmedCanonicalGateTransaction>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     if !review_gate_enabled() {
-        return apply_lane_review_outcome(
+        return apply_lane_review_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             incoming_status,
             LaneReviewOutcome::SkippedFailOpen {
@@ -1133,13 +1239,15 @@ async fn apply_lane_review_gate_in_transaction(
             },
         );
     }
-    let outcome = run_lane_review_gate_for_range(
+    let outcome = run_lane_review_gate_for_range_with_env_at(
         repo_root,
+        authority_root,
         target_branch,
         assignment,
         changed_files,
         review_range,
         review_config,
+        host_cargo_env,
     )
     .await;
     if let Some(transaction) = transaction {
@@ -1155,44 +1263,62 @@ async fn apply_lane_review_gate_in_transaction(
             assignment.task.id
         );
     }
-    apply_lane_review_outcome(repo_root, assignment, incoming_status, outcome)
+    apply_lane_review_outcome_at(
+        repo_root,
+        authority_root,
+        assignment,
+        incoming_status,
+        outcome,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_definition_of_done_gates(
     repo_root: &Path,
+    authority_root: &Path,
     target_branch: &str,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
     review_range: Option<&LaneReviewRange>,
     mut status: LoopTaskStatus,
     review_config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     if status != LoopTaskStatus::Done {
         return Ok(status);
     }
-    let transaction =
-        arm_canonical_gate_transaction(repo_root, &assignment.task.id, "definition-of-done")?;
+    let transaction = arm_canonical_gate_transaction_at(
+        repo_root,
+        authority_root,
+        &assignment.task.id,
+        "definition-of-done",
+    )?;
     let gate_result = async {
         status = apply_lane_verify_gate_in_transaction(
             repo_root,
+            authority_root,
             assignment,
             status,
             Some(&transaction),
+            host_cargo_env,
         )
         .await?;
         if status == LoopTaskStatus::Done {
             status = apply_workspace_test_gate_in_transaction(
                 repo_root,
+                authority_root,
                 assignment,
                 changed_files,
                 status,
                 Some(&transaction),
+                host_cargo_env,
             )
             .await?;
         }
         if status == LoopTaskStatus::Done {
             status = apply_lane_review_gate_in_transaction(
                 repo_root,
+                authority_root,
                 target_branch,
                 assignment,
                 changed_files,
@@ -1200,11 +1326,12 @@ async fn apply_definition_of_done_gates(
                 review_config,
                 review_range,
                 Some(&transaction),
+                host_cargo_env,
             )
             .await?;
         }
         if status == LoopTaskStatus::Done {
-            clear_gate_hold(repo_root, &assignment.task.id)?;
+            clear_gate_hold_at(authority_root, &assignment.task.id)?;
         }
         Result::<LoopTaskStatus>::Ok(status)
     }
@@ -1307,6 +1434,22 @@ pub(crate) fn apply_lane_review_outcome(
     incoming_status: LoopTaskStatus,
     outcome: LaneReviewOutcome,
 ) -> Result<LoopTaskStatus> {
+    apply_lane_review_outcome_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        assignment,
+        incoming_status,
+        outcome,
+    )
+}
+
+pub(crate) fn apply_lane_review_outcome_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    outcome: LaneReviewOutcome,
+) -> Result<LoopTaskStatus> {
     match outcome {
         LaneReviewOutcome::Clean => {
             match append_lane_review_clearance(repo_root, &assignment.task.id) {
@@ -1316,8 +1459,8 @@ pub(crate) fn apply_lane_review_outcome(
                             "warning: failed staging REVIEW.md after standing-review clearance for `{}`: {err:#}",
                             assignment.task.id
                         );
-                        record_gate_hold(
-                            repo_root,
+                        record_gate_hold_at(
+                            authority_root,
                             &assignment.task.id,
                             "standing review clearance was not staged",
                         )?;
@@ -1342,8 +1485,8 @@ pub(crate) fn apply_lane_review_outcome(
                         "warning: failed appending standing-review clearance for `{}`: {err:#}",
                         assignment.task.id
                     );
-                    record_gate_hold(
-                        repo_root,
+                    record_gate_hold_at(
+                        authority_root,
                         &assignment.task.id,
                         "standing review clearance could not be persisted",
                     )?;
@@ -1372,8 +1515,8 @@ pub(crate) fn apply_lane_review_outcome(
         }
         LaneReviewOutcome::FindingsKeepPartial { findings_summary } => {
             // Hold so evidence-only promotion can't re-promote past these findings.
-            record_gate_hold(
-                repo_root,
+            record_gate_hold_at(
+                authority_root,
                 &assignment.task.id,
                 "independent review findings",
             )?;
@@ -1405,7 +1548,11 @@ pub(crate) fn apply_lane_review_outcome(
                 "warning: independent-review gate skipped for `{}`; keeping task [~]: {reason}",
                 assignment.task.id
             );
-            record_gate_hold(repo_root, &assignment.task.id, "independent review skipped")?;
+            record_gate_hold_at(
+                authority_root,
+                &assignment.task.id,
+                "independent review skipped",
+            )?;
             append_lane_review_findings(
                 repo_root,
                 &assignment.task.id,
@@ -1459,35 +1606,55 @@ async fn apply_lane_verify_gate(
     assignment: &mut ActiveLaneAssignment,
     incoming_status: LoopTaskStatus,
 ) -> Result<LoopTaskStatus> {
-    apply_lane_verify_gate_in_transaction(repo_root, assignment, incoming_status, None).await
+    apply_lane_verify_gate_in_transaction(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        assignment,
+        incoming_status,
+        None,
+        &HostCargoEnv::default(),
+    )
+    .await
 }
 
 async fn run_guarded_lane_verify_gate(
     repo_root: &Path,
+    authority_root: &Path,
     task_id: &str,
     task_markdown: &str,
     gate_label: &str,
     refresh_completion_evidence: bool,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LaneVerifyOutcome> {
     if refresh_completion_evidence {
-        if let Err(err) = clear_verified_source_attestation(repo_root, task_id) {
+        if let Err(err) = clear_verified_source_attestation_at(authority_root, task_id) {
             return Ok(LaneVerifyOutcome::Skipped {
                 reason: format!("could not clear prior host verified-source attestation: {err:#}"),
             });
         }
     }
-    let transaction = arm_canonical_gate_transaction(repo_root, task_id, gate_label)?;
+    let transaction =
+        arm_canonical_gate_transaction_at(repo_root, authority_root, task_id, gate_label)?;
     let mut outcome = run_lane_verify_gate_in_canonical_transaction(
         repo_root,
         task_id,
         task_markdown,
         &transaction,
         gate_label,
+        host_cargo_env,
     )
     .await?;
     if refresh_completion_evidence && outcome == LaneVerifyOutcome::AllPassed {
-        let attestation = propagate_lane_receipts(repo_root, repo_root, task_id, task_markdown)
-            .and_then(|()| record_verified_source_attestation(repo_root, task_id));
+        let attestation = propagate_lane_receipts_at(
+            repo_root,
+            repo_root,
+            authority_root,
+            task_id,
+            task_markdown,
+        )
+        .and_then(|()| {
+            record_verified_source_attestation_at(repo_root, authority_root, task_id)
+        });
         if let Err(err) = attestation {
             outcome = LaneVerifyOutcome::Skipped {
                 reason: format!(
@@ -1506,22 +1673,27 @@ async fn run_lane_verify_gate_in_canonical_transaction(
     task_markdown: &str,
     transaction: &ArmedCanonicalGateTransaction,
     stage: &str,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LaneVerifyOutcome> {
     let snapshot = capture_canonical_gate_subprocess_snapshot(repo_root)?;
-    let outcome = run_lane_verify_gate(repo_root, task_id, task_markdown).await;
+    let outcome =
+        run_lane_verify_gate_with_env(repo_root, task_id, task_markdown, host_cargo_env).await;
     revalidate_canonical_gate_subprocess_snapshot(repo_root, transaction, &snapshot, stage)?;
     Ok(outcome)
 }
 
 async fn apply_lane_verify_gate_in_transaction(
     repo_root: &Path,
+    authority_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     incoming_status: LoopTaskStatus,
     transaction: Option<&ArmedCanonicalGateTransaction>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     if !verify_gate_enabled() {
-        return apply_lane_verify_outcome(
+        return apply_lane_verify_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             incoming_status,
             LaneVerifyOutcome::Skipped {
@@ -1531,9 +1703,12 @@ async fn apply_lane_verify_gate_in_transaction(
             },
         );
     }
-    if let Err(err) = clear_verified_source_attestation(repo_root, &assignment.task.id) {
-        return apply_lane_verify_outcome(
+    if let Err(err) =
+        clear_verified_source_attestation_at(authority_root, &assignment.task.id)
+    {
+        return apply_lane_verify_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             incoming_status,
             LaneVerifyOutcome::Skipped {
@@ -1548,19 +1723,33 @@ async fn apply_lane_verify_gate_in_transaction(
             &assignment.task.markdown,
             transaction,
             "host verification subprocess",
+            host_cargo_env,
         )
         .await?
     } else {
-        run_lane_verify_gate(repo_root, &assignment.task.id, &assignment.task.markdown).await
-    };
-    if outcome == LaneVerifyOutcome::AllPassed {
-        let attestation = propagate_lane_receipts(
-            repo_root,
+        run_lane_verify_gate_with_env(
             repo_root,
             &assignment.task.id,
             &assignment.task.markdown,
+            host_cargo_env,
         )
-        .and_then(|()| record_verified_source_attestation(repo_root, &assignment.task.id));
+        .await
+    };
+    if outcome == LaneVerifyOutcome::AllPassed {
+        let attestation = propagate_lane_receipts_at(
+            repo_root,
+            repo_root,
+            authority_root,
+            &assignment.task.id,
+            &assignment.task.markdown,
+        )
+        .and_then(|()| {
+            record_verified_source_attestation_at(
+                repo_root,
+                authority_root,
+                &assignment.task.id,
+            )
+        });
         if let Err(err) = attestation {
             outcome = LaneVerifyOutcome::Skipped {
                 reason: format!(
@@ -1569,7 +1758,13 @@ async fn apply_lane_verify_gate_in_transaction(
             };
         }
     }
-    apply_lane_verify_outcome(repo_root, assignment, incoming_status, outcome)
+    apply_lane_verify_outcome_at(
+        repo_root,
+        authority_root,
+        assignment,
+        incoming_status,
+        outcome,
+    )
 }
 
 /// Apply a [`LaneVerifyOutcome`] to the lane's landing status. Synchronous and
@@ -1577,6 +1772,22 @@ async fn apply_lane_verify_gate_in_transaction(
 /// demote/append/stamp wiring with a stubbed outcome instead of spawning builds.
 pub(crate) fn apply_lane_verify_outcome(
     repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    outcome: LaneVerifyOutcome,
+) -> Result<LoopTaskStatus> {
+    apply_lane_verify_outcome_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        assignment,
+        incoming_status,
+        outcome,
+    )
+}
+
+pub(crate) fn apply_lane_verify_outcome_at(
+    repo_root: &Path,
+    authority_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     incoming_status: LoopTaskStatus,
     outcome: LaneVerifyOutcome,
@@ -1593,8 +1804,8 @@ pub(crate) fn apply_lane_verify_outcome(
         }
         LaneVerifyOutcome::Failed { detail } => {
             // Hold the task so evidence-only promotion can't undo this demotion.
-            record_gate_hold(
-                repo_root,
+            record_gate_hold_at(
+                authority_root,
                 &assignment.task.id,
                 "host re-execution verification failed",
             )?;
@@ -1623,8 +1834,8 @@ pub(crate) fn apply_lane_verify_outcome(
             Ok(LoopTaskStatus::Partial)
         }
         LaneVerifyOutcome::Skipped { reason } => {
-            record_gate_hold(
-                repo_root,
+            record_gate_hold_at(
+                authority_root,
                 &assignment.task.id,
                 "host re-execution verification skipped",
             )?;
@@ -1673,29 +1884,35 @@ async fn apply_workspace_test_gate(
 ) -> Result<LoopTaskStatus> {
     apply_workspace_test_gate_in_transaction(
         repo_root,
+        &repo_root.join(".auto/parallel"),
         assignment,
         changed_files,
         incoming_status,
         None,
+        &HostCargoEnv::default(),
     )
     .await
 }
 
 async fn apply_workspace_test_gate_in_transaction(
     repo_root: &Path,
+    authority_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
     incoming_status: LoopTaskStatus,
     transaction: Option<&ArmedCanonicalGateTransaction>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     apply_workspace_test_gate_mode_in_transaction(
         repo_root,
+        authority_root,
         assignment,
         changed_files,
         incoming_status,
         transaction,
         workspace_gate_mode(),
         None,
+        host_cargo_env,
     )
     .await
 }
@@ -1703,12 +1920,14 @@ async fn apply_workspace_test_gate_in_transaction(
 #[allow(clippy::too_many_arguments)]
 async fn apply_workspace_test_gate_mode_in_transaction(
     repo_root: &Path,
+    authority_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
     incoming_status: LoopTaskStatus,
     transaction: Option<&ArmedCanonicalGateTransaction>,
     mode: WorkspaceGateMode,
     cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     match mode {
         WorkspaceGateMode::Strict => {
@@ -1717,19 +1936,28 @@ async fn apply_workspace_test_gate_mode_in_transaction(
                 transaction,
                 "strict workspace test subprocess",
                 cargo_bin,
+                host_cargo_env,
             )
             .await?;
             let outcome = workspace_test_outcome_from_probe(probe);
-            apply_workspace_test_outcome(repo_root, assignment, incoming_status, outcome)
+            apply_workspace_test_outcome_at(
+                repo_root,
+                authority_root,
+                assignment,
+                incoming_status,
+                outcome,
+            )
         }
         WorkspaceGateMode::Baseline => {
             apply_workspace_baseline_gate_in_transaction_with_cargo(
                 repo_root,
+                authority_root,
                 assignment,
                 changed_files,
                 incoming_status,
                 transaction,
                 cargo_bin,
+                host_cargo_env,
             )
             .await
         }
@@ -1758,28 +1986,33 @@ async fn apply_workspace_baseline_gate(
 ) -> Result<LoopTaskStatus> {
     apply_workspace_baseline_gate_in_transaction_with_cargo(
         repo_root,
+        &repo_root.join(".auto/parallel"),
         assignment,
         changed_files,
         incoming_status,
         None,
         None,
+        &HostCargoEnv::default(),
     )
     .await
 }
 
 async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     repo_root: &Path,
+    authority_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
     incoming_status: LoopTaskStatus,
     transaction: Option<&ArmedCanonicalGateTransaction>,
     cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopTaskStatus> {
     let probe = run_workspace_probe_in_canonical_transaction(
         repo_root,
         transaction,
         "workspace baseline subprocess",
         cargo_bin,
+        host_cargo_env,
     )
     .await?;
     let obs = match probe {
@@ -1795,8 +2028,9 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
             return Ok(incoming_status);
         }
         WorkspaceProbe::Skipped { reason } => {
-            return apply_workspace_test_outcome(
+            return apply_workspace_test_outcome_at(
                 repo_root,
+                authority_root,
                 assignment,
                 incoming_status,
                 WorkspaceTestOutcome::Skipped {
@@ -1808,8 +2042,9 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     };
 
     let Some(run_root) = workspace_baseline_run_root(&assignment.lane_root) else {
-        return apply_workspace_test_outcome(
+        return apply_workspace_test_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             incoming_status,
             WorkspaceTestOutcome::Skipped {
@@ -1824,8 +2059,9 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     if !baseline.captured
         && (!obs.compiled || !obs.failing_tests.is_empty() || !obs.broken_crates.is_empty())
     {
-        return apply_workspace_test_outcome(
+        return apply_workspace_test_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             incoming_status,
             WorkspaceTestOutcome::Skipped {
@@ -1852,7 +2088,7 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     let decision = if strict {
         let env_patterns = env_failure_patterns();
         if strict_workspace_has_blocking(&baseline, &obs, &env_patterns) {
-            let touched = touched_workspace_crates(repo_root, changed_files);
+            let touched = touched_workspace_crates(repo_root, changed_files, host_cargo_env);
             classify_workspace_regressions_strict(&baseline, &obs, &touched, &env_patterns)
         } else {
             // No blocking regression, but still classify to surface tolerated
@@ -1860,7 +2096,7 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
             classify_workspace_regressions_strict(&baseline, &obs, &BTreeSet::new(), &env_patterns)
         }
     } else if has_candidate_regression(&baseline, &obs) {
-        let touched = touched_workspace_crates(repo_root, changed_files);
+        let touched = touched_workspace_crates(repo_root, changed_files, host_cargo_env);
         classify_workspace_regressions(&baseline, &obs, &touched)
     } else {
         WorkspaceRegressionDecision::default()
@@ -1915,8 +2151,8 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
             "{baseline_note}\n\n{scope_note}\n- {}",
             decision.blocking.join("\n- ")
         );
-        record_gate_hold(
-            repo_root,
+        record_gate_hold_at(
+            authority_root,
             &assignment.task.id,
             "workspace baseline regression",
         )?;
@@ -1987,11 +2223,12 @@ async fn run_workspace_probe_in_canonical_transaction(
     transaction: Option<&ArmedCanonicalGateTransaction>,
     stage: &str,
     cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<WorkspaceProbe> {
     let snapshot = transaction
         .map(|_| capture_canonical_gate_subprocess_snapshot(repo_root))
         .transpose()?;
-    let probe = run_workspace_probe_with_cargo(repo_root, cargo_bin).await;
+    let probe = run_workspace_probe_with_cargo_env(repo_root, cargo_bin, host_cargo_env).await;
     if let (Some(transaction), Some(snapshot)) = (transaction, snapshot.as_ref()) {
         revalidate_canonical_gate_subprocess_snapshot(repo_root, transaction, snapshot, stage)?;
     }
@@ -2008,13 +2245,16 @@ async fn run_guarded_workspace_probe(
     repo_root: &Path,
     task_id: &str,
     gate_label: &str,
+    cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<WorkspaceProbe> {
     let transaction = arm_canonical_gate_transaction(repo_root, task_id, gate_label)?;
     let probe = run_workspace_probe_in_canonical_transaction(
         repo_root,
         Some(&transaction),
         gate_label,
-        None,
+        cargo_bin,
+        host_cargo_env,
     )
     .await?;
     clear_canonical_gate_transaction(repo_root, &transaction)?;
@@ -2025,6 +2265,24 @@ pub(crate) async fn maybe_capture_workspace_baseline(
     repo_root: &Path,
     run_root: &Path,
     parallel_logger: &ParallelEventLogger,
+    host_cargo_env: &HostCargoEnv,
+) {
+    maybe_capture_workspace_baseline_with_cargo(
+        repo_root,
+        run_root,
+        parallel_logger,
+        None,
+        host_cargo_env,
+    )
+    .await;
+}
+
+pub(crate) async fn maybe_capture_workspace_baseline_with_cargo(
+    repo_root: &Path,
+    run_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+    cargo_bin: Option<PathBuf>,
+    host_cargo_env: &HostCargoEnv,
 ) {
     if matches!(workspace_gate_mode(), WorkspaceGateMode::Strict) {
         return;
@@ -2051,6 +2309,8 @@ pub(crate) async fn maybe_capture_workspace_baseline(
                     repo_root,
                     "workspace-baseline",
                     "workspace baseline recapture",
+                    cargo_bin.clone(),
+                    host_cargo_env,
                 )
                 .await
                 {
@@ -2115,6 +2375,8 @@ pub(crate) async fn maybe_capture_workspace_baseline(
         repo_root,
         "workspace-baseline",
         "workspace baseline capture",
+        cargo_bin,
+        host_cargo_env,
     )
     .await
     {
@@ -2162,8 +2424,12 @@ pub(crate) async fn maybe_capture_workspace_baseline(
 /// they live in (the task's compile/test blast radius), via `cargo metadata`.
 /// Only invoked when a candidate regression exists, keeping metadata off the
 /// clean landing path.
-fn touched_workspace_crates(repo_root: &Path, changed_files: &[String]) -> BTreeSet<String> {
-    let members = workspace_member_dirs(repo_root);
+fn touched_workspace_crates(
+    repo_root: &Path,
+    changed_files: &[String],
+    host_cargo_env: &HostCargoEnv,
+) -> BTreeSet<String> {
+    let members = workspace_member_dirs(repo_root, host_cargo_env);
     let mut touched = BTreeSet::new();
     for file in changed_files {
         let abs = repo_root.join(file);
@@ -2187,11 +2453,16 @@ fn touched_workspace_crates(repo_root: &Path, changed_files: &[String]) -> BTree
 /// `cargo metadata --no-deps`. Returns empty on any error (attribution then
 /// treats all regressions as un-attributed/nonblocking — conservative for
 /// throughput, and the own-verify gate still guards the task's own crate).
-fn workspace_member_dirs(repo_root: &Path) -> Vec<(PathBuf, String)> {
-    let output = Command::new("cargo")
+fn workspace_member_dirs(
+    repo_root: &Path,
+    host_cargo_env: &HostCargoEnv,
+) -> Vec<(PathBuf, String)> {
+    let mut command = Command::new("cargo");
+    command
         .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(repo_root)
-        .output();
+        .current_dir(repo_root);
+    host_cargo_env.apply_to_std(&mut command);
+    let output = command.output();
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -2227,6 +2498,22 @@ pub(crate) fn apply_workspace_test_outcome(
     incoming_status: LoopTaskStatus,
     outcome: WorkspaceTestOutcome,
 ) -> Result<LoopTaskStatus> {
+    apply_workspace_test_outcome_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        assignment,
+        incoming_status,
+        outcome,
+    )
+}
+
+pub(crate) fn apply_workspace_test_outcome_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    outcome: WorkspaceTestOutcome,
+) -> Result<LoopTaskStatus> {
     match outcome {
         WorkspaceTestOutcome::Passed => {
             append_lane_host_event(
@@ -2238,8 +2525,8 @@ pub(crate) fn apply_workspace_test_outcome(
             Ok(incoming_status)
         }
         WorkspaceTestOutcome::Failed { detail } => {
-            record_gate_hold(
-                repo_root,
+            record_gate_hold_at(
+                authority_root,
                 &assignment.task.id,
                 "workspace cargo test failed",
             )?;
@@ -2282,8 +2569,8 @@ pub(crate) fn apply_workspace_test_outcome(
             Ok(incoming_status)
         }
         WorkspaceTestOutcome::Skipped { reason } => {
-            record_gate_hold(
-                repo_root,
+            record_gate_hold_at(
+                authority_root,
                 &assignment.task.id,
                 "workspace cargo test skipped",
             )?;
@@ -2378,18 +2665,415 @@ fn append_lane_workspace_test_failure(
 /// Only the named task's receipts are propagated; other lanes' receipts in the
 /// lane worktree are left alone. Missing files are not an error — the lane
 /// may legitimately have skipped the wrapper for non-verifiable tasks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptHandoffPhase {
+    SourceRevalidatedBeforePublication,
+    DestinationComparedBeforeReplacement,
+    PublishedBeforeValidation,
+}
+
+static RECEIPT_HANDOFF_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn acquire_receipt_handoff_lock(authority_root: &Path) -> Result<std::fs::File> {
+    let lock_dir = authority_root;
+    std::fs::create_dir_all(&lock_dir).with_context(|| {
+        format!(
+            "failed to create receipt handoff lock dir {}",
+            lock_dir.display()
+        )
+    })?;
+    let lock_path = lock_dir.join("receipt-handoff.lock");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32,
+            )
+            .mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "failed to open receipt handoff lock {} without following links",
+                lock_path.display()
+            )
+        })?;
+    let metadata = lock
+        .metadata()
+        .with_context(|| format!("failed to inspect receipt handoff lock {}", lock_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "receipt handoff lock must be a regular file: {}",
+            lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!(
+                "receipt handoff lock must be current-uid, single-link, and not group/other writable: {}",
+                lock_path.display()
+            );
+        }
+        let linked = std::fs::symlink_metadata(&lock_path).with_context(|| {
+            format!(
+                "failed to revalidate receipt handoff lock {}",
+                lock_path.display()
+            )
+        })?;
+        if linked.file_type().is_symlink()
+            || linked.dev() != metadata.dev()
+            || linked.ino() != metadata.ino()
+        {
+            bail!(
+                "receipt handoff lock identity changed while opening {}",
+                lock_path.display()
+            );
+        }
+    }
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).with_context(
+        || {
+            format!(
+                "concurrent canonical receipt handoff already holds {}",
+                lock_path.display()
+            )
+        },
+    )?;
+    Ok(lock)
+}
+
+fn read_optional_receipt_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "refusing receipt handoff through non-regular destination {}",
+            path.display()
+        );
+    }
+    std::fs::read(path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .map(Some)
+}
+
+/// Atomically publish a fully-written file only when `destination` does not
+/// already exist. A hard link is the portable create-if-absent CAS primitive:
+/// it cannot truncate or replace a receipt that appeared concurrently.
+fn publish_receipt_if_absent(destination: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = destination
+        .parent()
+        .with_context(|| format!("{} has no parent directory", destination.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = destination
+        .file_name()
+        .context("receipt destination has no file name")?
+        .to_string_lossy();
+    let sequence = RECEIPT_HANDOFF_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = parent.join(format!(
+        ".{file_name}.handoff-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let mut staging_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging)
+        .with_context(|| {
+            format!(
+                "failed to create receipt staging file {}",
+                staging.display()
+            )
+        })?;
+    staging_file
+        .write_all(bytes)
+        .with_context(|| format!("failed to write receipt staging file {}", staging.display()))?;
+    staging_file
+        .sync_all()
+        .with_context(|| format!("failed to sync receipt staging file {}", staging.display()))?;
+    drop(staging_file);
+
+    let publication = std::fs::hard_link(&staging, destination);
+    let cleanup = std::fs::remove_file(&staging);
+    if let Err(err) = cleanup {
+        return Err(err).with_context(|| {
+            format!(
+                "failed to remove receipt staging file {}",
+                staging.display()
+            )
+        });
+    }
+    match publication {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed no-replace publication of receipt {}",
+                destination.display()
+            )
+        }),
+    }
+}
+
+fn receipt_handoff_sibling_path(destination: &Path, role: &str) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .with_context(|| format!("{} has no parent directory", destination.display()))?;
+    let file_name = destination
+        .file_name()
+        .context("receipt destination has no file name")?
+        .to_string_lossy();
+    let sequence = RECEIPT_HANDOFF_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(parent.join(format!(
+        ".{file_name}.{role}-{}-{sequence}.tmp",
+        std::process::id()
+    )))
+}
+
+fn rename_receipt_no_replace(source: &Path, destination: &Path) -> Result<bool> {
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(true),
+        Err(err) if err == rustix::io::Errno::EXIST => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed no-replace rename {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        }),
+    }
+}
+
+/// Replace an existing receipt only after atomically moving the exact
+/// destination bytes that were inspected out of the authoritative pathname.
+///
+/// If another writer won before the move, its bytes are detected at the
+/// displaced path and restored with a no-replace rename. If another writer
+/// wins during the brief publication gap, its destination is never replaced.
+fn replace_receipt_if_snapshot_unchanged(
+    destination: &Path,
+    expected: &[u8],
+    candidate: &[u8],
+) -> Result<bool> {
+    let displaced = receipt_handoff_sibling_path(destination, "displaced")?;
+    let moved = match rename_receipt_no_replace(destination, &displaced) {
+        Ok(moved) => moved,
+        Err(err)
+            if err
+                .downcast_ref::<rustix::io::Errno>()
+                .is_some_and(|errno| *errno == rustix::io::Errno::NOENT) =>
+        {
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
+    if !moved {
+        bail!(
+            "receipt handoff displacement path unexpectedly exists at {}",
+            displaced.display()
+        );
+    }
+
+    let displaced_bytes = std::fs::read(&displaced).with_context(|| {
+        format!(
+            "failed to read displaced canonical receipt {}",
+            displaced.display()
+        )
+    })?;
+    if displaced_bytes != expected {
+        if !rename_receipt_no_replace(&displaced, destination)? {
+            bail!(
+                "canonical receipt changed concurrently and displaced bytes remain preserved at {} because a newer destination won",
+                displaced.display()
+            );
+        }
+        return Ok(false);
+    }
+
+    if !publish_receipt_if_absent(destination, candidate)? {
+        bail!(
+            "canonical receipt {} was created concurrently while the inspected snapshot remained preserved at {}",
+            destination.display(),
+            displaced.display()
+        );
+    }
+    std::fs::remove_file(&displaced).with_context(|| {
+        format!(
+            "failed to remove replaced canonical receipt snapshot {}",
+            displaced.display()
+        )
+    })?;
+    Ok(true)
+}
+
 pub(crate) fn propagate_lane_receipts(
     lane_repo_root: &Path,
     canonical_root: &Path,
     task_id: &str,
     task_markdown: &str,
 ) -> Result<()> {
+    propagate_lane_receipts_at(
+        lane_repo_root,
+        canonical_root,
+        &canonical_root.join(".auto/parallel"),
+        task_id,
+        task_markdown,
+    )
+}
+
+pub(crate) fn propagate_lane_receipts_at(
+    lane_repo_root: &Path,
+    canonical_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+) -> Result<()> {
+    propagate_lane_receipts_with_observer_at(
+        lane_repo_root,
+        canonical_root,
+        authority_root,
+        task_id,
+        task_markdown,
+        |_| Ok(()),
+    )
+}
+
+fn propagate_lane_receipts_with_observer<F>(
+    lane_repo_root: &Path,
+    canonical_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    observer: F,
+) -> Result<()>
+where
+    F: FnMut(ReceiptHandoffPhase) -> Result<()>,
+{
+    propagate_lane_receipts_with_observer_at(
+        lane_repo_root,
+        canonical_root,
+        &canonical_root.join(".auto/parallel"),
+        task_id,
+        task_markdown,
+        observer,
+    )
+}
+
+fn propagate_lane_receipts_with_observer_at<F>(
+    lane_repo_root: &Path,
+    canonical_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    observer: F,
+) -> Result<()>
+where
+    F: FnMut(ReceiptHandoffPhase) -> Result<()>,
+{
+    let receipt_rel = std::path::PathBuf::from(".auto/symphony/verification-receipts")
+        .join(format!("{task_id}.json"));
+    let src_receipt = lane_repo_root.join(&receipt_rel);
+    let task_receipts_rel = std::path::PathBuf::from(".auto/task-receipts").join(task_id);
+    let src_task_dir = lane_repo_root.join(&task_receipts_rel);
+    if !src_receipt.is_file() && !src_task_dir.is_dir() {
+        return Ok(());
+    }
+
+    // A canonical host verification invokes this seam with the same checkout
+    // as source and destination. Its receipt was already recorded against that
+    // exact source state, so projecting cross-worktree compatibility metadata
+    // would erase native schema fields and manufacture evidence. Resolve
+    // aliases as well as lexical equality and preserve every byte in place.
+    let canonical_lane_root = std::fs::canonicalize(lane_repo_root).with_context(|| {
+        format!(
+            "failed to resolve receipt handoff source root {}",
+            lane_repo_root.display()
+        )
+    })?;
+    let canonical_destination_root = std::fs::canonicalize(canonical_root).with_context(|| {
+        format!(
+            "failed to resolve receipt handoff destination root {}",
+            canonical_root.display()
+        )
+    })?;
+    if canonical_lane_root == canonical_destination_root {
+        return Ok(());
+    }
+
+    let _handoff_lock = acquire_receipt_handoff_lock(authority_root)?;
+    let transaction = arm_canonical_gate_transaction_at(
+        canonical_root,
+        authority_root,
+        task_id,
+        "receipt handoff publication",
+    )?;
+    let operation = propagate_lane_receipts_in_transaction(
+        lane_repo_root,
+        canonical_root,
+        task_id,
+        task_markdown,
+        observer,
+    );
+    let containment = clear_canonical_gate_transaction(canonical_root, &transaction);
+    match (operation, containment) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(containment_error)) => Err(containment_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(containment_error)) => Err(operation_error.context(format!(
+            "receipt handoff also failed canonical gate containment: {containment_error:#}"
+        ))),
+    }
+}
+
+fn propagate_lane_receipts_in_transaction<F>(
+    lane_repo_root: &Path,
+    canonical_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    mut observer: F,
+) -> Result<()>
+where
+    F: FnMut(ReceiptHandoffPhase) -> Result<()>,
+{
     let receipt_rel = std::path::PathBuf::from(".auto/symphony/verification-receipts")
         .join(format!("{task_id}.json"));
     let src_receipt = lane_repo_root.join(&receipt_rel);
     let dst_receipt = canonical_root.join(&receipt_rel);
+    let task_receipts_rel = std::path::PathBuf::from(".auto/task-receipts").join(task_id);
+    let src_task_dir = lane_repo_root.join(&task_receipts_rel);
+
     if src_receipt.is_file() {
-        let canonical_receipt_before = std::fs::read(&dst_receipt).ok();
+        // Lane receipts are repository-owned staging formats. Autodev may only
+        // project the schema-complete historical clean state into them after a
+        // bounded recursive proof establishes that canonical is clean. Never
+        // stamp an autodev-native v2 dirty fingerprint into a foreign schema,
+        // and never refresh a receipt for dirty or unknown source.
+        let source_proof =
+            clean_receipt_handoff_source_state(canonical_root).with_context(|| {
+                format!(
+                    "cannot propagate receipt for `{task_id}` into {}",
+                    dst_receipt.display()
+                )
+            })?;
+        let canonical_receipt_before = read_optional_receipt_bytes(&dst_receipt)?;
         let evidence = inspect_task_completion_evidence(canonical_root, task_id, task_markdown);
         let expected_commands = verification_plan(task_markdown).executable_commands;
         let declared_artifacts = evidence.declared_completion_artifacts;
@@ -2408,14 +3092,6 @@ pub(crate) fn propagate_lane_receipts(
                     )
                 })
             });
-        if let Some(parent) = dst_receipt.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create canonical receipts dir {}",
-                    parent.display()
-                )
-            })?;
-        }
         // Read the lane's receipt, rewrite the `commit` and `dirty_state`
         // fields to match canonical HEAD before writing to canonical. The
         // lane worker recorded its own local commit SHA in the receipt,
@@ -2435,20 +3111,21 @@ pub(crate) fn propagate_lane_receipts(
                 src_receipt.display()
             )
         })?;
-        if let Ok(canonical_commit) = git_stdout(canonical_root, ["rev-parse", "HEAD"]) {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "commit".to_string(),
-                    serde_json::Value::String(canonical_commit.trim().to_string()),
-                );
-            }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "commit".to_string(),
+                serde_json::Value::String(source_proof.commit.clone()),
+            );
         }
-        if let Some(fp) = current_dirty_state_fingerprint(canonical_root) {
-            if let Some(obj) = value.as_object_mut() {
-                let mut dirty = serde_json::Map::new();
-                dirty.insert("fingerprint".to_string(), serde_json::Value::String(fp));
-                obj.insert("dirty_state".to_string(), serde_json::Value::Object(dirty));
-            }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "dirty_state".to_string(),
+                serde_json::json!({
+                    "status": "clean",
+                    "fingerprint": source_proof.legacy_dirty_fingerprint(),
+                    "entries": [],
+                }),
+            );
         }
         // Refresh `plan_hash` to canonical's current IMPLEMENTATION_PLAN.md, the
         // same way `commit` and `dirty_state` are refreshed above. The host
@@ -2462,14 +3139,11 @@ pub(crate) fn propagate_lane_receipts(
         // (not its statuses) changed between worker verification and landing.
         // Genuine spec drift is still caught by the declared-artifact hash
         // checks, the verification-command checks, and the diff-review gate.
-        if let Ok(plan_bytes) = std::fs::read(canonical_root.join("IMPLEMENTATION_PLAN.md")) {
-            let plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(&plan_bytes);
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "plan_hash".to_string(),
-                    serde_json::Value::String(plan_hash),
-                );
-            }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "plan_hash".to_string(),
+                serde_json::Value::String(source_proof.normalized_plan_hash.clone()),
+            );
         }
         let pretty = serde_json::to_string_pretty(&value)
             .context("failed to re-serialize symphony receipt for canonical write")?;
@@ -2486,18 +3160,108 @@ pub(crate) fn propagate_lane_receipts(
                 "warning: refusing to replace valid canonical receipt for `{task_id}` with degraded lane evidence: {}",
                 candidate_problem.unwrap_or_default()
             );
+        } else if let Some(problem) = candidate_problem {
+            bail!(
+                "refusing to publish invalid lane receipt for `{task_id}` into {}: {problem}",
+                dst_receipt.display()
+            );
         } else {
-            atomic_write(&dst_receipt, candidate.as_bytes()).with_context(|| {
+            // Repeat the full recursive proof and bind publication to the
+            // original HEAD and source-state identity.
+            revalidate_clean_receipt_handoff_source_state(canonical_root, &source_proof)
+                .with_context(|| {
+                    format!(
+                        "canonical source changed before receipt handoff for `{task_id}` into {}",
+                        dst_receipt.display()
+                    )
+                })?;
+            observer(ReceiptHandoffPhase::SourceRevalidatedBeforePublication)?;
+
+            match canonical_receipt_before.as_deref() {
+                Some(previous) => {
+                    let current =
+                        read_optional_receipt_bytes(&dst_receipt)?.with_context(|| {
+                            format!(
+                                "canonical receipt {} disappeared during handoff",
+                                dst_receipt.display()
+                            )
+                        })?;
+                    if current != previous {
+                        bail!(
+                            "canonical receipt {} changed concurrently during handoff",
+                            dst_receipt.display()
+                        );
+                    }
+                    if current != candidate.as_bytes() {
+                        observer(ReceiptHandoffPhase::DestinationComparedBeforeReplacement)?;
+                        if !replace_receipt_if_snapshot_unchanged(
+                            &dst_receipt,
+                            previous,
+                            candidate.as_bytes(),
+                        )? {
+                            bail!(
+                                "canonical receipt {} changed concurrently before CAS replacement",
+                                dst_receipt.display()
+                            );
+                        }
+                        observer(ReceiptHandoffPhase::PublishedBeforeValidation)?;
+                    }
+                }
+                None => {
+                    if !publish_receipt_if_absent(&dst_receipt, candidate.as_bytes())? {
+                        bail!(
+                            "canonical receipt {} was created concurrently during no-replace publication",
+                            dst_receipt.display()
+                        );
+                    }
+                    observer(ReceiptHandoffPhase::PublishedBeforeValidation)?;
+                }
+            }
+
+            // Publication itself does not mint authority. Re-prove the source,
+            // re-read the destination bytes, and run the receipt validator over
+            // those exact published bytes before returning to the completion
+            // transition.
+            revalidate_clean_receipt_handoff_source_state(canonical_root, &source_proof)
+                .with_context(|| {
+                    format!(
+                        "canonical source changed after receipt publication for `{task_id}` into {}",
+                        dst_receipt.display()
+                    )
+                })?;
+            let published = read_optional_receipt_bytes(&dst_receipt)?.with_context(|| {
                 format!(
-                    "failed to write canonical symphony receipt {}",
+                    "published canonical receipt {} disappeared before validation",
                     dst_receipt.display()
                 )
             })?;
+            if published != candidate.as_bytes() {
+                bail!(
+                    "published canonical receipt {} changed before validation",
+                    dst_receipt.display()
+                );
+            }
+            let published_text = std::str::from_utf8(&published).with_context(|| {
+                format!(
+                    "published canonical receipt {} was not UTF-8",
+                    dst_receipt.display()
+                )
+            })?;
+            if let Some(problem) = direct_verification_receipt_problem(
+                canonical_root,
+                &dst_receipt,
+                published_text,
+                &expected_commands,
+                &declared_artifacts,
+            )? {
+                bail!(
+                    "published canonical receipt {} failed validation: {problem}",
+                    dst_receipt.display()
+                );
+            }
         }
     }
 
-    let task_receipts_rel = std::path::PathBuf::from(".auto/task-receipts").join(task_id);
-    let src_task_dir = lane_repo_root.join(&task_receipts_rel);
     let dst_task_dir = canonical_root.join(&task_receipts_rel);
     if src_task_dir.is_dir() {
         std::fs::create_dir_all(&dst_task_dir).with_context(|| {
@@ -2517,28 +3281,77 @@ pub(crate) fn propagate_lane_receipts(
             if !file_type.is_file() {
                 continue;
             }
+            let source = entry.path();
+            let bytes = std::fs::read(&source).with_context(|| {
+                format!("failed to read lane task-receipt {}", source.display())
+            })?;
             let dst = dst_task_dir.join(entry.file_name());
-            if dst.exists() {
+            if !publish_receipt_if_absent(&dst, &bytes)? {
                 continue;
             }
-            std::fs::copy(entry.path(), &dst).with_context(|| {
-                format!(
-                    "failed to copy lane task-receipt {} -> {}",
-                    entry.path().display(),
+            let published = read_optional_receipt_bytes(&dst)?
+                .with_context(|| format!("published task receipt {} disappeared", dst.display()))?;
+            if published != bytes {
+                bail!(
+                    "published task receipt {} changed before validation",
                     dst.display()
-                )
-            })?;
+                );
+            }
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn reconcile_parallel_clean_no_commit(
     repo_root: &Path,
     target_branch: &str,
     assignment: &mut ActiveLaneAssignment,
     parallel_logger: &ParallelEventLogger,
     review_config: &LaneReviewConfig,
+) -> Result<bool> {
+    let host_cargo_env = HostCargoEnv::default();
+    reconcile_parallel_clean_no_commit_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        assignment,
+        parallel_logger,
+        review_config,
+        &host_cargo_env,
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_parallel_clean_no_commit_with_env(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &mut ActiveLaneAssignment,
+    parallel_logger: &ParallelEventLogger,
+    review_config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
+) -> Result<bool> {
+    reconcile_parallel_clean_no_commit_at(
+        repo_root,
+        &parallel_logger.run_root(),
+        target_branch,
+        assignment,
+        parallel_logger,
+        review_config,
+        host_cargo_env,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_parallel_clean_no_commit_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    assignment: &mut ActiveLaneAssignment,
+    parallel_logger: &ParallelEventLogger,
+    review_config: &LaneReviewConfig,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<bool> {
     write_clean_no_commit_verdict(
         assignment,
@@ -2549,7 +3362,7 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     // liveness barrier: a concurrent canonical fix may already have resolved
     // the finding. Preserve the hold while re-running every current-tree gate;
     // only the complete gate pipeline may clear it.
-    if task_is_gate_held(repo_root, &assignment.task.id)? {
+    if task_is_gate_held_at(repo_root, authority_root, &assignment.task.id)? {
         parallel_logger.info(format!(
             "clean-no-commit: lane-{} `{}` is gate-held; starting full current-tree revalidation",
             assignment.lane_index, assignment.task.id
@@ -2561,9 +3374,10 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
             "clean-no-commit: existing gate hold retained while full revalidation runs",
         );
     }
-    propagate_lane_receipts(
+    propagate_lane_receipts_at(
         &assignment.lane_repo_root,
         repo_root,
+        authority_root,
         &assignment.task.id,
         &assignment.task.markdown,
     )?;
@@ -2608,18 +3422,21 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     let mut completion_status = LoopTaskStatus::Done;
     completion_status = apply_definition_of_done_gates(
         repo_root,
+        authority_root,
         target_branch,
         assignment,
         &[],
         None,
         completion_status,
         review_config,
+        host_cargo_env,
     )
     .await?;
 
     if completion_status != LoopTaskStatus::Done {
-        let hold_reason = std::fs::read_to_string(gate_hold_path(repo_root, &assignment.task.id))
-            .unwrap_or_else(|_| "a definition-of-done gate did not pass".to_string());
+        let hold_reason =
+            std::fs::read_to_string(gate_hold_path_at(authority_root, &assignment.task.id))
+                .unwrap_or_else(|_| "a definition-of-done gate did not pass".to_string());
         let review_marker = format!("## `{}`:", assignment.task.id);
         let review_detail = std::fs::read_to_string(repo_root.join("REVIEW.md"))
             .ok()
@@ -2643,9 +3460,10 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     // metadata after all gates, then require the ordinary evidence inspector
     // to accept it. A direct command pass without a wrapper/receipt is not
     // durable completion authority.
-    propagate_lane_receipts(
+    propagate_lane_receipts_at(
         repo_root,
         repo_root,
+        authority_root,
         &assignment.task.id,
         &assignment.task.markdown,
     )?;
@@ -2654,8 +3472,9 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     if !final_evidence.is_fully_evidenced() {
         let missing = final_evidence.missing_reasons().join("; ");
         let reason = format!("post-gate completion evidence is not fresh and durable: {missing}");
-        let demoted = apply_lane_verify_outcome(
+        let demoted = apply_lane_verify_outcome_at(
             repo_root,
+            authority_root,
             assignment,
             LoopTaskStatus::Done,
             LaneVerifyOutcome::Skipped {
@@ -2671,8 +3490,8 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
         return Ok(false);
     }
 
-    record_gate_hold(
-        repo_root,
+    record_gate_hold_at(
+        authority_root,
         &assignment.task.id,
         "all gates passed; durable closeout commit is still pending",
     )?;
@@ -2726,8 +3545,9 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
                 false,
             )
         };
-        commit_task_closeout(
+        commit_task_closeout_at(
             repo_root,
+            authority_root,
             &assignment.task.id,
             LoopTaskStatus::Done,
             &message,
@@ -2736,7 +3556,7 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     })();
     if let Err(err) = closeout_result {
         let reason = format!("durable clean-no-commit closeout failed: {err:#}");
-        record_gate_hold(repo_root, &assignment.task.id, &reason)?;
+        record_gate_hold_at(authority_root, &assignment.task.id, &reason)?;
         persist_failed_gate_demotion(
             repo_root,
             assignment,
@@ -2756,7 +3576,7 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
         ));
         return Ok(false);
     }
-    clear_gate_hold(repo_root, &assignment.task.id)?;
+    clear_gate_hold_at(authority_root, &assignment.task.id)?;
 
     write_clean_no_commit_verdict(
         assignment,
@@ -2780,13 +3600,25 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
 /// silently undoing the demotion. The hold blocks evidence-only promotion until
 /// the task lands cleanly through the full pipeline (which clears it).
 fn gate_hold_path(repo_root: &Path, task_id: &str) -> PathBuf {
-    repo_root
-        .join(".auto/parallel/gate-holds")
+    gate_hold_path_at(&repo_root.join(".auto/parallel"), task_id)
+}
+
+fn gate_hold_path_at(authority_root: &Path, task_id: &str) -> PathBuf {
+    authority_root
+        .join("gate-holds")
         .join(format!("{task_id}.hold"))
 }
 
 pub(crate) fn record_gate_hold(repo_root: &Path, task_id: &str, reason: &str) -> Result<()> {
-    let path = gate_hold_path(repo_root, task_id);
+    record_gate_hold_at(&repo_root.join(".auto/parallel"), task_id, reason)
+}
+
+pub(crate) fn record_gate_hold_at(
+    authority_root: &Path,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let path = gate_hold_path_at(authority_root, task_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating gate-hold directory for `{task_id}`"))?;
@@ -2796,7 +3628,11 @@ pub(crate) fn record_gate_hold(repo_root: &Path, task_id: &str, reason: &str) ->
 }
 
 pub(crate) fn clear_gate_hold(repo_root: &Path, task_id: &str) -> Result<()> {
-    let path = gate_hold_path(repo_root, task_id);
+    clear_gate_hold_at(&repo_root.join(".auto/parallel"), task_id)
+}
+
+pub(crate) fn clear_gate_hold_at(authority_root: &Path, task_id: &str) -> Result<()> {
+    let path = gate_hold_path_at(authority_root, task_id);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2805,7 +3641,15 @@ pub(crate) fn clear_gate_hold(repo_root: &Path, task_id: &str) -> Result<()> {
 }
 
 pub(crate) fn task_is_gate_held(repo_root: &Path, task_id: &str) -> Result<bool> {
-    Ok(gate_held_task_ids(repo_root)?.contains(task_id))
+    task_is_gate_held_at(repo_root, &repo_root.join(".auto/parallel"), task_id)
+}
+
+pub(crate) fn task_is_gate_held_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+) -> Result<bool> {
+    Ok(gate_held_task_ids_at(repo_root, authority_root)?.contains(task_id))
 }
 
 /// Task ids currently carrying a durable gate hold. A gate hold is recorded only
@@ -2815,7 +3659,14 @@ pub(crate) fn task_is_gate_held(repo_root: &Path, task_id: &str) -> Result<bool>
 /// the dependency block. Any unreadable hold/review state returns an error;
 /// callers must abort scheduling rather than treating unknown state as clear.
 pub(crate) fn gate_held_task_ids(repo_root: &Path) -> Result<BTreeSet<String>> {
-    let dir = repo_root.join(".auto/parallel/gate-holds");
+    gate_held_task_ids_at(repo_root, &repo_root.join(".auto/parallel"))
+}
+
+pub(crate) fn gate_held_task_ids_at(
+    repo_root: &Path,
+    authority_root: &Path,
+) -> Result<BTreeSet<String>> {
+    let dir = authority_root.join("gate-holds");
     let mut held = BTreeSet::new();
     match std::fs::read_dir(&dir) {
         Ok(entries) => {
@@ -2879,9 +3730,23 @@ pub(crate) fn promote_task_from_canonical_evidence_no_push(
     task_id: &str,
     markdown: &str,
 ) -> Result<bool> {
+    promote_task_from_canonical_evidence_no_push_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        task_id,
+        markdown,
+    )
+}
+
+pub(crate) fn promote_task_from_canonical_evidence_no_push_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    markdown: &str,
+) -> Result<bool> {
     // A task a host gate demoted must NOT be promoted from its (still-present)
     // stale evidence — it has to be re-worked and re-verified first.
-    if task_is_gate_held(repo_root, task_id)? {
+    if task_is_gate_held_at(repo_root, authority_root, task_id)? {
         return Ok(false);
     }
     let evidence = inspect_task_completion_evidence(repo_root, task_id, markdown);
@@ -2903,7 +3768,30 @@ pub(crate) fn try_promote_partial_before_dispatch(
     markdown: &str,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<bool> {
-    if !promote_task_from_canonical_evidence_no_push(repo_root, task_id, markdown)? {
+    try_promote_partial_before_dispatch_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        task_id,
+        markdown,
+        parallel_logger,
+    )
+}
+
+pub(crate) fn try_promote_partial_before_dispatch_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    task_id: &str,
+    markdown: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<bool> {
+    if !promote_task_from_canonical_evidence_no_push_at(
+        repo_root,
+        authority_root,
+        task_id,
+        markdown,
+    )? {
         return Ok(false);
     }
     if push_branch_with_remote_sync(repo_root, target_branch)? {
@@ -2925,9 +3813,30 @@ pub(crate) fn recover_shelved_tasks_from_canonical_evidence(
     shelved_tasks: &mut BTreeMap<String, String>,
     parallel_logger: &ParallelEventLogger,
 ) -> Result<usize> {
+    recover_shelved_tasks_from_canonical_evidence_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        target_branch,
+        shelved_tasks,
+        parallel_logger,
+    )
+}
+
+pub(crate) fn recover_shelved_tasks_from_canonical_evidence_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    target_branch: &str,
+    shelved_tasks: &mut BTreeMap<String, String>,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<usize> {
     let mut recovered = Vec::new();
     for (task_id, markdown) in shelved_tasks.clone() {
-        if promote_task_from_canonical_evidence_no_push(repo_root, &task_id, &markdown)? {
+        if promote_task_from_canonical_evidence_no_push_at(
+            repo_root,
+            authority_root,
+            &task_id,
+            &markdown,
+        )? {
             recovered.push(task_id);
         }
     }
@@ -2956,10 +3865,27 @@ pub(crate) fn recover_shelved_tasks_from_canonical_evidence(
 /// tasks were not rejected by a completion gate, so a passing host re-execution
 /// at the current canonical HEAD is sufficient to remove the stale scheduling
 /// poison. Conflict and legacy/gate-failure shelves are deliberately ignored.
+#[cfg(test)]
 pub(crate) async fn auto_unshelve_landing_divergence_tasks(
     repo_root: &Path,
     state: &mut ParallelRunState,
     parallel_logger: &ParallelEventLogger,
+) -> usize {
+    let host_cargo_env = HostCargoEnv::default();
+    auto_unshelve_landing_divergence_tasks_with_env(
+        repo_root,
+        state,
+        parallel_logger,
+        &host_cargo_env,
+    )
+    .await
+}
+
+pub(crate) async fn auto_unshelve_landing_divergence_tasks_with_env(
+    repo_root: &Path,
+    state: &mut ParallelRunState,
+    parallel_logger: &ParallelEventLogger,
+    host_cargo_env: &HostCargoEnv,
 ) -> usize {
     let candidates = state
         .shelved_tasks
@@ -2980,10 +3906,12 @@ pub(crate) async fn auto_unshelve_landing_divergence_tasks(
         ));
         match run_guarded_lane_verify_gate(
             repo_root,
+            &parallel_logger.run_root(),
             &task_id,
             &markdown,
             "landing-divergence unshelve reverify",
             false,
+            host_cargo_env,
         )
         .await
         {
@@ -3092,7 +4020,25 @@ pub(crate) fn commit_task_closeout(
     message: &str,
     allow_empty: bool,
 ) -> Result<()> {
-    enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    commit_task_closeout_at(
+        repo_root,
+        &repo_root.join(".auto/parallel"),
+        task_id,
+        expected_status,
+        message,
+        allow_empty,
+    )
+}
+
+pub(crate) fn commit_task_closeout_at(
+    repo_root: &Path,
+    authority_root: &Path,
+    task_id: &str,
+    expected_status: LoopTaskStatus,
+    message: &str,
+    allow_empty: bool,
+) -> Result<()> {
+    enforce_review_input_quarantine_before_dispatch_at(repo_root, authority_root)?;
     require_task_status_persisted(repo_root, task_id, expected_status)?;
     if expected_status == LoopTaskStatus::Done {
         refuse_unsealed_task_completion_transitions_except(repo_root, task_id)?;
@@ -3106,7 +4052,7 @@ pub(crate) fn commit_task_closeout(
             capture_validated_task_closeout_tree(repo_root, task_id, &queue_files, allow_empty)
         })
         .transpose()?;
-    let footer = verification_receipt_commit_footer(repo_root, task_id)?;
+    let footer = verification_receipt_commit_footer_at(repo_root, authority_root, task_id)?;
     if expected_status == LoopTaskStatus::Done && footer.is_none() {
         bail!(
             "refusing Done closeout for `{task_id}` without a durable verification receipt footer"
@@ -3441,6 +4387,7 @@ pub(crate) fn try_auto_checkpoint_canonical_for_landing(
 
 #[cfg(test)]
 mod tests {
+    use super::{propagate_lane_receipts_with_observer, ReceiptHandoffPhase};
     use crate::parallel_command::*;
     use anyhow::anyhow;
     use std::os::unix::fs::PermissionsExt;
@@ -3750,6 +4697,91 @@ Current-tree verification failed.\n",
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn bind_fixture_receipt_to_current_source(repo: &Path, task_id: &str) {
+        let path = repo
+            .join(".auto/symphony/verification-receipts")
+            .join(format!("{task_id}.json"));
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read fixture verification receipt"))
+                .expect("parse fixture verification receipt");
+        let object = receipt
+            .as_object_mut()
+            .expect("fixture verification receipt must be an object");
+        let commit = git_output(&repo.to_path_buf(), ["rev-parse", "HEAD"]);
+        let dirty_state = crate::completion_artifacts::current_dirty_state_fingerprint(repo)
+            .expect("fingerprint fixture source state");
+        let plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(
+            &fs::read(repo.join("IMPLEMENTATION_PLAN.md")).expect("read fixture plan"),
+        );
+        object.insert("commit".to_string(), serde_json::Value::String(commit));
+        object.insert(
+            "dirty_state".to_string(),
+            serde_json::json!({"fingerprint": dirty_state}),
+        );
+        object.insert(
+            "plan_hash".to_string(),
+            serde_json::Value::String(plan_hash),
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&receipt).expect("serialize bound fixture receipt"),
+        )
+        .expect("write bound fixture receipt");
+    }
+
+    fn repository_verification_wrapper() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/run-task-verification.sh")
+    }
+
+    fn install_env_recording_verification_wrapper(repo: &Path, marker: &str) -> PathBuf {
+        let scripts = repo.join("scripts");
+        fs::create_dir_all(&scripts).expect("create scripts dir");
+        let wrapper = scripts.join("run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n\
+set -eu\n\
+mkdir -p .auto\n\
+printf '%s\\n%s\\n' \"${{CARGO_TARGET_DIR-}}\" \"${{CARGO_BUILD_JOBS-}}\" > \".auto/{marker}\"\n\
+exec \"{}\" \"$@\"\n",
+                repository_verification_wrapper().display()
+            ),
+        )
+        .expect("write environment-recording verification wrapper");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("stat environment-recording verification wrapper")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions)
+            .expect("chmod environment-recording verification wrapper");
+        wrapper
+    }
+
+    fn selected_host_cargo_env(repo: &Path, jobs: &str) -> (HostCargoEnv, PathBuf) {
+        let target = repo.join("selected-host-cargo-target");
+        (
+            HostCargoEnv::from_vars(vec![
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    target.to_string_lossy().into_owned(),
+                ),
+                ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),
+            ]),
+            target,
+        )
+    }
+
+    fn assert_recorded_host_cargo_env(repo: &Path, marker: &str, target: &Path, jobs: &str) {
+        let recorded = fs::read_to_string(repo.join(".auto").join(marker))
+            .expect("read host Cargo env marker");
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            vec![target.to_string_lossy().as_ref(), jobs],
+            "host orchestration path must preserve the selected Cargo target and job bound"
+        );
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3823,6 +4855,7 @@ Current-tree verification failed.\n",
         let receipt_dir = lane.join(".auto/symphony/verification-receipts");
         fs::create_dir_all(&receipt_dir).expect("failed to create lane receipt dir");
         let stale = serde_json::json!({
+            "task_id": "TASK-1",
             "commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "plan_hash": sha256_hex_local(b"# Plan\n- [ ] `TASK-1` not yet\n"),
             "dirty_state": { "fingerprint": "stale" },
@@ -3862,6 +4895,474 @@ Current-tree verification failed.\n",
     }
 
     #[test]
+    fn propagate_lane_receipts_same_checkout_preserves_receipt_bytes() {
+        let root = unique_temp_dir("parallel-propagate-same-checkout");
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n- [ ] `TASK-SAME` preserve native receipt\n",
+        )
+        .expect("write plan");
+        git_ok(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&repo, ["commit", "-m", "seed plan"]);
+
+        let receipt = repo.join(".auto/symphony/verification-receipts/TASK-SAME.json");
+        fs::create_dir_all(receipt.parent().expect("receipt parent"))
+            .expect("create receipt directory");
+        let native_bytes = b"{\"schema\":\"native.v2\",\"dirty_state\":{\"status\":\"clean\",\"fingerprint\":\"native\",\"entries\":[]},\"commands\":[]}\n";
+        fs::write(&receipt, native_bytes).expect("write native receipt");
+
+        propagate_lane_receipts(
+            &repo,
+            &repo,
+            "TASK-SAME",
+            "- [ ] `TASK-SAME` preserve native receipt\n",
+        )
+        .expect("same-root propagation should be a no-op");
+        assert_eq!(
+            fs::read(&receipt).expect("read same-root receipt"),
+            native_bytes,
+            "same-root propagation must preserve native receipt bytes"
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = root.join("repo-alias");
+            std::os::unix::fs::symlink(&repo, &alias).expect("create checkout alias");
+            propagate_lane_receipts(
+                &alias,
+                &repo,
+                "TASK-SAME",
+                "- [ ] `TASK-SAME` preserve native receipt\n",
+            )
+            .expect("canonical-equivalent roots should be a no-op");
+            assert_eq!(
+                fs::read(&receipt).expect("read aliased same-root receipt"),
+                native_bytes,
+                "canonical-equivalent roots must preserve native receipt bytes"
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    fn receipt_handoff_race_fixture(
+        label: &str,
+        task_id: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = unique_temp_dir(label);
+        let lane = root.join("lane");
+        let canonical = root.join("canonical");
+        init_git_repo(&lane);
+        init_git_repo(&canonical);
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n- [ ] `{task_id}` receipt handoff race\n"),
+        )
+        .expect("write canonical plan");
+        fs::write(canonical.join("source.txt"), "stable canonical source\n")
+            .expect("write canonical source");
+        git_ok(&canonical, ["add", "."]);
+        git_ok(&canonical, ["commit", "-m", "seed canonical source"]);
+
+        let lane_receipt_dir = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&lane_receipt_dir).expect("create lane receipt directory");
+        fs::write(
+            lane_receipt_dir.join(format!("{task_id}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "task_id": task_id,
+                "commit": "1111111111111111111111111111111111111111",
+                "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "dirty_state": {
+                    "status": "clean",
+                    "fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "entries": [],
+                },
+                "commands": [],
+                "declared_artifacts": [],
+            }))
+            .expect("serialize lane receipt"),
+        )
+        .expect("write lane receipt");
+        let destination = canonical
+            .join(".auto/symphony/verification-receipts")
+            .join(format!("{task_id}.json"));
+        (root, lane, canonical, destination)
+    }
+
+    #[test]
+    fn propagate_lane_receipts_rejects_concurrent_destination_mutation() {
+        let task_id = "TASK-DEST-RACE";
+        let (root, lane, canonical, destination) =
+            receipt_handoff_race_fixture("parallel-propagate-destination-race", task_id);
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("create destination directory");
+        fs::write(&destination, b"{\"stale\":\"invalid receipt\"}\n")
+            .expect("write stale canonical receipt");
+        let sentinel = b"{\"native\":\"concurrent canonical evidence\"}\n";
+
+        let error = propagate_lane_receipts_with_observer(
+            &lane,
+            &canonical,
+            task_id,
+            "- [ ] `TASK-DEST-RACE` receipt handoff race\n",
+            |phase| {
+                if phase == ReceiptHandoffPhase::DestinationComparedBeforeReplacement {
+                    crate::util::atomic_write(&destination, sentinel)?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a concurrently-created destination must win without being overwritten");
+        assert!(
+            format!("{error:#}").contains("concurrent") || format!("{error:#}").contains("changed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read concurrent destination"),
+            sentinel,
+            "destination-CAS failure must preserve concurrent canonical evidence byte-for-byte"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_replaces_unchanged_invalid_destination_snapshot() {
+        let task_id = "TASK-STALE-REPAIR";
+        let (root, lane, canonical, destination) =
+            receipt_handoff_race_fixture("parallel-propagate-stale-repair", task_id);
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("create destination directory");
+        let stale = b"{\"dirty_state\":{\"status\":\"malformed\"}}\n";
+        fs::write(&destination, stale).expect("write stale canonical receipt");
+
+        propagate_lane_receipts(
+            &lane,
+            &canonical,
+            task_id,
+            "- [ ] `TASK-STALE-REPAIR` receipt handoff race\n",
+        )
+        .expect("an unchanged invalid destination snapshot should be repaired");
+        let repaired = fs::read(&destination).expect("read repaired receipt");
+        assert_ne!(repaired, stale, "stale bytes must be replaced");
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&repaired).expect("parse repaired receipt");
+        assert_eq!(repaired["task_id"], task_id);
+        assert_eq!(
+            repaired["dirty_state"],
+            serde_json::json!({
+                "status": "clean",
+                "fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "entries": [],
+            }),
+            "stale repair must preserve the exact clean schema tuple"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_rejects_source_mutation_after_publication() {
+        let task_id = "TASK-SOURCE-RACE";
+        let (root, lane, canonical, destination) =
+            receipt_handoff_race_fixture("parallel-propagate-source-race", task_id);
+
+        let error = propagate_lane_receipts_with_observer(
+            &lane,
+            &canonical,
+            task_id,
+            "- [ ] `TASK-SOURCE-RACE` receipt handoff race\n",
+            |phase| {
+                if phase == ReceiptHandoffPhase::PublishedBeforeValidation {
+                    fs::write(canonical.join("source.txt"), "mutated after publication\n")?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("source mutation after the pre-publication proof must reject the handoff");
+        assert!(
+            format!("{error:#}").contains("source")
+                && (format!("{error:#}").contains("changed")
+                    || format!("{error:#}").contains("dirty")),
+            "{error:#}"
+        );
+        assert!(
+            destination.exists(),
+            "the race may leave staging bytes, but the failed handoff must withhold authority"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_validates_published_bytes_without_clobbering_replacement() {
+        let task_id = "TASK-BYTES-RACE";
+        let (root, lane, canonical, destination) =
+            receipt_handoff_race_fixture("parallel-propagate-bytes-race", task_id);
+        let sentinel = b"{\"native\":\"replacement after publication\"}\n";
+
+        let error = propagate_lane_receipts_with_observer(
+            &lane,
+            &canonical,
+            task_id,
+            "- [ ] `TASK-BYTES-RACE` receipt handoff race\n",
+            |phase| {
+                if phase == ReceiptHandoffPhase::PublishedBeforeValidation {
+                    crate::util::atomic_write(&destination, sentinel)?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("published bytes must be re-read and validated before returning authority");
+        assert!(
+            format!("{error:#}").contains("published") || format!("{error:#}").contains("changed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read replacement destination"),
+            sentinel,
+            "post-publication validation must not clobber a concurrent canonical replacement"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_emits_schema_valid_clean_projection_for_strict_receipt() {
+        const LEGACY_CLEAN_FINGERPRINT: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let root = unique_temp_dir("parallel-propagate-foreign-clean");
+        let lane = root.join("lane");
+        let canonical = root.join("canonical");
+        init_git_repo(&lane);
+        init_git_repo(&canonical);
+
+        let canonical_plan = "# Plan\n- [ ] `TASK-STRICT` strict receipt handoff\n";
+        fs::write(canonical.join("IMPLEMENTATION_PLAN.md"), canonical_plan)
+            .expect("write canonical plan");
+        git_ok(&canonical, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(&canonical, ["commit", "-m", "seed canonical plan"]);
+
+        // Host-owned queue churn is intentionally excluded from the bounded
+        // source-only dirty snapshot and must not prevent a clean handoff.
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            canonical_plan.replace("[ ]", "[~]"),
+        )
+        .expect("mutate host queue only");
+        fs::write(
+            canonical.join("REVIEW.md"),
+            "# REVIEW\n\nhost queue churn\n",
+        )
+        .expect("write host review churn");
+
+        let native_dirty_state = serde_json::json!({
+            "status": "clean",
+            "fingerprint": LEGACY_CLEAN_FINGERPRINT,
+            "entries": [],
+        });
+        let source_before = serde_json::json!({
+            "commit": "1111111111111111111111111111111111111111",
+            "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dirty_state": native_dirty_state.clone(),
+        });
+        let source_after = serde_json::json!({
+            "commit": "1111111111111111111111111111111111111111",
+            "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dirty_state": native_dirty_state,
+        });
+        let receipt_dir = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("create lane receipt dir");
+        let strict_receipt = serde_json::json!({
+            "schema": "mm.task-verification-receipt.v2",
+            "schema_version": 2,
+            "task_id": "TASK-STRICT",
+            "plan_path": "IMPLEMENTATION_PLAN.md",
+            "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "commit": "1111111111111111111111111111111111111111",
+            "dirty_state": {
+                "status": "clean",
+                "fingerprint": LEGACY_CLEAN_FINGERPRINT,
+                "entries": [],
+            },
+            "declared_artifacts": [],
+            "recorded_at": "2026-07-24T00:00:00Z",
+            "commands": [{
+                "command": "cargo test strict_receipt",
+                "argv": ["cargo", "test", "strict_receipt"],
+                "argv_sha256": "60b2765bdc99b1a4a05e01bbb8b1e081aac0ea9573c4dcf495e02dd5e2bbb44e",
+                "expected_argv": ["cargo", "test", "strict_receipt"],
+                "source_before": source_before.clone(),
+                "source_after": source_after.clone(),
+                "started_at": "2026-07-24T00:00:00Z",
+                "ended_at": "2026-07-24T00:00:01Z",
+                "started_monotonic_ns": 1,
+                "ended_monotonic_ns": 1_000_000_001u64,
+                "duration_ms": 1_000,
+                "exit_code": 0,
+                "output_summary": {
+                    "stdout_tail": "",
+                    "stdout_bytes": 0,
+                    "stdout_truncated": false,
+                    "stderr_tail": "",
+                    "stderr_bytes": 0,
+                    "stderr_truncated": false,
+                    "redaction_version": 1,
+                },
+                "recorded_at": "2026-07-24T00:00:01Z",
+                "status": "passed",
+                "artifacts": [],
+            }],
+        });
+        fs::write(
+            receipt_dir.join("TASK-STRICT.json"),
+            serde_json::to_string_pretty(&strict_receipt).expect("serialize strict receipt"),
+        )
+        .expect("write strict lane receipt");
+
+        propagate_lane_receipts(
+            &lane,
+            &canonical,
+            "TASK-STRICT",
+            "- [~] `TASK-STRICT` strict receipt handoff\n\
+Verification: `cargo test strict_receipt`\n",
+        )
+        .expect("clean foreign receipt should propagate");
+
+        let propagated: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                canonical.join(".auto/symphony/verification-receipts/TASK-STRICT.json"),
+            )
+            .expect("read propagated strict receipt"),
+        )
+        .expect("parse propagated strict receipt");
+        assert_eq!(
+            propagated["dirty_state"],
+            serde_json::json!({
+                "status": "clean",
+                "fingerprint": LEGACY_CLEAN_FINGERPRINT,
+                "entries": [],
+            }),
+            "the cross-worktree handoff must satisfy the strict v2 dirty-state contract"
+        );
+        assert_eq!(
+            propagated["commands"][0]["source_before"], source_before,
+            "autodev must not rewrite nested foreign source metadata"
+        );
+        assert_eq!(
+            propagated["commands"][0]["source_after"], source_after,
+            "autodev must not rewrite nested foreign source metadata"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_refuses_dirty_source_without_touching_destination() {
+        let root = unique_temp_dir("parallel-propagate-dirty-refusal");
+        let lane = root.join("lane");
+        let canonical = root.join("canonical");
+        init_git_repo(&lane);
+        init_git_repo(&canonical);
+
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n- [ ] `TASK-DIRTY` dirty refusal\n",
+        )
+        .expect("write plan");
+        fs::write(canonical.join("source.txt"), "committed\n").expect("write source");
+        git_ok(&canonical, ["add", "."]);
+        git_ok(&canonical, ["commit", "-m", "seed canonical source"]);
+        fs::write(canonical.join("source.txt"), "substantively dirty\n")
+            .expect("dirty tracked source");
+
+        let lane_receipt_dir = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&lane_receipt_dir).expect("create lane receipt dir");
+        fs::write(
+            lane_receipt_dir.join("TASK-DIRTY.json"),
+            r#"{"task_id":"TASK-DIRTY","commands":[]}"#,
+        )
+        .expect("write lane receipt");
+
+        let destination = canonical.join(".auto/symphony/verification-receipts/TASK-DIRTY.json");
+        let error = propagate_lane_receipts(
+            &lane,
+            &canonical,
+            "TASK-DIRTY",
+            "- [ ] `TASK-DIRTY` dirty refusal\n",
+        )
+        .expect_err("substantive source dirt must withhold the handoff");
+        assert!(
+            format!("{error:#}").contains("dirty"),
+            "refusal must explain the dirty source state: {error:#}"
+        );
+        assert!(
+            !destination.exists(),
+            "refusal must not create a destination receipt"
+        );
+
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("create existing destination dir");
+        let sentinel = b"{\"existing\":\"canonical evidence\"}\n";
+        fs::write(&destination, sentinel).expect("write existing canonical receipt");
+        let error = propagate_lane_receipts(
+            &lane,
+            &canonical,
+            "TASK-DIRTY",
+            "- [ ] `TASK-DIRTY` dirty refusal\n",
+        )
+        .expect_err("substantive source dirt must preserve existing evidence");
+        assert!(format!("{error:#}").contains("dirty"), "{error:#}");
+        assert_eq!(
+            fs::read(&destination).expect("read preserved destination"),
+            sentinel,
+            "refusal must leave existing canonical evidence byte-identical"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_collection_failure_does_not_create_destination() {
+        let root = unique_temp_dir("parallel-propagate-collection-failure");
+        let lane = root.join("lane");
+        let canonical = root.join("not-a-git-repository");
+        init_git_repo(&lane);
+        fs::create_dir_all(&canonical).expect("create non-git canonical root");
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n- [ ] `TASK-NOGIT` collection failure\n",
+        )
+        .expect("write plan");
+
+        let lane_receipt_dir = lane.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&lane_receipt_dir).expect("create lane receipt dir");
+        fs::write(
+            lane_receipt_dir.join("TASK-NOGIT.json"),
+            r#"{"task_id":"TASK-NOGIT","commands":[]}"#,
+        )
+        .expect("write lane receipt");
+
+        let destination = canonical.join(".auto/symphony/verification-receipts/TASK-NOGIT.json");
+        propagate_lane_receipts(
+            &lane,
+            &canonical,
+            "TASK-NOGIT",
+            "- [ ] `TASK-NOGIT` collection failure\n",
+        )
+        .expect_err("unknown canonical source state must withhold the handoff");
+        assert!(
+            !destination.exists(),
+            "collection failure must occur before destination creation"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn propagate_lane_receipts_does_not_replace_valid_canonical_evidence_with_degraded_lane_receipt(
     ) {
         let root = unique_temp_dir("parallel-propagate-preserve-valid");
@@ -3895,9 +5396,19 @@ Dependencies: none\n";
 
         let canonical_receipt_dir = canonical.join(".auto/symphony/verification-receipts");
         fs::create_dir_all(&canonical_receipt_dir).expect("create canonical receipt dir");
+        let canonical_head = git_output(&canonical, ["rev-parse", "HEAD"]);
+        let canonical_plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(
+            fs::read(canonical.join("IMPLEMENTATION_PLAN.md"))
+                .expect("read canonical plan")
+                .as_slice(),
+        );
         let canonical_receipt = serde_json::json!({
             "task_id": "TASK-1",
-            "commit": "stale-before-host-refresh",
+            "commit": canonical_head,
+            "dirty_state": {
+                "fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "plan_hash": canonical_plan_hash,
             "commands": [{
                 "command": "cargo test -p demo task_1",
                 "argv": ["cargo", "test", "-p", "demo", "task_1"],
@@ -3912,8 +5423,6 @@ Dependencies: none\n";
             serde_json::to_string_pretty(&canonical_receipt).expect("serialize canonical receipt"),
         )
         .expect("write canonical receipt");
-        propagate_lane_receipts(&canonical, &canonical, "TASK-1", task_markdown)
-            .expect("canonical receipt metadata should refresh");
         let before = fs::read(&canonical_receipt_path).expect("read canonical receipt");
 
         let lane_receipt_dir = lane.join(".auto/symphony/verification-receipts");
@@ -4082,8 +5591,7 @@ Dependencies: none\n";
             ),
         )
         .expect("write receipt");
-        propagate_lane_receipts(&repo, &repo, "TASK-006", task_markdown)
-            .expect("refresh canonical receipt metadata");
+        bind_fixture_receipt_to_current_source(&repo, "TASK-006");
 
         let lane_root = repo.join("lane-clean-no-commit");
         fs::create_dir_all(&lane_root).expect("create lane root");
@@ -4162,6 +5670,105 @@ Dependencies: none\n";
             !task_is_gate_held(&repo, "TASK-006").expect("read holds"),
             "the complete current-tree gate pipeline must clear the prior hold"
         );
+
+        fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn clean_no_commit_revalidation_receives_selected_host_cargo_env() {
+        let repo = unique_temp_dir("parallel-clean-no-commit-host-cargo-env");
+        init_git_repo(&repo);
+        let task_id = "TASK-CLEAN-ENV";
+        let command = "bash -c true";
+        let task_markdown = format!(
+            "- [ ] `{task_id}` Revalidate canonical evidence\n\
+Verification:\n\
+  - `{command}`\n\
+Dependencies: none\n"
+        );
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        fs::write(
+            repo.join(".gitignore"),
+            ".auto/\nlane-clean-no-commit/\nlane-repo/\n",
+        )
+        .expect("write gitignore");
+        fs::write(
+            repo.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`\n\
+- Source: test handoff.\n\
+- Remaining blockers: none.\n"
+            ),
+        )
+        .expect("write review handoff");
+        let marker = "clean-no-commit-host-cargo-env";
+        let wrapper = install_env_recording_verification_wrapper(&repo, marker);
+        let fake_reviewer = write_fake_clean_reviewer(&repo);
+        git_ok(&repo, ["add", "."]);
+        git_ok(&repo, ["commit", "-q", "-m", "seed clean-no-commit task"]);
+        let base_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+
+        let initial = Command::new(&wrapper)
+            .args([task_id, "--", "bash", "-c", "true"])
+            .current_dir(&repo)
+            .status()
+            .expect("run initial task verification");
+        assert!(initial.success(), "initial task verification must pass");
+        fs::remove_file(repo.join(".auto").join(marker)).expect("clear initial env marker");
+
+        let lane_root = repo.join("lane-clean-no-commit");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let run_root = repo.join(".auto/parallel-run");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: task_id.to_string(),
+                title: "Revalidate canonical evidence".to_string(),
+                status: LoopTaskStatus::Pending,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: task_markdown,
+            },
+            resumed: false,
+            lane_root: lane_root.clone(),
+            lane_repo_root: repo.join("lane-repo"),
+            base_commit,
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+        let review_config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: fake_reviewer,
+        };
+        let (host_cargo_env, target) = selected_host_cargo_env(&repo, "2");
+
+        let reconciled = reconcile_parallel_clean_no_commit_with_env(
+            &repo,
+            "main",
+            &mut assignment,
+            &logger,
+            &review_config,
+            &host_cargo_env,
+        )
+        .await
+        .expect("clean no-commit revalidation should complete");
+
+        assert!(reconciled, "fully evidenced task should reconcile");
+        assert_recorded_host_cargo_env(&repo, marker, &target, "2");
 
         fs::remove_dir_all(&repo).expect("cleanup");
     }
@@ -4413,8 +6020,7 @@ Dependencies: none\n";
             ),
         )
         .expect("write receipt");
-        propagate_lane_receipts(&repo, &repo, "TASK-008", task_markdown)
-            .expect("refresh canonical receipt metadata");
+        bind_fixture_receipt_to_current_source(&repo, "TASK-008");
 
         let lane_root = repo.join("lane-clean-no-commit");
         fs::create_dir_all(&lane_root).expect("create lane root");
@@ -5003,8 +6609,7 @@ Dependencies: none\n";
         )
         .expect("failed to write receipt");
         let task_markdown = "- [ ] `TASK-004` Clear standing finding\nVerification:\n  - `cargo test -p demo task_004`\nDependencies: none\n";
-        propagate_lane_receipts(&repo, &repo, "TASK-004", task_markdown)
-            .expect("refresh canonical receipt metadata");
+        bind_fixture_receipt_to_current_source(&repo, "TASK-004");
 
         let mut task = LoopTask {
             id: "TASK-004".to_string(),
@@ -5524,6 +7129,179 @@ Dependencies: none\n";
         fs::remove_dir_all(&run_root).expect("remove run root");
     }
 
+    #[tokio::test]
+    async fn landing_divergence_unshelve_receives_selected_host_cargo_env() {
+        let repo = unique_temp_dir("parallel-auto-unshelve-host-cargo-env");
+        let run_root = unique_temp_dir("parallel-auto-unshelve-host-cargo-env-run");
+        init_git_repo(&repo);
+        fs::create_dir_all(&run_root).expect("create run root");
+        let task_id = "TASK-UNSHELVE-ENV";
+        let command = "bash -c true";
+        let markdown = format!(
+            "- [~] `{task_id}` Recheck landing divergence\n\
+Verification:\n\
+  - `{command}`\n\
+Dependencies: none\n"
+        );
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &markdown).expect("write plan");
+        fs::write(repo.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        let marker = "landing-divergence-host-cargo-env";
+        install_env_recording_verification_wrapper(&repo, marker);
+        git_ok(&repo, ["add", "."]);
+        git_ok(
+            &repo,
+            ["commit", "-q", "-m", "seed landing-divergence task"],
+        );
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+        let mut state = ParallelRunState::default();
+        state.shelved_tasks.insert(
+            task_id.to_string(),
+            ShelvedTaskState::Detailed(ShelvedTaskDetails {
+                markdown,
+                failure_reason: ShelvedTaskFailureReason::LandingDivergence,
+                conflict_paths: Vec::new(),
+                detail: Some("canonical moved".to_string()),
+            }),
+        );
+        let (host_cargo_env, target) = selected_host_cargo_env(&repo, "3");
+
+        let recovered = auto_unshelve_landing_divergence_tasks_with_env(
+            &repo,
+            &mut state,
+            &logger,
+            &host_cargo_env,
+        )
+        .await;
+
+        assert_eq!(recovered, 1);
+        assert!(!state.shelved_tasks.contains_key(task_id));
+        assert_recorded_host_cargo_env(&repo, marker, &target, "3");
+
+        fs::remove_dir_all(&repo).expect("remove repo");
+        fs::remove_dir_all(&run_root).expect("remove run root");
+    }
+
+    #[tokio::test]
+    async fn resumed_lane_harvest_receives_selected_host_cargo_env() {
+        let (root, remote, _upstream, canonical) =
+            init_remote_and_clones("parallel-resume-harvest-host-cargo-env", "trunk");
+        let task_id = "TASK-RESUME-ENV";
+        let command = "bash -c true";
+        let task_markdown = format!(
+            "- [ ] `{task_id}` Harvest committed resumed work\n\
+Verification:\n\
+  - `{command}`\n\
+Dependencies: none\n"
+        );
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("write canonical plan");
+        fs::write(canonical.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        fs::write(
+            canonical.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`\n\
+- Source: resumed-lane test handoff.\n\
+- Remaining blockers: none.\n"
+            ),
+        )
+        .expect("write review handoff");
+        let marker = "resume-harvest-host-cargo-env";
+        install_env_recording_verification_wrapper(&canonical, marker);
+        let fake_reviewer = write_fake_clean_reviewer(&canonical);
+        run_git_in(&canonical, ["add", "."]);
+        run_git_in(&canonical, ["commit", "-m", "seed resumable task"]);
+        run_git_in(&canonical, ["push", "origin", "trunk"]);
+        let base_commit = git_output(&canonical, ["rev-parse", "HEAD"]);
+
+        let lane_repo = root.join("resumed-lane-repo");
+        run_git_in(
+            &root,
+            [
+                "clone",
+                "--branch",
+                "trunk",
+                remote.to_str().expect("remote path should be utf-8"),
+                lane_repo.to_str().expect("lane path should be utf-8"),
+            ],
+        );
+        run_git_in(&lane_repo, ["config", "user.name", "autodev tests"]);
+        run_git_in(&lane_repo, ["config", "user.email", "autodev@example.com"]);
+        fs::write(
+            lane_repo.join("resumed-result.txt"),
+            "committed lane result\n",
+        )
+        .expect("write resumed lane result");
+        run_git_in(&lane_repo, ["add", "resumed-result.txt"]);
+        run_git_in(&lane_repo, ["commit", "-m", "implement resumed task"]);
+        let lane_verify = Command::new(lane_repo.join("scripts/run-task-verification.sh"))
+            .args([task_id, "--", "bash", "-c", "true"])
+            .current_dir(&lane_repo)
+            .status()
+            .expect("run resumed lane verification");
+        assert!(lane_verify.success(), "resumed lane verification must pass");
+
+        let lane_root = root.join("resume-lane");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+        let mut resumable_lanes = BTreeMap::from([(
+            1,
+            LaneResumeCandidate {
+                lane_index: 1,
+                task: LoopTask {
+                    id: task_id.to_string(),
+                    title: "Harvest committed resumed work".to_string(),
+                    status: LoopTaskStatus::Pending,
+                    dependencies: Vec::new(),
+                    estimated_scope: Some("S".to_string()),
+                    completion_path_target: None,
+                    lane_kind: LaneKind::Code,
+                    markdown: task_markdown,
+                },
+                lane_root: lane_root.clone(),
+                lane_repo_root: lane_repo,
+                base_commit,
+                stdout_log_path: lane_root.join("stdout.log"),
+                stderr_log_path: lane_root.join("stderr.log"),
+                worker_pid_path: lane_root.join("worker.pid"),
+                host_recovery_note: None,
+            },
+        )]);
+        let mut attempted_partial_followups = BTreeMap::new();
+        let mut deferred_partial_tasks = BTreeSet::new();
+        let mut linear_tracker = None;
+        let review_config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: fake_reviewer,
+        };
+        let (host_cargo_env, target) = selected_host_cargo_env(&canonical, "5");
+
+        let landed = harvest_resumable_lane_results(
+            &canonical,
+            "trunk",
+            &mut resumable_lanes,
+            &mut attempted_partial_followups,
+            &mut deferred_partial_tasks,
+            &mut linear_tracker,
+            &logger,
+            &review_config,
+            &host_cargo_env,
+        )
+        .await
+        .expect("resumed lane harvest should complete");
+
+        assert_eq!(landed, 1);
+        assert!(resumable_lanes.is_empty());
+        assert_recorded_host_cargo_env(&canonical, marker, &target, "5");
+
+        fs::remove_dir_all(&root).expect("remove fixture");
+    }
+
     #[test]
     fn drift_reverify_budget_parses_env() {
         use std::time::Duration;
@@ -5534,6 +7312,63 @@ Dependencies: none\n";
         std::env::set_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS", "0");
         assert!(super::drift_reverify_budget().is_zero());
         std::env::remove_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS");
+    }
+
+    #[tokio::test]
+    async fn completion_drift_reverify_receives_selected_host_cargo_env() {
+        let repo = unique_temp_dir("parallel-drift-host-cargo-env");
+        let run_root = unique_temp_dir("parallel-drift-host-cargo-env-run");
+        init_git_repo(&repo);
+        fs::create_dir_all(&run_root).expect("create run root");
+        let task_id = "TASK-DRIFT-ENV";
+        let command = "bash -c true";
+        let plan = format!(
+            "- [x] `{task_id}` Refresh stale local evidence\n\
+Verification:\n\
+  - `{command}`\n\
+Dependencies: none\n\
+Estimated scope: S\n"
+        );
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &plan).expect("write plan");
+        fs::write(repo.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        fs::write(
+            repo.join("REVIEW.md"),
+            format!("## `{task_id}`\n\nExisting host handoff.\n"),
+        )
+        .expect("write review handoff");
+        let marker = "completion-drift-host-cargo-env";
+        install_env_recording_verification_wrapper(&repo, marker);
+        git_ok(&repo, ["add", "."]);
+        git_ok(
+            &repo,
+            [
+                "commit",
+                "-q",
+                "-m",
+                "seed completed task with stale evidence",
+            ],
+        );
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+        let (host_cargo_env, target) = selected_host_cargo_env(&repo, "4");
+
+        let (updated, _) = audit_parallel_completion_drift_with_env(
+            &repo,
+            "main",
+            &plan,
+            &logger,
+            &host_cargo_env,
+        )
+        .await
+        .expect("completion-drift reverify should complete");
+
+        assert!(
+            updated.starts_with(&format!("- [~] `{task_id}`")),
+            "drift reverify must retain the definition-of-done interlock: {updated}"
+        );
+        assert_recorded_host_cargo_env(&repo, marker, &target, "4");
+
+        fs::remove_dir_all(&repo).expect("remove repo");
+        fs::remove_dir_all(&run_root).expect("remove run root");
     }
 
     #[tokio::test]
@@ -5710,8 +7545,7 @@ Dependencies: none\n";
             ),
         )
         .expect("write legacy receipt");
-        propagate_lane_receipts(&repo, &repo, task_id, &plan)
-            .expect("bind legacy receipt to current source");
+        bind_fixture_receipt_to_current_source(&repo, task_id);
         record_verified_source_attestation(&repo, task_id)
             .expect("record legacy source attestation");
         let evidence = inspect_task_completion_evidence(&repo, task_id, &plan);
@@ -5866,11 +7700,8 @@ Dependencies: none\n";
         )
         .expect("write review");
         let wrapper = repo.join("scripts/run-task-verification.sh");
-        fs::write(
-            &wrapper,
-            "#!/bin/sh\nshift\nif [ \"${1:-}\" = \"--\" ]; then shift; fi\nexec \"$@\"\n",
-        )
-        .expect("write wrapper");
+        fs::copy(repository_verification_wrapper(), &wrapper)
+            .expect("install production-shaped verification wrapper");
         let mut permissions = fs::metadata(&wrapper).expect("stat wrapper").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
@@ -6026,9 +7857,9 @@ shift
 if [ "${{1:-}}" = "--" ]; then shift; fi
 grep -F -- '- [~] `{task_id}`' IMPLEMENTATION_PLAN.md >/dev/null || exit 91
 printf 'refresh observed durable partial\n' > .auto/refresh-saw-partial
-printf '%s\n' '{{"task_id":"{task_id}","commands":[{{"command":"{command}","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}}]}}' > ".auto/symphony/verification-receipts/$task.json"
-exec "$@"
-"#
+exec '{}' "$task" -- "$@"
+"#,
+                repository_verification_wrapper().display()
             ),
         )
         .expect("write wrapper");
@@ -6153,8 +7984,7 @@ exec "$@"
             ),
         )
         .expect("write receipt");
-        propagate_lane_receipts(&repo, &repo, task_id, &partial_plan)
-            .expect("bind receipt to clean seeded source");
+        bind_fixture_receipt_to_current_source(&repo, task_id);
         record_verified_source_attestation(&repo, task_id)
             .expect("attest the fixture's exact verified source state");
 
@@ -6256,6 +8086,7 @@ exec "$@"
         passes: bool,
     ) {
         fs::create_dir_all(root.join("src")).expect("create src dir");
+        fs::write(root.join(".gitignore"), "target/\n").expect("write target ignore");
         fs::write(
             root.join("Cargo.toml"),
             format!(
@@ -6275,6 +8106,12 @@ exec "$@"
             ),
         )
         .expect("write src/lib.rs");
+        let lock_status = Command::new("cargo")
+            .current_dir(root)
+            .args(["generate-lockfile", "--offline"])
+            .status()
+            .expect("run cargo generate-lockfile");
+        assert!(lock_status.success(), "generate a valid Cargo.lock");
     }
 
     fn write_fake_passing_workspace_cargo(root: &Path, mutation: &str) -> PathBuf {
@@ -6290,6 +8127,50 @@ exec "$@"
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("chmod fake workspace cargo");
         path
+    }
+
+    #[tokio::test]
+    async fn startup_workspace_baseline_uses_selected_host_cargo_environment() {
+        let root = unique_temp_dir("startup-baseline-host-cargo-env");
+        let run_root = unique_temp_dir("startup-baseline-host-cargo-env-run");
+        init_git_repo(&root);
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        git_ok(&root, ["add", "Cargo.toml"]);
+        git_ok(&root, ["commit", "-q", "-m", "seed Cargo workspace"]);
+        fs::create_dir_all(&run_root).expect("create run root");
+        let target = run_root.join("host-cargo-target");
+        let cargo = write_fake_passing_workspace_cargo(
+            &root,
+            &format!(
+                "test \"${{CARGO_TARGET_DIR-}}\" = '{}'\ntest \"${{CARGO_BUILD_JOBS-}}\" = '2'",
+                target.display()
+            ),
+        );
+        let host_cargo_env = HostCargoEnv::from_vars(vec![
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_BUILD_JOBS".to_string(), "2".to_string()),
+        ]);
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+
+        maybe_capture_workspace_baseline_with_cargo(
+            &root,
+            &run_root,
+            &logger,
+            Some(cargo),
+            &host_cargo_env,
+        )
+        .await;
+
+        assert!(
+            load_workspace_baseline(&run_root).captured,
+            "startup must persist a baseline from the selected host Cargo process"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup repo");
+        fs::remove_dir_all(&run_root).expect("cleanup run root");
     }
 
     #[tokio::test]
@@ -6330,9 +8211,11 @@ exec "$@"
 
         let error = super::apply_lane_verify_gate_in_transaction(
             &root,
+            &root.join(".auto/parallel"),
             &mut assignment,
             LoopTaskStatus::Done,
             Some(&transaction),
+            &HostCargoEnv::default(),
         )
         .await
         .expect_err("passing verifier queue mutation must abort before gate outcome handling");
@@ -6388,12 +8271,14 @@ exec "$@"
             .expect("arm outer source transaction");
         let error = super::apply_workspace_test_gate_mode_in_transaction(
             &root,
+            &root.join(".auto/parallel"),
             &mut assignment,
             &[],
             LoopTaskStatus::Done,
             Some(&transaction),
             WorkspaceGateMode::Strict,
             Some(cargo),
+            &HostCargoEnv::default(),
         )
         .await
         .expect_err("passing strict workspace queue mutation must abort before outcome handling");
@@ -6448,12 +8333,14 @@ exec "$@"
             .expect("arm outer source transaction");
         let error = super::apply_workspace_test_gate_mode_in_transaction(
             &root,
+            &root.join(".auto/parallel"),
             &mut assignment,
             &[],
             LoopTaskStatus::Done,
             Some(&transaction),
             WorkspaceGateMode::Baseline,
             Some(cargo),
+            &HostCargoEnv::default(),
         )
         .await
         .expect_err("passing baseline workspace queue mutation must abort before baseline update");
@@ -6507,10 +8394,9 @@ exec "$@"
 task="$1"
 shift
 if [ "${{1:-}}" = "--" ]; then shift; fi
-mkdir -p .auto/symphony/verification-receipts
-printf '%s\n' '{{"task_id":"{task_id}","commands":[{{"command":"cargo test -q -p {package_name} tests::task_dod_pass -- --exact","argv":["cargo","test","-q","-p","{package_name}","tests::task_dod_pass","--","--exact"],"expected_argv":["cargo","test","-q","-p","{package_name}","tests::task_dod_pass","--","--exact"],"exit_code":0,"status":"passed"}}]}}' > ".auto/symphony/verification-receipts/$task.json"
-exec "$@"
-"#
+exec '{}' "$task" -- "$@"
+"#,
+                repository_verification_wrapper().display()
             ),
         )
         .expect("write verification wrapper");
@@ -7056,12 +8942,7 @@ exec "$@"
             r#"{"task_id":"TASK-B","commands":[{"command":"cargo test task_b","argv":["cargo","test","task_b"],"expected_argv":["cargo","test","task_b"],"exit_code":0,"status":"passed"}]}"#,
         )
         .expect("write TASK-B receipt");
-        let task_b = parse_loop_plan(&both_done)
-            .task("TASK-B")
-            .expect("TASK-B should parse")
-            .clone();
-        propagate_lane_receipts(&root, &root, "TASK-B", &task_b.markdown)
-            .expect("bind receipt to current source");
+        bind_fixture_receipt_to_current_source(&root, "TASK-B");
         record_verified_source_attestation(&root, "TASK-B").expect("attest TASK-B current source");
 
         let error = commit_task_closeout(
@@ -7126,17 +9007,31 @@ exec "$@"
             "pub fn injected() {}\n",
         )
         .expect("write uncommitted verifier mutation");
+        let commit = git_output(&root, ["rev-parse", "HEAD"]);
+        let dirty_state = crate::completion_artifacts::current_dirty_state_fingerprint(&root)
+            .expect("fingerprint test-only dirty source");
+        let plan_hash =
+            crate::completion_artifacts::normalized_plan_hash_bytes(done_plan.as_bytes());
+        let receipt = serde_json::json!({
+            "task_id": "TASK-B",
+            "commit": commit,
+            "dirty_state": {
+                "fingerprint": dirty_state,
+            },
+            "plan_hash": plan_hash,
+            "commands": [{
+                "command": "cargo test task_b",
+                "argv": ["cargo", "test", "task_b"],
+                "expected_argv": ["cargo", "test", "task_b"],
+                "exit_code": 0,
+                "status": "passed",
+            }],
+        });
         fs::write(
             root.join(".auto/symphony/verification-receipts/TASK-B.json"),
-            r#"{"task_id":"TASK-B","commands":[{"command":"cargo test task_b","argv":["cargo","test","task_b"],"expected_argv":["cargo","test","task_b"],"exit_code":0,"status":"passed"}]}"#,
+            serde_json::to_vec_pretty(&receipt).expect("serialize TASK-B receipt"),
         )
         .expect("write TASK-B receipt");
-        let task_b = parse_loop_plan(&done_plan)
-            .task("TASK-B")
-            .expect("TASK-B should parse")
-            .clone();
-        propagate_lane_receipts(&root, &root, "TASK-B", &task_b.markdown)
-            .expect("bind receipt to dirty current source");
         record_verified_source_attestation(&root, "TASK-B").expect("attest dirty current source");
 
         let error = commit_task_closeout(

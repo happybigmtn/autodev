@@ -22,14 +22,54 @@ impl LinearAutoSyncState {
 #[derive(Clone, Debug)]
 pub(crate) struct ParallelEventLogger {
     pub(crate) live_log_path: PathBuf,
+    #[cfg(unix)]
+    live_log: std::sync::Arc<std::sync::Mutex<SecuredParallelLiveLog>>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct SecuredParallelLiveLog {
+    root: SecuredParallelRunRoot,
+    file: std::fs::File,
+    dev: u64,
+    ino: u64,
 }
 
 impl ParallelEventLogger {
+    #[cfg(test)]
     pub(crate) fn new(run_root: &Path) -> Result<Self> {
-        let live_log_path = run_root.join("live.log");
-        fs::write(&live_log_path, b"")
-            .with_context(|| format!("failed to initialize {}", live_log_path.display()))?;
-        Ok(Self { live_log_path })
+        #[cfg(unix)]
+        {
+            let root = SecuredParallelRunRoot::open_unleased(run_root)?;
+            return Self::from_secured_root(root);
+        }
+        #[cfg(not(unix))]
+        {
+            bail!(
+                "parallel live log under {} requires Unix descriptor-relative no-follow support",
+                run_root.display()
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new_with_authority(authority: &ParallelRunRootAuthority) -> Result<Self> {
+        Self::from_secured_root(authority.duplicate_secured_root()?)
+    }
+
+    #[cfg(unix)]
+    fn from_secured_root(root: SecuredParallelRunRoot) -> Result<Self> {
+        let live_log_path = root.path().join("live.log");
+        let live_log = SecuredParallelLiveLog::open(root)?;
+        Ok(Self {
+            live_log_path,
+            live_log: std::sync::Arc::new(std::sync::Mutex::new(live_log)),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn new_with_authority(_authority: &ParallelRunRootAuthority) -> Result<Self> {
+        bail!("parallel live log requires Unix descriptor-relative no-follow support")
     }
 
     pub(crate) fn run_root(&self) -> PathBuf {
@@ -61,13 +101,158 @@ impl ParallelEventLogger {
             return Ok(());
         }
         let redacted = redact_parallel_live_log_message(&normalized);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.live_log_path)
-            .with_context(|| format!("failed to open {}", self.live_log_path.display()))?;
-        writeln!(file, "{redacted}")
-            .with_context(|| format!("failed to append {}", self.live_log_path.display()))
+        #[cfg(unix)]
+        {
+            let mut live_log = self.live_log.lock().map_err(|_| {
+                anyhow::anyhow!(
+                    "parallel live-log lock was poisoned for {}",
+                    self.live_log_path.display()
+                )
+            })?;
+            live_log.append(&redacted)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = redacted;
+            bail!("parallel live log requires Unix descriptor-relative no-follow support")
+        }
+    }
+}
+
+#[cfg(unix)]
+impl SecuredParallelLiveLog {
+    fn open(root: SecuredParallelRunRoot) -> Result<Self> {
+        use rustix::fs::{
+            fstat, ftruncate, openat, statat, AtFlags, FileType, Mode, OFlags,
+        };
+        use rustix::io::Errno;
+        use rustix::process::geteuid;
+
+        root.revalidate()?;
+        let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = match openat(root.directory(), "live.log", flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => openat(
+                root.directory(),
+                "live.log",
+                flags | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to create {} without following links",
+                    root.path().join("live.log").display()
+                )
+            })?,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to open {} without following links",
+                        root.path().join("live.log").display()
+                    )
+                })
+            }
+        };
+        let held = fstat(&fd).with_context(|| {
+            format!(
+                "failed to inspect secured parallel live log {}",
+                root.path().join("live.log").display()
+            )
+        })?;
+        let mode = held.st_mode & 0o7777;
+        if !FileType::from_raw_mode(held.st_mode).is_file()
+            || held.st_uid != geteuid().as_raw()
+            || held.st_nlink != 1
+            || mode & 0o022 != 0
+        {
+            bail!(
+                "parallel live log {} must be a current-uid, single-link regular file without group/other write permission (uid {}, links {}, mode {mode:04o})",
+                root.path().join("live.log").display(),
+                held.st_uid,
+                held.st_nlink
+            );
+        }
+        let linked = statat(
+            root.directory(),
+            "live.log",
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .context("failed to revalidate secured parallel live-log name")?;
+        if linked.st_dev != held.st_dev
+            || linked.st_ino != held.st_ino
+            || !FileType::from_raw_mode(linked.st_mode).is_file()
+        {
+            bail!(
+                "parallel live-log identity changed before initialization: {}",
+                root.path().join("live.log").display()
+            );
+        }
+        ftruncate(&fd, 0).with_context(|| {
+            format!(
+                "failed to truncate secured parallel live log {}",
+                root.path().join("live.log").display()
+            )
+        })?;
+        root.revalidate()?;
+        let live_log = Self {
+            root,
+            file: std::fs::File::from(fd),
+            dev: held.st_dev,
+            ino: held.st_ino,
+        };
+        live_log.revalidate()?;
+        Ok(live_log)
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        use rustix::fs::{fstat, statat, AtFlags, FileType};
+        use rustix::process::geteuid;
+
+        self.root.revalidate()?;
+        let held = fstat(&self.file).context("failed to inspect held parallel live log")?;
+        let linked = statat(
+            self.root.directory(),
+            "live.log",
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .with_context(|| {
+            format!(
+                "parallel live-log path identity changed: {}",
+                self.root.path().join("live.log").display()
+            )
+        })?;
+        let held_mode = held.st_mode & 0o7777;
+        let linked_mode = linked.st_mode & 0o7777;
+        if held.st_dev != self.dev
+            || held.st_ino != self.ino
+            || linked.st_dev != self.dev
+            || linked.st_ino != self.ino
+            || !FileType::from_raw_mode(held.st_mode).is_file()
+            || !FileType::from_raw_mode(linked.st_mode).is_file()
+            || held.st_uid != geteuid().as_raw()
+            || linked.st_uid != geteuid().as_raw()
+            || held.st_nlink != 1
+            || linked.st_nlink != 1
+            || held_mode & 0o022 != 0
+            || linked_mode & 0o022 != 0
+        {
+            bail!(
+                "parallel live-log identity changed or became unsafe: {}",
+                self.root.path().join("live.log").display()
+            );
+        }
+        self.root.revalidate()
+    }
+
+    fn append(&mut self, message: &str) -> Result<()> {
+        self.revalidate()?;
+        writeln!(self.file, "{message}").with_context(|| {
+            format!(
+                "failed to append {}",
+                self.root.path().join("live.log").display()
+            )
+        })?;
+        self.revalidate()
     }
 }
 
@@ -148,7 +333,11 @@ fn recover_failed_parallel_lane_completion(
     parallel_logger: &ParallelEventLogger,
     failure_context: &str,
 ) -> Result<Vec<String>> {
-    let recovered = recover_unsealed_task_completion_transitions(repo_root).with_context(|| {
+    let recovered = recover_unsealed_task_completion_transitions_at(
+        repo_root,
+        &parallel_logger.run_root(),
+    )
+    .with_context(|| {
         format!(
                 "failed to recover candidate completion for `{task_id}` after {failure_context}; \
                  refusing to continue scheduling with {remaining_active_lanes} other active lane(s)"
@@ -184,7 +373,12 @@ pub(crate) async fn run_parallel_loop(
     parallel_logger: &ParallelEventLogger,
 ) -> Result<()> {
     let harness = if args.claude { "Claude" } else { "Codex" };
-    repair_parallel_canonical_before_dispatch(repo_root, target_branch, parallel_logger)?;
+    repair_parallel_canonical_before_dispatch_at(
+        repo_root,
+        run_root,
+        target_branch,
+        parallel_logger,
+    )?;
     let mut join_set = JoinSet::<LaneAttemptResult>::new();
     let mut active_lanes = BTreeMap::<usize, ActiveLaneAssignment>::new();
     let mut active_tasks = BTreeSet::<String>::new();
@@ -206,9 +400,13 @@ pub(crate) async fn run_parallel_loop(
             "resume: HEAD advanced since the last run; auto-retrying {auto_cleared} shelved/deferred task(s) whose transient blocker plausibly resolved (set AUTO_PARALLEL_AUTOCLEAR_SHELVED=0 to disable)"
         ));
     }
-    let auto_unshelved =
-        auto_unshelve_landing_divergence_tasks(repo_root, &mut restored_run_state, parallel_logger)
-            .await;
+    let auto_unshelved = auto_unshelve_landing_divergence_tasks_with_env(
+        repo_root,
+        &mut restored_run_state,
+        parallel_logger,
+        &worker_env.host_cargo_env,
+    )
+    .await;
     if auto_unshelved > 0 {
         parallel_logger.info(format!(
             "resume: auto-unshelved {auto_unshelved} landing-divergence task(s) after current-HEAD verification passed"
@@ -248,16 +446,28 @@ pub(crate) async fn run_parallel_loop(
         linear_tracker,
         &mut linear_auto_sync_state,
         parallel_logger,
+        &worker_env.host_cargo_env,
     )
     .await?;
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
     // Capture the pre-existing workspace failure/compile baseline before any lane
     // lands, so the baseline-aware landing gate can tell a NEW regression apart
     // from a failure that was already red at the run's base commit.
-    maybe_capture_workspace_baseline(repo_root, run_root, parallel_logger).await;
+    maybe_capture_workspace_baseline(
+        repo_root,
+        run_root,
+        parallel_logger,
+        &worker_env.host_cargo_env,
+    )
+    .await;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     let review_config = LaneReviewConfig::from_run_config(&args.model, &args.codex_bin);
-    try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
+    checkpoint_parallel_host_queue_changes_at(
+        repo_root,
+        run_root,
+        target_branch,
+        parallel_logger,
+    )?;
     let mut resumable_lanes = discover_resume_candidates(
         repo_root,
         run_root,
@@ -275,6 +485,7 @@ pub(crate) async fn run_parallel_loop(
         linear_tracker,
         parallel_logger,
         &review_config,
+        &worker_env.host_cargo_env,
     )
     .await?;
     plan = refresh_parallel_plan_or_last_good(
@@ -284,9 +495,15 @@ pub(crate) async fn run_parallel_loop(
         &mut linear_auto_sync_state,
         &plan,
         parallel_logger,
+        &worker_env.host_cargo_env,
     )
     .await?;
-    try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
+    checkpoint_parallel_host_queue_changes_at(
+        repo_root,
+        run_root,
+        target_branch,
+        parallel_logger,
+    )?;
     let mut rediscovered_lanes = discover_resume_candidates(
         repo_root,
         run_root,
@@ -302,7 +519,12 @@ pub(crate) async fn run_parallel_loop(
     loop {
         nudge_lingering_committed_lanes(&mut active_lanes);
         if active_lanes.is_empty() {
-            repair_parallel_canonical_before_dispatch(repo_root, target_branch, parallel_logger)?;
+            repair_parallel_canonical_before_dispatch_at(
+                repo_root,
+                run_root,
+                target_branch,
+                parallel_logger,
+            )?;
         }
         plan = refresh_parallel_plan_or_last_good(
             repo_root,
@@ -311,9 +533,15 @@ pub(crate) async fn run_parallel_loop(
             &mut linear_auto_sync_state,
             &plan,
             parallel_logger,
+            &worker_env.host_cargo_env,
         )
         .await?;
-        try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
+        checkpoint_parallel_host_queue_changes_at(
+            repo_root,
+            run_root,
+            target_branch,
+            parallel_logger,
+        )?;
         shelved_tasks.retain(|task_id, markdown| {
             plan.tasks
                 .iter()
@@ -392,7 +620,7 @@ pub(crate) async fn run_parallel_loop(
             // Gate-held partials failed a real gate; their landed code is known
             // to not pass, so dependents built on them would rework. Hold those
             // dependents until the hold clears (task lands cleanly).
-            let gate_held = gate_held_task_ids(repo_root)
+            let gate_held = gate_held_task_ids_at(repo_root, run_root)
                 .context("failed to read durable gate holds before dependency dispatch")?;
             let ready = prioritize_ready_parallel_tasks(
                 repo_root,
@@ -596,8 +824,9 @@ pub(crate) async fn run_parallel_loop(
             // recovery to reclaim. Genuine-partial tasks fail the same
             // `is_fully_evidenced()` gate and fall through to normal dispatch.
             if task.status == LoopTaskStatus::Partial {
-                match try_promote_partial_before_dispatch(
+                match try_promote_partial_before_dispatch_at(
                     repo_root,
+                    run_root,
                     target_branch,
                     &task.id,
                     &task.markdown,
@@ -611,18 +840,19 @@ pub(crate) async fn run_parallel_loop(
                             &mut linear_auto_sync_state,
                             &plan,
                             parallel_logger,
+                            &worker_env.host_cargo_env,
                         )
                         .await?;
                         last_idle_summary = None;
                         continue;
                     }
                     Ok(false) => {}
-                    Err(err) => {
-                        parallel_logger.warn(format!(
-                            "warning: pre-dispatch evidence check for `{}` failed; dispatching a worker instead: {err:#}",
+                    Err(err) => return Err(err).with_context(|| {
+                        format!(
+                            "pre-dispatch authority check for `{}` failed; refusing worker dispatch",
                             task.id
-                        ));
-                    }
+                        )
+                    }),
                 }
             }
 
@@ -726,8 +956,9 @@ pub(crate) async fn run_parallel_loop(
                 break;
             }
 
-            let recovered = recover_shelved_tasks_from_canonical_evidence(
+            let recovered = recover_shelved_tasks_from_canonical_evidence_at(
                 repo_root,
+                run_root,
                 target_branch,
                 &mut shelved_tasks,
                 parallel_logger,
@@ -740,6 +971,7 @@ pub(crate) async fn run_parallel_loop(
                     &mut linear_auto_sync_state,
                     &plan,
                     parallel_logger,
+                    &worker_env.host_cargo_env,
                 )
                 .await?;
                 last_idle_summary = None;
@@ -848,6 +1080,7 @@ pub(crate) async fn run_parallel_loop(
                 &mut linear_auto_sync_state,
                 &plan,
                 parallel_logger,
+                &worker_env.host_cargo_env,
             )
             .await?;
             if let Err(err) = spawn_parallel_lane_attempt(
@@ -911,6 +1144,7 @@ pub(crate) async fn run_parallel_loop(
                         target_branch,
                         &mut assignment,
                         &review_config,
+                        &worker_env.host_cargo_env,
                     )
                     .await
                     {
@@ -1254,6 +1488,7 @@ pub(crate) async fn run_parallel_loop(
                 &mut linear_auto_sync_state,
                 &plan,
                 parallel_logger,
+                &worker_env.host_cargo_env,
             )
             .await?;
             if let Err(err) = spawn_parallel_lane_attempt(
@@ -1330,12 +1565,13 @@ pub(crate) async fn run_parallel_loop(
                 continue;
             }
             LaneRepoProgress::None => {
-                match reconcile_parallel_clean_no_commit(
+                match reconcile_parallel_clean_no_commit_with_env(
                     repo_root,
                     target_branch,
                     &mut assignment,
                     parallel_logger,
                     &review_config,
+                    &worker_env.host_cargo_env,
                 )
                 .await
                 {
@@ -1428,6 +1664,7 @@ pub(crate) async fn run_parallel_loop(
                     target_branch,
                     &mut assignment,
                     &review_config,
+                    &worker_env.host_cargo_env,
                 )
                 .await
                 {
@@ -1682,6 +1919,7 @@ pub(crate) async fn refresh_parallel_plan(
     linear_tracker: &mut Option<LinearTracker>,
     linear_auto_sync_state: &mut LinearAutoSyncState,
     parallel_logger: &ParallelEventLogger,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopPlanSnapshot> {
     let mut plan_text = read_loop_plan(repo_root)?;
     // Content-addressed sweep skip (2026-07-10 radical harness fix, all repos):
@@ -1705,9 +1943,14 @@ pub(crate) async fn refresh_parallel_plan(
             "drift-reverify: inputs unchanged since last exhaustive sweep; skipping re-verification",
         );
     } else {
-        let (audited, exhaustive) =
-            audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
-                .await?;
+        let (audited, exhaustive) = audit_parallel_completion_drift_with_env(
+            repo_root,
+            target_branch,
+            &plan_text,
+            parallel_logger,
+            host_cargo_env,
+        )
+        .await?;
         plan_text = audited;
         // Only cache when the sweep verified every row (no budget defer), and
         // recompute the fingerprint AFTER the audit's own receipt/plan writes.
@@ -1810,6 +2053,7 @@ pub(crate) async fn refresh_parallel_plan_or_last_good(
     linear_auto_sync_state: &mut LinearAutoSyncState,
     last_good_plan: &LoopPlanSnapshot,
     parallel_logger: &ParallelEventLogger,
+    host_cargo_env: &HostCargoEnv,
 ) -> Result<LoopPlanSnapshot> {
     match refresh_parallel_plan(
         repo_root,
@@ -1817,6 +2061,7 @@ pub(crate) async fn refresh_parallel_plan_or_last_good(
         linear_tracker,
         linear_auto_sync_state,
         parallel_logger,
+        host_cargo_env,
     )
     .await
     {
@@ -2252,7 +2497,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
     let stderr_log_path = assignment.stderr_log_path.clone();
     let stdout_log_path = assignment.stdout_log_path.clone();
     let worker_pid_path = assignment.worker_pid_path.clone();
-    let extra_env = lane_config.env_for_lane(&assignment.lane_root);
+    let extra_env = lane_config.env_for_lane(&assignment.lane_root)?;
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
     let effort = lane_config.effective_reasoning_effort(
@@ -2469,6 +2714,8 @@ pub(crate) fn clean_commit_harvest_ready(
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::UNIX_EPOCH;
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -2505,6 +2752,75 @@ mod tests {
         run_git(&repo, ["commit", "-m", "seed scheduler plan"])
             .expect("failed to commit seed plan");
         repo
+    }
+
+    #[cfg(unix)]
+    fn make_private_directory(path: &Path) {
+        let mut permissions = fs::metadata(path)
+            .unwrap_or_else(|_| panic!("stat {}", path.display()))
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)
+            .unwrap_or_else(|_| panic!("chmod {}", path.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_log_initialization_rejects_a_symlink_without_truncating_its_target() {
+        let root = unique_temp_dir("parallel-live-log-symlink");
+        let run_root = root.join("run");
+        let outside = root.join("outside.log");
+        fs::create_dir_all(&run_root).expect("create run root");
+        make_private_directory(&root);
+        make_private_directory(&run_root);
+        fs::write(&outside, b"operator data\n").expect("write outside target");
+        std::os::unix::fs::symlink(&outside, run_root.join("live.log"))
+            .expect("install live-log symlink");
+
+        let error =
+            ParallelEventLogger::new(&run_root).expect_err("live.log symlink must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("without following links"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("read outside target"),
+            b"operator data\n"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_log_append_rejects_a_path_swap_and_never_follows_the_replacement() {
+        let root = unique_temp_dir("parallel-live-log-swap");
+        let run_root = root.join("run");
+        let outside = root.join("outside.log");
+        let moved = run_root.join("moved-live.log");
+        fs::create_dir_all(&run_root).expect("create run root");
+        make_private_directory(&root);
+        make_private_directory(&run_root);
+        fs::write(&outside, b"operator data\n").expect("write outside target");
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize secured live log");
+        fs::rename(run_root.join("live.log"), &moved).expect("move secured log");
+        std::os::unix::fs::symlink(&outside, run_root.join("live.log"))
+            .expect("replace live-log path");
+
+        let error = logger
+            .append("must not be written")
+            .expect_err("path swap must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("identity changed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("read outside target"),
+            b"operator data\n"
+        );
+        assert_eq!(fs::read(&moved).expect("read held original"), b"");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
