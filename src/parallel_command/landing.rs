@@ -747,10 +747,43 @@ pub(crate) fn render_receipts_drift_entry(entry: &ReceiptDriftTriageEntry) -> St
         rendered.push_str("  - Reason: no specific evidence gap reported\n");
     } else {
         for reason in &entry.reasons {
-            rendered.push_str(&format!("  - Reason: {reason}\n"));
+            rendered.push_str(&format!(
+                "  - Reason: {}\n",
+                stable_receipt_drift_reason(reason)
+            ));
         }
     }
     rendered
+}
+
+/// Remove only the volatile *current* commit identity from generated triage.
+///
+/// A receipt mismatch remains actionable because the recorded proof commit is
+/// retained. Embedding the current `HEAD`, however, makes committing the report
+/// change the report again on the next audit, creating an infinite queue-sync
+/// loop. Other diagnostics remain byte-for-byte unchanged.
+fn stable_receipt_drift_reason(reason: &str) -> String {
+    const MARKER: &str = " is not current HEAD `";
+    let Some(marker_start) = reason.find(MARKER) else {
+        return reason.to_string();
+    };
+    let hash_start = marker_start + MARKER.len();
+    let Some(hash_end_offset) = reason[hash_start..].find('`') else {
+        return reason.to_string();
+    };
+    let hash_end = hash_start + hash_end_offset;
+    let candidate = &reason[hash_start..hash_end];
+    if !(7..=64).contains(&candidate.len())
+        || !candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return reason.to_string();
+    }
+
+    format!(
+        "{} is not current HEAD{}",
+        &reason[..marker_start],
+        &reason[hash_end + 1..]
+    )
 }
 
 pub(crate) async fn land_parallel_lane_result(
@@ -5612,6 +5645,41 @@ Dependencies: none\n";
         std::env::set_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS", "0");
         assert!(super::drift_reverify_budget().is_zero());
         std::env::remove_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS");
+    }
+
+    #[test]
+    fn receipt_drift_triage_is_stable_across_current_head_changes() {
+        let recorded = "421beaf8f49627bc9ef67353622bc05654535e4f";
+        let entry_at_first_head = ReceiptDriftTriageEntry {
+            task_id: "TASK-STABLE-TRIAGE".to_string(),
+            title: "Keep generated triage idempotent".to_string(),
+            status: LoopTaskStatus::Done,
+            reasons: vec![format!(
+                "stale verification receipt `receipt.json`: commit mismatch, recorded `{recorded}` is not current HEAD `12b7411c41a03b63f05ab1d0c95593a0ea4c692d`"
+            )],
+        };
+        let entry_at_next_head = ReceiptDriftTriageEntry {
+            task_id: "TASK-STABLE-TRIAGE".to_string(),
+            title: "Keep generated triage idempotent".to_string(),
+            status: LoopTaskStatus::Done,
+            reasons: vec![format!(
+                "stale verification receipt `receipt.json`: commit mismatch, recorded `{recorded}` is not current HEAD `4420c916f489bb0c408a8c898e4544531dfe512a`"
+            )],
+        };
+
+        let first = render_receipts_drift_triage(&[entry_at_first_head], &[]);
+        let next = render_receipts_drift_triage(&[entry_at_next_head], &[]);
+
+        assert_eq!(
+            first, next,
+            "committing the triage report must not change its own generated body"
+        );
+        assert!(
+            first.contains(recorded),
+            "the recorded proof identity matters"
+        );
+        assert!(!first.contains("12b7411c41a03b63f05ab1d0c95593a0ea4c692d"));
+        assert!(first.contains("is not current HEAD"));
     }
 
     #[tokio::test]
