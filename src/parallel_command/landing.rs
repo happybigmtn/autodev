@@ -202,13 +202,20 @@ pub(crate) fn checkpoint_parallel_host_queue_changes(
 ) -> Result<Option<String>> {
     enforce_review_input_quarantine_before_dispatch(repo_root)?;
     repair_stale_git_index_lock(repo_root, parallel_logger, "before host queue sync")?;
-    let queue_files = host_queue_state_files_for_repo(repo_root);
+    let derived_files = run_after_plan_update_hook(repo_root)?;
+    let mut queue_files = host_queue_state_files_for_repo(repo_root)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    queue_files.extend(derived_files);
+    queue_files.sort();
+    queue_files.dedup();
     if queue_files.is_empty() {
         return Ok(None);
     }
 
     let mut status_args = vec!["status", "--short", "--"];
-    status_args.extend(queue_files.iter().copied());
+    status_args.extend(queue_files.iter().map(String::as_str));
     let status = git_stdout(repo_root, status_args)?;
     if status.trim().is_empty() {
         return Ok(None);
@@ -216,9 +223,10 @@ pub(crate) fn checkpoint_parallel_host_queue_changes(
 
     refuse_unsealed_task_completion_checkpoint(repo_root)?;
     let mut add_args = vec!["add", "--all", "--"];
-    add_args.extend(queue_files.iter().copied());
+    add_args.extend(queue_files.iter().map(String::as_str));
     run_git(repo_root, add_args)?;
-    refuse_worktree_paths_outside(repo_root, &queue_files, "parallel host queue checkpoint")?;
+    let allowed_paths = queue_files.iter().map(String::as_str).collect::<Vec<_>>();
+    refuse_worktree_paths_outside(repo_root, &allowed_paths, "parallel host queue checkpoint")?;
     let message = format!("{}: parallel host queue sync", repo_name(repo_root));
     let commit = commit_staged_checkpoint_cas(repo_root, target_branch, &message)?;
     let short_commit = git_stdout(repo_root, ["rev-parse", "--short", &commit])?;
@@ -3093,17 +3101,25 @@ pub(crate) fn commit_task_closeout(
     allow_empty: bool,
 ) -> Result<()> {
     enforce_review_input_quarantine_before_dispatch(repo_root)?;
+    let derived_files = run_after_plan_update_hook(repo_root)?;
     require_task_status_persisted(repo_root, task_id, expected_status)?;
     if expected_status == LoopTaskStatus::Done {
         refuse_unsealed_task_completion_transitions_except(repo_root, task_id)?;
     } else {
         refuse_unsealed_task_completion_checkpoint(repo_root)?;
     }
-    let queue_files = host_queue_state_files_for_repo(repo_root);
-    refuse_worktree_paths_outside(repo_root, &queue_files, "task closeout")?;
+    let mut queue_files = host_queue_state_files_for_repo(repo_root)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    queue_files.extend(derived_files);
+    queue_files.sort();
+    queue_files.dedup();
+    let allowed_paths = queue_files.iter().map(String::as_str).collect::<Vec<_>>();
+    refuse_worktree_paths_outside(repo_root, &allowed_paths, "task closeout")?;
     let validated_tree = (expected_status == LoopTaskStatus::Done)
         .then(|| {
-            capture_validated_task_closeout_tree(repo_root, task_id, &queue_files, allow_empty)
+            capture_validated_task_closeout_tree(repo_root, task_id, &allowed_paths, allow_empty)
         })
         .transpose()?;
     let footer = verification_receipt_commit_footer(repo_root, task_id)?;
@@ -3126,6 +3142,88 @@ pub(crate) fn commit_task_closeout(
         commit_staged_queue_checkpoint_cas(repo_root, &exact_message, allow_empty)?;
     }
     Ok(())
+}
+
+/// Run the repository-owned derived-state refresh after the host changes
+/// IMPLEMENTATION_PLAN.md. The optional hook prints one tracked repository path
+/// per line; only those paths are staged and admitted to the queue closeout
+/// authority set. This keeps hash-bound manifests consistent without granting
+/// the hook permission to sweep arbitrary source changes into a host commit.
+pub(crate) fn run_after_plan_update_hook(repo_root: &Path) -> Result<Vec<String>> {
+    let hook = repo_root.join("scripts/autodev-after-plan-update.sh");
+    if !hook.is_file() {
+        return Ok(Vec::new());
+    }
+    let plan_diff = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--quiet", "HEAD", "--", "IMPLEMENTATION_PLAN.md"])
+        .output()
+        .with_context(|| format!("failed checking plan changes in {}", repo_root.display()))?;
+    match plan_diff.status.code() {
+        Some(0) => return Ok(Vec::new()),
+        Some(1) => {}
+        _ => bail!(
+            "failed checking whether IMPLEMENTATION_PLAN.md changed: {}",
+            String::from_utf8_lossy(&plan_diff.stderr).trim()
+        ),
+    }
+
+    let output = Command::new("bash")
+        .arg(&hook)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to launch {}", hook.display()))?;
+    if !output.status.success() {
+        bail!(
+            "post-plan-update hook {} failed with status {}:\n{}\n{}",
+            hook.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .context("post-plan-update hook output was not valid UTF-8")?;
+    let mut paths = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    for path in &paths {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            bail!("post-plan-update hook reported unsafe path `{path}`");
+        }
+        let tracked = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["ls-files", "--error-unmatch", "--", path])
+            .output()
+            .with_context(|| format!("failed checking hook output path `{path}`"))?;
+        if !tracked.status.success() {
+            bail!("post-plan-update hook reported untracked path `{path}`");
+        }
+    }
+    if !paths.is_empty() {
+        let mut add_args = vec!["add", "-u", "--"];
+        add_args.extend(paths.iter().map(String::as_str));
+        run_git(repo_root, add_args)?;
+    }
+    Ok(paths)
 }
 
 pub(crate) fn prepare_lane_landing_recovery(
@@ -7443,5 +7541,57 @@ exec "$@"
         assert!(!super::task_is_sweep_excluded(
             "- [x] `T1` x\n  Verification:\n    - `cargo test`\n"
         ));
+    }
+
+    #[test]
+    fn partial_closeout_commits_reported_plan_derived_file() {
+        let root = unique_temp_dir("plan-update-hook");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::write(
+            root.join("scripts/autodev-after-plan-update.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\ncp IMPLEMENTATION_PLAN.md derived-plan.txt\nprintf '%s\\n' derived-plan.txt\n",
+        )
+        .expect("write hook");
+        fs::write(root.join("derived-plan.txt"), "# old plan\n").expect("write derived");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# Plan\n\n- [ ] `TASK-HOOK` refresh derived plan\nDependencies: none\n",
+        )
+        .expect("write seed plan");
+        git_ok(
+            &root,
+            [
+                "add",
+                "scripts/autodev-after-plan-update.sh",
+                "derived-plan.txt",
+                "IMPLEMENTATION_PLAN.md",
+            ],
+        );
+        git_ok(&root, ["commit", "-q", "-m", "seed hook"]);
+
+        let partial = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md"))
+            .expect("read plan")
+            .replace("- [ ] `TASK-HOOK`", "- [~] `TASK-HOOK`");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), &partial).expect("write partial plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+
+        commit_task_closeout(
+            &root,
+            "TASK-HOOK",
+            LoopTaskStatus::Partial,
+            "repo: TASK-HOOK queue sync",
+            false,
+        )
+        .expect("partial closeout should include derived plan file");
+
+        assert_eq!(
+            fs::read_to_string(root.join("derived-plan.txt")).expect("read derived"),
+            partial
+        );
+        let committed = run_git_in(&root, ["show", "--name-only", "--format=", "HEAD"]);
+        assert!(committed.contains("IMPLEMENTATION_PLAN.md"), "{committed}");
+        assert!(committed.contains("derived-plan.txt"), "{committed}");
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 }
