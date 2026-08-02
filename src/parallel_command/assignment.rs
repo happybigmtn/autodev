@@ -800,17 +800,8 @@ pub(crate) fn discover_resume_candidates(
             }
         }
 
-        let mut host_recovery_note = match inspect_lane_repo_progress(&lane_repo_root, &base_commit)
-        {
-            Ok(LaneRepoProgress::None) => continue,
-            Ok(LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status)) => {
-                Some(lane_repo_recovery_note(
-                    &lane_repo_root,
-                    target_branch,
-                    &status,
-                ))
-            }
-            Ok(LaneRepoProgress::NewCommits) => None,
+        let progress = match inspect_lane_repo_progress(&lane_repo_root, &base_commit) {
+            Ok(progress) => progress,
             Err(err) => {
                 eprintln!(
                     "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
@@ -818,6 +809,25 @@ pub(crate) fn discover_resume_candidates(
                 );
                 continue;
             }
+        };
+        let mut host_recovery_note = match &progress {
+            LaneRepoProgress::None
+                if resume_lane_progress_is_harvestable(
+                    &lane_repo_root,
+                    &task_id,
+                    &progress,
+                ) => Some(format!(
+                    "host restart found a clean lane receipt for `{task_id}`; reconcile the existing proof before dispatching duplicate work"
+                )),
+            LaneRepoProgress::None => continue,
+            LaneRepoProgress::Dirty(status) | LaneRepoProgress::NewCommitsWithDirty(status) => {
+                Some(lane_repo_recovery_note(
+                    &lane_repo_root,
+                    target_branch,
+                    status,
+                ))
+            }
+            LaneRepoProgress::NewCommits => None,
         };
         if host_recovery_note.is_none() {
             host_recovery_note =
@@ -843,6 +853,85 @@ pub(crate) fn discover_resume_candidates(
     Ok(candidates)
 }
 
+fn resume_lane_progress_is_harvestable(
+    lane_repo_root: &Path,
+    task_id: &str,
+    progress: &LaneRepoProgress,
+) -> bool {
+    matches!(progress, LaneRepoProgress::NewCommits)
+        || (matches!(progress, LaneRepoProgress::None)
+            && lane_repo_root
+                .join(".auto/symphony/verification-receipts")
+                .join(format!("{task_id}.json"))
+                .is_file())
+}
+
+pub(crate) fn live_resume_workers(run_root: &Path) -> Result<Vec<(usize, String, u32)>> {
+    let lanes_root = run_root.join("lanes");
+    if !lanes_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut live = Vec::new();
+    for entry in fs::read_dir(&lanes_root)
+        .with_context(|| format!("failed to read {}", lanes_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", lanes_root.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let lane_root = entry.path();
+        let Some(lane_index) = entry.file_name().to_str().and_then(parse_lane_index) else {
+            continue;
+        };
+        let Some(pid) = read_worker_pid(&lane_root.join("worker.pid"))? else {
+            continue;
+        };
+        if !worker_pid_is_alive(pid)? {
+            continue;
+        }
+        let task_id = read_lane_task_id(&lane_root)?.unwrap_or_else(|| "unknown".to_string());
+        live.push((lane_index, task_id, pid));
+    }
+    live.sort();
+    Ok(live)
+}
+
+pub(crate) async fn wait_for_live_resume_workers(
+    run_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+) -> Result<()> {
+    let mut last_summary = None;
+    loop {
+        let live = live_resume_workers(run_root)?;
+        if live.is_empty() {
+            if last_summary.is_some() {
+                parallel_logger.info(
+                    "resume-wait: prior-host workers exited; harvesting their lanes before dispatch",
+                );
+            }
+            return Ok(());
+        }
+        let summary = live
+            .iter()
+            .map(|(lane, task, pid)| format!("lane-{lane} `{task}` pid {pid}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if last_summary.as_deref() != Some(summary.as_str()) {
+            parallel_logger.info(format!(
+                "resume-wait: preserving {} live prior-host worker(s) before duplicate dispatch: {summary}",
+                live.len()
+            ));
+            last_summary = Some(summary);
+        }
+        tokio::time::sleep(LANE_POLL_INTERVAL).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn harvest_resumable_lane_results(
     repo_root: &Path,
@@ -861,12 +950,11 @@ pub(crate) async fn harvest_resumable_lane_results(
             Some(candidate) => {
                 match inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)
                 {
-                    Ok(LaneRepoProgress::NewCommits) => true,
-                    Ok(
-                        LaneRepoProgress::Dirty(_)
-                        | LaneRepoProgress::NewCommitsWithDirty(_)
-                        | LaneRepoProgress::None,
-                    ) => false,
+                    Ok(progress) => resume_lane_progress_is_harvestable(
+                        &candidate.lane_repo_root,
+                        &candidate.task.id,
+                        &progress,
+                    ),
                     Err(err) => {
                         eprintln!(
                             "warning: skipping resumable lane-{} because repo progress inspection failed: {err:#}",
@@ -899,6 +987,81 @@ pub(crate) async fn harvest_resumable_lane_results(
             terminate_requested_at: None,
             host_recovery_note: candidate.host_recovery_note,
         };
+
+        let clean_no_commit = matches!(
+            inspect_lane_repo_progress(&assignment.lane_repo_root, &assignment.base_commit),
+            Ok(LaneRepoProgress::None)
+        );
+        if clean_no_commit {
+            match reconcile_parallel_clean_no_commit(
+                repo_root,
+                target_branch,
+                &mut assignment,
+                parallel_logger,
+                review_config,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if push_parallel_landing_with_divergence_retries(
+                        repo_root,
+                        target_branch,
+                        &assignment,
+                    )? {
+                        parallel_logger.info(format!(
+                            "remote sync: rebased onto origin/{target_branch} after resumed clean-no-commit closeout"
+                        ));
+                    }
+                    if let Some(tracker) = linear_tracker.as_mut() {
+                        if let Err(err) = tracker.note_done(&assignment.task.id).await {
+                            eprintln!(
+                                "warning: failed to archive `{}` in Linear: {err:#}",
+                                assignment.task.id
+                            );
+                        }
+                    }
+                    landed += 1;
+                    attempted_partial_followups.remove(&assignment.task.id);
+                    deferred_partial_tasks.remove(&assignment.task.id);
+                    parallel_logger.info(format!(
+                        "resumed:     reconciled {} from clean lane-{} receipt before duplicate dispatch (total landed: {})",
+                        assignment.task.id, assignment.lane_index, landed
+                    ));
+                    continue;
+                }
+                Ok(false) => {
+                    parallel_logger.warn(format!(
+                        "warning: resumed clean lane-{} `{}` receipt did not satisfy current-tree gates; keeping lane resumable",
+                        assignment.lane_index, assignment.task.id
+                    ));
+                }
+                Err(error) => {
+                    parallel_logger.warn(format!(
+                        "warning: resumed clean lane-{} `{}` reconciliation failed; keeping lane resumable: {error:#}",
+                        assignment.lane_index, assignment.task.id
+                    ));
+                }
+            }
+            resumable_lanes.insert(
+                lane_index,
+                LaneResumeCandidate {
+                    lane_index: assignment.lane_index,
+                    task: assignment.task,
+                    lane_root: assignment.lane_root,
+                    lane_repo_root: assignment.lane_repo_root,
+                    base_commit: assignment.base_commit,
+                    stdout_log_path: assignment.stdout_log_path,
+                    stderr_log_path: assignment.stderr_log_path,
+                    worker_pid_path: assignment.worker_pid_path,
+                    host_recovery_note: Some(
+                        "clean-lane receipt did not pass resumed reconciliation; rerun only the missing current-tree gates"
+                            .to_string(),
+                    ),
+                },
+            );
+            continue;
+        }
+
         match land_parallel_lane_result(repo_root, target_branch, &mut assignment, review_config)
             .await
         {
@@ -1316,7 +1479,7 @@ pub(crate) fn task_id_from_prompt_filename(file_name: &str) -> Option<String> {
 mod tests {
     use super::{
         parse_lane_cache_max_bytes, parse_lane_cargo_incremental_enabled,
-        DEFAULT_LANE_CACHE_MAX_GIB, GIB,
+        resume_lane_progress_is_harvestable, DEFAULT_LANE_CACHE_MAX_GIB, GIB,
     };
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
@@ -2000,5 +2163,52 @@ mod tests {
         assert!(
             take_resume_candidate_for_task(&mut resumable, &ready_tasks[1].id, &active).is_none()
         );
+    }
+
+    #[test]
+    fn clean_no_commit_lane_with_receipt_is_harvestable_after_host_restart() {
+        let lane_repo = unique_temp_dir("parallel-clean-receipt-resume");
+        let receipt = lane_repo.join(".auto/symphony/verification-receipts/TASK-RECOVER.json");
+        fs::create_dir_all(receipt.parent().expect("receipt parent"))
+            .expect("create receipt directory");
+        fs::write(&receipt, "{}\n").expect("write generated receipt");
+
+        assert!(resume_lane_progress_is_harvestable(
+            &lane_repo,
+            "TASK-RECOVER",
+            &LaneRepoProgress::None,
+        ));
+        assert!(!resume_lane_progress_is_harvestable(
+            &lane_repo,
+            "TASK-WITHOUT-RECEIPT",
+            &LaneRepoProgress::None,
+        ));
+
+        fs::remove_dir_all(lane_repo).ok();
+    }
+
+    #[test]
+    fn live_resume_worker_scan_protects_prior_host_processes() {
+        let run_root = unique_temp_dir("parallel-live-resume-worker");
+        let lane_root = run_root.join("lanes/lane-3");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(lane_root.join("task-id"), "TASK-LIVE\n").expect("write task id");
+        fs::write(
+            lane_root.join("worker.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("write live worker pid");
+
+        assert_eq!(
+            live_resume_workers(&run_root).expect("scan live workers"),
+            vec![(3, "TASK-LIVE".to_string(), std::process::id())]
+        );
+
+        fs::write(lane_root.join("worker.pid"), "4294967295\n").expect("write dead worker pid");
+        assert!(live_resume_workers(&run_root)
+            .expect("scan dead workers")
+            .is_empty());
+
+        fs::remove_dir_all(run_root).ok();
     }
 }

@@ -258,6 +258,7 @@ pub(crate) async fn run_parallel_loop(
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     let review_config = LaneReviewConfig::from_run_config(&args.model, &args.codex_bin);
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
+    wait_for_live_resume_workers(run_root, parallel_logger).await?;
     let mut resumable_lanes = discover_resume_candidates(
         repo_root,
         run_root,
