@@ -157,6 +157,18 @@ pub(crate) fn inspect_task_completion_evidence(
     task_id: &str,
     task_markdown: &str,
 ) -> TaskCompletionEvidence {
+    inspect_task_completion_evidence_with_owned_inputs(repo_root, task_id, task_markdown, None)
+}
+
+/// Inspect completion evidence during a drift sweep after the host has proved
+/// that the durable footer's task-owned input fingerprint still matches.
+/// Receipt content, artifacts, audits, and reviews remain fully enforced.
+pub(crate) fn inspect_task_completion_evidence_with_owned_inputs(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+    unchanged_owned_inputs: Option<&str>,
+) -> TaskCompletionEvidence {
     let review_path = repo_root.join("REVIEW.md");
     let review_text = fs::read_to_string(&review_path).unwrap_or_default();
     let verification_receipt_path = verification_receipt_path(repo_root, task_id);
@@ -171,6 +183,7 @@ pub(crate) fn inspect_task_completion_evidence(
         &verification_receipt_path,
         &verification.executable_commands,
         &declared_completion_artifacts,
+        unchanged_owned_inputs,
     );
     let missing_completion_artifacts = declared_completion_artifacts
         .iter()

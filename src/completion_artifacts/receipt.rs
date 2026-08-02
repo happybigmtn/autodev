@@ -520,6 +520,7 @@ fn shared_footer_receipt_freshness_problem(
             expected_commands,
             declared_artifacts,
             source: VerificationReceiptSource::CommitFooter,
+            unchanged_owned_inputs: None,
             limits: SourceStateLimits::default(),
         },
         None,
@@ -735,6 +736,10 @@ struct VerificationReceiptFreshnessRequest<'a> {
     expected_commands: &'a [String],
     declared_artifacts: &'a [String],
     source: VerificationReceiptSource,
+    /// During a parallel drift sweep, a matching host-stamped per-task input
+    /// fingerprint is allowed to replace whole-repository freshness. This is
+    /// deliberately footer-only: staging JSON never carries durable authority.
+    unchanged_owned_inputs: Option<&'a str>,
     limits: SourceStateLimits,
 }
 
@@ -752,6 +757,7 @@ pub(crate) fn inspect_verification_receipt(
     verification_receipt_path: &Path,
     expected_commands: &[String],
     declared_artifacts: &[String],
+    unchanged_owned_inputs: Option<&str>,
 ) -> (bool, Option<String>) {
     if !verification_receipt_required {
         return (true, None);
@@ -784,6 +790,7 @@ pub(crate) fn inspect_verification_receipt(
                         expected_commands,
                         declared_artifacts,
                         source: VerificationReceiptSource::CommitFooter,
+                        unchanged_owned_inputs,
                         limits: SourceStateLimits::default(),
                     },
                     None,
@@ -1173,6 +1180,7 @@ fn direct_verification_receipt_freshness_problem_with_limits(
             expected_commands,
             declared_artifacts,
             source: VerificationReceiptSource::JsonFile,
+            unchanged_owned_inputs: None,
             limits,
         },
         None,
@@ -1231,6 +1239,7 @@ fn direct_verification_receipt_problem_with_bounded_freshness(
             expected_commands,
             declared_artifacts,
             source: VerificationReceiptSource::JsonFile,
+            unchanged_owned_inputs: None,
             limits: bounded.limits,
         },
         Some(bounded),
@@ -1301,6 +1310,7 @@ fn verification_receipt_freshness_problem(
             expected_commands,
             declared_artifacts,
             source: VerificationReceiptSource::JsonFile,
+            unchanged_owned_inputs: None,
             limits: SourceStateLimits::default(),
         },
         None,
@@ -1319,6 +1329,7 @@ fn verification_receipt_freshness_problem_for_source(
         expected_commands,
         declared_artifacts,
         source,
+        unchanged_owned_inputs,
         limits,
     } = request;
 
@@ -1351,8 +1362,42 @@ fn verification_receipt_freshness_problem_for_source(
         }
     }
 
+    let owned_inputs_replace_global_freshness = match unchanged_owned_inputs {
+        Some(_) if source != VerificationReceiptSource::CommitFooter => {
+            return Some(
+                "unchanged task-owned inputs may only authorize a committed receipt footer"
+                    .to_string(),
+            )
+        }
+        Some(expected) => match receipt.task_owned_inputs_v1.as_deref() {
+            Some(recorded) if recorded == expected => {
+                if receipt.source_state_v2.is_none() {
+                    return Some(
+                        "verification footer with matching task-owned inputs is missing its host-attested source_state_v2"
+                            .to_string(),
+                    );
+                }
+                true
+            }
+            Some(recorded) => {
+                return Some(format!(
+                    "task-owned inputs fingerprint mismatch, recorded `{recorded}` but expected `{expected}`"
+                ))
+            }
+            None => {
+                return Some(
+                    "verification footer is missing the matched task_owned_inputs_v1 fingerprint"
+                        .to_string(),
+                )
+            }
+        },
+        None => false,
+    };
+
     let (current_commit, current_dirty_fingerprint, current_dirty_is_clean, current_plan_hash) =
-        if let Some(context) = bounded.as_mut() {
+        if owned_inputs_replace_global_freshness {
+            (None, None, false, None)
+        } else if let Some(context) = bounded.as_mut() {
             let current_commit =
                 match current_git_commit_with_budget(repo_root, context.limits, context.budget) {
                     Ok(commit) => Some(commit),
@@ -1494,6 +1539,10 @@ fn verification_receipt_freshness_problem_for_source(
         if let Some(problem) = verification_command_argv_problem(receipt, expected_command) {
             return Some(problem);
         }
+    }
+
+    if owned_inputs_replace_global_freshness {
+        return None;
     }
 
     match (source, receipt.source_state_v2.as_deref()) {

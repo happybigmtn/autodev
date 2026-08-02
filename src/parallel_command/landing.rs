@@ -327,8 +327,8 @@ pub(crate) struct ReceiptDriftTriageEntry {
 /// Local drift re-verify is on unless `AUTO_PARALLEL_DRIFT_REVERIFY=0`.
 /// When completion evidence for a `[x]` row goes stale for a locally
 /// repairable reason (receipt/plan/artifact freshness), re-running the row's
-/// declared verification commands can refresh its receipt before demotion. A
-/// verify-only refresh never substitutes for the workspace and review gates.
+/// declared verification commands can refresh its proof while the accepted
+/// queue-truth policy preserves the completed row.
 fn drift_local_reverify_enabled() -> bool {
     std::env::var("AUTO_PARALLEL_DRIFT_REVERIFY")
         .map(|value| value.trim() != "0")
@@ -339,10 +339,9 @@ fn drift_local_reverify_enabled() -> bool {
 /// invocation (`AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS`, default 900). Local
 /// re-verification re-runs a task's real test commands, so a large stale set
 /// could otherwise turn one audit into a serial test marathon that starves the
-/// run. Once the budget is spent, remaining stale rows take the honest path
-/// (Done -> demote to [~]; fully-evidenced Partial -> manual closeout) — a stale
-/// row never silently stays [x] without either fresh receipts or demotion. `0`
-/// disables the sweep entirely, reproducing pre-re-verify behavior.
+/// run. Once the budget is spent, remaining completed rows stay `[x]` and their
+/// proof gaps remain explicit in `RECEIPTS-DRIFT.md`; fully-evidenced partials
+/// remain manual closeout candidates. `0` disables local re-execution.
 fn drift_reverify_budget() -> Duration {
     let secs = std::env::var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS")
         .ok()
@@ -444,7 +443,6 @@ pub(crate) async fn audit_parallel_completion_drift(
     let all_plan_tasks = parse_shared_tasks(plan_text);
     let receipt_footers = git_verification_receipt_footers(repo_root);
     let forced_full_reverify = force_full_reverify_enabled();
-    let mut updated_plan_text = plan_text.to_string();
     let mut completed_drift = Vec::new();
     let mut locally_refreshed_done = Vec::new();
     let mut locally_refreshed_partial = Vec::new();
@@ -476,40 +474,33 @@ pub(crate) async fn audit_parallel_completion_drift(
         );
         let reverify_active = drift_local_reverify_enabled() && !reverify_budget.is_zero();
         let must_reverify = decision == OwnedInputsDecision::ForceReverify;
-        let mut host_verify_refreshed = false;
-
-        let mut evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+        let unchanged_owned_inputs = (!must_reverify)
+            .then_some((stored_fp.as_deref(), current_fp.as_deref()))
+            .and_then(|(stored, current)| match (stored, current) {
+                (Some(stored), Some(current)) if stored == current => Some(current),
+                _ => None,
+            });
+        let mut evidence = inspect_task_completion_evidence_with_owned_inputs(
+            repo_root,
+            &task.id,
+            &task.markdown,
+            unchanged_owned_inputs,
+        );
         if !must_reverify && evidence.is_fully_evidenced() {
             continue;
         }
-        // From this point onward the sweep may refresh receipt JSON, record a
-        // verified-source attestation, synthesize a review handoff, or migrate
-        // legacy evidence. Persist the accumulated demotion first so a crash
-        // after any of those mutations restarts from [~], never from a Done row
-        // that newly appears fully evidenced.
-        updated_plan_text = update_reconciled_task_completion_in_plan_text(
-            &updated_plan_text,
-            task,
-            LoopTaskStatus::Partial,
-        );
-        let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
-        atomic_write(&plan_path, updated_plan_text.as_bytes()).with_context(|| {
-            format!(
-                "failed to durably demote `{}` before evidence refresh",
-                task.id
-            )
-        })?;
         if reverify_active
             && (must_reverify
                 || assess_task_completion_gap(&task.markdown, &evidence).kind
                     == CompletionGapKind::LocalRepairable)
         {
             if reverify_spent >= reverify_budget {
-                // Budget spent: fall through to the honest demote path below.
+                // Budget spent: preserve queue truth and report the stale proof
+                // in triage for a later sweep.
                 reverify_deferred.push(task.id.clone());
             } else {
                 parallel_logger.info(format!(
-                    "drift-reverify: `{}` completion evidence went stale ({}); re-running its verification locally after durable demotion",
+                    "drift-reverify: `{}` completion evidence went stale ({}); re-running its verification locally without changing queue status",
                     task.id,
                     evidence.missing_reasons().join("; ")
                 ));
@@ -533,31 +524,25 @@ pub(crate) async fn audit_parallel_completion_drift(
                     }
                     if refreshed.is_fully_evidenced() {
                         locally_refreshed_done.push(task.id.clone());
-                        host_verify_refreshed = true;
+                        continue;
                     }
                     evidence = refreshed;
                 }
             }
         }
         let mut reasons = evidence.missing_reasons();
-        if reasons.is_empty() && host_verify_refreshed {
+        if reasons.is_empty() && must_reverify {
+            // A changed task-owned fingerprint is itself actionable drift even
+            // when the older receipt remains content-valid.
             reasons.push(
-                "host verification refreshed receipt evidence, but workspace and independent-review gates must re-run before [x]"
-                    .to_string(),
-            );
-        } else if reasons.is_empty() && must_reverify {
-            // A fingerprint-forced demote of a row whose receipt still looked
-            // fresh: its own inputs changed and host re-verification did not
-            // re-prove [x]. Record a legible reason.
-            reasons.push(
-                "task-owned inputs changed since the receipt was stamped and host re-verification did not re-prove [x]"
+                "task-owned inputs changed since the receipt was stamped and host re-verification did not refresh the proof"
                     .to_string(),
             );
         }
         let entry = ReceiptDriftTriageEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
-            status: LoopTaskStatus::Partial,
+            status: LoopTaskStatus::Done,
             reasons,
         };
         completed_drift.push(entry);
@@ -628,11 +613,6 @@ pub(crate) async fn audit_parallel_completion_drift(
         });
     }
 
-    if updated_plan_text != plan_text {
-        let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
-        atomic_write(&plan_path, updated_plan_text.as_bytes())
-            .with_context(|| format!("failed to write {}", plan_path.display()))?;
-    }
     let triage_changed = if !completed_drift.is_empty()
         || !manual_closeout_candidates.is_empty()
         || repo_root.join("RECEIPTS-DRIFT.md").exists()
@@ -665,7 +645,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     }
     if !locally_refreshed_done.is_empty() {
         parallel_logger.info(format!(
-            "drift-reverify: refreshed receipt evidence for {} completed task(s), but demoted [x] to [~] pending workspace and independent-review gates ({})",
+            "drift-reverify: refreshed receipt evidence for {} completed task(s) while preserving [x] queue status ({})",
             locally_refreshed_done.len(),
             locally_refreshed_done.join(", ")
         ));
@@ -690,7 +670,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     }
     if triage_changed && !completed_drift.is_empty() {
         parallel_logger.warn(format!(
-            "warning: repo-local completion evidence drifted for {} completed task(s); wrote RECEIPTS-DRIFT.md and demoted IMPLEMENTATION_PLAN.md rows to [~] ({})",
+            "warning: repo-local completion evidence drifted for {} completed task(s); wrote RECEIPTS-DRIFT.md without changing IMPLEMENTATION_PLAN.md ({})",
             completed_drift.len(),
             completed_drift
                 .iter()
@@ -701,7 +681,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     }
     // exhaustive = the sweep finished without deferring any row for budget.
     // Only an exhaustive sweep may be cached as "nothing left to check".
-    Ok((updated_plan_text, reverify_deferred.is_empty()))
+    Ok((plan_text.to_string(), reverify_deferred.is_empty()))
 }
 
 pub(crate) fn write_receipts_drift_triage(
@@ -5635,7 +5615,7 @@ Dependencies: none\n";
     }
 
     #[tokio::test]
-    async fn audit_parallel_completion_drift_demotes_completed_rows() {
+    async fn audit_parallel_completion_drift_preserves_completed_rows() {
         let repo = unique_temp_dir("parallel-drift-audit");
         let run_root = unique_temp_dir("parallel-drift-audit-run");
         init_git_repo(&repo);
@@ -5646,10 +5626,7 @@ Dependencies: none\n";
         git_ok(&repo, ["commit", "-q", "-m", "seed completed plan"]);
         let logger = ParallelEventLogger::new(&run_root).expect("logger should initialize");
 
-        // A row with no receipts and no runnable verification demotes whether or
-        // not the budget is spent — the budgeted re-verify path finds nothing to
-        // run and falls through honestly. (Budget parsing is covered directly by
-        // `drift_reverify_budget_parses_env`.)
+        // Missing evidence is triaged, but landed queue truth remains completed.
         let (updated, _) = audit_parallel_completion_drift(
             &repo,
             "main",
@@ -5659,7 +5636,7 @@ Dependencies: none\n";
         .await
         .expect("drift audit should succeed");
 
-        assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
+        assert_eq!(updated, plan);
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("plan should persist");
         assert_eq!(persisted, updated);
@@ -5670,7 +5647,7 @@ Dependencies: none\n";
         );
         let live_log = fs::read_to_string(run_root.join("live.log"))
             .expect("receipt repair should write host log");
-        assert!(live_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
+        assert!(live_log.contains("without changing IMPLEMENTATION_PLAN.md"));
     }
 
     #[tokio::test]
@@ -5688,10 +5665,10 @@ Dependencies: none\n";
         let (updated, _) = audit_parallel_completion_drift(&repo, "main", plan, &logger)
             .await
             .expect("first drift audit should succeed");
-        assert!(updated.starts_with("- [~] `TASK-001`"), "{updated}");
+        assert_eq!(updated, plan);
         let first_log =
             fs::read_to_string(run_root.join("live.log")).expect("first audit should log drift");
-        assert!(first_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
+        assert!(first_log.contains("without changing IMPLEMENTATION_PLAN.md"));
 
         let _ = audit_parallel_completion_drift(&repo, "main", &updated, &logger)
             .await
@@ -5699,21 +5676,24 @@ Dependencies: none\n";
         let second_log =
             fs::read_to_string(run_root.join("live.log")).expect("second audit should keep log");
         assert_eq!(
-            second_log, first_log,
-            "unchanged receipt drift should stay visible in RECEIPTS-DRIFT.md without appending another fresh host warning"
+            second_log
+                .matches("wrote RECEIPTS-DRIFT.md without changing IMPLEMENTATION_PLAN.md")
+                .count(),
+            1,
+            "unchanged triage may retry local repair, but must not append another warning: first={first_log:?} second={second_log:?}"
         );
 
         let drift_summary = receipt_drift_status_summary(&repo);
         assert!(
             drift_summary
                 .as_deref()
-                .is_none_or(|summary| !summary.contains("completed task(s)")),
-            "completed receipt drift should be cleared once the row is demoted: {drift_summary:?}"
+                .is_some_and(|summary| summary.contains("completed task(s)")),
+            "completed receipt drift should remain visible without changing queue truth: {drift_summary:?}"
         );
     }
 
     #[tokio::test]
-    async fn audit_parallel_completion_drift_demotes_legacy_receipt_without_host_attestation() {
+    async fn audit_parallel_completion_drift_triages_legacy_receipt_without_demotion() {
         let (_root, _remote, repo, _worker) =
             init_remote_and_clones("parallel-drift-backfill", "trunk");
         let run_root = unique_temp_dir("parallel-drift-backfill-run");
@@ -5750,12 +5730,9 @@ Dependencies: none\n";
 
         let (updated, _) = audit_parallel_completion_drift(&repo, "trunk", plan, &logger)
             .await
-            .expect("drift audit should demote legacy receipt without source attestation");
+            .expect("drift audit should triage legacy receipt without source attestation");
 
-        assert!(
-            updated.starts_with("- [~] `TASK-001`"),
-            "legacy receipt migration must not substitute for current-tree definition-of-done gates: {updated}"
-        );
+        assert_eq!(updated, plan, "receipt drift must not rewrite queue truth");
         let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md"))
             .expect("backfilled legacy receipt should remain in drift triage");
         assert!(
@@ -5771,11 +5748,11 @@ Dependencies: none\n";
         );
         let live_log = fs::read_to_string(run_root.join("live.log"))
             .expect("drift audit should write host log");
-        assert!(live_log.contains("demoted IMPLEMENTATION_PLAN.md rows to [~]"));
+        assert!(live_log.contains("without changing IMPLEMENTATION_PLAN.md"));
     }
 
     #[tokio::test]
-    async fn legacy_done_evidence_is_demoted_without_publishing_a_footer_before_restart() {
+    async fn legacy_done_evidence_is_triaged_without_publishing_a_footer() {
         let repo = unique_temp_dir("parallel-drift-no-early-footer");
         let run_root = unique_temp_dir("parallel-drift-no-early-footer-run");
         init_git_repo(&repo);
@@ -5820,13 +5797,10 @@ Dependencies: none\n";
         let head_before = git_output(&repo, ["rev-parse", "HEAD"]);
         let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
 
-        let (demoted, _) = audit_parallel_completion_drift(&repo, "main", &plan, &logger)
+        let (audited, _) = audit_parallel_completion_drift(&repo, "main", &plan, &logger)
             .await
-            .expect("legacy drift should demote without early footer publication");
-        assert!(
-            demoted.starts_with(&format!("- [~] `{task_id}`")),
-            "{demoted}"
-        );
+            .expect("legacy drift should be triaged without early footer publication");
+        assert_eq!(audited, plan);
         assert_eq!(
             git_output(&repo, ["rev-parse", "HEAD"]),
             head_before,
@@ -5842,11 +5816,8 @@ Dependencies: none\n";
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read restart plan");
         let (restarted, _) = audit_parallel_completion_drift(&repo, "main", &restart_plan, &logger)
             .await
-            .expect("restart should retain the Partial interlock");
-        assert!(
-            restarted.starts_with(&format!("- [~] `{task_id}`")),
-            "restart must leave remaining definition-of-done gates in the path: {restarted}"
-        );
+            .expect("restart should preserve completed queue truth");
+        assert_eq!(restarted, plan);
 
         fs::remove_dir_all(&repo).expect("remove repo");
         fs::remove_dir_all(&run_root).expect("remove run root");
@@ -6016,7 +5987,7 @@ Dependencies: none\n";
     }
 
     #[tokio::test]
-    async fn drift_verify_refresh_demotes_done_until_full_dod_reproof() {
+    async fn drift_verify_refresh_preserves_done_queue_truth() {
         let repo = unique_temp_dir("parallel-drift-done-needs-dod");
         let run_root = unique_temp_dir("parallel-drift-done-needs-dod-run");
         init_git_repo(&repo);
@@ -6078,15 +6049,14 @@ exec "$@"
             .await
             .expect("drift audit should be bounded");
 
-        assert!(
-            updated.starts_with(&format!("- [~] `{task_id}`")),
-            "verify-only refresh must demote stale [x] until workspace and review gates run: {updated}"
+        assert_eq!(
+            updated, plan,
+            "receipt repair must preserve [x] queue truth"
         );
-        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md"))
-            .expect("demotion should remain visible");
+        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
-            triage.contains("Completed Tasks With Drift") && triage.contains(task_id),
-            "{triage}"
+            !triage.contains(task_id),
+            "successfully refreshed evidence should leave no drift entry: {triage}"
         );
 
         fs::remove_dir_all(&repo).expect("remove repo");
@@ -6094,7 +6064,7 @@ exec "$@"
     }
 
     #[tokio::test]
-    async fn done_drift_is_partial_before_receipt_refresh_and_survives_restart() {
+    async fn done_drift_preserves_queue_truth_across_refresh_failure_and_restart() {
         let repo = unique_temp_dir("parallel-drift-refresh-crash");
         let run_root = unique_temp_dir("parallel-drift-refresh-crash-run");
         init_git_repo(&repo);
@@ -6105,7 +6075,7 @@ exec "$@"
         let task_id = "TASK-REFRESH-CRASH";
         let command = "bash -c true";
         let plan = format!(
-            "- [x] `{task_id}` Refresh must follow durable demotion\n  Verification: `{command}`\n  Dependencies: none\n  Estimated scope: S\n"
+            "- [x] `{task_id}` Refresh preserves durable queue truth\n  Verification: `{command}`\n  Dependencies: none\n  Estimated scope: S\n"
         );
         fs::write(repo.join(".gitignore"), ".auto/\n").expect("write gitignore");
         fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &plan).expect("write plan");
@@ -6122,8 +6092,8 @@ exec "$@"
 task="$1"
 shift
 if [ "${{1:-}}" = "--" ]; then shift; fi
-grep -F -- '- [~] `{task_id}`' IMPLEMENTATION_PLAN.md >/dev/null || exit 91
-printf 'refresh observed durable partial\n' > .auto/refresh-saw-partial
+grep -F -- '- [x] `{task_id}`' IMPLEMENTATION_PLAN.md >/dev/null || exit 91
+printf 'refresh observed durable done\n' > .auto/refresh-saw-done
 printf '%s\n' '{{"task_id":"{task_id}","commands":[{{"command":"{command}","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}}]}}' > ".auto/symphony/verification-receipts/$task.json"
 exec "$@"
 "#
@@ -6163,8 +6133,8 @@ exec "$@"
             "{error:#}"
         );
         assert!(
-            repo.join(".auto/refresh-saw-partial").exists(),
-            "verification must observe durable [~] before it can refresh evidence"
+            repo.join(".auto/refresh-saw-done").exists(),
+            "verification must observe preserved [x] queue truth while refreshing evidence"
         );
         assert!(
             repo.join(format!(".auto/parallel/verified-source/{task_id}.json"))
@@ -6173,9 +6143,9 @@ exec "$@"
         );
         let persisted =
             fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read persisted plan");
-        assert!(
-            persisted.starts_with(&format!("- [~] `{task_id}`")),
-            "crash recovery authority must already be Partial: {persisted}"
+        assert_eq!(
+            persisted, plan,
+            "a triage write failure must not alter the plan"
         );
 
         fs::remove_dir(repo.join("RECEIPTS-DRIFT.md")).expect("clear crash fixture");
@@ -6185,15 +6155,109 @@ exec "$@"
             audit_parallel_completion_drift(&repo, "main", &restarted_plan, &logger)
                 .await
                 .expect("restart should audit the durable Partial row");
+        assert_eq!(restarted, plan, "restart must retain completed queue truth");
+        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
-            restarted.starts_with(&format!("- [~] `{task_id}`")),
-            "restart must force the remaining definition-of-done gates: {restarted}"
+            !triage.contains(task_id),
+            "the refreshed receipt should clear drift after restart: {triage}"
         );
-        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md"))
-            .expect("restart should leave a manual closeout candidate");
+
+        fs::remove_dir_all(&repo).expect("remove repo");
+        fs::remove_dir_all(&run_root).expect("remove run root");
+    }
+
+    #[tokio::test]
+    async fn matching_owned_inputs_survive_an_unrelated_later_commit() {
+        let repo = unique_temp_dir("parallel-drift-unrelated-commit");
+        let run_root = unique_temp_dir("parallel-drift-unrelated-commit-run");
+        init_git_repo(&repo);
+        fs::create_dir_all(repo.join("scripts")).expect("create scripts dir");
+        fs::create_dir_all(repo.join(".auto/symphony/verification-receipts"))
+            .expect("create receipt dir");
+        fs::create_dir_all(&run_root).expect("create run root");
+        let task_id = "TASK-UNCHANGED-INPUTS";
+        let command = "bash -c true";
+        let partial_plan = format!(
+            "- [~] `{task_id}` Unrelated commits preserve proof\n  Verification: `{command}`\n  Dependencies: none\n  Estimated scope: S\n"
+        );
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &partial_plan).expect("write partial plan");
+        fs::write(repo.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        fs::write(
+            repo.join("REVIEW.md"),
+            format!("## `{task_id}`\n\nInitial handoff.\n"),
+        )
+        .expect("write review");
+        let wrapper = repo.join("scripts/run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nshift\nif [ \"${1:-}\" = \"--\" ]; then shift; fi\nexec \"$@\"\n",
+        )
+        .expect("write wrapper");
+        let mut permissions = fs::metadata(&wrapper).expect("stat wrapper").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
+        run_git_in(
+            &repo,
+            [
+                "add",
+                ".gitignore",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "scripts/run-task-verification.sh",
+            ],
+        );
+        run_git_in(&repo, ["commit", "-m", "seed partial task"]);
+
+        fs::write(
+            repo.join(format!(
+                ".auto/symphony/verification-receipts/{task_id}.json"
+            )),
+            format!(
+                r#"{{"task_id":"{task_id}","commands":[{{"command":"{command}","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("write receipt");
+        propagate_lane_receipts(&repo, &repo, task_id, &partial_plan)
+            .expect("bind receipt to seeded source");
+        record_verified_source_attestation(&repo, task_id)
+            .expect("attest the fixture's verified source state");
+
+        let plan =
+            partial_plan.replace(&format!("- [~] `{task_id}`"), &format!("- [x] `{task_id}`"));
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &plan).expect("write done plan");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+        commit_task_closeout(
+            &repo,
+            task_id,
+            LoopTaskStatus::Done,
+            &format!("{}: {task_id} queue sync", repo_name(&repo)),
+            false,
+        )
+        .expect("commit completion with a host-stamped footer");
+
+        fs::write(
+            repo.join("unrelated.txt"),
+            "This file is outside the task-owned inputs.\n",
+        )
+        .expect("write unrelated file");
+        run_git_in(&repo, ["add", "unrelated.txt"]);
+        run_git_in(&repo, ["commit", "-m", "add unrelated work"]);
+        let logger = ParallelEventLogger::new(&run_root).expect("initialize logger");
+
+        let (updated, _) = audit_parallel_completion_drift(&repo, "main", &plan, &logger)
+            .await
+            .expect("drift audit should trust unchanged task inputs");
+
+        assert_eq!(updated, plan, "unrelated work must not demote the task");
+        assert_eq!(
+            fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read persisted plan"),
+            plan,
+            "the durable plan must remain Done"
+        );
+        let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
-            triage.contains("Manual Closeout Candidates") && triage.contains(task_id),
-            "{triage}"
+            !triage.contains(task_id),
+            "unchanged task evidence must not enter drift triage: {triage}"
         );
 
         fs::remove_dir_all(&repo).expect("remove repo");
@@ -6282,9 +6346,9 @@ exec "$@"
             .await
             .expect("drift audit should be bounded");
 
-        assert!(
-            updated.starts_with(&format!("- [~] `{task_id}`")),
-            "matching owned inputs must not hide a new standing review finding: {updated}"
+        assert_eq!(
+            updated, plan,
+            "a review finding is triage evidence, not authority to rewrite queue truth"
         );
         let triage =
             fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).expect("finding should be triaged");
