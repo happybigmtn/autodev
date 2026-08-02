@@ -2027,10 +2027,20 @@ fn collect_repository_source_state(
         limits,
         budget,
     )?;
-    if let Some(path) = ignored_controls.first() {
+    let ignored_control = ignored_controls
+        .into_iter()
+        .map(|path| {
+            std::str::from_utf8(&path)
+                .context("source-state ignored control path was not UTF-8")
+                .map(str::to_string)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| !source_state_path_is_excluded_at_depth(path, depth));
+    if let Some(path) = ignored_control {
         bail!(
             "source-state collection found untracked ignore control `{}`; .gitignore files must be tracked before they can exclude source",
-            String::from_utf8_lossy(path)
+            path
         );
     }
 
@@ -3117,6 +3127,32 @@ mod tests {
             before, after,
             "host queue and .auto runtime churn must not invalidate verified source"
         );
+    }
+
+    #[test]
+    fn dirty_state_fingerprint_excludes_nested_lane_repository_ignore_controls() {
+        let root = temp_dir("nested-lane-repository-dirty-fingerprint");
+        init_git_repo(&root);
+        let before = super::current_dirty_state_fingerprint(&root).expect("baseline fingerprint");
+
+        let lane_repo = root.join(".auto/parallel/lanes/lane-1/repo");
+        fs::create_dir_all(&lane_repo).expect("failed to create nested lane repository");
+        init_git_repo(&lane_repo);
+        fs::write(lane_repo.join(".gitignore"), "generated/\n")
+            .expect("failed to write nested lane ignore control");
+        fs::create_dir_all(lane_repo.join("generated"))
+            .expect("failed to create nested lane generated directory");
+        fs::write(lane_repo.join("generated/output.bin"), "runtime output\n")
+            .expect("failed to write nested lane runtime output");
+
+        let after = super::current_dirty_state_fingerprint(&root)
+            .expect("nested Autodev lane repository must be excluded");
+        assert_eq!(
+            before, after,
+            "Autodev's nested lane repositories must not invalidate verified source"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

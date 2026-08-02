@@ -42,6 +42,10 @@ const PLANNING_SURFACE_PROBES: [&str; 9] = [
 
 pub(crate) async fn run_steward(args: StewardArgs) -> Result<()> {
     let repo_root = git_repo_root()?;
+    run_steward_in(args, repo_root).await
+}
+
+async fn run_steward_in(args: StewardArgs, repo_root: PathBuf) -> Result<()> {
     ensure_repo_layout(&repo_root)?;
     let current_branch = git_stdout(&repo_root, ["branch", "--show-current"])?
         .trim()
@@ -730,15 +734,13 @@ The first pass produced five artifacts. Verify they hold in the live tree and ap
 mod tests {
     use super::PLANNING_SURFACE_PROBES;
     use super::{
-        build_finalizer_prompt, build_steward_prompt, detect_planning_surface, run_steward,
+        build_finalizer_prompt, build_steward_prompt, detect_planning_surface, run_steward_in,
     };
     use crate::StewardArgs;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::Mutex;
 
     fn unique_temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -790,14 +792,7 @@ mod tests {
     }
 
     async fn run_steward_from(repo: &Path, args: StewardArgs) -> anyhow::Result<()> {
-        static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-        let _guard = CURRENT_DIR_LOCK.get_or_init(|| Mutex::new(())).lock().await;
-        let previous = std::env::current_dir().expect("read current dir");
-        std::env::set_current_dir(repo).expect("enter repo");
-        let result = run_steward(args).await;
-        std::env::set_current_dir(previous).expect("restore current dir");
-        result
+        run_steward_in(args, repo.to_path_buf()).await
     }
 
     #[tokio::test(flavor = "current_thread")]
