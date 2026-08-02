@@ -1648,33 +1648,13 @@ pub(crate) async fn run_parallel_loop(
     Ok(())
 }
 
-/// Fingerprint of everything a drift-reverify sweep could depend on: the
-/// committed HEAD plus the full working tree (tracked, modified, and untracked
-/// — source, plan, and receipts all live here). Changes iff some
-/// verification-relevant input changed. `None` on any git error, which
-/// conservatively forces the sweep to run (never a false skip).
+/// Fingerprint of the source and normalized task contracts a drift-reverify
+/// sweep could depend on. Host-owned queue commits must not invalidate a sweep:
+/// they change HEAD and REVIEW/triage files, but do not change verified source.
+/// The shared source-state collector still hashes tracked, staged, modified,
+/// and untracked source contents and fails closed on collection errors.
 fn drift_sweep_input_fingerprint(repo_root: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    use std::process::Command;
-    let head = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let mut hasher = Sha256::new();
-    hasher.update(&head.stdout);
-    hasher.update(b"\0");
-    hasher.update(&status.stdout);
-    Some(format!("{:x}", hasher.finalize()))
+    current_dirty_state_fingerprint(repo_root)
 }
 
 pub(crate) async fn refresh_parallel_plan(
@@ -2506,6 +2486,49 @@ mod tests {
         run_git(&repo, ["commit", "-m", "seed scheduler plan"])
             .expect("failed to commit seed plan");
         repo
+    }
+
+    #[test]
+    fn drift_sweep_fingerprint_ignores_host_queue_commits_but_tracks_source() {
+        let repo = init_parallel_scheduler_repo(
+            "parallel-drift-source-fingerprint",
+            "- [ ] `TASK-A` Verify source\n  Dependencies: none\n",
+        );
+        fs::write(repo.join("source.rs"), "pub fn value() -> u8 { 1 }\n")
+            .expect("failed to write source fixture");
+        run_git(&repo, ["add", "source.rs"]).expect("failed to stage source fixture");
+        run_git(&repo, ["commit", "-m", "seed source fixture"])
+            .expect("failed to commit source fixture");
+        let before = drift_sweep_input_fingerprint(&repo).expect("baseline fingerprint");
+
+        fs::write(repo.join("REVIEW.md"), "# REVIEW\n\nhost queue update\n")
+            .expect("failed to write host review fixture");
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-A` Verify source\n  Dependencies: none\n",
+        )
+        .expect("failed to mark queue item done");
+        run_git(&repo, ["add", "REVIEW.md", "IMPLEMENTATION_PLAN.md"])
+            .expect("failed to stage host queue update");
+        run_git(&repo, ["commit", "-m", "host queue sync"])
+            .expect("failed to commit host queue update");
+        let after_queue =
+            drift_sweep_input_fingerprint(&repo).expect("queue-only fingerprint");
+        assert_eq!(
+            before, after_queue,
+            "host queue commits must not trigger an exhaustive drift reverify"
+        );
+
+        fs::write(repo.join("source.rs"), "pub fn value() -> u8 { 2 }\n")
+            .expect("failed to change source fixture");
+        let after_source =
+            drift_sweep_input_fingerprint(&repo).expect("changed-source fingerprint");
+        assert_ne!(
+            after_queue, after_source,
+            "source changes must trigger an exhaustive drift reverify"
+        );
+
+        fs::remove_dir_all(repo).expect("failed to remove fingerprint fixture");
     }
 
     #[test]
