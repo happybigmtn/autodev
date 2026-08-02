@@ -813,6 +813,7 @@ pub(crate) fn discover_resume_candidates(
         let mut host_recovery_note = match &progress {
             LaneRepoProgress::None
                 if resume_lane_progress_is_harvestable(
+                    repo_root,
                     &lane_repo_root,
                     &task_id,
                     &progress,
@@ -854,16 +855,18 @@ pub(crate) fn discover_resume_candidates(
 }
 
 fn resume_lane_progress_is_harvestable(
+    repo_root: &Path,
     lane_repo_root: &Path,
     task_id: &str,
     progress: &LaneRepoProgress,
 ) -> bool {
     matches!(progress, LaneRepoProgress::NewCommits)
         || (matches!(progress, LaneRepoProgress::None)
-            && lane_repo_root
-                .join(".auto/symphony/verification-receipts")
-                .join(format!("{task_id}.json"))
-                .is_file())
+            && [repo_root, lane_repo_root].iter().any(|root| {
+                root.join(".auto/symphony/verification-receipts")
+                    .join(format!("{task_id}.json"))
+                    .is_file()
+            }))
 }
 
 pub(crate) fn live_resume_workers(run_root: &Path) -> Result<Vec<(usize, String, u32)>> {
@@ -951,6 +954,7 @@ pub(crate) async fn harvest_resumable_lane_results(
                 match inspect_lane_repo_progress(&candidate.lane_repo_root, &candidate.base_commit)
                 {
                     Ok(progress) => resume_lane_progress_is_harvestable(
+                        repo_root,
                         &candidate.lane_repo_root,
                         &candidate.task.id,
                         &progress,
@@ -2167,23 +2171,32 @@ mod tests {
 
     #[test]
     fn clean_no_commit_lane_with_receipt_is_harvestable_after_host_restart() {
-        let lane_repo = unique_temp_dir("parallel-clean-receipt-resume");
-        let receipt = lane_repo.join(".auto/symphony/verification-receipts/TASK-RECOVER.json");
+        let canonical_repo = unique_temp_dir("parallel-clean-receipt-canonical");
+        let lane_repo = unique_temp_dir("parallel-clean-receipt-lane");
+        // The repository verification wrapper deliberately publishes receipts
+        // from `.auto/parallel/lanes/lane-N/repo` into the canonical checkout's
+        // shared `.auto/symphony` root. Host-restart discovery must inspect that
+        // real location instead of assuming the ignored receipt lives inside
+        // the disposable lane clone.
+        let receipt = canonical_repo.join(".auto/symphony/verification-receipts/TASK-RECOVER.json");
         fs::create_dir_all(receipt.parent().expect("receipt parent"))
             .expect("create receipt directory");
         fs::write(&receipt, "{}\n").expect("write generated receipt");
 
         assert!(resume_lane_progress_is_harvestable(
+            &canonical_repo,
             &lane_repo,
             "TASK-RECOVER",
             &LaneRepoProgress::None,
         ));
         assert!(!resume_lane_progress_is_harvestable(
+            &canonical_repo,
             &lane_repo,
             "TASK-WITHOUT-RECEIPT",
             &LaneRepoProgress::None,
         ));
 
+        fs::remove_dir_all(canonical_repo).ok();
         fs::remove_dir_all(lane_repo).ok();
     }
 
