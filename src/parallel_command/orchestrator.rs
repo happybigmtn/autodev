@@ -127,10 +127,35 @@ pub(crate) fn append_idle_status_to_free_lanes(
     }
 }
 
+fn partition_ready_tasks_with_operator_closeout(
+    ready: Vec<LoopTask>,
+    mut operator_has_closeout_evidence: impl FnMut(&LoopTask) -> bool,
+) -> (Vec<LoopTask>, Vec<LoopTask>) {
+    ready
+        .into_iter()
+        .partition(|task| is_operator_task(task) && !operator_has_closeout_evidence(task))
+}
+
+fn operator_task_has_closeout_evidence(repo_root: &Path, task: &LoopTask) -> bool {
+    if !is_operator_task(task) {
+        return false;
+    }
+    let mut evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    // A review handoff is produced by the ordinary closeout pipeline. The
+    // operator must already have supplied every immutable input: a current
+    // passing receipt, declared artifacts, and clean owned-audit scope.
+    evidence.has_review_handoff = true;
+    evidence.unresolved_review_findings.clear();
+    evidence.is_ready_for_definition_of_done_gates()
+}
+
 fn partition_ready_tasks_for_worker_dispatch(
+    repo_root: &Path,
     ready: Vec<LoopTask>,
 ) -> (Vec<LoopTask>, Vec<LoopTask>) {
-    ready.into_iter().partition(is_operator_task)
+    partition_ready_tasks_with_operator_closeout(ready, |task| {
+        operator_task_has_closeout_evidence(repo_root, task)
+    })
 }
 
 /// Restore the completion transaction to a dependency-blocking Partial state
@@ -556,7 +581,8 @@ pub(crate) async fn run_parallel_loop(
                 }
                 break;
             }
-            let (operator_ready, worker_ready) = partition_ready_tasks_for_worker_dispatch(ready);
+            let (operator_ready, worker_ready) =
+                partition_ready_tasks_for_worker_dispatch(repo_root, ready);
             if !operator_ready.is_empty() {
                 match write_operator_actions_for_ready_tasks(run_root, &operator_ready) {
                     Ok(path) => parallel_logger.info(format!(
@@ -659,6 +685,12 @@ pub(crate) async fn run_parallel_loop(
                 }
             };
             attach_partial_follow_up_note(repo_root, &mut assignment, &attempted_partial_followups);
+            if is_operator_task(&assignment.task) {
+                prepend_host_recovery_note(
+                    &mut assignment,
+                    "The operator action is already represented by current canonical artifacts and a passing receipt. Treat this as verification-only closeout: do not repeat the external action, change its captured inputs, or invent provenance. Inspect the existing evidence and return AUTO_ALREADY_COMPLETE when it satisfies the task contract.",
+                );
+            }
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
                 &lane_config,
@@ -2512,8 +2544,7 @@ mod tests {
             .expect("failed to stage host queue update");
         run_git(&repo, ["commit", "-m", "host queue sync"])
             .expect("failed to commit host queue update");
-        let after_queue =
-            drift_sweep_input_fingerprint(&repo).expect("queue-only fingerprint");
+        let after_queue = drift_sweep_input_fingerprint(&repo).expect("queue-only fingerprint");
         assert_eq!(
             before, after_queue,
             "host queue commits must not trigger an exhaustive drift reverify"
@@ -2626,7 +2657,8 @@ mod tests {
             ),
         ];
 
-        let (operator, worker) = partition_ready_tasks_for_worker_dispatch(ready);
+        let (operator, worker) =
+            partition_ready_tasks_with_operator_closeout(ready.clone(), |_| false);
 
         assert_eq!(
             operator
@@ -2643,6 +2675,116 @@ mod tests {
             vec!["CODE", "EVIDENCE", "VERIFY-ONLY"],
             "all non-operator tasks must enter normal dispatch so clean-no-commit can run every definition-of-done gate"
         );
+
+        let (operator, worker) =
+            partition_ready_tasks_with_operator_closeout(ready, |task| task.id == "OPERATOR");
+        assert!(operator.is_empty());
+        assert_eq!(
+            worker
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CODE", "EVIDENCE", "VERIFY-ONLY", "OPERATOR"],
+            "an operator row with canonical receipt/artifact evidence must enter verification-only closeout"
+        );
+    }
+
+    #[test]
+    fn operator_with_valid_canonical_receipt_enters_closeout_worker_queue() {
+        use crate::completion_artifacts::normalized_plan_hash_bytes;
+        use sha2::{Digest as _, Sha256};
+
+        let plan_text = "\
+- [ ] `OPERATOR` Capture external identity
+  Lane kind: operator
+  Verification: `bash scripts/verify-operator.sh`
+  Completion artifacts: `evidence/identity.json`
+  Dependencies: none
+";
+        let repo = init_parallel_scheduler_repo("operator-receipt-closeout", plan_text);
+        fs::create_dir_all(repo.join("scripts")).expect("create scripts directory");
+        fs::create_dir_all(repo.join("evidence")).expect("create evidence directory");
+        fs::write(repo.join(".gitignore"), ".auto/\n").expect("write ignore file");
+        fs::write(repo.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("write receipt wrapper");
+        fs::write(
+            repo.join("scripts/verify-operator.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("write task verifier");
+        fs::write(repo.join("evidence/identity.json"), "identity\n")
+            .expect("write identity artifact");
+        run_git(
+            &repo,
+            [
+                "add",
+                ".gitignore",
+                "scripts/run-task-verification.sh",
+                "scripts/verify-operator.sh",
+                "evidence/identity.json",
+            ],
+        )
+        .expect("stage operator evidence fixtures");
+        run_git(&repo, ["commit", "-m", "capture operator evidence"])
+            .expect("commit operator evidence fixtures");
+
+        let receipt_dir = repo.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("create receipt directory");
+        let commit = git_stdout(&repo, ["rev-parse", "HEAD"])
+            .expect("read HEAD")
+            .trim()
+            .to_string();
+        let dirty = current_dirty_state_fingerprint(&repo).expect("compute dirty fingerprint");
+        let plan_hash = normalized_plan_hash_bytes(plan_text.as_bytes());
+        let artifact_hash = format!("{:x}", Sha256::digest(b"identity\n"));
+        fs::write(
+            receipt_dir.join("OPERATOR.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "task_id": "OPERATOR",
+                "commit": commit,
+                "dirty_state": {"fingerprint": dirty, "entries": []},
+                "plan_hash": plan_hash,
+                "commands": [{
+                    "command": "bash scripts/verify-operator.sh",
+                    "argv": ["bash", "scripts/verify-operator.sh"],
+                    "expected_argv": ["bash", "scripts/verify-operator.sh"],
+                    "exit_code": 0,
+                    "status": "passed"
+                }],
+                "declared_artifacts": [{
+                    "path": "evidence/identity.json",
+                    "sha256": artifact_hash
+                }]
+            }))
+            .expect("serialize receipt"),
+        )
+        .expect("write receipt");
+
+        let task = parse_loop_plan(plan_text)
+            .task("OPERATOR")
+            .expect("operator task should parse")
+            .clone();
+        let evidence = inspect_task_completion_evidence(&repo, &task.id, &task.markdown);
+        assert!(
+            operator_task_has_closeout_evidence(&repo, &task),
+            "operator evidence should be closeout-ready: {:?}",
+            evidence.missing_reasons()
+        );
+        let (operator, worker) =
+            partition_ready_tasks_for_worker_dispatch(&repo, vec![task.clone()]);
+        assert!(operator.is_empty());
+        assert_eq!(
+            worker
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OPERATOR"]
+        );
+
+        fs::write(repo.join("evidence/identity.json"), "drifted\n")
+            .expect("mutate identity artifact");
+        assert!(!operator_task_has_closeout_evidence(&repo, &task));
+        fs::remove_dir_all(repo).expect("clean operator closeout fixture");
     }
 
     #[test]
