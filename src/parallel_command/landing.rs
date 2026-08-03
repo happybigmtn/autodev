@@ -987,6 +987,18 @@ pub(crate) async fn land_parallel_lane_result(
     )
     .await?;
     if completion_status == LoopTaskStatus::Done {
+        if let Some(outcome) = refresh_post_review_derived_attestation_if_needed(
+            repo_root,
+            &assignment.task.id,
+            &assignment.task.markdown,
+        )
+        .await?
+        {
+            completion_status =
+                apply_lane_verify_outcome(repo_root, assignment, completion_status, outcome)?;
+        }
+    }
+    if completion_status == LoopTaskStatus::Done {
         record_gate_hold(
             repo_root,
             &assignment.task.id,
@@ -3111,6 +3123,35 @@ pub(crate) fn reconcile_parallel_landed_task_state(
 pub(crate) fn repo_has_staged_queue_updates(repo_root: &Path) -> Result<bool> {
     let output = git_stdout(repo_root, ["diff", "--cached", "--name-only"])?;
     Ok(output.lines().any(|line| !line.trim().is_empty()))
+}
+
+/// Refresh repository-owned manifests after the independent review has written
+/// its host queue handoff. Some hooks derive tracked manifests from REVIEW.md as
+/// well as the active plan, so the post-review refresh can legitimately change
+/// source-state after the ordinary definition-of-done verification attestation.
+/// Re-run the declared deterministic verification only when the resulting
+/// footer is no longer valid, avoiding an unnecessary model recovery lane while
+/// retaining fail-closed source binding.
+async fn refresh_post_review_derived_attestation_if_needed(
+    repo_root: &Path,
+    task_id: &str,
+    task_markdown: &str,
+) -> Result<Option<LaneVerifyOutcome>> {
+    let derived_files = run_after_plan_update_hook(repo_root)?;
+    if derived_files.is_empty()
+        || verification_receipt_commit_footer(repo_root, task_id).is_ok()
+    {
+        return Ok(None);
+    }
+    let outcome = run_guarded_lane_verify_gate(
+        repo_root,
+        task_id,
+        task_markdown,
+        "post-review derived-state verification",
+        true,
+    )
+    .await?;
+    Ok(Some(outcome))
 }
 
 pub(crate) fn commit_task_closeout(
@@ -7850,6 +7891,84 @@ exec "$@"
         assert!(
             message.contains("Auto-Verification-Receipt-Task: TASK-HOOK-DONE"),
             "{message}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn post_review_derived_change_is_reverified_before_done_closeout() {
+        let root = unique_temp_dir("post-review-derived-attestation");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("create receipts");
+        fs::write(root.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        let wrapper = root.join("scripts/run-task-verification.sh");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nshift\nif [ \"${1:-}\" = \"--\" ]; then shift; fi\nexec \"$@\"\n",
+        )
+        .expect("write verification wrapper");
+        let mut permissions = fs::metadata(&wrapper).expect("stat wrapper").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
+        fs::write(
+            root.join("scripts/autodev-after-plan-update.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\ncp REVIEW.md derived-review.txt\nprintf '%s\\n' derived-review.txt\n",
+        )
+        .expect("write hook");
+        let partial_plan = "# Plan\n\n- [~] `TASK-POST-REVIEW` refresh review-derived state\n  Verification: `bash -c true`\n  Dependencies: none\n";
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), partial_plan).expect("write plan");
+        fs::write(root.join("REVIEW.md"), "initial review\n").expect("write review");
+        fs::write(root.join("derived-review.txt"), "initial review\n").expect("write derived");
+        git_ok(
+            &root,
+            [
+                "add",
+                ".gitignore",
+                "IMPLEMENTATION_PLAN.md",
+                "REVIEW.md",
+                "derived-review.txt",
+                "scripts/run-task-verification.sh",
+                "scripts/autodev-after-plan-update.sh",
+            ],
+        );
+        git_ok(&root, ["commit", "-q", "-m", "seed post-review hook"]);
+
+        let done_plan =
+            partial_plan.replace("- [~] `TASK-POST-REVIEW`", "- [x] `TASK-POST-REVIEW`");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), &done_plan).expect("write done plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        run_after_plan_update_hook(&root).expect("refresh initial derived state");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-POST-REVIEW.json"),
+            r#"{"task_id":"TASK-POST-REVIEW","commands":[{"command":"bash -c true","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("write receipt");
+        propagate_lane_receipts(&root, &root, "TASK-POST-REVIEW", &done_plan)
+            .expect("bind initial receipt");
+        record_verified_source_attestation(&root, "TASK-POST-REVIEW")
+            .expect("record pre-review attestation");
+
+        fs::write(root.join("REVIEW.md"), "initial review\nreview cleared\n")
+            .expect("write review clearance");
+        git_ok(&root, ["add", "REVIEW.md"]);
+        let outcome = super::refresh_post_review_derived_attestation_if_needed(
+            &root,
+            "TASK-POST-REVIEW",
+            &done_plan,
+        )
+        .await
+        .expect("refresh post-review evidence");
+        assert_eq!(outcome, Some(LaneVerifyOutcome::AllPassed));
+        assert!(
+            verification_receipt_commit_footer(&root, "TASK-POST-REVIEW")
+                .expect("footer should be valid after local re-verification")
+                .is_some()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("derived-review.txt")).expect("read derived"),
+            "initial review\nreview cleared\n"
         );
         fs::remove_dir_all(&root).expect("cleanup");
     }
