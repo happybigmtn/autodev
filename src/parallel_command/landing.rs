@@ -916,6 +916,12 @@ pub(crate) async fn land_parallel_lane_result(
     } else if completion_status == LoopTaskStatus::Partial {
         assignment.task.status = LoopTaskStatus::Partial;
     }
+    // Refresh repository-owned plan-derived state before any host verification
+    // attestation is recorded. `commit_task_closeout` runs the hook again as a
+    // final safety net, but that second run must be a no-op; otherwise a
+    // deterministic manifest update after verification invalidates the source
+    // fingerprint and needlessly queues a recovery model lane.
+    run_after_plan_update_hook(repo_root)?;
     // Inline receipt-gap repair (2026-07-10): if the ONLY thing holding this
     // task at `[~]` is a locally-repairable verification gap — a MISSING
     // receipt (worker skipped the wrapper) OR a STALE receipt (a concurrent
@@ -7726,6 +7732,80 @@ exec "$@"
         let committed = run_git_in(&root, ["show", "--name-only", "--format=", "HEAD"]);
         assert!(committed.contains("IMPLEMENTATION_PLAN.md"), "{committed}");
         assert!(committed.contains("derived-plan.txt"), "{committed}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn done_closeout_preserves_attestation_when_plan_hook_precedes_verification() {
+        let root = unique_temp_dir("done-plan-update-hook-attestation");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("create receipts");
+        fs::write(root.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        fs::write(
+            root.join("scripts/run-task-verification.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("write verification wrapper");
+        fs::write(
+            root.join("scripts/autodev-after-plan-update.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\ncp IMPLEMENTATION_PLAN.md derived-plan.txt\nprintf '%s\\n' derived-plan.txt\n",
+        )
+        .expect("write hook");
+        let partial_plan = "# Plan\n\n- [~] `TASK-HOOK-DONE` refresh derived plan\n  Verification: `cargo test hook_done`\n  Dependencies: none\n";
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), partial_plan).expect("write seed plan");
+        fs::write(root.join("derived-plan.txt"), partial_plan).expect("write derived plan");
+        git_ok(
+            &root,
+            [
+                "add",
+                ".gitignore",
+                "scripts/run-task-verification.sh",
+                "scripts/autodev-after-plan-update.sh",
+                "derived-plan.txt",
+                "IMPLEMENTATION_PLAN.md",
+            ],
+        );
+        git_ok(&root, ["commit", "-q", "-m", "seed done hook"]);
+
+        let done_plan = partial_plan.replace("- [~] `TASK-HOOK-DONE`", "- [x] `TASK-HOOK-DONE`");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), &done_plan).expect("write done plan");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        let derived = run_after_plan_update_hook(&root).expect("refresh plan-derived state");
+        assert_eq!(derived, vec!["derived-plan.txt"]);
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-HOOK-DONE.json"),
+            r#"{"task_id":"TASK-HOOK-DONE","commands":[{"command":"cargo test hook_done","argv":["cargo","test","hook_done"],"expected_argv":["cargo","test","hook_done"],"exit_code":0,"status":"passed"}]}"#,
+        )
+        .expect("write receipt");
+        let task = parse_loop_plan(&done_plan)
+            .task("TASK-HOOK-DONE")
+            .expect("task should parse")
+            .clone();
+        propagate_lane_receipts(&root, &root, "TASK-HOOK-DONE", &task.markdown)
+            .expect("bind receipt after derived refresh");
+        record_verified_source_attestation(&root, "TASK-HOOK-DONE")
+            .expect("record post-hook host attestation");
+
+        commit_task_closeout(
+            &root,
+            "TASK-HOOK-DONE",
+            LoopTaskStatus::Done,
+            "repo: TASK-HOOK-DONE queue sync",
+            false,
+        )
+        .expect("Done closeout should retain the post-hook attestation");
+
+        assert_eq!(
+            fs::read_to_string(root.join("derived-plan.txt")).expect("read derived"),
+            done_plan
+        );
+        let message = run_git_in(&root, ["log", "-1", "--format=%B"]);
+        assert!(
+            message.contains("Auto-Verification-Receipt-Task: TASK-HOOK-DONE"),
+            "{message}"
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }
