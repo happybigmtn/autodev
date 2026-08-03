@@ -3174,22 +3174,13 @@ pub(crate) fn run_after_plan_update_hook(repo_root: &Path) -> Result<Vec<String>
     if !hook.is_file() {
         return Ok(Vec::new());
     }
-    let plan_relative = active_plan_relative(repo_root);
-    let plan_diff = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["diff", "--quiet", "HEAD", "--", plan_relative])
-        .output()
-        .with_context(|| format!("failed checking plan changes in {}", repo_root.display()))?;
-    match plan_diff.status.code() {
-        Some(0) => return Ok(Vec::new()),
-        Some(1) => {}
-        _ => bail!(
-            "failed checking whether {plan_relative} changed: {}",
-            String::from_utf8_lossy(&plan_diff.stderr).trim()
-        ),
-    }
-
+    // Always execute an installed hook. A previous closeout attempt can refresh
+    // and stage a declared derived file, then restore the task row to its
+    // original status after a later gate fails. In that state the active plan
+    // matches HEAD while the derived file is still dirty. Skipping the hook
+    // would lose its declared-path authority and strand every later host queue
+    // checkpoint. Repository hooks must therefore be deterministic/idempotent;
+    // their printed paths remain the narrow authority boundary.
     let output = Command::new("bash")
         .arg(&hook)
         .current_dir(repo_root)
@@ -7732,6 +7723,60 @@ exec "$@"
         let committed = run_git_in(&root, ["show", "--name-only", "--format=", "HEAD"]);
         assert!(committed.contains("IMPLEMENTATION_PLAN.md"), "{committed}");
         assert!(committed.contains("derived-plan.txt"), "{committed}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn partial_closeout_recovers_dirty_derived_file_when_plan_matches_head() {
+        let root = unique_temp_dir("stale-plan-update-hook-output");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::write(
+            root.join("scripts/autodev-after-plan-update.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\ncp IMPLEMENTATION_PLAN.md derived-plan.txt\nprintf '%s\\n' derived-plan.txt\n",
+        )
+        .expect("write hook");
+        let partial = "# Plan\n\n- [~] `TASK-HOOK-STALE` refresh derived plan\nDependencies: none\n";
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), partial).expect("write plan");
+        fs::write(root.join("derived-plan.txt"), partial).expect("write derived");
+        git_ok(
+            &root,
+            [
+                "add",
+                "scripts/autodev-after-plan-update.sh",
+                "derived-plan.txt",
+                "IMPLEMENTATION_PLAN.md",
+            ],
+        );
+        git_ok(&root, ["commit", "-q", "-m", "seed stale hook"]);
+
+        // Simulate a failed Done closeout: the plan row has been restored to
+        // its committed Partial state, but the generated output still reflects
+        // the transient Done row and remains staged.
+        fs::write(
+            root.join("derived-plan.txt"),
+            partial.replace("- [~] `TASK-HOOK-STALE`", "- [x] `TASK-HOOK-STALE`"),
+        )
+        .expect("write stale derived output");
+        git_ok(&root, ["add", "derived-plan.txt"]);
+
+        commit_task_closeout(
+            &root,
+            "TASK-HOOK-STALE",
+            LoopTaskStatus::Partial,
+            "repo: TASK-HOOK-STALE queue sync",
+            true,
+        )
+        .expect("closeout should recover the hook-declared dirty path");
+
+        assert_eq!(
+            fs::read_to_string(root.join("derived-plan.txt")).expect("read derived"),
+            partial
+        );
+        assert!(
+            run_git_in(&root, ["status", "--short"]).trim().is_empty(),
+            "closeout should leave a clean worktree"
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
