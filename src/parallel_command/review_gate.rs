@@ -567,10 +567,8 @@ fn restore_head_after_reviewer_commit(repo_root: &Path, commit: &str) -> Result<
 }
 
 fn normalized_review_bytes(path: &str, bytes: &[u8], task_id: &str) -> Result<Vec<u8>> {
-    if path != "IMPLEMENTATION_PLAN.md" && path != "PLAN.md" {
-        return Ok(bytes.to_vec());
-    }
-    let plan = std::str::from_utf8(bytes).context("IMPLEMENTATION_PLAN.md was not UTF-8")?;
+    let plan = std::str::from_utf8(bytes)
+        .with_context(|| format!("active plan `{path}` was not UTF-8"))?;
     let matching = parse_shared_tasks(plan)
         .into_iter()
         .filter(|task| task.id == task_id)
@@ -825,6 +823,7 @@ fn collect_repository_input_path_states(
         }
         let absolute = repo_root.join(path);
         let state_path = prefixed_state_path(state_prefix, path);
+        let plan_relative = active_plan_relative(repo_root);
         let component = match fs::symlink_metadata(&absolute) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let target = fs::read_link(&absolute).with_context(|| {
@@ -854,7 +853,9 @@ fn collect_repository_input_path_states(
                     review_path_content_state(
                         path,
                         &bytes,
-                        (depth == 0).then_some(task_id).flatten(),
+                        (depth == 0 && path == plan_relative)
+                            .then_some(task_id)
+                            .flatten(),
                     )?
                 )
             }
@@ -2561,6 +2562,35 @@ printf 'VERDICT: CLEAN\n' > "$report"
         }
         let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
         assert!(plan.starts_with("- [~] `TASK-007`"), "{plan}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review_input_normalizes_only_the_focused_active_plan() {
+        let root = temp_dir("review-focused-plan-normalization");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            "# Historical reference\n\n- [x] `LEGACY-001` Completed legacy task\n",
+        )
+        .expect("write legacy reference plan");
+        fs::write(
+            root.join("PLAN.md"),
+            "- [x] `TASK-007` Focused queue task\n  Verification: `cargo test focused`\n",
+        )
+        .expect("write focused plan");
+        init_git_repo(&root);
+
+        let done = review_input_path_states(&root, "TASK-007")
+            .expect("capture focused active plan with legacy plan also tracked");
+        fs::write(
+            root.join("PLAN.md"),
+            "- [~] `TASK-007` Focused queue task\n  Verification: `cargo test focused`\n",
+        )
+        .expect("write partial focused plan");
+        let partial = review_input_path_states(&root, "TASK-007")
+            .expect("capture partial focused active plan");
+
+        assert_eq!(done, partial, "active task status must be review-neutral");
         let _ = fs::remove_dir_all(&root);
     }
 
