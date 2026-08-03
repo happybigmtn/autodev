@@ -46,7 +46,8 @@ const OWNED_INPUTS_SCHEME: &str = "task-owned-inputs-v1";
 fn path_is_fingerprint_excluded(rel: &str) -> bool {
     matches!(
         rel,
-        "IMPLEMENTATION_PLAN.md"
+        "PLAN.md"
+            | "IMPLEMENTATION_PLAN.md"
             | "REVIEW.md"
             | "RECEIPTS-DRIFT.md"
             | "COMPLETED.md"

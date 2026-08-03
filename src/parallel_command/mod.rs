@@ -34,13 +34,13 @@ pub(crate) use crate::task_parser::{
     validate_execution_rows, LaneKind, PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
-    atomic_write, auto_checkpoint_if_needed, capture_validated_task_closeout_tree,
-    commit_staged_checkpoint_cas, commit_staged_queue_checkpoint_cas,
-    commit_validated_task_closeout_tree_cas, ensure_repo_layout, ensure_writable_run_root,
-    git_cherry_pick_empty_arg, git_repo_root, git_stdout, push_branch_with_remote_sync,
-    refuse_unsealed_task_completion_checkpoint, refuse_unsealed_task_completion_transitions_except,
-    refuse_worktree_paths_outside, repo_name, run_git, sync_branch_with_remote, timestamp_slug,
-    unsealed_task_completion_ids,
+    active_plan_path, active_plan_relative, atomic_write, auto_checkpoint_if_needed,
+    capture_validated_task_closeout_tree, commit_staged_checkpoint_cas,
+    commit_staged_queue_checkpoint_cas, commit_validated_task_closeout_tree_cas,
+    ensure_repo_layout, ensure_writable_run_root, git_cherry_pick_empty_arg, git_repo_root,
+    git_stdout, push_branch_with_remote_sync, refuse_unsealed_task_completion_checkpoint,
+    refuse_unsealed_task_completion_transitions_except, refuse_worktree_paths_outside, repo_name,
+    run_git, sync_branch_with_remote, timestamp_slug, unsealed_task_completion_ids,
 };
 pub(crate) use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
@@ -92,22 +92,6 @@ pub(crate) const HOST_QUEUE_STATE_FILES: [&str; 8] = [
     "ARCHIVED.md",
     "RECEIPTS-DRIFT.md",
 ];
-
-/// Select the executable queue without forcing established repositories to
-/// rename their historical implementation corpus. New repositories may keep a
-/// focused `PLAN.md`; legacy repositories continue to use
-/// `IMPLEMENTATION_PLAN.md` when no focused queue exists.
-pub(crate) fn active_plan_relative(repo_root: &Path) -> &'static str {
-    if repo_root.join("PLAN.md").is_file() {
-        "PLAN.md"
-    } else {
-        "IMPLEMENTATION_PLAN.md"
-    }
-}
-
-pub(crate) fn active_plan_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(active_plan_relative(repo_root))
-}
 
 pub(crate) const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 

@@ -18,6 +18,7 @@ REDACTION_VERSION = 1
 FINGERPRINT_PATHS = [
     "--",
     ".",
+    ":(exclude)PLAN.md",
     ":(exclude)IMPLEMENTATION_PLAN.md",
     ":(exclude)COMPLETED.md",
     ":(exclude)WORKLIST.md",
@@ -232,7 +233,9 @@ def normalize_plan_status_markers(text: str) -> str:
 
 
 def plan_hash(root: Path) -> str | None:
-    path = root / "IMPLEMENTATION_PLAN.md"
+    path = root / "PLAN.md"
+    if not path.exists():
+        path = root / "IMPLEMENTATION_PLAN.md"
     if not path.exists():
         return None
     text = path.read_text(encoding="utf-8")
@@ -240,7 +243,9 @@ def plan_hash(root: Path) -> str | None:
 
 
 def declared_completion_artifacts(root: Path, task_id: str) -> list[str]:
-    plan_path = root / "IMPLEMENTATION_PLAN.md"
+    plan_path = root / "PLAN.md"
+    if not plan_path.exists():
+        plan_path = root / "IMPLEMENTATION_PLAN.md"
     if not plan_path.exists():
         return []
     lines = plan_path.read_text(encoding="utf-8").splitlines()
@@ -495,7 +500,7 @@ def record(args: argparse.Namespace) -> None:
 
     payload = {
         "task_id": task_id,
-        "plan_path": "IMPLEMENTATION_PLAN.md",
+        "plan_path": "PLAN.md" if (root / "PLAN.md").exists() else "IMPLEMENTATION_PLAN.md",
         "plan_hash": plan_hash(root),
         "commit": current_commit(root),
         "dirty_state": dirty_state(root),

@@ -40,6 +40,7 @@ fn declared_artifact_hash_is_mutable_handoff(relative: &str) -> bool {
     matches!(
         relative,
         "REVIEW.md"
+            | "PLAN.md"
             | "IMPLEMENTATION_PLAN.md"
             | "COMPLETED.md"
             | "WORKLIST.md"

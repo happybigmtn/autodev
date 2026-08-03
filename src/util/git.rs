@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use anyhow::{bail, Context, Result};
 
 use crate::task_parser::{parse_tasks, TaskStatus};
-use crate::util::repo_name;
+use crate::util::{active_plan_path, active_plan_relative, repo_name};
 
 /// Primary branch names auto treats as the repo's integration branch when no
 /// explicit branch is requested. Shared by `auto ship` base-branch resolution
@@ -515,8 +515,11 @@ struct CompletionPlanViews {
 }
 
 fn completion_plan_views(repo_root: &Path) -> Result<CompletionPlanViews> {
-    let head = git_plan_blob_or_empty(repo_root, "HEAD:IMPLEMENTATION_PLAN.md", true)?;
-    let worktree_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_relative = active_plan_relative(repo_root);
+    let head_object = format!("HEAD:{plan_relative}");
+    let index_object = format!(":{plan_relative}");
+    let head = git_plan_blob_or_empty(repo_root, &head_object, true)?;
+    let worktree_path = active_plan_path(repo_root);
     let worktree = match std::fs::read_to_string(&worktree_path) {
         Ok(plan) => plan,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -524,7 +527,7 @@ fn completion_plan_views(repo_root: &Path) -> Result<CompletionPlanViews> {
             return Err(err).with_context(|| format!("failed to read {}", worktree_path.display()))
         }
     };
-    let indexed = git_plan_blob_or_empty(repo_root, ":IMPLEMENTATION_PLAN.md", false)?;
+    let indexed = git_plan_blob_or_empty(repo_root, &index_object, false)?;
     Ok(CompletionPlanViews {
         head,
         worktree,
@@ -533,6 +536,10 @@ fn completion_plan_views(repo_root: &Path) -> Result<CompletionPlanViews> {
 }
 
 fn git_plan_blob_or_empty(repo_root: &Path, object: &str, committed: bool) -> Result<String> {
+    let plan_relative = object
+        .rsplit_once(':')
+        .map(|(_, path)| path)
+        .unwrap_or(object);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -553,12 +560,7 @@ fn git_plan_blob_or_empty(repo_root: &Path, object: &str, committed: bool) -> Re
         Command::new("git")
             .arg("-C")
             .arg(repo_root)
-            .args([
-                "ls-files",
-                "--error-unmatch",
-                "--",
-                "IMPLEMENTATION_PLAN.md",
-            ])
+            .args(["ls-files", "--error-unmatch", "--", plan_relative])
             .output()
     }
     .with_context(|| format!("failed to inspect plan presence in {}", repo_root.display()))?;
@@ -792,14 +794,15 @@ fn validate_task_closeout_tree_transition(
         );
     }
 
+    let plan_relative = active_plan_relative(repo_root);
     let parent_plan = git_plan_blob_or_empty(
         repo_root,
-        &format!("{}:IMPLEMENTATION_PLAN.md", snapshot.parent),
+        &format!("{}:{plan_relative}", snapshot.parent),
         true,
     )?;
     let candidate_plan = git_plan_blob_or_empty(
         repo_root,
-        &format!("{}:IMPLEMENTATION_PLAN.md", snapshot.tree),
+        &format!("{}:{plan_relative}", snapshot.tree),
         true,
     )?;
     validate_task_closeout_plan_transition(&parent_plan, &candidate_plan, &candidate_plan, task_id)
@@ -850,13 +853,11 @@ fn validate_generic_checkpoint_commit_transition(
     parent: &str,
     candidate: &str,
 ) -> Result<()> {
+    let plan_relative = active_plan_relative(repo_root);
     let parent_plan =
-        git_plan_blob_or_empty(repo_root, &format!("{parent}:IMPLEMENTATION_PLAN.md"), true)?;
-    let candidate_plan = git_plan_blob_or_empty(
-        repo_root,
-        &format!("{candidate}:IMPLEMENTATION_PLAN.md"),
-        true,
-    )?;
+        git_plan_blob_or_empty(repo_root, &format!("{parent}:{plan_relative}"), true)?;
+    let candidate_plan =
+        git_plan_blob_or_empty(repo_root, &format!("{candidate}:{plan_relative}"), true)?;
     let excess = excess_completed_task_contracts(&parent_plan, &candidate_plan);
     if !excess.is_empty() {
         let tasks = excess
@@ -877,13 +878,11 @@ fn validate_task_closeout_commit_transition(
     candidate: &str,
     task_id: &str,
 ) -> Result<()> {
+    let plan_relative = active_plan_relative(repo_root);
     let parent_plan =
-        git_plan_blob_or_empty(repo_root, &format!("{parent}:IMPLEMENTATION_PLAN.md"), true)?;
-    let candidate_plan = git_plan_blob_or_empty(
-        repo_root,
-        &format!("{candidate}:IMPLEMENTATION_PLAN.md"),
-        true,
-    )?;
+        git_plan_blob_or_empty(repo_root, &format!("{parent}:{plan_relative}"), true)?;
+    let candidate_plan =
+        git_plan_blob_or_empty(repo_root, &format!("{candidate}:{plan_relative}"), true)?;
     validate_task_closeout_plan_transition(&parent_plan, &candidate_plan, &candidate_plan, task_id)
 }
 
@@ -1230,8 +1229,9 @@ mod tests {
     use super::{
         auto_checkpoint_if_needed, capture_validated_task_closeout_tree, checkpoint_status,
         commit_staged_checkpoint_cas, commit_validated_task_closeout_tree_cas,
-        git_cherry_pick_empty_arg_from_help, is_checkpoint_excluded_path, parse_origin_head_branch,
-        push_branch_with_remote_sync, refuse_checkpoint_excluded_staged_paths,
+        completion_plan_views, git_cherry_pick_empty_arg_from_help, is_checkpoint_excluded_path,
+        parse_origin_head_branch, push_branch_with_remote_sync,
+        refuse_checkpoint_excluded_staged_paths,
         refuse_unsealed_task_completion_transitions_except, stage_checkpoint_changes,
         sync_branch_with_remote,
     };
@@ -1417,6 +1417,21 @@ mod tests {
         assert_eq!(staged, "README.md\nsrc/new.txt\n");
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn completion_plan_views_prefer_focused_plan_md() {
+        let repo = init_repo("focused-completion-plan-views");
+        fs::write(repo.join("PLAN.md"), "- [~] `TASK-PLAN-1` active\n").expect("write active plan");
+        run_git_in(&repo, ["add", "PLAN.md"]);
+        run_git_in(&repo, ["commit", "-m", "add focused plan"]);
+
+        let views = completion_plan_views(&repo).expect("read focused plan views");
+        assert!(views.head.contains("TASK-PLAN-1"));
+        assert!(views.worktree.contains("TASK-PLAN-1"));
+        assert!(views.indexed.contains("TASK-PLAN-1"));
+
+        fs::remove_dir_all(repo).expect("cleanup");
     }
 
     #[test]

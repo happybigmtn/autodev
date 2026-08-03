@@ -44,6 +44,21 @@ pub(crate) fn repo_name(repo_root: &Path) -> String {
         .to_string()
 }
 
+/// Return the active executable queue name. Repositories may keep a focused
+/// `PLAN.md` beside a historical `IMPLEMENTATION_PLAN.md`; legacy repositories
+/// continue to work unchanged.
+pub(crate) fn active_plan_relative(repo_root: &Path) -> &'static str {
+    if repo_root.join("PLAN.md").is_file() {
+        "PLAN.md"
+    } else {
+        "IMPLEMENTATION_PLAN.md"
+    }
+}
+
+pub(crate) fn active_plan_path(repo_root: &Path) -> std::path::PathBuf {
+    repo_root.join(active_plan_relative(repo_root))
+}
+
 pub(crate) fn timestamp_slug() -> String {
     Utc::now().format("%Y%m%d-%H%M%S").to_string()
 }

@@ -19,7 +19,7 @@ use crate::completion_artifacts::artifacts::{
 use crate::completion_artifacts::review_contains_task;
 use crate::completion_artifacts::verification::verification_plan;
 use crate::task_parser::{parse_tasks, TaskStatus};
-use crate::util::atomic_write;
+use crate::util::{active_plan_path, active_plan_relative, atomic_write};
 
 const RECEIPT_FOOTER_VERSION: &str = "Auto-Verification-Receipt-Version:";
 const RECEIPT_FOOTER_TASK: &str = "Auto-Verification-Receipt-Task:";
@@ -30,7 +30,8 @@ const SOURCE_STATE_MAX_ENTRIES: usize = 200_000;
 const SOURCE_STATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const LEGACY_CLEAN_PORCELAIN_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const HOST_QUEUE_STATE_FILES: [&str; 7] = [
+const HOST_QUEUE_STATE_FILES: [&str; 8] = [
+    "PLAN.md",
     "IMPLEMENTATION_PLAN.md",
     "COMPLETED.md",
     "WORKLIST.md",
@@ -73,7 +74,7 @@ fn record_verified_source_attestation_with_source_limits(
     source_limits: SourceStateLimits,
 ) -> Result<()> {
     let mut budget = SourceStateBudget::default();
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_path = active_plan_path(repo_root);
     let plan_text = read_bounded_utf8_file(
         &plan_path,
         source_limits,
@@ -190,7 +191,7 @@ fn verification_receipt_commit_footer_with_source_limits(
         ),
     }
 
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_path = active_plan_path(repo_root);
     let plan_text = read_bounded_utf8_file(
         &plan_path,
         source_limits,
@@ -375,11 +376,11 @@ fn verification_receipt_footer_has_host_provenance(
         return false;
     }
 
-    let Some(plan_text) = git_show_file(repo_root, &footer.commit, "IMPLEMENTATION_PLAN.md") else {
+    let plan_relative = active_plan_relative(repo_root);
+    let Some(plan_text) = git_show_file(repo_root, &footer.commit, plan_relative) else {
         return false;
     };
-    let Some(parent_plan_text) = git_show_file(repo_root, parent_commit, "IMPLEMENTATION_PLAN.md")
-    else {
+    let Some(parent_plan_text) = git_show_file(repo_root, parent_commit, plan_relative) else {
         return false;
     };
     if !footer_task_transition_is_scoped(&parent_plan_text, &plan_text, &footer.task_id) {
@@ -593,7 +594,7 @@ fn compact_receipt_json_for_footer(
 /// plan currently on disk. Returns `None` (no stamp) when the plan is missing,
 /// the task is absent from it, or git enumeration fails.
 fn task_owned_inputs_fingerprint_for(repo_root: &Path, task_id: &str) -> Option<String> {
-    let plan_text = fs::read_to_string(repo_root.join("IMPLEMENTATION_PLAN.md")).ok()?;
+    let plan_text = fs::read_to_string(active_plan_path(repo_root)).ok()?;
     let tasks = crate::task_parser::parse_tasks(&plan_text);
     super::owned_inputs::compute_task_owned_inputs_fingerprint(repo_root, task_id, &tasks)
 }
@@ -1441,7 +1442,7 @@ fn verification_receipt_freshness_problem_for_source(
                         ))
                     }
                 };
-            let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+            let plan_path = active_plan_path(repo_root);
             let current_plan_hash = match read_bounded_file_bytes(
                 &plan_path,
                 limits,
@@ -1689,6 +1690,7 @@ fn current_dirty_state_snapshot_with_budget(
             "--no-renames",
             "--",
             ".",
+            ":(exclude)PLAN.md",
             ":(exclude)IMPLEMENTATION_PLAN.md",
             ":(exclude)COMPLETED.md",
             ":(exclude)WORKLIST.md",
@@ -1717,6 +1719,7 @@ fn current_dirty_state_snapshot_with_budget(
             "--dst-prefix=b/",
             "--",
             ".",
+            ":(exclude)PLAN.md",
             ":(exclude)IMPLEMENTATION_PLAN.md",
             ":(exclude)COMPLETED.md",
             ":(exclude)WORKLIST.md",
@@ -1746,6 +1749,7 @@ fn current_dirty_state_snapshot_with_budget(
             "--dst-prefix=b/",
             "--",
             ".",
+            ":(exclude)PLAN.md",
             ":(exclude)IMPLEMENTATION_PLAN.md",
             ":(exclude)COMPLETED.md",
             ":(exclude)WORKLIST.md",
@@ -1769,6 +1773,7 @@ fn current_dirty_state_snapshot_with_budget(
             "-z",
             "--",
             ".",
+            ":(exclude)PLAN.md",
             ":(exclude)IMPLEMENTATION_PLAN.md",
             ":(exclude)COMPLETED.md",
             ":(exclude)WORKLIST.md",
@@ -1875,7 +1880,7 @@ fn current_source_state_fingerprint_with_limits(
     limits: SourceStateLimits,
 ) -> Result<String> {
     let mut budget = SourceStateBudget::default();
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_path = active_plan_path(repo_root);
     let plan_input = match read_bounded_file_bytes(
         &plan_path,
         limits,
@@ -2257,6 +2262,7 @@ fn append_source_state_exclusion_pathspecs(args: &mut Vec<&str>, depth: usize) {
     ]);
     if depth == 0 {
         args.extend([
+            ":(top,exclude)PLAN.md",
             ":(top,exclude)IMPLEMENTATION_PLAN.md",
             ":(top,exclude)COMPLETED.md",
             ":(top,exclude)WORKLIST.md",
@@ -2643,7 +2649,7 @@ pub(crate) fn normalized_plan_hash_bytes(plan_bytes: &[u8]) -> String {
 
 #[cfg(test)]
 fn current_plan_hash(repo_root: &Path) -> Option<String> {
-    fs::read(repo_root.join("IMPLEMENTATION_PLAN.md"))
+    fs::read(active_plan_path(repo_root))
         .ok()
         .map(|bytes| normalized_plan_hash_bytes(&bytes))
 }
@@ -2931,8 +2937,9 @@ mod tests {
     use crate::completion_artifacts::artifacts::artifact_hash;
 
     use super::{
-        normalized_plan_hash_bytes, verification_receipt_freshness_problem, VerificationDirtyState,
-        VerificationReceipt, VerificationReceiptArtifact, VerificationReceiptCommand,
+        current_plan_hash, normalized_plan_hash_bytes, verification_receipt_freshness_problem,
+        VerificationDirtyState, VerificationReceipt, VerificationReceiptArtifact,
+        VerificationReceiptCommand,
     };
 
     #[test]
@@ -3001,6 +3008,18 @@ mod tests {
             .args(["commit", "-m", "initial"])
             .output()
             .expect("git commit failed");
+    }
+
+    #[test]
+    fn current_plan_hash_prefers_focused_plan_md() {
+        let root = temp_dir("focused-plan-hash");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "legacy\n").expect("legacy plan");
+        fs::write(root.join("PLAN.md"), "- [ ] `TASK-1` active\n").expect("active plan");
+        assert_eq!(
+            current_plan_hash(&root),
+            Some(normalized_plan_hash_bytes(b"- [ ] `TASK-1` active\n"))
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn git_ok<const N: usize>(root: &std::path::Path, args: [&str; N]) {
