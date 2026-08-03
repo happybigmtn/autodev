@@ -567,7 +567,7 @@ fn restore_head_after_reviewer_commit(repo_root: &Path, commit: &str) -> Result<
 }
 
 fn normalized_review_bytes(path: &str, bytes: &[u8], task_id: &str) -> Result<Vec<u8>> {
-    if path != "IMPLEMENTATION_PLAN.md" {
+    if path != "IMPLEMENTATION_PLAN.md" && path != "PLAN.md" {
         return Ok(bytes.to_vec());
     }
     let plan = std::str::from_utf8(bytes).context("IMPLEMENTATION_PLAN.md was not UTF-8")?;
@@ -797,9 +797,11 @@ fn collect_repository_input_path_states(
             .unwrap_or_default()
             .to_string();
         index_modes.insert(path.to_string(), index_mode.clone());
-        let component = if depth == 0 && path == "IMPLEMENTATION_PLAN.md" {
-            let bytes = git_bytes(repo_root, ["show", ":IMPLEMENTATION_PLAN.md"])?;
-            budget.consume_bytes(bytes.len(), "indexed IMPLEMENTATION_PLAN.md")?;
+        let plan_relative = active_plan_relative(repo_root);
+        let component = if depth == 0 && path == plan_relative {
+            let indexed_spec = format!(":{plan_relative}");
+            let bytes = git_bytes(repo_root, ["show", indexed_spec.as_str()])?;
+            budget.consume_bytes(bytes.len(), "indexed active plan")?;
             format!(
                 "index:{}:{}",
                 index_mode,
@@ -1277,7 +1279,7 @@ pub(crate) fn clear_canonical_gate_transaction(
 }
 
 fn preserve_unsealed_review_input_interlock(repo_root: &Path, task_id: &str) -> Result<()> {
-    let path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let path = active_plan_path(repo_root);
     let plan =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let matching = parse_shared_tasks(&plan)
@@ -1321,7 +1323,7 @@ fn preserve_unsealed_review_input_interlock(repo_root: &Path, task_id: &str) -> 
     }
     atomic_write(&path, rewritten.as_bytes())
         .with_context(|| format!("failed to write restart interlock {}", path.display()))?;
-    run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])
+    run_git(repo_root, ["add", active_plan_relative(repo_root)])
         .context("failed to stage restart-visible review-input interlock")?;
     Ok(())
 }

@@ -249,6 +249,7 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         parts.push(
             match action {
                 ParallelAction::Status => "status",
+                ParallelAction::PlanCheck => "plan-check",
                 ParallelAction::ReceiptBackfill => "receipt-backfill",
             }
             .to_string(),

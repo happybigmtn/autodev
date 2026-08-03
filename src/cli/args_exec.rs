@@ -278,6 +278,8 @@ pub(crate) struct ParallelArgs {
 pub(crate) enum ParallelAction {
     /// Print host, tmux, and lane health for the current repo's parallel run.
     Status,
+    /// Validate the active PLAN.md or legacy IMPLEMENTATION_PLAN.md without launching workers.
+    PlanCheck,
     /// Write a no-model plan for closing historical receipt drift.
     ReceiptBackfill,
 }

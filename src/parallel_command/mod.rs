@@ -30,8 +30,8 @@ pub(crate) use crate::completion_artifacts::{
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
 pub(crate) use crate::task_parser::{
-    parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks, LaneKind,
-    PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
+    parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks,
+    validate_execution_rows, LaneKind, PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
     atomic_write, auto_checkpoint_if_needed, capture_validated_task_closeout_tree,
@@ -82,7 +82,8 @@ pub(crate) use worker_env::*;
 
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 
-pub(crate) const HOST_QUEUE_STATE_FILES: [&str; 7] = [
+pub(crate) const HOST_QUEUE_STATE_FILES: [&str; 8] = [
+    "PLAN.md",
     "IMPLEMENTATION_PLAN.md",
     "COMPLETED.md",
     "WORKLIST.md",
@@ -91,6 +92,22 @@ pub(crate) const HOST_QUEUE_STATE_FILES: [&str; 7] = [
     "ARCHIVED.md",
     "RECEIPTS-DRIFT.md",
 ];
+
+/// Select the executable queue without forcing established repositories to
+/// rename their historical implementation corpus. New repositories may keep a
+/// focused `PLAN.md`; legacy repositories continue to use
+/// `IMPLEMENTATION_PLAN.md` when no focused queue exists.
+pub(crate) fn active_plan_relative(repo_root: &Path) -> &'static str {
+    if repo_root.join("PLAN.md").is_file() {
+        "PLAN.md"
+    } else {
+        "IMPLEMENTATION_PLAN.md"
+    }
+}
+
+pub(crate) fn active_plan_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(active_plan_relative(repo_root))
+}
 
 pub(crate) const LANE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -110,7 +127,7 @@ pub(crate) const DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE: &str = r#"
 
 Repo-specific direct `REVIEW.md` handoff:
 - This repo normally records completion notes in `REVIEW.md`, but `auto parallel` treats queue and review files as host-owned state.
-- Do not edit `REVIEW.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, `AGENTS.md`, `ARCHIVED.md`, or `RECEIPTS-DRIFT.md` from a lane.
+- Do not edit `REVIEW.md`, `PLAN.md`, `IMPLEMENTATION_PLAN.md`, `COMPLETED.md`, `WORKLIST.md`, `AGENTS.md`, `ARCHIVED.md`, or `RECEIPTS-DRIFT.md` from a lane.
 - Preserve blocker or completion evidence in your committed code/tests and command output; the host will reconcile queue and review docs after landing."#;
 
 pub(crate) const LANE_TASK_ID_FILE: &str = "task-id";
@@ -128,6 +145,17 @@ pub(crate) const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
         return run_parallel_status(&args);
+    }
+    if args.action == Some(ParallelAction::PlanCheck) {
+        let repo_root = git_repo_root()?;
+        let plan = inspect_loop_plan(&repo_root)?;
+        println!(
+            "{}: {} task(s), {} actionable",
+            active_plan_relative(&repo_root),
+            plan.tasks.len(),
+            plan.queue_snapshot().pending_ids.len()
+        );
+        return Ok(());
     }
     if args.action == Some(ParallelAction::ReceiptBackfill) {
         return run_parallel_receipt_backfill(&args);

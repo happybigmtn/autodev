@@ -187,11 +187,9 @@ pub(crate) fn recover_unsealed_task_completion_transitions(
             "recovered unsealed Done transition after interrupted host closeout",
         )?;
     }
-    atomic_write(
-        &repo_root.join("IMPLEMENTATION_PLAN.md"),
-        updated_plan.as_bytes(),
-    )?;
-    run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+    let plan_relative = active_plan_relative(repo_root);
+    atomic_write(&active_plan_path(repo_root), updated_plan.as_bytes())?;
+    run_git(repo_root, ["add", plan_relative])?;
     Ok(unsealed)
 }
 
@@ -1262,8 +1260,10 @@ fn require_task_status_persisted(
 ) -> Result<()> {
     let worktree = read_loop_plan(repo_root)?;
     let worktree_status = task_status_in_plan_text(&worktree, task_id)?;
-    let indexed = git_stdout(repo_root, ["show", ":IMPLEMENTATION_PLAN.md"])
-        .context("failed to read the indexed IMPLEMENTATION_PLAN.md")?;
+    let plan_relative = active_plan_relative(repo_root);
+    let indexed_spec = format!(":{plan_relative}");
+    let indexed = git_stdout(repo_root, ["show", indexed_spec.as_str()])
+        .with_context(|| format!("failed to read the indexed {plan_relative}"))?;
     let indexed_status = task_status_in_plan_text(&indexed, task_id)?;
     if worktree_status != expected || indexed_status != expected {
         bail!(
@@ -1291,7 +1291,8 @@ fn persist_failed_gate_demotion(
         &assignment.task,
         LoopTaskStatus::Partial,
     )? {
-        run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"]).with_context(|| {
+        let plan_relative = active_plan_relative(repo_root);
+        run_git(repo_root, ["add", plan_relative]).with_context(|| {
             format!(
                 "failed staging IMPLEMENTATION_PLAN.md after {gate_label} demote for `{}`",
                 assignment.task.id
@@ -2483,7 +2484,7 @@ pub(crate) fn propagate_lane_receipts(
         // (not its statuses) changed between worker verification and landing.
         // Genuine spec drift is still caught by the declared-artifact hash
         // checks, the verification-command checks, and the diff-review gate.
-        if let Ok(plan_bytes) = std::fs::read(canonical_root.join("IMPLEMENTATION_PLAN.md")) {
+        if let Ok(plan_bytes) = std::fs::read(active_plan_path(canonical_root)) {
             let plan_hash = crate::completion_artifacts::normalized_plan_hash_bytes(&plan_bytes);
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
@@ -2710,7 +2711,7 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
             LoopTaskStatus::Done,
         )?;
         if plan_updated {
-            run_git(repo_root, ["add", "IMPLEMENTATION_PLAN.md"])?;
+            run_git(repo_root, ["add", active_plan_relative(repo_root)])?;
         }
         let staged = git_stdout(repo_root, ["diff", "--cached", "--name-only"])?;
         let staged_paths = staged
@@ -3090,7 +3091,7 @@ pub(crate) fn reconcile_parallel_landed_task_state(
             queue_files.push("REVIEW.md");
         }
         if plan_updated {
-            queue_files.push("IMPLEMENTATION_PLAN.md");
+            queue_files.push(active_plan_relative(repo_root));
         }
         if !queue_files.is_empty() {
             let mut args = vec!["add"];
@@ -3167,17 +3168,18 @@ pub(crate) fn run_after_plan_update_hook(repo_root: &Path) -> Result<Vec<String>
     if !hook.is_file() {
         return Ok(Vec::new());
     }
+    let plan_relative = active_plan_relative(repo_root);
     let plan_diff = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--quiet", "HEAD", "--", "IMPLEMENTATION_PLAN.md"])
+        .args(["diff", "--quiet", "HEAD", "--", plan_relative])
         .output()
         .with_context(|| format!("failed checking plan changes in {}", repo_root.display()))?;
     match plan_diff.status.code() {
         Some(0) => return Ok(Vec::new()),
         Some(1) => {}
         _ => bail!(
-            "failed checking whether IMPLEMENTATION_PLAN.md changed: {}",
+            "failed checking whether {plan_relative} changed: {}",
             String::from_utf8_lossy(&plan_diff.stderr).trim()
         ),
     }

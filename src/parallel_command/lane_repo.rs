@@ -426,6 +426,7 @@ pub(crate) fn is_docs_only_path(path: &str) -> bool {
     // these counts as real progress even if everything else is doc-shaped.
     let meaningful_progress_files = [
         "IMPLEMENTATION_PLAN.md",
+        "PLAN.md",
         "CHANGELOG.md",
         "README.md",
         "AGENTS.md",

@@ -25,7 +25,7 @@ pub(crate) fn build_iteration_prompt(prompt_template: &str, queue: &LoopQueueSna
 }
 
 pub(crate) fn read_loop_plan(repo_root: &Path) -> Result<String> {
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_path = active_plan_path(repo_root);
     if !plan_path.exists() {
         return Ok(String::new());
     }
@@ -386,6 +386,12 @@ pub(crate) fn task_field_body(markdown: &str, field: &str, next_field: &str) -> 
 
 pub(crate) fn inspect_loop_plan(repo_root: &Path) -> Result<LoopPlanSnapshot> {
     let plan = read_loop_plan(repo_root)?;
+    validate_execution_rows(&plan).with_context(|| {
+        format!(
+            "{} contains an invalid execution row",
+            active_plan_path(repo_root).display()
+        )
+    })?;
     Ok(parse_loop_plan(&plan))
 }
 
@@ -394,7 +400,7 @@ pub(crate) fn update_reconciled_task_completion_in_plan(
     task: &LoopTask,
     status: LoopTaskStatus,
 ) -> Result<bool> {
-    let plan_path = repo_root.join("IMPLEMENTATION_PLAN.md");
+    let plan_path = active_plan_path(repo_root);
     if !plan_path.exists() {
         return Ok(false);
     }
@@ -511,6 +517,26 @@ fn mark_task_header_status_with_policy(
 #[cfg(test)]
 mod tests {
     use crate::parallel_command::*;
+
+    #[test]
+    fn active_plan_prefers_plan_md_and_falls_back_to_legacy_name() {
+        let root = std::env::temp_dir().join(format!(
+            "autodev-active-plan-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("tempdir");
+        assert_eq!(active_plan_relative(&root), "IMPLEMENTATION_PLAN.md");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "legacy").expect("legacy");
+        assert_eq!(active_plan_relative(&root), "IMPLEMENTATION_PLAN.md");
+        fs::write(root.join("PLAN.md"), "active").expect("active");
+        assert_eq!(active_plan_relative(&root), "PLAN.md");
+        assert_eq!(read_loop_plan(&root).expect("read"), "active");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn lane_kind_routes_operator_and_evidence_tasks() {
