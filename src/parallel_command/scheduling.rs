@@ -561,8 +561,7 @@ pub(crate) fn attach_partial_follow_up_note(
     assignment: &mut ActiveLaneAssignment,
     attempted_partial_followups: &BTreeMap<String, usize>,
 ) {
-    if assignment.task.status != LoopTaskStatus::Partial || assignment.host_recovery_note.is_some()
-    {
+    if assignment.task.status != LoopTaskStatus::Partial {
         return;
     }
 
@@ -610,9 +609,44 @@ pub(crate) fn attach_partial_follow_up_note(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    assignment.host_recovery_note = Some(format!(
-        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
-    ));
+    let standing_review_findings = fs::read_to_string(repo_root.join("REVIEW.md"))
+        .map(|review| unresolved_review_sections_for_task(&review, &assignment.task.id))
+        .unwrap_or_default();
+    let standing_review_clause = if standing_review_findings.is_empty() {
+        "- none".to_string()
+    } else {
+        standing_review_findings
+            .iter()
+            .map(|finding| format!("- {}", finding.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let follow_up_note = format!(
+        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nUnresolved independent-review findings that MUST be addressed before `AUTO_ALREADY_COMPLETE` is valid:\n{standing_review_clause}\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
+    );
+    prepend_host_recovery_note(assignment, &follow_up_note);
+}
+
+fn unresolved_review_sections_for_task(review_text: &str, task_id: &str) -> Vec<String> {
+    let marker = format!("## `{task_id}`");
+    let mut sections = Vec::new();
+    for (start, _) in review_text.match_indices(&marker) {
+        let tail = &review_text[start..];
+        let section = tail
+            .split_once("\n## ")
+            .map(|(current, _)| current)
+            .unwrap_or(tail)
+            .trim();
+        if section
+            .to_ascii_lowercase()
+            .contains("auto parallel standing-review gate cleared")
+        {
+            sections.clear();
+        } else if !unresolved_review_findings_for_task(section, task_id).is_empty() {
+            sections.push(section.to_string());
+        }
+    }
+    sections
 }
 
 pub(crate) fn completion_status_suffix(
@@ -812,6 +846,53 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn partial_follow_up_preserves_resume_note_and_surfaces_standing_review_finding() {
+        let repo = unique_temp_dir("partial-review-recovery-note");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-P`: independent review findings\n\n1. `src/lib.rs`: add the missing runtime case.\n",
+        )
+        .expect("write review");
+        let task = LoopTask {
+            id: "TASK-P".to_string(),
+            title: "repair partial".to_string(),
+            status: LoopTaskStatus::Partial,
+            dependencies: Vec::new(),
+            estimated_scope: Some("S".to_string()),
+            completion_path_target: None,
+            lane_kind: LaneKind::Code,
+            markdown: "- [~] `TASK-P` repair partial\n  Verification: `cargo test task_p`\n  Dependencies: none\n".to_string(),
+        };
+        let lane_root = repo.join("lane-1");
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 0,
+            task,
+            resumed: true,
+            lane_repo_root: lane_root.join("repo"),
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            lane_root,
+            base_commit: "abc123".to_string(),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: Some(
+                "host restart found a clean lane receipt; reconcile existing proof".to_string(),
+            ),
+        };
+
+        attach_partial_follow_up_note(&repo, &mut assignment, &BTreeMap::new());
+
+        let note = assignment.host_recovery_note.expect("recovery note");
+        assert!(note.contains("host restart found a clean lane receipt"));
+        assert!(note.contains("add the missing runtime case"));
+        assert!(note.contains("already marked `- [~]`"));
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]

@@ -3138,9 +3138,7 @@ async fn refresh_post_review_derived_attestation_if_needed(
     task_markdown: &str,
 ) -> Result<Option<LaneVerifyOutcome>> {
     let derived_files = run_after_plan_update_hook(repo_root)?;
-    if derived_files.is_empty()
-        || verification_receipt_commit_footer(repo_root, task_id).is_ok()
-    {
+    if derived_files.is_empty() || verification_receipt_commit_footer(repo_root, task_id).is_ok() {
         return Ok(None);
     }
     let outcome = run_guarded_lane_verify_gate(
@@ -7777,7 +7775,8 @@ exec "$@"
             "#!/usr/bin/env bash\nset -euo pipefail\ncp IMPLEMENTATION_PLAN.md derived-plan.txt\nprintf '%s\\n' derived-plan.txt\n",
         )
         .expect("write hook");
-        let partial = "# Plan\n\n- [~] `TASK-HOOK-STALE` refresh derived plan\nDependencies: none\n";
+        let partial =
+            "# Plan\n\n- [~] `TASK-HOOK-STALE` refresh derived plan\nDependencies: none\n";
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), partial).expect("write plan");
         fs::write(root.join("derived-plan.txt"), partial).expect("write derived");
         git_ok(
