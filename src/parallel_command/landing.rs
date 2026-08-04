@@ -2753,6 +2753,18 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
                 assignment.task.id
             );
         }
+        // Updating the task checkbox changes the tracked plan bytes even
+        // though the receipt's dedicated plan hash normalizes status markers.
+        // Bind the durable footer after that final queue mutation, immediately
+        // before committing, so the full source-state fingerprint cannot be
+        // made stale by the closeout operation itself.
+        propagate_lane_receipts(
+            repo_root,
+            repo_root,
+            &assignment.task.id,
+            &assignment.task.markdown,
+        )?;
+        record_verified_source_attestation(repo_root, &assignment.task.id)?;
         let (message, allow_empty) = if staged_paths.is_empty() {
             (
                 format!(
