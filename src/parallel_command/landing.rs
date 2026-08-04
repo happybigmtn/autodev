@@ -2689,6 +2689,12 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
         &assignment.task.id,
         &assignment.task.markdown,
     )?;
+    // The verification gate records its source attestation before the
+    // workspace and independent-review gates run. Those later gates may
+    // truthfully update tracked host-owned evidence such as REVIEW.md. Refresh
+    // the attestation only after the complete gate pipeline has settled so the
+    // closeout footer is bound to the exact tree it is about to commit.
+    record_verified_source_attestation(repo_root, &assignment.task.id)?;
     let final_evidence =
         inspect_task_completion_evidence(repo_root, &assignment.task.id, &assignment.task.markdown);
     if !final_evidence.is_fully_evidenced() {
