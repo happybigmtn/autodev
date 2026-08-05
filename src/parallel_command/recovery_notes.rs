@@ -417,17 +417,23 @@ pub(crate) fn detect_lane_environment_blocker(assignment: &ActiveLaneAssignment)
     environment_blocker_reason(&combined)
 }
 
+pub(crate) fn detect_lane_explicit_environment_blocker(
+    assignment: &ActiveLaneAssignment,
+) -> Option<String> {
+    let combined = [
+        read_recent_log_text(&assignment.stdout_log_path, 200).ok(),
+        read_recent_log_text(&assignment.stderr_log_path, 200).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    explicit_environment_blocker_reason(&combined)
+}
+
 pub(crate) fn environment_blocker_reason(log_text: &str) -> Option<String> {
-    for line in log_text.lines().rev() {
-        if let Some(reason) = line
-            .split_once("AUTO_ENV_BLOCKER:")
-            .map(|(_, reason)| reason)
-        {
-            let reason = reason.trim();
-            if !reason.is_empty() {
-                return Some(reason.to_string());
-            }
-        }
+    if let Some(reason) = explicit_environment_blocker_reason(log_text) {
+        return Some(reason);
     }
 
     let lower = log_text.to_ascii_lowercase();
@@ -458,6 +464,25 @@ pub(crate) fn environment_blocker_reason(log_text: &str) -> Option<String> {
     patterns
         .iter()
         .find_map(|(reason, pattern)| lower.contains(pattern).then(|| (*reason).to_string()))
+}
+
+/// Read only the worker's explicit environment-blocker contract. Successful
+/// committed handoffs use this narrower signal: historical transient errors
+/// such as "connection refused" may appear earlier in a recovered worker log
+/// and must not override a later successful finish.
+pub(crate) fn explicit_environment_blocker_reason(log_text: &str) -> Option<String> {
+    for line in log_text.lines().rev() {
+        if let Some(reason) = line
+            .split_once("AUTO_ENV_BLOCKER:")
+            .map(|(_, reason)| reason)
+        {
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                return Some(reason.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn read_recent_log_text(path: &Path, max_lines: usize) -> Result<String> {

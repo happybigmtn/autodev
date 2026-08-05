@@ -520,6 +520,14 @@ pub(crate) fn render_parallel_health_summary(
 pub(crate) fn receipt_drift_status_summary(repo_root: &Path) -> Option<String> {
     let path = repo_root.join("RECEIPTS-DRIFT.md");
     let content = fs::read_to_string(&path).ok()?;
+    // The report describes a particular canonical source state. A normal
+    // closeout may commit the generated report immediately after that source
+    // state, so accept HEAD or its direct parent. Anything older is historical
+    // evidence, not current pipeline degradation; the next exhaustive sweep
+    // will regenerate it if the drift still exists.
+    if !receipt_drift_report_is_fresh(repo_root, &content) {
+        return None;
+    }
     if content.contains("No repo-local receipt drift detected.") {
         return None;
     }
@@ -559,6 +567,31 @@ pub(crate) fn receipt_drift_status_summary(repo_root: &Path) -> Option<String> {
         parts.push(format!("{candidates} manual closeout candidate(s)"));
     }
     Some(format!("{}; see RECEIPTS-DRIFT.md", parts.join(", ")))
+}
+
+const RECEIPT_DRIFT_SOURCE_HEAD_MARKER: &str = "<!-- auto-receipts-drift-source-head: ";
+
+fn receipt_drift_report_source_head(content: &str) -> Option<&str> {
+    let tail = content.split_once(RECEIPT_DRIFT_SOURCE_HEAD_MARKER)?.1;
+    let source = tail.split_once(" -->")?.0.trim();
+    (!source.is_empty() && source.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(source)
+}
+
+fn receipt_drift_report_is_fresh(repo_root: &Path, content: &str) -> bool {
+    let Some(source_head) = receipt_drift_report_source_head(content) else {
+        return false;
+    };
+    let current_head = git_stdout(repo_root, ["rev-parse", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if current_head == source_head {
+        return true;
+    }
+    git_stdout(repo_root, ["rev-parse", "HEAD^"])
+        .unwrap_or_default()
+        .trim()
+        == source_head
 }
 
 pub(crate) fn latest_lane_log_line(lane_root: &Path) -> (String, Option<String>) {
@@ -746,6 +779,45 @@ mod tests {
         assert!(summary.contains("stale recovery lanes: lane-2 TASK-2"));
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn receipt_drift_status_ignores_reports_older_than_the_closeout_commit() {
+        let repo = unique_temp_dir("parallel-status-stale-drift");
+        fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, ["init", "-q", "-b", "main"]).expect("init git repo");
+        run_git(&repo, ["config", "user.name", "autodev tests"]).expect("set git name");
+        run_git(&repo, ["config", "user.email", "autodev@example.com"]).expect("set git email");
+        fs::write(repo.join("source.txt"), "one\n").expect("write source");
+        run_git(&repo, ["add", "source.txt"]).expect("stage source");
+        run_git(&repo, ["commit", "-q", "-m", "source"]).expect("commit source");
+        let source_head = git_stdout(&repo, ["rev-parse", "HEAD"])
+            .expect("read source head")
+            .trim()
+            .to_string();
+        let report = format!(
+            "# Receipt Drift Triage\n\n<!-- auto-receipts-drift-source-head: {source_head} -->\n\n## Completed Tasks With Drift\n\n- [x] `TASK-1` stale\n"
+        );
+        fs::write(repo.join("RECEIPTS-DRIFT.md"), &report).expect("write report");
+
+        assert!(super::receipt_drift_status_summary(&repo).is_some());
+        run_git(&repo, ["add", "RECEIPTS-DRIFT.md"]).expect("stage report");
+        run_git(&repo, ["commit", "-q", "-m", "receipt drift closeout"]).expect("commit report");
+        assert!(
+            super::receipt_drift_status_summary(&repo).is_some(),
+            "the direct closeout child of the recorded source remains fresh"
+        );
+
+        fs::write(repo.join("source.txt"), "two\n").expect("change source");
+        run_git(&repo, ["add", "source.txt"]).expect("stage changed source");
+        run_git(&repo, ["commit", "-q", "-m", "new source"]).expect("commit changed source");
+        assert_eq!(
+            super::receipt_drift_status_summary(&repo),
+            None,
+            "a historical report must not degrade current pipeline health"
+        );
+
+        fs::remove_dir_all(&repo).expect("remove repo");
     }
 
     #[test]

@@ -1713,11 +1713,10 @@ pub(crate) async fn refresh_parallel_plan(
         .zip(load_completed_sweep_fingerprint(&run_root).as_deref())
         .map(|(now, last)| now == last)
         .unwrap_or(false);
-    if already_swept {
-        parallel_logger.info(
-            "drift-reverify: inputs unchanged since last exhaustive sweep; skipping re-verification",
-        );
-    } else {
+    // The skipped branch runs on every idle host refresh. The persisted sweep
+    // fingerprint is already the evidence that no work is needed; do not log
+    // the same no-op decision every poll and bury actionable worker events.
+    if !already_swept {
         let (audited, exhaustive) =
             audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
                 .await?;

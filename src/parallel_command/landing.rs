@@ -688,7 +688,17 @@ pub(crate) fn write_receipts_drift_triage(
     manual_closeout_candidates: &[ReceiptDriftTriageEntry],
 ) -> Result<bool> {
     let path = repo_root.join("RECEIPTS-DRIFT.md");
-    let body = render_receipts_drift_triage(completed_drift, manual_closeout_candidates);
+    let source_head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    let mut body = render_receipts_drift_triage(completed_drift, manual_closeout_candidates);
+    let marker = format!(
+        "<!-- auto-receipts-drift-source-head: {} -->\n\n",
+        source_head.trim()
+    );
+    if let Some(offset) = body.find("\n\n") {
+        body.insert_str(offset + 2, &marker);
+    } else {
+        body.push_str(&marker);
+    }
     if fs::read_to_string(&path).is_ok_and(|existing| existing == body) {
         return Ok(false);
     }
@@ -922,6 +932,18 @@ pub(crate) async fn land_parallel_lane_result(
     // deterministic manifest update after verification invalidates the source
     // fingerprint and needlessly queues a recovery model lane.
     run_after_plan_update_hook(repo_root)?;
+    // A worker can finish useful, committed scaffolding and still report that
+    // the task's final proof is blocked on external infrastructure. That is a
+    // successful *code landing*, not successful task completion. Historically
+    // this marker was only consulted on non-zero worker exits, so a clean
+    // handoff with a passing local receipt could be promoted to `[x]` by the
+    // inline receipt repair below. Preserve the code, but fail the completion
+    // claim closed before any gate can promote it.
+    let landed_environment_blocker = detect_lane_explicit_environment_blocker(assignment);
+    if let Some(reason) = landed_environment_blocker.as_deref() {
+        completion_status =
+            hold_landed_environment_blocker(repo_root, assignment, completion_status, reason)?;
+    }
     // Inline receipt-gap repair (2026-07-10): if the ONLY thing holding this
     // task at `[~]` is a locally-repairable verification gap — a MISSING
     // receipt (worker skipped the wrapper) OR a STALE receipt (a concurrent
@@ -939,7 +961,10 @@ pub(crate) async fn land_parallel_lane_result(
     // re-verification) moves that re-verification inline to landing time, so a
     // stale-but-still-passing task closes as `[x]` immediately instead of
     // demoting and burning a follow-up model lane.
-    if completion_status == LoopTaskStatus::Partial && verify_gate_enabled() {
+    if completion_status == LoopTaskStatus::Partial
+        && landed_environment_blocker.is_none()
+        && verify_gate_enabled()
+    {
         let evidence = inspect_task_completion_evidence(
             repo_root,
             &assignment.task.id,
@@ -1107,6 +1132,37 @@ pub(crate) async fn land_parallel_lane_result(
         auto_repaired,
         completion_status,
     })
+}
+
+fn hold_landed_environment_blocker(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+    reason: &str,
+) -> Result<LoopTaskStatus> {
+    let detail = format!(
+        "worker landed committed code but declared an external environment blocker: {}",
+        reason.trim()
+    );
+    append_lane_environment_blocker(repo_root, &assignment.task.id, reason)?;
+    run_git(repo_root, ["add", "REVIEW.md"])?;
+    persist_failed_gate_demotion(
+        repo_root,
+        assignment,
+        incoming_status,
+        "successful handoff environment blocker",
+    )?;
+    record_gate_hold(repo_root, &assignment.task.id, &detail)?;
+    append_lane_host_event(
+        &assignment.stdout_log_path,
+        assignment.lane_index,
+        &assignment.task.id,
+        &format!(
+            "landed-env-blocked: code retained; task held [~]: {}",
+            reason.trim()
+        ),
+    );
+    Ok(LoopTaskStatus::Partial)
 }
 
 /// Orchestrator-side glue for the independent diff-review gate.
@@ -2374,6 +2430,28 @@ fn append_lane_verify_failure(repo_root: &Path, task_id: &str, detail: &str) -> 
 - Source: auto parallel host re-execution verify gate (held at `[~]`).\n\
 - The host re-ran this task's declared verification command(s) at canonical HEAD and one FAILED.\n  Fix the failure, then the task re-dispatches until the host's own re-run is green.\n\n\
 ```\n{}\n```\n",
+        detail.trim()
+    ));
+    atomic_write(&review_path, review_text.as_bytes())?;
+    Ok(())
+}
+
+fn append_lane_environment_blocker(repo_root: &Path, task_id: &str, detail: &str) -> Result<()> {
+    let review_path = repo_root.join("REVIEW.md");
+    let mut review_text = if review_path.exists() {
+        std::fs::read_to_string(&review_path)?
+    } else {
+        "# REVIEW\n\nAwaiting auto review:\n".to_string()
+    };
+    if !review_text.ends_with('\n') {
+        review_text.push('\n');
+    }
+    review_text.push_str(&format!(
+        "\n## `{task_id}`: landed code awaiting external proof\n\
+- Source: auto parallel successful-handoff environment gate (held at `[~]`).\n\
+- The worker's committed code was retained, but it explicitly reported `AUTO_ENV_BLOCKER`.\n\
+- Blocker: {}\n\
+- Completion may be reconsidered only after the external condition is available and the normal definition-of-done gates pass.\n",
         detail.trim()
     ));
     atomic_write(&review_path, review_text.as_bytes())?;
@@ -5125,6 +5203,77 @@ Dependencies: none\n";
         assert!(staged.contains("REVIEW.md"));
 
         fs::remove_dir_all(&repo).expect("failed to remove temp repo");
+    }
+
+    #[test]
+    fn successful_committed_handoff_with_env_blocker_stays_partial() {
+        let repo = unique_temp_dir("parallel-landed-env-blocker");
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            "- [x] `TASK-ENV` Build deployment kit\n  Verification: `true`\n  Completion artifacts: `kit.txt`\n  Dependencies: none\n",
+        )
+        .expect("write completed-looking plan");
+        fs::write(repo.join("kit.txt"), "locally verified kit\n").expect("write artifact");
+        run_git_in(&repo, ["add", "IMPLEMENTATION_PLAN.md", "kit.txt"]);
+        run_git_in(&repo, ["commit", "-m", "seed completed-looking task"]);
+
+        let mut assignment = review_gate_assignment_with_markdown(
+            &repo,
+            "TASK-ENV",
+            "Build deployment kit",
+            "- [ ] `TASK-ENV` Build deployment kit\n  Verification: `true`\n  Completion artifacts: `kit.txt`\n  Dependencies: none\n".to_string(),
+        );
+        fs::create_dir_all(&assignment.lane_root).expect("create lane root");
+        fs::write(
+            &assignment.stdout_log_path,
+            "connection refused during warm-up\nservice recovered\nall tests passed\n",
+        )
+        .expect("write recovered worker handoff");
+        assert!(
+            detect_lane_environment_blocker(&assignment).is_some(),
+            "failed-attempt heuristics should still recognize the transient"
+        );
+        assert_eq!(
+            detect_lane_explicit_environment_blocker(&assignment),
+            None,
+            "a recovered successful handoff must not be held by historical heuristic text"
+        );
+        fs::write(
+            &assignment.stdout_log_path,
+            "tests passed\nAUTO_ENV_BLOCKER: live validator quorum is unavailable\n",
+        )
+        .expect("write successful worker handoff");
+
+        let blocker = detect_lane_explicit_environment_blocker(&assignment)
+            .expect("explicit successful-handoff blocker should be detected");
+        let status = super::hold_landed_environment_blocker(
+            &repo,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            &blocker,
+        )
+        .expect("landed code should be retained while completion is held");
+
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Partial);
+        let plan = fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        assert!(plan.contains("- [~] `TASK-ENV`"), "{plan}");
+        let review = fs::read_to_string(repo.join("REVIEW.md")).expect("read review");
+        assert!(
+            review.contains("landed code awaiting external proof"),
+            "{review}"
+        );
+        assert!(
+            review.contains("live validator quorum is unavailable"),
+            "{review}"
+        );
+        assert!(task_is_gate_held(&repo, "TASK-ENV").expect("read gate hold"));
+        let lane_log = fs::read_to_string(&assignment.stdout_log_path).expect("read lane log");
+        assert!(lane_log.contains("landed-env-blocked: code retained; task held [~]"));
+        assert!(!lane_log.contains("host-reexec-verify(inline)"));
+
+        fs::remove_dir_all(&repo).expect("remove repo");
     }
 
     #[test]
