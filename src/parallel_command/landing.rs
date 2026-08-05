@@ -2940,11 +2940,17 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
                 assignment.task.id
             );
         }
-        // Updating the task checkbox changes the tracked plan bytes even
-        // though the receipt's dedicated plan hash normalizes status markers.
-        // Bind the durable footer after that final queue mutation, immediately
-        // before committing, so the full source-state fingerprint cannot be
-        // made stale by the closeout operation itself.
+        // Updating the task checkbox can deterministically change tracked
+        // plan-derived manifests. Refresh them BEFORE binding the final source
+        // attestation. `commit_task_closeout` runs the hook again as a safety
+        // net; repository hooks are required to be idempotent, so that second
+        // run must be a no-op. Recording the attestation before this refresh
+        // makes every repo with a real after-plan hook fail its otherwise-green
+        // clean-no-commit closeout and roll the task back to [~].
+        run_after_plan_update_hook(repo_root)?;
+        // Bind the durable footer after the final queue + derived-state
+        // mutation, immediately before committing, so the full source-state
+        // fingerprint matches the exact closeout tree.
         propagate_lane_receipts(
             repo_root,
             repo_root,
@@ -2977,7 +2983,8 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
             LoopTaskStatus::Done,
             &message,
             allow_empty,
-        )
+        )?;
+        require_task_status_at_ref(repo_root, "HEAD", &assignment.task.id, LoopTaskStatus::Done)
     })();
     if let Err(err) = closeout_result {
         let reason = format!("durable clean-no-commit closeout failed: {err:#}");
@@ -3665,6 +3672,79 @@ pub(crate) fn push_parallel_landing_with_divergence_retries(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Push a successful clean-no-commit closeout and prove that both local HEAD
+/// and the published primary branch contain the task's durable Done row.
+///
+/// A caller must never report `self-heal` merely because the gates were green;
+/// the queue transition itself is part of the result. Local-only runs still
+/// verify HEAD and intentionally skip the remote assertion.
+pub(crate) fn push_parallel_clean_no_commit_closeout(
+    repo_root: &Path,
+    target_branch: &str,
+    assignment: &ActiveLaneAssignment,
+) -> Result<bool> {
+    let synced =
+        push_parallel_landing_with_divergence_retries(repo_root, target_branch, assignment)?;
+    require_task_status_at_ref(repo_root, "HEAD", &assignment.task.id, LoopTaskStatus::Done)?;
+    if env::var_os("AUTO_SKIP_REMOTE_SYNC").is_some_and(|value| !value.as_os_str().is_empty()) {
+        return Ok(synced);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-remote", "--heads", "origin"])
+        .arg(format!("refs/heads/{target_branch}"))
+        .output()
+        .context("failed to inspect pushed clean-no-commit branch")?;
+    if !output.status.success() {
+        bail!(
+            "failed to verify pushed clean-no-commit branch origin/{target_branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let remote_head = String::from_utf8(output.stdout)
+        .context("pushed clean-no-commit branch identity was not UTF-8")?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .context("pushed clean-no-commit branch has no remote HEAD")?;
+    let local_head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    if local_head.trim() != remote_head {
+        bail!(
+            "clean-no-commit closeout was not durably published: local HEAD {} != origin/{target_branch} {remote_head}",
+            local_head.trim()
+        );
+    }
+    require_task_status_at_ref(
+        repo_root,
+        &remote_head,
+        &assignment.task.id,
+        LoopTaskStatus::Done,
+    )?;
+    Ok(synced)
+}
+
+fn require_task_status_at_ref(
+    repo_root: &Path,
+    git_ref: &str,
+    task_id: &str,
+    expected: LoopTaskStatus,
+) -> Result<()> {
+    let plan_relative = active_plan_relative(repo_root);
+    let object = format!("{git_ref}:{plan_relative}");
+    let plan = git_stdout(repo_root, ["show", object.as_str()]).with_context(|| {
+        format!("failed to read {plan_relative} from `{git_ref}` for `{task_id}`")
+    })?;
+    let actual = task_status_in_plan_text(&plan, task_id)?;
+    if actual != expected {
+        bail!(
+            "clean-no-commit closeout did not persist `{task_id}` as {expected:?} in {plan_relative} at `{git_ref}` (found {actual:?})"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn landing_error_suggests_retryable_divergence(err: &anyhow::Error) -> bool {
@@ -4518,6 +4598,138 @@ Dependencies: none\n";
         );
 
         fs::remove_dir_all(&repo).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn clean_no_commit_refreshes_derived_state_before_attestation_and_pushes_done_plan() {
+        let (root, remote, _upstream, repo) =
+            init_remote_and_clones("parallel-clean-no-commit-primary-plan", "main");
+        let task_id = "TASK-REMOTE-CLOSE";
+        let title = "Push durable primary plan completion";
+        let task_markdown = format!(
+            "- [~] `{task_id}` {title}\nVerification:\n  - `bash -c true`\nDependencies: none\n"
+        );
+        fs::write(repo.join("PLAN.md"), format!("# Plan\n\n{task_markdown}"))
+            .expect("write primary plan");
+        fs::write(
+            repo.join(".gitignore"),
+            ".auto/\nlane-clean-no-commit/\nlane-repo/\nparallel-run/\n",
+        )
+        .expect("write gitignore");
+        fs::create_dir_all(repo.join("scripts")).expect("create scripts");
+        let wrapper = repo.join("scripts/run-task-verification.sh");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").expect("write wrapper");
+        let hook = repo.join("scripts/autodev-after-plan-update.sh");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nset -eu\nif grep -Fq -- '- [x] `{task_id}`' PLAN.md; then state=done; else state=partial; fi\nprintf '%s\\n' \"$state\" > derived-plan-state.txt\nprintf '%s\\n' derived-plan-state.txt\n"
+            ),
+        )
+        .expect("write derived-state hook");
+        for executable in [&wrapper, &hook] {
+            let mut permissions = fs::metadata(executable).expect("stat script").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).expect("chmod script");
+        }
+        fs::write(repo.join("derived-plan-state.txt"), "partial\n")
+            .expect("write initial derived state");
+        fs::write(
+            repo.join("REVIEW.md"),
+            format!(
+                "# Review\n\n## `{task_id}`\n- Source: test handoff.\n- Remaining blockers: none.\n\n## `{task_id}`: independent review findings\n- Source: stale test finding (held at `[~]`).\n\n1. Recheck the current tree.\n"
+            ),
+        )
+        .expect("write review");
+        let fake_reviewer = write_fake_clean_reviewer(&repo);
+        run_git_in(&repo, ["add", "."]);
+        run_git_in(&repo, ["commit", "-m", "seed partial primary plan"]);
+        run_git_in(&repo, ["push", "origin", "main"]);
+        let base_commit = git_output(&repo, ["rev-parse", "HEAD"]);
+        fs::create_dir_all(repo.join(".auto/symphony/verification-receipts"))
+            .expect("create receipt dir");
+        fs::write(
+            repo.join(format!(
+                ".auto/symphony/verification-receipts/{task_id}.json"
+            )),
+            format!(
+                r#"{{"task_id":"{task_id}","commit":"{base_commit}","commands":[{{"command":"bash -c true","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("write receipt");
+        propagate_lane_receipts(&repo, &repo, task_id, &task_markdown)
+            .expect("refresh receipt metadata");
+
+        let lane_root = repo.join(".auto/parallel-run/lanes/lane-1");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        let logger = ParallelEventLogger::new(&repo.join(".auto/parallel-run"))
+            .expect("logger should initialize");
+        let mut assignment = ActiveLaneAssignment {
+            lane_index: 1,
+            attempts: 1,
+            task: LoopTask {
+                id: task_id.to_string(),
+                title: title.to_string(),
+                status: LoopTaskStatus::Partial,
+                dependencies: Vec::new(),
+                estimated_scope: Some("S".to_string()),
+                completion_path_target: None,
+                lane_kind: LaneKind::Code,
+                markdown: task_markdown.clone(),
+            },
+            resumed: false,
+            lane_root: lane_root.clone(),
+            lane_repo_root: repo.clone(),
+            base_commit,
+            stdout_log_path: lane_root.join("stdout.log"),
+            stderr_log_path: lane_root.join("stderr.log"),
+            worker_pid_path: lane_root.join("worker.pid"),
+            clean_commit_since: None,
+            terminate_requested_at: None,
+            host_recovery_note: None,
+        };
+        let review_config = LaneReviewConfig {
+            model: "unused".to_string(),
+            reasoning_effort: "unused".to_string(),
+            codex_bin: fake_reviewer,
+        };
+        record_gate_hold(&repo, task_id, "standing review must be re-adjudicated")
+            .expect("record hold");
+
+        let reconciled = reconcile_parallel_clean_no_commit(
+            &repo,
+            "main",
+            &mut assignment,
+            &logger,
+            &review_config,
+        )
+        .await
+        .expect("clean no-commit reconciliation should succeed");
+        assert!(reconciled);
+        assert!(
+            push_parallel_clean_no_commit_closeout(&repo, "main", &assignment)
+                .expect("push closeout")
+                || git_output(&repo, ["rev-parse", "HEAD"])
+                    == git_output(&repo, ["rev-parse", "origin/main"])
+        );
+
+        let remote_plan = run_git_in(&remote, ["show", "main:PLAN.md"]);
+        assert!(
+            remote_plan.contains(&format!("- [x] `{task_id}` {title}")),
+            "pushed primary plan must contain Done row: {remote_plan}"
+        );
+        assert_eq!(
+            run_git_in(&remote, ["show", "main:derived-plan-state.txt"]),
+            "done\n",
+            "pushed derived state must match the Done plan"
+        );
+        let closeout_paths = run_git_in(&remote, ["show", "--pretty=", "--name-only", "main"]);
+        assert!(closeout_paths.lines().any(|path| path == "PLAN.md"));
+        assert!(closeout_paths
+            .lines()
+            .any(|path| path == "derived-plan-state.txt"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[tokio::test]

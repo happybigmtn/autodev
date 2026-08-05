@@ -1007,7 +1007,7 @@ pub(crate) async fn harvest_resumable_lane_results(
             .await
             {
                 Ok(true) => {
-                    if push_parallel_landing_with_divergence_retries(
+                    if push_parallel_clean_no_commit_closeout(
                         repo_root,
                         target_branch,
                         &assignment,

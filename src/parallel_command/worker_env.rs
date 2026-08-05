@@ -727,6 +727,7 @@ mod tests {
             .expect("canonical lease should lock");
         let mut worker = Command::new(&guard_path)
             .arg("test")
+            .stdout(std::process::Stdio::piped())
             .env("AUTO_REAL_CARGO", "/bin/echo")
             .env("AUTO_PARALLEL_FLOCK", "/usr/bin/flock")
             .env(
