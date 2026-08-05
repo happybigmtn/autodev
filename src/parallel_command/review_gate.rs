@@ -583,8 +583,8 @@ fn normalized_review_bytes(path: &str, bytes: &[u8], task_id: &str) -> Result<Ve
     let mut normalized_headers = 0usize;
     for line in plan.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-        let is_target_header =
-            parse_shared_task_header(line_without_newline).is_some_and(|(_, id, _)| id == task_id);
+        let is_target_header = parse_shared_top_level_task_header(line_without_newline)
+            .is_some_and(|(_, id, _)| id == task_id);
         if !is_target_header {
             normalized.push_str(line);
             continue;
@@ -1297,7 +1297,7 @@ fn preserve_unsealed_review_input_interlock(repo_root: &Path, task_id: &str) -> 
     let mut changed = false;
     for line in plan.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-        let Some((status, id, _)) = parse_shared_task_header(line_without_newline) else {
+        let Some((status, id, _)) = parse_shared_top_level_task_header(line_without_newline) else {
             rewritten.push_str(line);
             continue;
         };
@@ -2935,6 +2935,7 @@ printf 'VERDICT: CLEAN\n' > "$report"
 Prose copy: - [x] `TASK-007` must stay literal
 
 - [x] `TASK-007` Parsed task
+  - [x] `TASK-007` indented task-like prose must stay literal
   Verification: `cargo test parsed`
 ";
         let normalized = String::from_utf8(
@@ -2948,6 +2949,10 @@ Prose copy: - [x] `TASK-007` must stay literal
         );
         assert!(
             normalized.contains("- [?] `TASK-007` Parsed task"),
+            "{normalized}"
+        );
+        assert!(
+            normalized.contains("  - [x] `TASK-007` indented task-like prose must stay literal"),
             "{normalized}"
         );
     }

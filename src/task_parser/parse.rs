@@ -9,8 +9,7 @@ pub(crate) fn parse_tasks(plan: &str) -> Vec<PlanTask> {
         // `- [~] Foo-123 ...` bullets are body prose; the lenient bare-ID
         // rule must not turn them into phantom dispatchable tasks
         // (2026-07-10 ludeme Wave-004 incident).
-        let column_zero = !line.starts_with(' ') && !line.starts_with('\t');
-        if column_zero && parse_task_header(line).is_some() {
+        if parse_top_level_task_header(line).is_some() {
             if let Some(task) = finalize_task(&current_lines) {
                 tasks.push(task);
             }
@@ -28,6 +27,15 @@ pub(crate) fn parse_tasks(plan: &str) -> Vec<PlanTask> {
     }
 
     tasks
+}
+
+/// Parse only a dispatchable task header. Markdown checkbox bullets indented
+/// beneath a task are body prose, even when their text resembles a task ID.
+pub(crate) fn parse_top_level_task_header(line: &str) -> Option<(TaskStatus, String, String)> {
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return None;
+    }
+    parse_task_header(line)
 }
 
 fn finalize_task(lines: &[String]) -> Option<PlanTask> {

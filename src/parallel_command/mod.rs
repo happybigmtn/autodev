@@ -30,8 +30,9 @@ pub(crate) use crate::completion_artifacts::{
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
 pub(crate) use crate::task_parser::{
-    parse_task_header as parse_shared_task_header, parse_tasks as parse_shared_tasks,
-    validate_execution_rows, LaneKind, PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
+    parse_tasks as parse_shared_tasks,
+    parse_top_level_task_header as parse_shared_top_level_task_header, validate_execution_rows,
+    LaneKind, PlanTask as SharedPlanTask, TaskStatus as SharedTaskStatus,
 };
 pub(crate) use crate::util::{
     active_plan_path, active_plan_relative, atomic_write, auto_checkpoint_if_needed,

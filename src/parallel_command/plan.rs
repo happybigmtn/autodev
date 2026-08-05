@@ -337,8 +337,8 @@ pub(crate) fn task_is_deferred_not_shipped_placeholder(title: &str, markdown: &s
     })
 }
 
-pub(crate) fn parse_task_header(line: &str) -> Option<(LoopTaskStatus, String, String)> {
-    let (status, id, title) = parse_shared_task_header(line)?;
+fn parse_top_level_task_header(line: &str) -> Option<(LoopTaskStatus, String, String)> {
+    let (status, id, title) = parse_shared_top_level_task_header(line)?;
     Some((loop_task_status(status), id, title))
 }
 
@@ -426,7 +426,7 @@ pub(crate) fn update_task_completion_in_plan_text(
 
     for chunk in plan.split_inclusive('\n') {
         let line = chunk.trim_end_matches('\n').trim_end_matches('\r');
-        if let Some((_, current_task_id, _)) = parse_task_header(line) {
+        if let Some((_, current_task_id, _)) = parse_top_level_task_header(line) {
             if current_task_id == task_id {
                 updated.push_str(&mark_task_header_status(chunk, status));
                 continue;
@@ -448,7 +448,7 @@ pub(crate) fn update_reconciled_task_completion_in_plan_text(
 
     for chunk in plan.split_inclusive('\n') {
         let line = chunk.trim_end_matches('\n').trim_end_matches('\r');
-        if let Some((_, current_task_id, current_title)) = parse_task_header(line) {
+        if let Some((_, current_task_id, current_title)) = parse_top_level_task_header(line) {
             if current_task_id == task.id && current_title == task.title {
                 updated.push_str(&mark_task_header_status_with_policy(chunk, status, true));
                 matched_exact_row = true;
@@ -983,6 +983,22 @@ mod tests {
         assert!(updated.contains("- [~] `TASK-001` First task"));
         assert!(updated.contains("TASK-002"));
         assert!(updated.starts_with("- [~] `TASK-001`"));
+    }
+
+    #[test]
+    fn update_task_completion_ignores_indented_task_like_prose() {
+        let plan = "- [ ] `TASK-001` Real task\n\n  - [ ] `TASK-001` quoted example\n";
+
+        let updated = update_task_completion_in_plan_text(plan, "TASK-001", LoopTaskStatus::Done);
+
+        assert!(
+            updated.starts_with("- [x] `TASK-001` Real task"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("  - [ ] `TASK-001` quoted example"),
+            "{updated}"
+        );
     }
 
     #[test]
