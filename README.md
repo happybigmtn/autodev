@@ -1229,6 +1229,21 @@ Useful flags:
 - `--branch <name>` to lock the executor to a specific branch
 - `--run-root <dir>` to change where parallel logs are stored
 - `status` to print current host/tmux/lane health without starting new work
+- `prune` to preview the exact obsolete lane, worker-shim, salvage, and host-log paths that can be
+  removed. This is always a read-only dry run unless `--apply` is present. Applied pruning refuses
+  to run while a tmux or direct parallel host is active, the run-root lease is held, or a resumable
+  `.run-state.json` exists. It accepts only the repo's canonical `.auto/parallel` root or the
+  canonical `<AUTO_RUN_ROOT>/<repo>/parallel` root, requires an Autodev run marker, and preserves
+  the bounded `lane-caches/` build caches and all semantic evidence files. Unknown tmux or process
+  probe results fail closed. Applied deletion currently requires Linux so it can use atomic
+  no-replace quarantine moves; other platforms retain the safe dry-run preview.
+
+Safe periodic cleanup:
+
+```sh
+auto parallel prune
+auto parallel prune --apply
+```
 
 ### `auto qa`
 

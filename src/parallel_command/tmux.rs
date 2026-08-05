@@ -172,7 +172,29 @@ pub(crate) fn tmux_session_exists(session_name: &str) -> Result<bool> {
         .args(["has-session", "-t", session_name])
         .output()
         .context("failed to launch tmux")?;
-    Ok(output.status.success())
+    classify_tmux_has_session_output(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+    .with_context(|| format!("failed probing tmux session `{session_name}`"))
+}
+
+fn classify_tmux_has_session_output(success: bool, stderr: &str) -> Result<bool> {
+    if success {
+        return Ok(true);
+    }
+    let stderr = stderr.trim();
+    if stderr.starts_with("can't find session:") || stderr.starts_with("no server running on ") {
+        return Ok(false);
+    }
+    bail!(
+        "tmux has-session failed without proving absence: {}",
+        if stderr.is_empty() {
+            "no error detail"
+        } else {
+            stderr
+        }
+    )
 }
 
 pub(crate) fn parallel_tmux_session_name(repo_root: &Path) -> String {
@@ -347,6 +369,7 @@ pub(crate) fn shell_quote(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::classify_tmux_has_session_output;
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -430,6 +453,22 @@ mod tests {
             parallel_tmux_session_name(&PathBuf::from("/tmp/weird:repo name")),
             "weird-repo-name-parallel"
         );
+    }
+
+    #[test]
+    fn tmux_probe_fails_closed_on_unknown_errors() {
+        assert!(classify_tmux_has_session_output(true, "").expect("success"));
+        assert!(
+            !classify_tmux_has_session_output(false, "can't find session: missing")
+                .expect("known absence")
+        );
+        assert!(!classify_tmux_has_session_output(
+            false,
+            "no server running on /tmp/tmux-1000/default"
+        )
+        .expect("known absent server"));
+        assert!(classify_tmux_has_session_output(false, "protocol version mismatch").is_err());
+        assert!(classify_tmux_has_session_output(false, "").is_err());
     }
 
     #[test]

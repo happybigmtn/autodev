@@ -17,6 +17,7 @@ console = "0.15"
 dirs = "6"
 fd-lock = "4"
 fs2 = "0.4"
+libc = "0.2"
 regex = "1"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

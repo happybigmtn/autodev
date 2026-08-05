@@ -180,7 +180,9 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     }
     if args.max_concurrent_workers > 1 && should_launch_parallel_tmux(&args) {
         ensure_writable_run_root(&run_root)?;
+        let startup_lease = acquire_parallel_host_lease(&run_root, "parallel tmux startup")?;
         purge_previous_parallel_run_artifacts(&repo_root, &run_root);
+        drop(startup_lease);
         log_parallel_startup_prep(
             prepare_parallel_startup(&repo_root, target_branch.as_str())?,
             target_branch.as_str(),
@@ -210,6 +212,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         prompt_template.push_str(DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE);
     }
     ensure_writable_run_root(&run_root)?;
+    let _parallel_host_lease = acquire_parallel_host_lease(&run_root, "parallel host startup")?;
     purge_previous_parallel_run_artifacts(&repo_root, &run_root);
     // Reclaim persistent lane-caches for lane indices this run will never use
     // (e.g. after dialing lanes down). Safe at startup: those indices are never

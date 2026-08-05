@@ -565,9 +565,24 @@ pub(crate) fn parallel_status_safety_verdict(
 }
 
 pub(crate) fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> {
+    parallel_host_processes_for_repo_strict(repo_root).unwrap_or_default()
+}
+
+/// Strict process discovery for destructive callers. `pgrep` exit 1 means no
+/// matches; launch failures and all other exit statuses are unknown, not safe.
+pub(crate) fn parallel_host_processes_for_repo_strict(repo_root: &Path) -> Result<Vec<String>> {
     let current_pid = std::process::id();
-    command_stdout(Path::new("."), ["pgrep", "-af", "auto parallel"])
-        .unwrap_or_default()
+    let output = Command::new("pgrep")
+        .args(["-af", "auto parallel"])
+        .output()
+        .context("failed to launch pgrep for parallel host discovery")?;
+    if !classify_pgrep_parallel_host_exit(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    )? {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| {
             line.split_whitespace()
@@ -589,7 +604,20 @@ pub(crate) fn parallel_host_processes_for_repo(repo_root: &Path) -> Vec<String> 
         .filter(|line| !line.contains(" parallel status"))
         .filter(|line| process_line_cwd_matches_repo(line, repo_root))
         .map(str::to_string)
-        .collect()
+        .collect())
+}
+
+fn classify_pgrep_parallel_host_exit(code: Option<i32>, stderr: &str) -> Result<bool> {
+    match code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => bail!(
+            "pgrep parallel host discovery failed with status {}: {}",
+            code.map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            stderr.trim()
+        ),
+    }
 }
 
 pub(crate) fn tmux_status_line_has_live_worker(line: &str) -> bool {
@@ -886,6 +914,7 @@ pub(crate) fn format_system_time_age(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::classify_pgrep_parallel_host_exit;
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -895,6 +924,14 @@ mod tests {
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn strict_pgrep_probe_fails_closed_on_unknown_exit() {
+        assert!(classify_pgrep_parallel_host_exit(Some(0), "").expect("matches"));
+        assert!(!classify_pgrep_parallel_host_exit(Some(1), "").expect("no matches"));
+        assert!(classify_pgrep_parallel_host_exit(Some(2), "permission denied").is_err());
+        assert!(classify_pgrep_parallel_host_exit(None, "terminated").is_err());
     }
 
     fn init_status_repo(label: &str) -> (PathBuf, String) {
