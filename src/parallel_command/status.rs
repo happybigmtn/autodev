@@ -46,6 +46,9 @@ struct LaneStatusRecord {
 
 #[derive(Serialize)]
 struct ParallelStatusReport {
+    status_binary: BinaryProvenance,
+    host_binary: Option<BinaryProvenance>,
+    revision_match: Option<bool>,
     repo_root: String,
     branch: String,
     run_root: String,
@@ -72,11 +75,16 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         .trim()
         .to_string();
     let mut lane_records: Vec<LaneStatusRecord> = Vec::new();
+    let status_binary = current_binary_provenance();
     if !json {
         println!("auto parallel status");
         println!("repo root:   {}", repo_root.display());
         println!("branch:      {}", current_branch);
         println!("run root:    {}", run_root.display());
+        println!(
+            "status binary: {} @ {} ({}, {})",
+            status_binary.version, status_binary.commit, status_binary.dirty, status_binary.profile
+        );
     }
     let mut tmux_worker_running = false;
     let mut tmux_running = false;
@@ -132,6 +140,21 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         }
     }
     let no_live_parallel_host = host_processes.is_empty() && !tmux_worker_running;
+    let (host_binary, revision_match) =
+        parallel_status_binary_provenance(&run_root, &host_processes);
+    if !json {
+        match (&host_binary, revision_match) {
+            (Some(host), Some(true)) => println!(
+                "host binary:   {} @ {} (matches status binary)",
+                host.version, host.commit
+            ),
+            (Some(host), Some(false)) => println!(
+                "host binary:   {} @ {} (REVISION MISMATCH)",
+                host.version, host.commit
+            ),
+            _ => println!("host binary:   unknown (older or unreadable host metadata)"),
+        }
+    }
 
     let lanes_root = run_root.join("lanes");
     let mut lanes = if !lanes_root.exists() {
@@ -350,6 +373,9 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         println!("health:      {health}");
     } else {
         let report = ParallelStatusReport {
+            status_binary,
+            host_binary,
+            revision_match,
             repo_root: repo_root.display().to_string(),
             branch: current_branch,
             run_root: run_root.display().to_string(),
@@ -373,6 +399,20 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn parallel_status_binary_provenance(
+    run_root: &Path,
+    host_processes: &[String],
+) -> (Option<BinaryProvenance>, Option<bool>) {
+    let detected_host_pids = host_processes
+        .iter()
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .collect::<BTreeSet<_>>();
+    let status_binary = current_binary_provenance();
+    let host_binary = parallel_host_binary_provenance(run_root, &detected_host_pids);
+    let revision_match = binary_revision_match(&status_binary, host_binary.as_ref());
+    (host_binary, revision_match)
 }
 
 fn lane_is_unassigned_placeholder(lane_root: &Path) -> bool {
@@ -932,6 +972,22 @@ mod tests {
         assert!(!classify_pgrep_parallel_host_exit(Some(1), "").expect("no matches"));
         assert!(classify_pgrep_parallel_host_exit(Some(2), "permission denied").is_err());
         assert!(classify_pgrep_parallel_host_exit(None, "terminated").is_err());
+    }
+
+    #[test]
+    fn newer_status_client_reports_older_live_host_provenance_as_unknown() {
+        let run_root = unique_temp_dir("parallel-status-older-live-host");
+        fs::create_dir_all(&run_root).expect("create run root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "older-host-run")
+            .expect("write older host run id");
+        let host_processes = vec!["4242 auto parallel --threads 8".to_string()];
+
+        let (host_binary, revision_match) =
+            super::parallel_status_binary_provenance(&run_root, &host_processes);
+
+        assert_eq!(host_binary, None);
+        assert_eq!(revision_match, None);
+        fs::remove_dir_all(run_root).expect("cleanup run root");
     }
 
     fn init_status_repo(label: &str) -> (PathBuf, String) {

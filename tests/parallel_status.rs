@@ -31,6 +31,11 @@ fn parallel_status_reports_health_when_run_root_has_no_lanes() {
     assert!(stdout.contains("repo root:"), "{stdout}");
     assert!(stdout.contains("branch:"), "{stdout}");
     assert!(stdout.contains("run root:"), "{stdout}");
+    assert!(stdout.contains("status binary:"), "{stdout}");
+    assert!(
+        stdout.contains("host binary:   unknown"),
+        "a stopped or older host must not imply a revision match: {stdout}"
+    );
     assert!(stdout.contains("tmux:"), "{stdout}");
     assert!(stdout.contains("host pids:   none detected"), "{stdout}");
     assert!(stdout.contains("lanes:       none"), "{stdout}");
@@ -41,6 +46,38 @@ fn parallel_status_reports_health_when_run_root_has_no_lanes() {
     );
 
     let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn parallel_status_json_exposes_status_binary_and_unknown_host_revision() {
+    let repo = unique_temp_dir("parallel-status-build-provenance-repo");
+    let run_root = unique_temp_dir("parallel-status-build-provenance-run");
+    init_git_repo(&repo);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run auto parallel status --json");
+    assert!(output.status.success(), "status command failed");
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    assert_eq!(
+        report["status_binary"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(report["status_binary"]["commit"], env!("AUTODEV_GIT_SHA"));
+    assert_eq!(report["host_binary"], serde_json::Value::Null);
+    assert_eq!(report["revision_match"], serde_json::Value::Null);
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&run_root);
 }
 
 #[test]

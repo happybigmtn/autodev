@@ -53,6 +53,7 @@ mod orchestrator;
 mod plan;
 mod preflight;
 mod prompt;
+mod provenance;
 mod purge;
 mod receipt_backfill;
 mod recovery_notes;
@@ -72,6 +73,7 @@ pub(crate) use orchestrator::*;
 pub(crate) use plan::*;
 pub(crate) use preflight::*;
 pub(crate) use prompt::*;
+pub(crate) use provenance::*;
 pub(crate) use purge::*;
 pub(crate) use receipt_backfill::*;
 pub(crate) use recovery_notes::*;
@@ -219,7 +221,8 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     // active this run. A purge above (clean run) already removed lane-caches
     // wholesale; this catches the resuming-run case where the purge is skipped.
     prune_orphan_lane_caches(&run_root, args.max_concurrent_workers);
-    stamp_current_parallel_run_id(&run_root);
+    let run_id = stamp_current_parallel_run_id(&run_root);
+    persist_parallel_host_provenance(&run_root, &run_id)?;
     let parallel_logger = ParallelEventLogger::new(&run_root)?;
     if args.max_concurrent_workers > 1 {
         setup_parallel_tmux_windows(&run_root, args.max_concurrent_workers, std::process::id())?;
