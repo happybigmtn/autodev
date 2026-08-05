@@ -219,6 +219,24 @@ mod tests {
     }
 
     #[test]
+    fn parallel_prune_is_dry_run_unless_apply_is_explicit() {
+        let cli =
+            Cli::try_parse_from(["auto", "parallel", "prune"]).expect("dry-run prune should parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+        assert_eq!(args.action, Some(ParallelAction::Prune));
+        assert!(!args.apply);
+
+        let cli = Cli::try_parse_from(["auto", "parallel", "prune", "--apply"])
+            .expect("applied prune should parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+        assert!(args.apply);
+    }
+
+    #[test]
     fn doctor_command_is_parseable() {
         let cli = Cli::try_parse_from(["auto", "doctor"]).expect("cli parse");
         let Command::Doctor(_) = cli.command else {

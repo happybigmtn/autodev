@@ -13,12 +13,22 @@
 //! - the run root has no `.run-state.json` ledger (an unfinished run keeps
 //!   its lanes and salvage records for resume and forensics).
 //!
+//! Persistent `lane-caches/` are deliberately excluded. They are bounded at
+//! assignment time and make subsequent Rust lanes materially faster.
+//!
 //! Opt out with `AUTO_PARALLEL_PURGE_PREVIOUS=0`.
 
 use super::*;
 
-const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin", "salvage", "lane-caches"];
+const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin", "salvage"];
 const PURGEABLE_LOGS: &[&str] = &["host.stdout.log", "host.stderr.log"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParallelPrunePlan {
+    targets: Vec<PathBuf>,
+    bytes: u64,
+    blocked_by_run_state: bool,
+}
 
 fn purge_previous_run_enabled() -> bool {
     std::env::var("AUTO_PARALLEL_PURGE_PREVIOUS")
@@ -85,6 +95,172 @@ pub(crate) fn purge_previous_parallel_run_artifacts(repo_root: &Path, run_root: 
     }
 }
 
+/// Preview or apply cleanup of disposable parallel artifacts. Unlike the
+/// best-effort startup purge, this operator-facing path fails closed: it must
+/// prove that tmux has no host session and that no resumable ledger exists.
+pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
+    let repo_root = git_repo_root()?;
+    let run_root = parallel_run_root(&repo_root, args);
+    validate_parallel_prune_root(&repo_root, &run_root)?;
+
+    let session = parallel_tmux_session_name(&repo_root);
+    let host_running = tmux_session_exists(&session)
+        .with_context(|| format!("cannot prove parallel host `{session}` is stopped"))?;
+    let plan = parallel_prune_plan(&run_root)?;
+
+    println!("auto parallel prune");
+    println!("repo root:   {}", repo_root.display());
+    println!("run root:    {}", run_root.display());
+    println!(
+        "mode:        {}",
+        if args.apply { "apply" } else { "dry-run" }
+    );
+    println!(
+        "host:        {}",
+        if host_running {
+            "ACTIVE (protected)"
+        } else {
+            "stopped"
+        }
+    );
+    println!(
+        "run state:   {}",
+        if plan.blocked_by_run_state {
+            "present (protected)"
+        } else {
+            "absent"
+        }
+    );
+    println!("lane caches: preserved");
+    if plan.targets.is_empty() {
+        println!("targets:     none (0 B)");
+    } else {
+        println!(
+            "targets:     {} ({})",
+            plan.targets.len(),
+            human_bytes(plan.bytes)
+        );
+        for target in &plan.targets {
+            println!("  {}", target.display());
+        }
+    }
+
+    if !args.apply {
+        println!("dry-run: no files removed; pass --apply to remove listed targets");
+        return Ok(());
+    }
+    apply_parallel_prune_plan(&run_root, &plan, host_running, &session)?;
+    println!(
+        "pruned:      {} ({})",
+        plan.targets.len(),
+        human_bytes(plan.bytes)
+    );
+    Ok(())
+}
+
+fn apply_parallel_prune_plan(
+    run_root: &Path,
+    plan: &ParallelPrunePlan,
+    host_running: bool,
+    session: &str,
+) -> Result<()> {
+    if host_running {
+        bail!("refusing prune while parallel tmux host `{session}` is active");
+    }
+    if plan.blocked_by_run_state {
+        bail!(
+            "refusing prune because {} is a resumable run ledger",
+            run_root.join(".run-state.json").display()
+        );
+    }
+    for target in &plan.targets {
+        remove_parallel_prune_target(run_root, target)?;
+    }
+    Ok(())
+}
+
+fn validate_parallel_prune_root(repo_root: &Path, run_root: &Path) -> Result<()> {
+    if !run_root.is_absolute() {
+        bail!(
+            "parallel prune run root must be absolute: {}",
+            run_root.display()
+        );
+    }
+    if run_root.parent().is_none() || run_root == Path::new("/") || run_root == repo_root {
+        bail!(
+            "refusing unsafe parallel prune run root: {}",
+            run_root.display()
+        );
+    }
+    if run_root.exists() && fs::symlink_metadata(run_root)?.file_type().is_symlink() {
+        bail!(
+            "refusing symlinked parallel prune run root: {}",
+            run_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
+    let mut targets = Vec::new();
+    let mut bytes = 0u64;
+    for name in PURGEABLE_SUBDIRS.iter().chain(PURGEABLE_LOGS.iter()) {
+        let target = run_root.join(name);
+        validate_parallel_prune_target(run_root, &target)?;
+        let Ok(metadata) = fs::symlink_metadata(&target) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "refusing symlinked parallel prune target: {}",
+                target.display()
+            );
+        }
+        bytes += if metadata.is_dir() {
+            dir_size_bytes(&target)
+        } else {
+            metadata.len()
+        };
+        targets.push(target);
+    }
+    Ok(ParallelPrunePlan {
+        targets,
+        bytes,
+        blocked_by_run_state: run_root.join(".run-state.json").exists(),
+    })
+}
+
+fn validate_parallel_prune_target(run_root: &Path, target: &Path) -> Result<()> {
+    let name = target.file_name().and_then(|name| name.to_str());
+    let allowed = name
+        .is_some_and(|name| PURGEABLE_SUBDIRS.contains(&name) || PURGEABLE_LOGS.contains(&name));
+    if target.parent() != Some(run_root) || !allowed {
+        bail!(
+            "refusing unexpected parallel prune target: {}",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_parallel_prune_target(run_root: &Path, target: &Path) -> Result<()> {
+    validate_parallel_prune_target(run_root, target)?;
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("failed to inspect prune target {}", target.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing symlinked parallel prune target: {}",
+            target.display()
+        );
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(target)
+    } else {
+        fs::remove_file(target)
+    }
+    .with_context(|| format!("failed to prune {}", target.display()))
+}
+
 pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -149,6 +325,10 @@ mod tests {
         }
         std::fs::write(root.join("preflight.txt"), b"preflight\n").expect("write preflight");
         std::fs::create_dir_all(root.join("gate-holds")).expect("create gate-holds");
+        std::fs::create_dir_all(root.join("lane-caches/lane-1"))
+            .expect("create persistent lane cache");
+        std::fs::write(root.join("lane-caches/lane-1/cache.bin"), vec![0u8; 2048])
+            .expect("write cache");
     }
 
     #[test]
@@ -167,6 +347,7 @@ mod tests {
         }
         assert!(run_root.join("preflight.txt").exists());
         assert!(run_root.join("gate-holds").exists());
+        assert!(run_root.join("lane-caches/lane-1/cache.bin").exists());
 
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&run_root).ok();
@@ -208,5 +389,107 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn explicit_prune_plan_lists_only_disposable_artifacts() {
+        let run_root = temp_dir("explicit-plan");
+        seed_run_artifacts(&run_root);
+
+        let plan = parallel_prune_plan(&run_root).expect("build prune plan");
+        let names = plan
+            .targets
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "lanes",
+                "worker-bin",
+                "salvage",
+                "host.stdout.log",
+                "host.stderr.log"
+            ]
+        );
+        assert!(!plan.blocked_by_run_state);
+        assert!(plan.bytes > 0);
+        assert!(!names.contains(&"lane-caches"));
+
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn explicit_prune_applies_exact_plan_and_preserves_caches() {
+        let run_root = temp_dir("explicit-apply");
+        seed_run_artifacts(&run_root);
+        let plan = parallel_prune_plan(&run_root).expect("build prune plan");
+
+        apply_parallel_prune_plan(&run_root, &plan, false, "test-parallel")
+            .expect("apply prune plan");
+
+        for target in plan.targets {
+            assert!(!target.exists(), "{} should be removed", target.display());
+        }
+        assert!(run_root.join("lane-caches/lane-1/cache.bin").exists());
+        assert!(run_root.join("preflight.txt").exists());
+
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn explicit_prune_refuses_active_host_and_resumable_ledger() {
+        let run_root = temp_dir("explicit-protected");
+        seed_run_artifacts(&run_root);
+        let plan = parallel_prune_plan(&run_root).expect("build prune plan");
+        let err = apply_parallel_prune_plan(&run_root, &plan, true, "test-parallel")
+            .expect_err("active host must block prune");
+        assert!(err.to_string().contains("host `test-parallel` is active"));
+        assert!(run_root.join("lanes").exists());
+
+        std::fs::write(run_root.join(".run-state.json"), b"{}").expect("write run state");
+        let plan = parallel_prune_plan(&run_root).expect("build blocked prune plan");
+        assert!(plan.blocked_by_run_state);
+        let err = apply_parallel_prune_plan(&run_root, &plan, false, "test-parallel")
+            .expect_err("resumable ledger must block prune");
+        assert!(err.to_string().contains("resumable run ledger"));
+        assert!(run_root.join("lanes").exists());
+
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_prune_refuses_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let run_root = temp_dir("explicit-symlink");
+        let outside = temp_dir("explicit-symlink-outside");
+        symlink(&outside, run_root.join("lanes")).expect("create target symlink");
+
+        let err = parallel_prune_plan(&run_root).expect_err("symlink must be rejected");
+        assert!(err.to_string().contains("symlinked parallel prune target"));
+        assert!(outside.exists());
+
+        std::fs::remove_file(run_root.join("lanes")).ok();
+        std::fs::remove_dir_all(&run_root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn explicit_prune_rejects_broad_roots_and_unlisted_targets() {
+        assert!(validate_parallel_prune_root(Path::new("/repo"), Path::new("/")).is_err());
+        assert!(validate_parallel_prune_root(Path::new("/repo"), Path::new("/repo")).is_err());
+        assert!(validate_parallel_prune_target(
+            Path::new("/repo/.auto/parallel"),
+            Path::new("/repo")
+        )
+        .is_err());
+        assert!(validate_parallel_prune_target(
+            Path::new("/repo/.auto/parallel"),
+            Path::new("/repo/.auto/parallel/lane-caches")
+        )
+        .is_err());
     }
 }

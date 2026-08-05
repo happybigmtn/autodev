@@ -209,6 +209,11 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     pub(crate) json: bool,
 
+    /// For `auto parallel prune`: delete the listed obsolete artifacts.
+    /// Without this flag, prune is a read-only dry run.
+    #[arg(long)]
+    pub(crate) apply: bool,
+
     /// Stop after this many successful parallel lands. Default is unlimited.
     #[arg(long)]
     pub(crate) max_iterations: Option<usize>,
@@ -282,6 +287,8 @@ pub(crate) enum ParallelAction {
     PlanCheck,
     /// Write a no-model plan for closing historical receipt drift.
     ReceiptBackfill,
+    /// Preview or remove obsolete lane artifacts while preserving lane caches.
+    Prune,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

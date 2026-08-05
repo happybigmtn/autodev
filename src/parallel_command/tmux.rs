@@ -245,12 +245,16 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
     push_optional_usize_arg(&mut parts, "--max-turns", args.max_turns);
     parts.push("--max-retries".to_string());
     parts.push(args.max_retries.to_string());
+    if args.apply {
+        parts.push("--apply".to_string());
+    }
     if let Some(action) = args.action {
         parts.push(
             match action {
                 ParallelAction::Status => "status",
                 ParallelAction::PlanCheck => "plan-check",
                 ParallelAction::ReceiptBackfill => "receipt-backfill",
+                ParallelAction::Prune => "prune",
             }
             .to_string(),
         );
@@ -434,6 +438,7 @@ mod tests {
             action: None,
             apply_receipt_backfill_handoffs: false,
             json: false,
+            apply: false,
             max_iterations: Some(3),
             max_concurrent_workers: 8,
             cargo_build_jobs: Some(2),
@@ -472,6 +477,7 @@ mod tests {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
             json: false,
+            apply: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,
@@ -515,6 +521,7 @@ mod tests {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
             json: false,
+            apply: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,

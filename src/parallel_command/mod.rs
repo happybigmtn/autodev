@@ -151,6 +151,9 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::ReceiptBackfill) {
         return run_parallel_receipt_backfill(&args);
     }
+    if args.action == Some(ParallelAction::Prune) {
+        return run_parallel_prune(&args);
+    }
 
     if args.max_concurrent_workers == 0 {
         bail!("--max-concurrent-workers must be greater than 0");
