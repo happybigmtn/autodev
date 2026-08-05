@@ -2093,7 +2093,7 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
         &assignment.task.id,
         &format!("workspace-baseline: promoted [x] — {promote_reason}"),
     );
-    Ok(incoming_status)
+    persist_prior_workspace_test_clearance(repo_root, assignment, incoming_status)
 }
 
 async fn run_workspace_probe_in_canonical_transaction(
@@ -2363,6 +2363,11 @@ pub(crate) fn apply_workspace_test_outcome(
 ) -> Result<LoopTaskStatus> {
     match outcome {
         WorkspaceTestOutcome::Passed => {
+            let status =
+                persist_prior_workspace_test_clearance(repo_root, assignment, incoming_status)?;
+            if status != incoming_status {
+                return Ok(status);
+            }
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
@@ -2451,6 +2456,50 @@ pub(crate) fn apply_workspace_test_outcome(
     }
 }
 
+fn persist_prior_workspace_test_clearance(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    incoming_status: LoopTaskStatus,
+) -> Result<LoopTaskStatus> {
+    let persistence = append_lane_workspace_test_clearance(repo_root, &assignment.task.id)
+        .and_then(|changed| {
+            if changed {
+                run_git(repo_root, ["add", "REVIEW.md"]).with_context(|| {
+                    format!(
+                        "failed staging workspace-gate clearance for `{}`",
+                        assignment.task.id
+                    )
+                })?;
+            }
+            Ok(())
+        });
+    match persistence {
+        Ok(()) => Ok(incoming_status),
+        Err(err) => {
+            record_gate_hold(
+                repo_root,
+                &assignment.task.id,
+                "workspace gate passed but prior failure clearance was not durable",
+            )?;
+            demote_task_for_failed_gate(
+                repo_root,
+                assignment,
+                incoming_status,
+                "workspace clearance persistence failure",
+            );
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                &format!(
+                    "workspace-test: passed, but prior workspace finding clearance could not be persisted; task held [~]: {err:#}"
+                ),
+            );
+            Ok(LoopTaskStatus::Partial)
+        }
+    }
+}
+
 /// Append a host re-execution failure note to `REVIEW.md` so the next worker
 /// sees exactly which declared verification command failed at canonical HEAD.
 fn append_lane_verify_failure(repo_root: &Path, task_id: &str, detail: &str) -> Result<()> {
@@ -2521,6 +2570,28 @@ fn append_lane_workspace_test_failure(
     ));
     atomic_write(&review_path, review_text.as_bytes())?;
     Ok(())
+}
+
+fn append_lane_workspace_test_clearance(repo_root: &Path, task_id: &str) -> Result<bool> {
+    let review_path = repo_root.join("REVIEW.md");
+    let mut review_text = match std::fs::read_to_string(&review_path) {
+        Ok(review_text) => review_text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if unresolved_workspace_review_findings_for_task(&review_text, task_id).is_empty() {
+        return Ok(false);
+    }
+    if !review_text.ends_with('\n') {
+        review_text.push('\n');
+    }
+    review_text.push_str(&format!(
+        "\n## `{task_id}`: workspace validation cleared\n\
+- Source: auto parallel workspace definition-of-done gate cleared prior workspace findings after `cargo test --workspace` passed at canonical HEAD.\n\
+- Scope: this supersedes only earlier workspace-gate failures or skips; independent-review findings still require a clean independent review.\n"
+    ));
+    atomic_write(&review_path, review_text.as_bytes())?;
+    Ok(true)
 }
 
 /// Copy a lane worker's `.auto/symphony/verification-receipts/<task>.json` and
@@ -7926,6 +7997,111 @@ exec "$@"
             staged.contains("IMPLEMENTATION_PLAN.md"),
             "plan staged: {staged}"
         );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn workspace_test_pass_durably_clears_only_prior_workspace_findings() {
+        let root = unique_temp_dir("workspace-gate-scoped-clearance");
+        init_git_repo(&root);
+        let task_id = "TASK-WCLEAR-1";
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!(
+                "# IMPLEMENTATION_PLAN\n\n- [x] `{task_id}` workspace pass clears stale gate evidence\n"
+            ),
+        )
+        .expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`: workspace cargo test failed\n- Source: auto parallel workspace definition-of-done gate (held at `[~]`).\n- Gate result: old load-sensitive failure.\n\n## `{task_id}`: independent review findings\n- Source: auto parallel independent diff-review gate (held at `[~]`).\n\n1. `src/lib.rs`: old code finding still requires re-review.\n"
+            ),
+        )
+        .expect("write review");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md", "REVIEW.md"]);
+        git_ok(
+            &root,
+            ["commit", "-q", "-m", "seed stale workspace finding"],
+        );
+
+        let mut assignment =
+            review_gate_assignment(&root, task_id, "workspace pass clears stale gate evidence");
+        let status = apply_workspace_test_outcome(
+            &root,
+            &mut assignment,
+            LoopTaskStatus::Done,
+            WorkspaceTestOutcome::Passed,
+        )
+        .expect("apply passing workspace test");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("workspace validation cleared"), "{review}");
+        assert!(
+            unresolved_workspace_review_findings_for_task(&review, task_id).is_empty(),
+            "old workspace evidence must be superseded: {review}"
+        );
+        let unresolved = unresolved_review_findings_for_task(&review, task_id);
+        assert_eq!(unresolved.len(), 1, "{unresolved:#?}");
+        assert!(unresolved[0].contains("independent review findings"));
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn baseline_workspace_pass_also_persists_scoped_clearance() {
+        let root = unique_temp_dir("workspace-baseline-scoped-clearance");
+        init_git_repo(&root);
+        let task_id = "TASK-WBASE-CLEAR";
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!(
+                "# IMPLEMENTATION_PLAN\n\n- [x] `{task_id}` baseline pass clears stale gate evidence\n"
+            ),
+        )
+        .expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`: workspace cargo test failed\n- Source: auto parallel workspace definition-of-done gate (held at `[~]`).\n- Gate result: old load-sensitive failure.\n"
+            ),
+        )
+        .expect("write review");
+        git_ok(&root, ["add", "."]);
+        git_ok(&root, ["commit", "-q", "-m", "seed stale baseline finding"]);
+
+        let run_root = root.join("run");
+        let mut assignment =
+            review_gate_assignment(&root, task_id, "baseline pass clears stale gate evidence");
+        assignment.lane_root = run_root.join("lanes/lane-1");
+        fs::create_dir_all(&assignment.lane_root).expect("create lane root");
+        let fake_cargo = write_fake_passing_workspace_cargo(&root, "");
+        let status = super::apply_workspace_baseline_gate_in_transaction_with_cargo(
+            &root,
+            &mut assignment,
+            &[],
+            LoopTaskStatus::Done,
+            None,
+            Some(fake_cargo),
+        )
+        .await
+        .expect("apply passing baseline workspace gate");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("workspace validation cleared"), "{review}");
+        assert!(
+            unresolved_workspace_review_findings_for_task(&review, task_id).is_empty(),
+            "baseline success must clear stale workspace evidence: {review}"
+        );
+        assert!(unresolved_review_findings_for_task(&review, task_id).is_empty());
+        let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

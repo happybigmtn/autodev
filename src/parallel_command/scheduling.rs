@@ -629,7 +629,7 @@ pub(crate) fn attach_partial_follow_up_note(
 
 fn unresolved_review_sections_for_task(review_text: &str, task_id: &str) -> Vec<String> {
     let marker = format!("## `{task_id}`");
-    let mut sections = Vec::new();
+    let mut sections = Vec::<String>::new();
     for (start, _) in review_text.match_indices(&marker) {
         let tail = &review_text[start..];
         let section = tail
@@ -642,11 +642,21 @@ fn unresolved_review_sections_for_task(review_text: &str, task_id: &str) -> Vec<
             .contains("auto parallel standing-review gate cleared")
         {
             sections.clear();
+        } else if section.to_ascii_lowercase().contains(
+            "auto parallel workspace definition-of-done gate cleared prior workspace findings",
+        ) {
+            sections.retain(|prior| !review_section_is_workspace_gate_finding(prior));
         } else if !unresolved_review_findings_for_task(section, task_id).is_empty() {
             sections.push(section.to_string());
         }
     }
     sections
+}
+
+fn review_section_is_workspace_gate_finding(section: &str) -> bool {
+    let lower = section.to_ascii_lowercase();
+    lower.contains("source: auto parallel workspace definition-of-done gate (held at `[~]`)")
+        || lower.contains(": workspace cargo test failed")
 }
 
 pub(crate) fn completion_status_suffix(
@@ -893,6 +903,29 @@ mod tests {
         assert!(note.contains("add the missing runtime case"));
         assert!(note.contains("already marked `- [~]`"));
         let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn partial_follow_up_omits_scoped_workspace_findings_after_canonical_pass() {
+        let review = r#"# REVIEW
+
+## `TASK-P`: workspace cargo test failed
+- Source: auto parallel workspace definition-of-done gate (held at `[~]`).
+- Gate result: old load-sensitive failure.
+
+## `TASK-P`: independent review findings
+- Source: auto parallel independent diff-review gate (held at `[~]`).
+
+1. `src/lib.rs`: independent finding remains.
+
+## `TASK-P`: workspace validation cleared
+- Source: auto parallel workspace definition-of-done gate cleared prior workspace findings after `cargo test --workspace` passed at canonical HEAD.
+"#;
+
+        let sections = super::unresolved_review_sections_for_task(review, "TASK-P");
+        assert_eq!(sections.len(), 1, "{sections:#?}");
+        assert!(sections[0].contains("independent review findings"));
+        assert!(!sections[0].contains("workspace cargo test failed"));
     }
 
     #[test]

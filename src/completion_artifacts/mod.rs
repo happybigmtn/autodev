@@ -276,20 +276,50 @@ pub(crate) fn review_contains_task(review_text: &str, task_id: &str) -> bool {
 }
 
 pub(crate) fn unresolved_review_findings_for_task(review_text: &str, task_id: &str) -> Vec<String> {
-    let mut unresolved = Vec::new();
+    let mut unresolved_items = Vec::<String>::new();
     for item in extract_review_items(review_text) {
         if !review_item_mentions_task(&item, task_id) {
             continue;
         }
         if review_item_clears_task(&item, task_id) {
-            unresolved.clear();
+            unresolved_items.clear();
+            continue;
+        }
+        if review_item_clears_workspace_gate(&item, task_id) {
+            unresolved_items.retain(|prior| !review_item_is_workspace_gate_finding(prior));
             continue;
         }
         if review_item_has_unresolved_finding(&item) {
-            unresolved.push(review_item_summary(&item));
+            unresolved_items.push(item);
         }
     }
-    unresolved
+    unresolved_items
+        .iter()
+        .map(|item| review_item_summary(item))
+        .collect()
+}
+
+pub(crate) fn unresolved_workspace_review_findings_for_task(
+    review_text: &str,
+    task_id: &str,
+) -> Vec<String> {
+    let mut unresolved_items = Vec::new();
+    for item in extract_review_items(review_text) {
+        if !review_item_mentions_task(&item, task_id) {
+            continue;
+        }
+        if review_item_clears_task(&item, task_id)
+            || review_item_clears_workspace_gate(&item, task_id)
+        {
+            unresolved_items.clear();
+            continue;
+        }
+        if review_item_has_unresolved_finding(&item) && review_item_is_workspace_gate_finding(&item)
+        {
+            unresolved_items.push(review_item_summary(&item));
+        }
+    }
+    unresolved_items
 }
 
 fn extract_review_items(content: &str) -> Vec<String> {
@@ -346,6 +376,19 @@ fn review_item_clears_task(item: &str, task_id: &str) -> bool {
     review_item_mentions_task(item, task_id)
         && (lower.contains("auto parallel standing-review gate cleared")
             || lower.contains("auto parallel inline receipt repair at canonical head"))
+}
+
+fn review_item_clears_workspace_gate(item: &str, task_id: &str) -> bool {
+    review_item_mentions_task(item, task_id)
+        && item.to_ascii_lowercase().contains(
+            "auto parallel workspace definition-of-done gate cleared prior workspace findings",
+        )
+}
+
+fn review_item_is_workspace_gate_finding(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    lower.contains("source: auto parallel workspace definition-of-done gate (held at `[~]`)")
+        || lower.contains(": workspace cargo test failed")
 }
 
 fn review_item_has_unresolved_finding(item: &str) -> bool {
@@ -1288,6 +1331,46 @@ mod tests {
         assert!(
             super::unresolved_review_findings_for_task(&cleared, "TASK-REVIEW").is_empty(),
             "clear marker should supersede earlier standing findings"
+        );
+    }
+
+    #[test]
+    fn workspace_clearance_supersedes_only_workspace_findings() {
+        let review = r#"# REVIEW
+
+## `TASK-SCOPED-CLEAR`: workspace cargo test failed
+- Source: auto parallel workspace definition-of-done gate (held at `[~]`).
+- Gate result: workspace cargo test failed before finalization.
+
+## `TASK-SCOPED-CLEAR`: independent review findings
+- Source: auto parallel independent diff-review gate (held at `[~]`).
+
+1. `src/lib.rs`: controller identity remains untrusted.
+
+## `TASK-SCOPED-CLEAR`: workspace validation cleared
+- Source: auto parallel workspace definition-of-done gate cleared prior workspace findings after `cargo test --workspace` passed at canonical HEAD.
+- Scope: this supersedes only earlier workspace-gate failures or skips; independent-review findings still require a clean independent review.
+"#;
+
+        assert!(
+            super::unresolved_workspace_review_findings_for_task(review, "TASK-SCOPED-CLEAR")
+                .is_empty()
+        );
+        let unresolved = super::unresolved_review_findings_for_task(review, "TASK-SCOPED-CLEAR");
+        assert_eq!(unresolved.len(), 1, "{unresolved:#?}");
+        assert!(unresolved[0].contains("independent review findings"));
+
+        let later_failure = format!(
+            "{review}\n## `TASK-SCOPED-CLEAR`: workspace cargo test failed\n- Source: auto parallel workspace definition-of-done gate (held at `[~]`).\n"
+        );
+        assert_eq!(
+            super::unresolved_workspace_review_findings_for_task(
+                &later_failure,
+                "TASK-SCOPED-CLEAR"
+            )
+            .len(),
+            1,
+            "a later workspace failure must become active again"
         );
     }
 

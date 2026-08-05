@@ -24,7 +24,8 @@ pub(crate) use crate::completion_artifacts::{
     current_dirty_state_fingerprint, direct_verification_receipt_problem,
     ensure_host_review_handoff, footer_task_owned_inputs, git_verification_receipt_footers,
     inspect_task_completion_evidence, inspect_task_completion_evidence_with_owned_inputs,
-    record_verified_source_attestation, unresolved_review_findings_for_task, verification_plan,
+    record_verified_source_attestation, unresolved_review_findings_for_task,
+    unresolved_workspace_review_findings_for_task, verification_plan,
     verification_receipt_commit_footer, CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
