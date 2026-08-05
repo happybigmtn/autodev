@@ -166,10 +166,12 @@ pub(crate) async fn run_codex_exec_with_env(
                 match result {
                     Ok(result) => (result.exit_status, result.stderr_text),
                     Err(err) if quota_exec::error_is_all_accounts_invalid(&err) => {
-                        eprintln!("[quota-router] {err:#}");
-                        eprintln!(
-                            "[quota-router] falling back to the default codex login (~/.codex)"
-                        );
+                        if !quota_exec::error_is_cached_all_accounts_invalid(&err) {
+                            eprintln!("[quota-router] {err:#}");
+                            eprintln!(
+                                "[quota-router] falling back to the default codex login (~/.codex)"
+                            );
+                        }
                         spawn_codex(
                             &fb_repo_root,
                             &fb_full_prompt,

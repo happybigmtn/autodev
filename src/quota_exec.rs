@@ -943,6 +943,17 @@ pub(crate) fn error_is_all_accounts_invalid(err: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<crate::quota_selector::AllAccountsInvalid>())
 }
 
+/// Cached all-invalid errors mean the same safe fallback should happen, but
+/// the detailed probe warnings were already emitted on the first live pass.
+/// Exec seams use this marker to avoid repeating an unchanged warning cycle.
+pub(crate) fn error_is_cached_all_accounts_invalid(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::quota_selector::AllAccountsInvalid>()
+            .is_some_and(|invalid| invalid.cached)
+    })
+}
+
 /// Select the best account, swap credentials, launch the provider CLI
 /// with the given args, wait for exit, and restore credentials.
 pub(crate) async fn run_quota_open(provider: Provider, args: &[String]) -> Result<i32> {
@@ -1049,11 +1060,29 @@ pub(crate) async fn run_quota_select(provider: Provider) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_oauth_expires_at, quota_backoff_wait, quota_output_has_agent_progress,
+        claude_oauth_expires_at, error_is_all_accounts_invalid,
+        error_is_cached_all_accounts_invalid, quota_backoff_wait, quota_output_has_agent_progress,
         restore_credentials, run_with_quota, swap_credentials_legacy as swap_credentials,
         sync_newer_claude_credentials, Duration,
     };
     use crate::quota_config::{AccountEntry, Provider, QuotaConfig};
+
+    #[test]
+    fn cached_all_invalid_error_preserves_fallback_type_and_suppression_marker() {
+        let cached = anyhow::Error::new(crate::quota_selector::AllAccountsInvalid {
+            provider: Provider::Codex,
+            cached: true,
+        });
+        assert!(error_is_all_accounts_invalid(&cached));
+        assert!(error_is_cached_all_accounts_invalid(&cached));
+
+        let fresh = anyhow::Error::new(crate::quota_selector::AllAccountsInvalid {
+            provider: Provider::Codex,
+            cached: false,
+        });
+        assert!(error_is_all_accounts_invalid(&fresh));
+        assert!(!error_is_cached_all_accounts_invalid(&fresh));
+    }
 
     #[test]
     fn backoff_waits_for_soonest_session_reset_within_cap() {

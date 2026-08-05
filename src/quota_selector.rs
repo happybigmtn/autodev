@@ -1,4 +1,9 @@
+use std::fs;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
 
 use crate::quota_config::{codex_live_home, AccountEntry, Provider, QuotaConfig};
 use crate::quota_state::QuotaState;
@@ -16,6 +21,9 @@ const SESSION_FLOOR_PCT: u32 = 25;
 #[derive(Debug)]
 pub(crate) struct AllAccountsInvalid {
     pub(crate) provider: Provider,
+    /// True when no live probes were needed because the unchanged pool was
+    /// already proven invalid earlier in this process.
+    pub(crate) cached: bool,
 }
 
 impl std::fmt::Display for AllAccountsInvalid {
@@ -30,6 +38,125 @@ impl std::fmt::Display for AllAccountsInvalid {
 }
 
 impl std::error::Error for AllAccountsInvalid {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PoolFingerprint([u8; 32]);
+
+#[derive(Default)]
+struct InvalidPoolCache {
+    claude: Option<PoolFingerprint>,
+    codex: Option<PoolFingerprint>,
+}
+
+impl InvalidPoolCache {
+    fn get(&self, provider: Provider) -> Option<PoolFingerprint> {
+        match provider {
+            Provider::Claude => self.claude,
+            Provider::Codex => self.codex,
+        }
+    }
+
+    fn set(&mut self, provider: Provider, fingerprint: Option<PoolFingerprint>) {
+        match provider {
+            Provider::Claude => self.claude = fingerprint,
+            Provider::Codex => self.codex = fingerprint,
+        }
+    }
+}
+
+fn invalid_pool_cache() -> &'static Mutex<InvalidPoolCache> {
+    static CACHE: OnceLock<Mutex<InvalidPoolCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(InvalidPoolCache::default()))
+}
+
+/// Hash a credential path's identity and content without ever retaining or
+/// logging credential bytes. Metadata makes a same-content rewrite invalidate
+/// the cache too, while content catches in-place updates on coarse-mtime filesystems.
+fn hash_path_state(hasher: &mut Sha256, path: &Path) {
+    hasher.update(path.to_string_lossy().as_bytes());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            hasher.update(b"present");
+            hasher.update(metadata.len().to_le_bytes());
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(duration.as_secs().to_le_bytes());
+                    hasher.update(duration.subsec_nanos().to_le_bytes());
+                }
+            }
+            if metadata.file_type().is_symlink() {
+                hasher.update(b"symlink");
+                if let Ok(target) = fs::read_link(path) {
+                    hasher.update(target.to_string_lossy().as_bytes());
+                }
+            } else if metadata.is_file() {
+                hasher.update(b"file");
+                match fs::read(path) {
+                    Ok(bytes) => hasher.update(Sha256::digest(bytes)),
+                    Err(error) => hasher.update(error.kind().to_string().as_bytes()),
+                }
+            } else {
+                hasher.update(b"other");
+            }
+        }
+        Err(error) => {
+            hasher.update(b"missing-or-unreadable");
+            hasher.update(error.kind().to_string().as_bytes());
+        }
+    }
+}
+
+fn pool_fingerprint(config: &QuotaConfig, provider: Provider) -> Result<PoolFingerprint> {
+    let mut hasher = Sha256::new();
+    hasher.update(provider.label().as_bytes());
+    // Hash the on-disk config as well as the parsed account paths. This makes
+    // every operator config edit an explicit invalidation event.
+    hash_path_state(&mut hasher, &QuotaConfig::config_path());
+
+    for entry in config.accounts_for_provider(provider) {
+        hasher.update(entry.name.as_bytes());
+        hasher.update([u8::from(entry.live)]);
+        let profile_dir = usage_profile_dir(provider, entry)?;
+        match provider {
+            Provider::Codex => {
+                // Include both supported layouts so creating/removing the
+                // isolated home invalidates even when resolution changes.
+                hash_path_state(&mut hasher, &profile_dir.join("auth.json"));
+                hash_path_state(
+                    &mut hasher,
+                    &profile_dir.join("codex-home").join("auth.json"),
+                );
+            }
+            Provider::Claude => {
+                hash_path_state(&mut hasher, &profile_dir.join(".credentials.json"));
+            }
+        }
+    }
+
+    Ok(PoolFingerprint(hasher.finalize().into()))
+}
+
+fn cached_invalid_pool(provider: Provider, fingerprint: PoolFingerprint) -> bool {
+    invalid_pool_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(provider)
+        == Some(fingerprint)
+}
+
+fn remember_invalid_pool(provider: Provider, fingerprint: PoolFingerprint) {
+    invalid_pool_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set(provider, Some(fingerprint));
+}
+
+fn forget_invalid_pool(provider: Provider) {
+    invalid_pool_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set(provider, None);
+}
 
 #[derive(Debug)]
 pub(crate) struct SelectedAccount<'a> {
@@ -50,6 +177,14 @@ pub(crate) async fn score_accounts(
 
     if std::env::var_os("AUTO_QUOTA_SKIP_USAGE").as_deref() == Some(std::ffi::OsStr::new("1")) {
         return Ok(candidates.into_iter().map(|entry| (entry, None)).collect());
+    }
+
+    let fingerprint = pool_fingerprint(config, provider)?;
+    if cached_invalid_pool(provider, fingerprint) {
+        return Err(anyhow::Error::new(AllAccountsInvalid {
+            provider,
+            cached: true,
+        }));
     }
 
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
@@ -91,8 +226,16 @@ pub(crate) async fn score_accounts(
     }
 
     if scored.is_empty() {
-        return Err(anyhow::Error::new(AllAccountsInvalid { provider }));
+        remember_invalid_pool(provider, fingerprint);
+        return Err(anyhow::Error::new(AllAccountsInvalid {
+            provider,
+            cached: false,
+        }));
     }
+
+    // This is a negative-only cache. A pool that produces any candidate must
+    // leave no remembered failure behind.
+    forget_invalid_pool(provider);
 
     Ok(scored)
 }
@@ -450,12 +593,112 @@ fn log_selection(chosen: &AccountEntry, scored: &[(&AccountEntry, Option<Account
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct TempPoolHome {
+        root: std::path::PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_config_home: Option<std::ffi::OsString>,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl TempPoolHome {
+        fn new() -> Self {
+            let env_lock = crate::util::test_process_env_lock()
+                .lock()
+                .expect("failed to lock process env");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "autodev-quota-negative-cache-{}-{stamp}",
+                std::process::id()
+            ));
+            let home = root.join("home");
+            let config_home = root.join("config");
+            fs::create_dir_all(&home).expect("failed to create temp home");
+            fs::create_dir_all(&config_home).expect("failed to create temp config home");
+            let previous_home = std::env::var_os("HOME");
+            let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_CONFIG_HOME", config_home);
+            Self {
+                root,
+                previous_home,
+                previous_config_home,
+                _env_lock: env_lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempPoolHome {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous_home {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(previous) = &self.previous_config_home {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn make_account(name: &str, provider: Provider) -> AccountEntry {
         AccountEntry {
             name: name.into(),
             provider,
             live: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_pool_cache_is_reused_then_invalidated_by_credentials_and_config() {
+        let _home = TempPoolHome::new();
+        let mut config = QuotaConfig::default();
+        config
+            .add_account(make_account("dead", Provider::Codex))
+            .expect("failed to add codex account");
+        config.save().expect("failed to save quota config");
+
+        let profile_dir = QuotaConfig::profile_dir(Provider::Codex, "dead")
+            .expect("failed to resolve profile dir");
+        fs::create_dir_all(&profile_dir).expect("failed to create profile dir");
+        let auth_path = profile_dir.join("auth.json");
+        fs::write(&auth_path, br#"{"token":"revoked"}"#)
+            .expect("failed to write initial credentials");
+
+        let initial =
+            pool_fingerprint(&config, Provider::Codex).expect("failed to fingerprint initial pool");
+        assert!(!cached_invalid_pool(Provider::Codex, initial));
+        remember_invalid_pool(Provider::Codex, initial);
+        assert!(cached_invalid_pool(Provider::Codex, initial));
+
+        fs::write(&auth_path, br#"{"token":"new-login"}"#).expect("failed to update credentials");
+        let after_credentials = pool_fingerprint(&config, Provider::Codex)
+            .expect("failed to fingerprint updated credentials");
+        assert_ne!(initial, after_credentials);
+        assert!(!cached_invalid_pool(Provider::Codex, after_credentials));
+
+        remember_invalid_pool(Provider::Codex, after_credentials);
+        config
+            .add_account(make_account("config-change", Provider::Claude))
+            .expect("failed to update quota config");
+        config.save().expect("failed to save updated quota config");
+        let after_config = pool_fingerprint(&config, Provider::Codex)
+            .expect("failed to fingerprint updated config");
+        assert_ne!(after_credentials, after_config);
+        assert!(!cached_invalid_pool(Provider::Codex, after_config));
+
+        remember_invalid_pool(Provider::Codex, after_config);
+        forget_invalid_pool(Provider::Codex);
+        assert!(!cached_invalid_pool(Provider::Codex, after_config));
     }
 
     fn make_usage(
