@@ -174,7 +174,12 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_else(|| "[unknown]".to_string());
-        let stale = lane_is_from_previous_run(&run_root, &lane_root);
+        // tmux provisions every configured lane up front by creating its
+        // directory and two empty log files. A lane receives task/run metadata
+        // only when work is assigned, so an untouched placeholder is idle
+        // capacity, not debris from a previous run.
+        let stale = lane_is_from_previous_run(&run_root, &lane_root)
+            && !lane_is_unassigned_placeholder(&lane_root);
         let lane_repo_root = lane_root.join("repo");
         let (worker_running, pid_state) = lane_worker_status(&lane_root, &lane_repo_root)
             .unwrap_or_else(|err| {
@@ -330,6 +335,21 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn lane_is_unassigned_placeholder(lane_root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(lane_root) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).all(|entry| {
+        let name = entry.file_name();
+        if name != "stdout.log" && name != "stderr.log" {
+            return false;
+        }
+        entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+    })
 }
 
 fn canonical_gate_marker_paths(repo_root: &Path) -> Vec<PathBuf> {

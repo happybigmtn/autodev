@@ -159,6 +159,59 @@ fn parallel_status_json_reports_canonical_gate_as_staged_active_work() {
     let _ = fs::remove_dir_all(&run_root);
 }
 
+#[test]
+fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
+    let repo = unique_temp_dir("parallel-status-unused-lane-repo");
+    let run_root = unique_temp_dir("parallel-status-unused-lane-run");
+    init_git_repo(&repo);
+
+    fs::create_dir_all(run_root.join("lanes/lane-4")).expect("create unused lane");
+    fs::write(run_root.join("lanes/lane-4/stdout.log"), "").expect("touch stdout log");
+    fs::write(run_root.join("lanes/lane-4/stderr.log"), "").expect("touch stderr log");
+
+    fs::create_dir_all(run_root.join("lanes/lane-5/repo")).expect("create stale lane repo");
+    fs::write(run_root.join("lanes/lane-5/task-id"), "TASK-OLD\n").expect("write stale task id");
+    fs::write(run_root.join("lanes/lane-5/.run-id"), "previous-run\n").expect("write stale run id");
+    fs::write(run_root.join(".current-run-id"), "current-run\n").expect("write current run id");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run auto parallel status --json");
+    assert!(
+        output.status.success(),
+        "status command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    let lanes = report["lanes"].as_array().expect("lane records");
+    let unused = lanes
+        .iter()
+        .find(|lane| lane["lane"] == 4)
+        .expect("unused lane record");
+    assert_eq!(unused["task_id"], "[unknown]");
+    assert_eq!(unused["running"], false);
+    assert_eq!(unused["stale"], false);
+
+    let stale = lanes
+        .iter()
+        .find(|lane| lane["lane"] == 5)
+        .expect("stale lane record");
+    assert_eq!(stale["task_id"], "TASK-OLD");
+    assert_eq!(stale["running"], false);
+    assert_eq!(stale["stale"], true);
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&run_root);
+}
+
 fn init_git_repo(path: &Path) {
     fs::create_dir_all(path).expect("failed to create repo dir");
     run_git(path, ["init", "-q"]);
