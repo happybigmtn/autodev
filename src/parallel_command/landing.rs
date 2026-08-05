@@ -2100,17 +2100,18 @@ async fn run_workspace_probe_in_canonical_transaction(
 /// on non-Rust repos, and on resume (a baseline is already persisted). Bounded by
 /// the same timeout as the gate; a timeout/skip just defers to lazy capture at
 /// the first landing.
-async fn run_guarded_workspace_probe(
+async fn run_guarded_workspace_probe_with_cargo(
     repo_root: &Path,
     task_id: &str,
     gate_label: &str,
+    cargo_bin: Option<PathBuf>,
 ) -> Result<WorkspaceProbe> {
     let transaction = arm_canonical_gate_transaction(repo_root, task_id, gate_label)?;
     let probe = run_workspace_probe_in_canonical_transaction(
         repo_root,
         Some(&transaction),
         gate_label,
-        None,
+        cargo_bin,
     )
     .await?;
     clear_canonical_gate_transaction(repo_root, &transaction)?;
@@ -2121,12 +2122,21 @@ pub(crate) async fn maybe_capture_workspace_baseline(
     repo_root: &Path,
     run_root: &Path,
     parallel_logger: &ParallelEventLogger,
-) {
+) -> Result<()> {
+    maybe_capture_workspace_baseline_with_cargo(repo_root, run_root, parallel_logger, None).await
+}
+
+async fn maybe_capture_workspace_baseline_with_cargo(
+    repo_root: &Path,
+    run_root: &Path,
+    parallel_logger: &ParallelEventLogger,
+    cargo_bin: Option<PathBuf>,
+) -> Result<()> {
     if matches!(workspace_gate_mode(), WorkspaceGateMode::Strict) {
-        return;
+        return Ok(());
     }
     if !repo_root.join("Cargo.toml").is_file() {
-        return;
+        return Ok(());
     }
     let existing = load_workspace_baseline(run_root);
     if existing.captured {
@@ -2143,10 +2153,11 @@ pub(crate) async fn maybe_capture_workspace_baseline(
                 (Some(prev), Some(now)) if prev != now
             );
             if drifted {
-                let probe = match run_guarded_workspace_probe(
+                let probe = match run_guarded_workspace_probe_with_cargo(
                     repo_root,
                     "workspace-baseline",
                     "workspace baseline recapture",
+                    cargo_bin.clone(),
                 )
                 .await
                 {
@@ -2156,7 +2167,9 @@ pub(crate) async fn maybe_capture_workspace_baseline(
                             "workspace-baseline: canonical integrity failed during recapture: \
                              {err:#}"
                         ));
-                        return;
+                        return Err(err).context(
+                            "startup workspace baseline recapture violated canonical integrity",
+                        );
                     }
                 };
                 if let (Some(now), WorkspaceProbe::Ran(obs)) = (current_head.as_deref(), probe) {
@@ -2186,7 +2199,7 @@ pub(crate) async fn maybe_capture_workspace_baseline(
                     if let Some(diag) = workspace_compile_block_diagnostic(&recapture.baseline) {
                         parallel_logger.warn(format!("workspace-compile-block: {diag}"));
                     }
-                    return;
+                    return Ok(());
                 }
                 parallel_logger.warn(
                     "workspace-baseline: HEAD advanced but recapture probe was skipped; reusing persisted baseline",
@@ -2203,14 +2216,15 @@ pub(crate) async fn maybe_capture_workspace_baseline(
         if let Some(diag) = workspace_compile_block_diagnostic(&existing) {
             parallel_logger.warn(format!("workspace-compile-block: {diag}"));
         }
-        return;
+        return Ok(());
     }
     parallel_logger
         .info("workspace-baseline: capturing pre-existing workspace baseline at run start (one-time; `cargo test --workspace --no-fail-fast`)...");
-    let probe = match run_guarded_workspace_probe(
+    let probe = match run_guarded_workspace_probe_with_cargo(
         repo_root,
         "workspace-baseline",
         "workspace baseline capture",
+        cargo_bin,
     )
     .await
     {
@@ -2219,7 +2233,8 @@ pub(crate) async fn maybe_capture_workspace_baseline(
             parallel_logger.warn(format!(
                 "workspace-baseline: canonical integrity failed during baseline capture: {err:#}"
             ));
-            return;
+            return Err(err)
+                .context("startup workspace baseline capture violated canonical integrity");
         }
     };
     match probe {
@@ -2252,6 +2267,7 @@ pub(crate) async fn maybe_capture_workspace_baseline(
             ));
         }
     }
+    Ok(())
 }
 
 /// Map a task's changed files to the normalized names of the workspace crates
@@ -6713,10 +6729,18 @@ exec "$@"
     }
 
     fn write_fake_passing_workspace_cargo(root: &Path, mutation: &str) -> PathBuf {
-        let path = root.join("fake-workspace-cargo.sh");
+        write_fake_workspace_cargo(
+            root,
+            "fake-workspace-cargo.sh",
+            &format!("{mutation}\nexit 0"),
+        )
+    }
+
+    fn write_fake_workspace_cargo(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
         fs::write(
             &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{mutation}\nexit 0\n"),
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
         )
         .expect("write fake workspace cargo");
         let mut permissions = fs::metadata(&path)
@@ -6725,6 +6749,129 @@ exec "$@"
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("chmod fake workspace cargo");
         path
+    }
+
+    #[tokio::test]
+    async fn startup_workspace_baseline_source_mutation_is_quarantined() {
+        let root = unique_temp_dir("startup-baseline-source-mutation");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("src")).expect("create source directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"startup_baseline_mutation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").expect("write source");
+        git_ok(&root, ["add", "."]);
+        git_ok(
+            &root,
+            ["commit", "-q", "-m", "seed baseline mutation fixture"],
+        );
+        let cargo = write_fake_passing_workspace_cargo(
+            &root,
+            "printf 'pub fn value() -> u8 { 2 }\\n' > src/lib.rs",
+        );
+
+        let result = super::run_guarded_workspace_probe_with_cargo(
+            &root,
+            "workspace-baseline",
+            "startup workspace baseline",
+            Some(cargo),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("source mutation during baseline must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains(REVIEW_INPUT_MUTATION_FATAL_MARKER),
+            "{error:#}"
+        );
+        let restart_error = enforce_review_input_quarantine_before_dispatch(&root)
+            .expect_err("a restart-visible mutation quarantine must remain");
+        assert!(
+            format!("{restart_error:#}").contains(REVIEW_INPUT_MUTATION_FATAL_MARKER),
+            "{restart_error:#}"
+        );
+        assert!(fs::read_to_string(root.join("src/lib.rs"))
+            .expect("read mutated source")
+            .contains("value() -> u8 { 2 }"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn skipped_startup_baseline_cannot_be_learned_from_later_red_landing() {
+        let root = unique_temp_dir("startup-baseline-skipped-red-landing");
+        init_git_repo(&root);
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        git_ok(&root, ["add", "."]);
+        git_ok(
+            &root,
+            ["commit", "-q", "-m", "seed skipped baseline fixture"],
+        );
+        let run_root = root.join("run");
+        fs::create_dir_all(run_root.join("lanes/lane-1")).expect("create lane root");
+        let logger = ParallelEventLogger::new(&run_root).expect("create logger");
+        let skipped_cargo = write_fake_workspace_cargo(
+            &root,
+            "fake-workspace-cargo-skipped.sh",
+            "printf 'transient cargo infrastructure failure\\n'\nexit 73",
+        );
+
+        super::maybe_capture_workspace_baseline_with_cargo(
+            &root,
+            &run_root,
+            &logger,
+            Some(skipped_cargo),
+        )
+        .await
+        .expect("skipped probe is a typed non-fatal baseline outcome");
+        assert!(
+            !load_workspace_baseline(&run_root).captured,
+            "an ambiguous skipped startup probe must not become a baseline"
+        );
+
+        let task_id = "TASK-RED-AFTER-SKIP";
+        let title = "red landing after skipped startup baseline";
+        let task_markdown = format!("- [x] `{task_id}` {title}\n");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!("# IMPLEMENTATION_PLAN\n\n{task_markdown}"),
+        )
+        .expect("write task plan");
+        let red_cargo = write_fake_workspace_cargo(
+            &root,
+            "fake-workspace-cargo-red.sh",
+            "printf 'error: could not compile `red_crate` (lib) due to 1 previous error\\n'\nexit 101",
+        );
+        let mut assignment =
+            review_gate_assignment_with_markdown(&root, task_id, title, task_markdown);
+        assignment.lane_root = run_root.join("lanes/lane-1");
+        let status = super::apply_workspace_baseline_gate_in_transaction_with_cargo(
+            &root,
+            &mut assignment,
+            &[],
+            LoopTaskStatus::Done,
+            None,
+            Some(red_cargo),
+        )
+        .await
+        .expect("classify red landing");
+
+        assert_eq!(status, LoopTaskStatus::Partial);
+        assert!(
+            !load_workspace_baseline(&run_root).captured,
+            "a later red landing must not be learned after startup capture skipped"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(
+            review.contains("refusing to learn a tolerated baseline from this red tree"),
+            "{review}"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[tokio::test]

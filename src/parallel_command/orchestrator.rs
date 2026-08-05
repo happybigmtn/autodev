@@ -71,6 +71,26 @@ impl ParallelEventLogger {
     }
 }
 
+/// Resolve the one-time startup workspace barrier only after at least one
+/// isolated worker has been dispatched. Keeping this tiny sequencing primitive
+/// separate makes the safety ordering executable in tests: dispatch happens
+/// first, baseline completion second, and canonical host work may resume only
+/// after this future returns.
+async fn resolve_startup_workspace_baseline_after_dispatch<F>(
+    pending: &mut bool,
+    workers_active: bool,
+    capture: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    if *pending && workers_active {
+        capture.await?;
+        *pending = false;
+    }
+    Ok(())
+}
+
 pub(crate) fn append_lane_host_event(
     log_path: &Path,
     lane_index: usize,
@@ -276,10 +296,12 @@ pub(crate) async fn run_parallel_loop(
     )
     .await?;
     let preflight_report = run_parallel_preflight(repo_root, &plan, run_root, parallel_logger)?;
-    // Capture the pre-existing workspace failure/compile baseline before any lane
-    // lands, so the baseline-aware landing gate can tell a NEW regression apart
-    // from a failure that was already red at the run's base commit.
-    maybe_capture_workspace_baseline(repo_root, run_root, parallel_logger).await;
+    // Defer the expensive initial workspace baseline until after the first
+    // workers have been dispatched. Workers run in isolated worktrees, so their
+    // implementation time can overlap this canonical read-only probe. The main
+    // loop resolves this barrier before it joins/harvests any worker, and thus
+    // before any canonical cherry-pick, queue checkpoint, or landing can occur.
+    let mut startup_workspace_baseline_pending = true;
     let lane_config = LaneRunConfig::new(args, worker_env, preflight_report.prompt_clause());
     let review_config = LaneReviewConfig::from_run_config(&args.model, &args.codex_bin);
     try_checkpoint_parallel_host_queue_changes(repo_root, target_branch, parallel_logger);
@@ -292,6 +314,13 @@ pub(crate) async fn run_parallel_loop(
         &plan,
         parallel_logger,
     )?;
+    // A completed resumable lane can be harvested immediately below, before the
+    // normal dispatch loop gets a chance to resolve the startup barrier. Keep
+    // resume semantics conservative: capture first, then permit harvesting.
+    if !resumable_lanes.is_empty() {
+        maybe_capture_workspace_baseline(repo_root, run_root, parallel_logger).await?;
+        startup_workspace_baseline_pending = false;
+    }
     landed += harvest_resumable_lane_results(
         repo_root,
         target_branch,
@@ -623,6 +652,14 @@ pub(crate) async fn run_parallel_loop(
             // recovery to reclaim. Genuine-partial tasks fail the same
             // `is_fully_evidenced()` gate and fall through to normal dispatch.
             if task.status == LoopTaskStatus::Partial {
+                // Once the first startup worker is live, do not let a later
+                // slot's host-side evidence promotion mutate the canonical
+                // queue before the baseline barrier has resolved. Break out,
+                // capture/revalidate the baseline, then reconsider this task on
+                // the next outer iteration.
+                if startup_workspace_baseline_pending && !active_lanes.is_empty() {
+                    break;
+                }
                 match try_promote_partial_before_dispatch(
                     repo_root,
                     target_branch,
@@ -737,6 +774,18 @@ pub(crate) async fn run_parallel_loop(
             active_lanes.insert(lane_index, assignment);
             last_idle_summary = None;
         }
+
+        // Hard startup barrier. At least one isolated worker is now running, so
+        // its implementation time overlaps the expensive baseline probe. While
+        // this await is in progress the host performs no canonical repair,
+        // refresh, checkpoint, join, cherry-pick, or landing. The guarded probe
+        // itself snapshots and revalidates exact canonical state.
+        resolve_startup_workspace_baseline_after_dispatch(
+            &mut startup_workspace_baseline_pending,
+            !active_lanes.is_empty(),
+            maybe_capture_workspace_baseline(repo_root, run_root, parallel_logger),
+        )
+        .await?;
 
         if active_lanes.is_empty() {
             let queue = plan.queue_snapshot();
@@ -2481,7 +2530,9 @@ pub(crate) fn clean_commit_harvest_ready(
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::sync::{Arc, Mutex};
     use std::time::UNIX_EPOCH;
+    use tokio::sync::Notify;
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -2517,6 +2568,89 @@ mod tests {
         run_git(&repo, ["commit", "-m", "seed scheduler plan"])
             .expect("failed to commit seed plan");
         repo
+    }
+
+    #[tokio::test]
+    async fn startup_workspace_baseline_begins_after_worker_dispatch_and_before_harvest() {
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        events.lock().expect("lock events").push("worker-started");
+        let capture_events = Arc::clone(&events);
+        let mut pending = true;
+
+        resolve_startup_workspace_baseline_after_dispatch(&mut pending, true, async move {
+            capture_events
+                .lock()
+                .expect("lock capture events")
+                .push("baseline-started");
+            tokio::task::yield_now().await;
+            capture_events
+                .lock()
+                .expect("lock capture events")
+                .push("baseline-completed");
+            Ok(())
+        })
+        .await
+        .expect("resolve startup baseline");
+        events.lock().expect("lock events").push("harvest-allowed");
+
+        assert_eq!(
+            *events.lock().expect("lock final events"),
+            vec![
+                "worker-started",
+                "baseline-started",
+                "baseline-completed",
+                "harvest-allowed"
+            ]
+        );
+        assert!(!pending);
+    }
+
+    #[tokio::test]
+    async fn startup_workspace_barrier_blocks_canonical_queue_mutation_until_completion() {
+        let original = "- [ ] `TASK-A` Wait behind startup baseline\n  Dependencies: none\n";
+        let repo = init_parallel_scheduler_repo("startup-baseline-queue-barrier", original);
+        let original_head = current_repo_head(&repo).expect("read original HEAD");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let capture_entered = Arc::clone(&entered);
+        let capture_release = Arc::clone(&release);
+        let mut pending = true;
+        {
+            let barrier =
+                resolve_startup_workspace_baseline_after_dispatch(&mut pending, true, async move {
+                    capture_entered.notify_one();
+                    capture_release.notified().await;
+                    Ok(())
+                });
+            tokio::pin!(barrier);
+
+            tokio::select! {
+                result = &mut barrier => panic!("startup barrier completed before the probe was released: {result:?}"),
+                _ = entered.notified() => {}
+            }
+            assert_eq!(
+                fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md")).expect("read frozen plan"),
+                original
+            );
+            assert_eq!(
+                current_repo_head(&repo).as_deref(),
+                Some(original_head.as_str())
+            );
+
+            release.notify_one();
+            barrier.await.expect("resolve startup barrier");
+        }
+        fs::write(
+            repo.join("IMPLEMENTATION_PLAN.md"),
+            original.replace("- [ ]", "- [~]"),
+        )
+        .expect("mutate queue after barrier");
+        assert!(!pending);
+        assert!(fs::read_to_string(repo.join("IMPLEMENTATION_PLAN.md"))
+            .expect("read updated plan")
+            .contains("- [~]"));
+
+        fs::remove_dir_all(repo).expect("clean startup barrier fixture");
     }
 
     #[test]
