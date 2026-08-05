@@ -130,6 +130,9 @@ pub(crate) const LANE_RUN_ID_FILE: &str = ".run-id";
 
 pub(crate) const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 
+pub(crate) const LANE_HOST_PENDING_FILE: &str = "host-pending.json";
+pub(crate) const LANE_HOST_PENDING_VERSION: u32 = 1;
+
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
         return run_parallel_status(&args);

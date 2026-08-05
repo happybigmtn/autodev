@@ -212,6 +212,69 @@ fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
     let _ = fs::remove_dir_all(&run_root);
 }
 
+#[test]
+fn parallel_status_json_reports_only_current_valid_host_pending_candidates() {
+    let repo = unique_temp_dir("parallel-status-host-pending-repo");
+    let run_root = unique_temp_dir("parallel-status-host-pending-run");
+    init_git_repo(&repo);
+    fs::create_dir_all(&run_root).expect("create run root");
+    fs::write(run_root.join(".current-run-id"), "current-run\n").expect("write run id");
+
+    let current_lane = run_root.join("lanes/lane-1");
+    fs::create_dir_all(current_lane.join("repo")).expect("create current lane");
+    fs::write(current_lane.join(".run-id"), "current-run\n").expect("write lane run id");
+    fs::write(current_lane.join("task-id"), "TASK-WAIT\n").expect("write lane task id");
+    fs::write(
+        current_lane.join("host-pending.json"),
+        r#"{"version":1,"phase":"awaiting_host","run_id":"current-run","task_id":"TASK-WAIT","lane":1,"attempt":1}"#,
+    )
+    .expect("write current host-pending marker");
+
+    let malformed_lane = run_root.join("lanes/lane-2");
+    fs::create_dir_all(&malformed_lane).expect("create malformed lane");
+    fs::write(malformed_lane.join(".run-id"), "current-run\n").expect("write lane run id");
+    fs::write(malformed_lane.join("task-id"), "TASK-SAFE\n").expect("write safe task id");
+    fs::write(
+        malformed_lane.join("host-pending.json"),
+        r#"{"version":1,"phase":"awaiting_host","run_id":"current-run","task_id":"../../private-secret","lane":2,"attempt":1}"#,
+    )
+    .expect("write malformed host-pending marker");
+
+    let stale_lane = run_root.join("lanes/lane-3");
+    fs::create_dir_all(&stale_lane).expect("create stale lane");
+    fs::write(stale_lane.join(".run-id"), "previous-run\n").expect("write stale run id");
+    fs::write(stale_lane.join("task-id"), "TASK-STALE\n").expect("write stale task id");
+    fs::write(
+        stale_lane.join("host-pending.json"),
+        r#"{"version":1,"phase":"awaiting_host","run_id":"previous-run","task_id":"TASK-STALE","lane":3,"attempt":1}"#,
+    )
+    .expect("write stale host-pending marker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run auto parallel status --json");
+    assert!(output.status.success(), "status command failed");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    assert_eq!(
+        report["host_pending_task_ids"],
+        serde_json::json!(["TASK-WAIT"])
+    );
+    assert_eq!(report["active_task_ids"], serde_json::json!([]));
+    let serialized = serde_json::to_string(&report).expect("serialize report");
+    assert!(!serialized.contains("private-secret"));
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&run_root);
+}
+
 fn init_git_repo(path: &Path) {
     fs::create_dir_all(path).expect("failed to create repo dir");
     run_git(path, ["init", "-q"]);

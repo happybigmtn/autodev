@@ -24,6 +24,16 @@ struct CanonicalGateMarker {
     reviewed_head: String,
 }
 
+#[derive(Deserialize)]
+struct LaneHostPendingStatusMarker {
+    version: u32,
+    phase: String,
+    run_id: String,
+    task_id: String,
+    lane: usize,
+    attempt: usize,
+}
+
 #[derive(Serialize)]
 struct LaneStatusRecord {
     lane: usize,
@@ -45,6 +55,7 @@ struct ParallelStatusReport {
     lanes: Vec<LaneStatusRecord>,
     canonical_gate: Option<CanonicalGateStatus>,
     staged_task_ids: Vec<String>,
+    host_pending_task_ids: Vec<String>,
     active_task_ids: Vec<String>,
     frontier: Option<String>,
     safety_verdict: Option<String>,
@@ -148,6 +159,7 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     let canonical_gate = current_canonical_gate_status(&repo_root);
     let mut active_recovery_lanes = Vec::new();
     let mut stale_recovery_lanes = Vec::new();
+    let mut host_pending_task_ids = BTreeSet::new();
     let mut active_task_ids = BTreeSet::new();
     let staged_task_ids = canonical_gate
         .iter()
@@ -188,6 +200,21 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
                     format!("worker liveness check failed for lane repo: {err:#}"),
                 )
             });
+        if !stale {
+            if let Some(task_id) = current_lane_host_pending_task_id(
+                &run_root,
+                lane_index,
+                &lane_root,
+                &stored_task_id,
+            ) {
+                record_host_pending_task(
+                    &mut host_pending_task_ids,
+                    &mut active_task_ids,
+                    task_id,
+                    no_live_parallel_host,
+                );
+            }
+        }
         // A lane from a previous run is not live work for THIS run: keep it out
         // of the active-task set and the health assessment so a dead run's
         // lanes never read as in-flight.
@@ -257,6 +284,16 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             }
         }
     }
+    if !json && !host_pending_task_ids.is_empty() {
+        println!(
+            "host pending: {}",
+            host_pending_task_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let mut report_frontier: Option<String> = None;
     let mut report_verdict: Option<String> = None;
     if let Ok(plan) = inspect_loop_plan(&repo_root) {
@@ -322,6 +359,7 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             lanes: lane_records,
             canonical_gate,
             staged_task_ids,
+            host_pending_task_ids: host_pending_task_ids.into_iter().collect(),
             active_task_ids: active_task_ids.into_iter().collect(),
             frontier: report_frontier,
             safety_verdict: report_verdict,
@@ -350,6 +388,43 @@ fn lane_is_unassigned_placeholder(lane_root: &Path) -> bool {
             .metadata()
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
     })
+}
+
+fn current_lane_host_pending_task_id(
+    run_root: &Path,
+    lane_index: usize,
+    lane_root: &Path,
+    stored_task_id: &str,
+) -> Option<String> {
+    let current_run_id = current_parallel_run_id(run_root)?;
+    if lane_run_id(lane_root).as_deref() != Some(current_run_id.as_str()) {
+        return None;
+    }
+    let bytes = fs::read(lane_root.join(LANE_HOST_PENDING_FILE)).ok()?;
+    let marker: LaneHostPendingStatusMarker = serde_json::from_slice(&bytes).ok()?;
+    if marker.version != LANE_HOST_PENDING_VERSION
+        || marker.phase != "awaiting_host"
+        || marker.run_id != current_run_id
+        || marker.lane != lane_index
+        || marker.attempt == 0
+        || marker.task_id != stored_task_id
+        || !safe_status_identifier(&marker.task_id, 128, false)
+    {
+        return None;
+    }
+    Some(marker.task_id)
+}
+
+fn record_host_pending_task(
+    host_pending_task_ids: &mut BTreeSet<String>,
+    active_task_ids: &mut BTreeSet<String>,
+    task_id: String,
+    no_live_parallel_host: bool,
+) {
+    host_pending_task_ids.insert(task_id.clone());
+    if !no_live_parallel_host {
+        active_task_ids.insert(task_id);
+    }
 }
 
 fn canonical_gate_marker_paths(repo_root: &Path) -> Vec<PathBuf> {
@@ -536,7 +611,10 @@ pub(crate) fn process_line_cwd_matches_repo(line: &str, repo_root: &Path) -> boo
     else {
         return true;
     };
-    fs::read_link(format!("/proc/{pid}/cwd")).map_or(true, |cwd| cwd == repo_root)
+    // A process can exit between `pgrep` and this lookup. Treat an unreadable
+    // cwd as not-live instead of attributing that vanished process to whatever
+    // repo happened to invoke status.
+    fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd == repo_root)
 }
 
 pub(crate) fn lane_repo_status_summary(repo_root: &Path) -> String {
@@ -924,6 +1002,19 @@ mod tests {
     }
 
     #[test]
+    fn live_host_pending_candidates_are_active_but_orphaned_candidates_are_not() {
+        let mut pending = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        super::record_host_pending_task(&mut pending, &mut active, "TASK-LIVE".to_string(), false);
+        super::record_host_pending_task(&mut pending, &mut active, "TASK-ORPHAN".to_string(), true);
+        assert_eq!(
+            pending,
+            BTreeSet::from(["TASK-LIVE".to_string(), "TASK-ORPHAN".to_string()])
+        );
+        assert_eq!(active, BTreeSet::from(["TASK-LIVE".to_string()]));
+    }
+
+    #[test]
     fn tmux_status_worker_detection_ignores_parked_shells() {
         assert!(tmux_status_line_has_live_worker("0:host:dead=0:cmd=auto"));
         assert!(tmux_status_line_has_live_worker(
@@ -932,6 +1023,14 @@ mod tests {
         assert!(!tmux_status_line_has_live_worker("0:host:dead=0:cmd=bash"));
         assert!(!tmux_status_line_has_live_worker(
             "1:lane-1:dead=1:cmd=auto"
+        ));
+    }
+
+    #[test]
+    fn vanished_process_never_counts_as_a_repo_host() {
+        assert!(!process_line_cwd_matches_repo(
+            "4294967295 auto parallel --threads 8",
+            Path::new("/tmp/repo")
         ));
     }
 

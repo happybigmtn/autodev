@@ -127,6 +127,97 @@ pub(crate) fn append_lane_log_line(log_path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}").with_context(|| format!("failed to append {}", log_path.display()))
 }
 
+#[derive(Deserialize, Serialize)]
+struct LaneHostPendingMarker {
+    version: u32,
+    phase: String,
+    run_id: String,
+    task_id: String,
+    lane: usize,
+    attempt: usize,
+}
+
+fn publish_lane_host_pending_marker(
+    lane_root: &Path,
+    lane: usize,
+    task_id: &str,
+    attempt: usize,
+) -> Result<()> {
+    let run_root = lane_root
+        .parent()
+        .and_then(Path::parent)
+        .context("lane root is not nested under a parallel run root")?;
+    let run_id = current_parallel_run_id(run_root)
+        .context("parallel run has no current run id for host-pending publication")?;
+    if lane_run_id(lane_root).as_deref() != Some(run_id.as_str()) {
+        bail!("lane run id does not match the current parallel run")
+    }
+    let marker = LaneHostPendingMarker {
+        version: LANE_HOST_PENDING_VERSION,
+        phase: "awaiting_host".to_string(),
+        run_id,
+        task_id: task_id.to_string(),
+        lane,
+        attempt,
+    };
+    let bytes = serde_json::to_vec_pretty(&marker).context("serialize host-pending marker")?;
+    atomic_write(&lane_root.join(LANE_HOST_PENDING_FILE), &bytes)
+        .context("persist host-pending marker")
+}
+
+fn clear_lane_host_pending_marker(lane_root: &Path) -> Result<()> {
+    let path = lane_root.join(LANE_HOST_PENDING_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn publish_lane_host_pending_marker_best_effort(
+    lane_root: &Path,
+    lane: usize,
+    task_id: &str,
+    attempt: usize,
+) {
+    if let Err(err) = publish_lane_host_pending_marker(lane_root, lane, task_id, attempt) {
+        eprintln!(
+            "warning: failed publishing host-pending state for lane-{lane} `{task_id}`: {err:#}"
+        );
+    }
+}
+
+struct LaneHostPendingGuard {
+    lane_root: PathBuf,
+    task_id: String,
+    attempt: usize,
+}
+
+impl LaneHostPendingGuard {
+    fn new(assignment: &ActiveLaneAssignment) -> Self {
+        Self {
+            lane_root: assignment.lane_root.clone(),
+            task_id: assignment.task.id.clone(),
+            attempt: assignment.attempts,
+        }
+    }
+}
+
+impl Drop for LaneHostPendingGuard {
+    fn drop(&mut self) {
+        let path = self.lane_root.join(LANE_HOST_PENDING_FILE);
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        let Ok(marker) = serde_json::from_slice::<LaneHostPendingMarker>(&bytes) else {
+            return;
+        };
+        if marker.task_id == self.task_id && marker.attempt == self.attempt {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub(crate) fn append_idle_status_to_free_lanes(
     run_root: &Path,
     max_concurrent_workers: usize,
@@ -877,6 +968,10 @@ pub(crate) async fn run_parallel_loop(
             rebuild_active_tasks(&mut active_tasks, &active_lanes);
             continue;
         };
+        // Keep the durable marker present throughout host processing (including
+        // a long canonical gate), then remove only this exact attempt's marker.
+        // A fast retry cannot be erased by an older attempt's guard.
+        let _host_pending_guard = LaneHostPendingGuard::new(&assignment);
         active_tasks.remove(&assignment.task.id);
 
         if let Some(violation) =
@@ -2292,6 +2387,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
     assignment: &mut ActiveLaneAssignment,
     target_branch: &str,
 ) -> Result<()> {
+    clear_lane_host_pending_marker(&assignment.lane_root)?;
     assignment.attempts += 1;
     assignment.clean_commit_since = None;
     assignment.terminate_requested_at = None;
@@ -2316,6 +2412,8 @@ pub(crate) fn spawn_parallel_lane_attempt(
     let extra_env = lane_config.env_for_lane(&assignment.lane_root);
     let lane_index = assignment.lane_index;
     let task_id = assignment.task.id.clone();
+    let lane_root = assignment.lane_root.clone();
+    let attempt = assignment.attempts;
     let effort = lane_config.effective_reasoning_effort(
         assignment.task.estimated_scope.as_deref(),
         assignment.attempts,
@@ -2336,6 +2434,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
         if let Err(err) = atomic_write(&prompt_path, full_prompt.as_bytes())
             .with_context(|| format!("failed to write {}", prompt_path.display()))
         {
+            publish_lane_host_pending_marker_best_effort(&lane_root, lane_index, &task_id, attempt);
             return LaneAttemptResult {
                 lane_index,
                 exit_status: None,
@@ -2374,7 +2473,7 @@ pub(crate) fn spawn_parallel_lane_attempt(
             )
             .await
         };
-        match exit_status {
+        let result = match exit_status {
             Ok(exit_status) => LaneAttemptResult {
                 lane_index,
                 exit_status: Some(exit_status),
@@ -2385,7 +2484,11 @@ pub(crate) fn spawn_parallel_lane_attempt(
                 exit_status: None,
                 error: Some(format!("{err:#}")),
             },
-        }
+        };
+        // Publish immediately before JoinSet can expose this completed result
+        // to the host. Cancellation/panic does not create a false queue item.
+        publish_lane_host_pending_marker_best_effort(&lane_root, lane_index, &task_id, attempt);
+        result
     });
     Ok(())
 }
@@ -2568,6 +2671,47 @@ mod tests {
         run_git(&repo, ["commit", "-m", "seed scheduler plan"])
             .expect("failed to commit seed plan");
         repo
+    }
+
+    #[test]
+    fn host_pending_marker_is_run_bound_and_attempt_owned() {
+        let run_root = unique_temp_dir("parallel-host-pending-marker");
+        let lane_root = run_root.join("lanes/lane-2");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "run-current\n")
+            .expect("write current run id");
+        fs::write(lane_root.join(LANE_RUN_ID_FILE), "run-current\n").expect("write lane run id");
+
+        publish_lane_host_pending_marker(&lane_root, 2, "TASK-WAIT", 1).expect("publish marker");
+        let marker: LaneHostPendingMarker = serde_json::from_slice(
+            &fs::read(lane_root.join(LANE_HOST_PENDING_FILE)).expect("read marker"),
+        )
+        .expect("parse marker");
+        assert_eq!(marker.run_id, "run-current");
+        assert_eq!(marker.task_id, "TASK-WAIT");
+        assert_eq!(marker.attempt, 1);
+
+        let older_guard = LaneHostPendingGuard {
+            lane_root: lane_root.clone(),
+            task_id: "TASK-WAIT".to_string(),
+            attempt: 1,
+        };
+        publish_lane_host_pending_marker(&lane_root, 2, "TASK-WAIT", 2)
+            .expect("publish replacement marker");
+        drop(older_guard);
+        assert!(
+            lane_root.join(LANE_HOST_PENDING_FILE).exists(),
+            "older attempt must not clear a replacement marker"
+        );
+
+        let current_guard = LaneHostPendingGuard {
+            lane_root: lane_root.clone(),
+            task_id: "TASK-WAIT".to_string(),
+            attempt: 2,
+        };
+        drop(current_guard);
+        assert!(!lane_root.join(LANE_HOST_PENDING_FILE).exists());
+        fs::remove_dir_all(run_root).expect("remove run root");
     }
 
     #[tokio::test]
