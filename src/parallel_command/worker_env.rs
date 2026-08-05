@@ -307,6 +307,13 @@ fn install_parallel_worker_cargo_lease(
         WORKER_CARGO_LEASE_ENV,
         &validation_lease_path(run_root).to_string_lossy(),
     );
+    // Cargo intentionally sets CARGO to its own executable for build scripts
+    // and built programs. Preserve that behavior once Cargo is running. At the
+    // worker root, however, CARGO may be an unrelated absolute Cargo inherited
+    // by auto itself. Point that value at the cargo-compatible lease shim so a
+    // prebuilt binary or helper that invokes $CARGO cannot bypass the lane and
+    // canonical-validation locks before any governed Cargo parent exists.
+    upsert_env(extra_env, "CARGO", &guard_path.to_string_lossy());
     Ok(())
 }
 
@@ -458,7 +465,8 @@ pub(crate) fn default_cargo_build_jobs_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        make_executable, worker_cargo_lease_script, worker_git_guard_script, WORKER_GIT_GUARD_DIR,
+        install_parallel_worker_cargo_lease, make_executable, worker_cargo_lease_script,
+        worker_git_guard_script, WORKER_GIT_GUARD_DIR,
     };
     use crate::parallel_command::*;
     use crate::util::output_retrying_etxtbsy;
@@ -682,6 +690,14 @@ mod tests {
             .extra_env
             .iter()
             .any(|(key, value)| key == "AUTO_REAL_CARGO" && Path::new(value).is_absolute()));
+        assert_eq!(
+            env.extra_env
+                .iter()
+                .find(|(key, _)| key == "CARGO")
+                .map(|(_, value)| PathBuf::from(value)),
+            Some(guard_dir.join("cargo")),
+            "worker-root CARGO must re-enter the lease shim"
+        );
 
         fs::remove_dir_all(&repo_root).expect("failed to remove repo root");
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
@@ -762,6 +778,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inherited_cargo_env_reenters_lease_for_prebuilt_helper_chains() {
+        let run_root = unique_temp_dir("loop-worker-env-inherited-cargo");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("cargo");
+        atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+            .expect("failed to write cargo guard");
+        make_executable(&guard_path).expect("failed to chmod cargo guard");
+
+        let lease = acquire_exclusive_validation_lease(&run_root)
+            .await
+            .expect("canonical lease should lock");
+        let mut helper = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec \"$CARGO\" test --locked")
+            .stdout(std::process::Stdio::piped())
+            .env("CARGO", &guard_path)
+            .env("AUTO_REAL_CARGO", "/bin/echo")
+            .env("AUTO_PARALLEL_FLOCK", "/usr/bin/flock")
+            .env(WORKER_CARGO_LEASE_ENV, validation_lease_path(&run_root))
+            .env(
+                WORKER_LANE_CARGO_LEASE_ENV,
+                run_root.join("lane-1-cargo.lock"),
+            )
+            .spawn()
+            .expect("prebuilt helper chain should start");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            helper.try_wait().expect("inspect helper chain").is_none(),
+            "an inherited $CARGO invocation must wait for canonical validation"
+        );
+
+        drop(lease);
+        let output = helper
+            .wait_with_output()
+            .expect("helper chain should resume");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "test --locked"
+        );
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn cargo_root_shim_preserves_cargo_owned_build_script_semantics() {
+        let run_root = unique_temp_dir("loop-worker-env-cargo-semantics");
+        let project_root = run_root.join("project");
+        let source_root = project_root.join("src");
+        fs::create_dir_all(&source_root).expect("failed to create test project");
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"cargo-env-semantics\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("failed to write test manifest");
+        fs::write(
+            project_root.join("build.rs"),
+            "fn main() { println!(\"cargo:rustc-env=BUILD_SCRIPT_CARGO={}\", std::env::var(\"CARGO\").unwrap()); }\n",
+        )
+        .expect("failed to write build script");
+        fs::write(
+            source_root.join("main.rs"),
+            "fn main() { println!(\"{}\", env!(\"BUILD_SCRIPT_CARGO\")); }\n",
+        )
+        .expect("failed to write test program");
+
+        let mut worker_env = vec![("CARGO".to_string(), "/inherited/real/cargo".to_string())];
+        install_parallel_worker_cargo_lease(&mut worker_env, &run_root)
+            .expect("cargo lease should install");
+        let env_value = |key: &str| {
+            worker_env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        let guard_path = PathBuf::from(env_value("CARGO"));
+        assert_eq!(
+            guard_path,
+            run_root.join(WORKER_GIT_GUARD_DIR).join("cargo")
+        );
+
+        let output = Command::new(&guard_path)
+            .arg("run")
+            .arg("--quiet")
+            .arg("--manifest-path")
+            .arg(project_root.join("Cargo.toml"))
+            .envs(worker_env.iter().map(|(key, value)| (key, value)))
+            .env(
+                WORKER_LANE_CARGO_LEASE_ENV,
+                run_root.join("cargo-semantics-lane.lock"),
+            )
+            .env("CARGO_TARGET_DIR", run_root.join("cargo-target"))
+            .output()
+            .expect("guarded Cargo should run the test project");
+        assert!(
+            output.status.success(),
+            "guarded Cargo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let build_script_cargo = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        assert!(build_script_cargo.is_absolute());
+        assert_ne!(
+            build_script_cargo, guard_path,
+            "Cargo must retain ownership of CARGO inside build scripts"
+        );
+        let version = Command::new(&build_script_cargo)
+            .arg("--version")
+            .output()
+            .expect("build-script CARGO should be executable");
+        assert!(version.status.success());
+
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[tokio::test]
     async fn canonical_validation_waits_for_running_lane_cargo_to_drain() {
         let run_root = unique_temp_dir("loop-worker-env-cargo-drain");
         fs::create_dir_all(&run_root).expect("failed to create run root");
@@ -834,7 +965,7 @@ mod tests {
         fs::create_dir_all(lane_lease.parent().expect("lane lease parent"))
             .expect("create lane root");
 
-        let mut first = cargo_guard_test_command(
+        let mut first_command = cargo_guard_test_command(
             &guard_path,
             &fake_cargo,
             &run_root,
@@ -842,12 +973,11 @@ mod tests {
             &started,
             &release,
             "first",
-        )
-        .spawn()
-        .expect("first cargo guard should start");
+        );
+        let mut first = spawn_retrying_etxtbsy(&mut first_command, "first cargo guard");
         wait_for_test_path(&started.join("first"));
 
-        let mut second = cargo_guard_test_command(
+        let mut second_command = cargo_guard_test_command(
             &guard_path,
             &fake_cargo,
             &run_root,
@@ -855,9 +985,8 @@ mod tests {
             &started,
             &release,
             "second",
-        )
-        .spawn()
-        .expect("second cargo guard should start");
+        );
+        let mut second = spawn_retrying_etxtbsy(&mut second_command, "second cargo guard");
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !started.join("second").exists(),
@@ -894,7 +1023,7 @@ mod tests {
         fs::create_dir_all(run_root.join("lanes/lane-1")).expect("create lane one root");
         fs::create_dir_all(run_root.join("lanes/lane-2")).expect("create lane two root");
 
-        let mut first = cargo_guard_test_command(
+        let mut first_command = cargo_guard_test_command(
             &guard_path,
             &fake_cargo,
             &run_root,
@@ -902,10 +1031,9 @@ mod tests {
             &started,
             &release,
             "first",
-        )
-        .spawn()
-        .expect("first lane cargo should start");
-        let mut second = cargo_guard_test_command(
+        );
+        let mut first = spawn_retrying_etxtbsy(&mut first_command, "first lane cargo");
+        let mut second_command = cargo_guard_test_command(
             &guard_path,
             &fake_cargo,
             &run_root,
@@ -913,9 +1041,8 @@ mod tests {
             &started,
             &release,
             "second",
-        )
-        .spawn()
-        .expect("second lane cargo should start");
+        );
+        let mut second = spawn_retrying_etxtbsy(&mut second_command, "second lane cargo");
         wait_for_test_path(&started.join("first"));
         wait_for_test_path(&started.join("second"));
 
@@ -947,6 +1074,19 @@ mod tests {
             .env("AUTO_TEST_RELEASE", release)
             .env("AUTO_TEST_ID", id);
         command
+    }
+
+    fn spawn_retrying_etxtbsy(command: &mut Command, description: &str) -> std::process::Child {
+        for attempt in 0..20 {
+            match command.spawn() {
+                Ok(child) => return child,
+                Err(err) if err.raw_os_error() == Some(26) && attempt < 19 => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("{description} should start: {err}"),
+            }
+        }
+        unreachable!("bounded spawn retry must return or panic")
     }
 
     fn wait_for_test_path(path: &Path) {
