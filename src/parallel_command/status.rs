@@ -38,6 +38,7 @@ struct LaneHostPendingStatusMarker {
 struct LaneStatusRecord {
     lane: usize,
     task_id: String,
+    idle: bool,
     running: bool,
     stale: bool,
     pid_state: String,
@@ -209,12 +210,12 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_else(|| "[unknown]".to_string());
-        // tmux provisions every configured lane up front by creating its
-        // directory and two empty log files. A lane receives task/run metadata
-        // only when work is assigned, so an untouched placeholder is idle
-        // capacity, not debris from a previous run.
-        let stale = lane_is_from_previous_run(&run_root, &lane_root)
-            && !lane_is_unassigned_placeholder(&lane_root);
+        // Assigned lanes carry a run id. Unassigned lanes instead carry a
+        // host heartbeat, while an untouched empty placeholder can exist in
+        // the narrow startup window before that first heartbeat. Anything
+        // ambiguous fails closed as stale rather than masquerading as idle.
+        let idle = lane_is_current_idle_capacity(&run_root, &lane_root, !no_live_parallel_host);
+        let stale = lane_is_from_previous_run(&run_root, &lane_root) && !idle;
         let lane_repo_root = lane_root.join("repo");
         let (worker_running, pid_state) = lane_worker_status(&lane_root, &lane_repo_root)
             .unwrap_or_else(|err| {
@@ -248,6 +249,7 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         lane_records.push(LaneStatusRecord {
             lane: lane_index,
             task_id: stored_task_id.clone(),
+            idle,
             running: worker_running && !stale,
             stale,
             pid_state: pid_state.clone(),
@@ -415,19 +417,85 @@ fn parallel_status_binary_provenance(
     (host_binary, revision_match)
 }
 
-fn lane_is_unassigned_placeholder(lane_root: &Path) -> bool {
+fn lane_is_current_idle_capacity(
+    run_root: &Path,
+    lane_root: &Path,
+    live_parallel_host: bool,
+) -> bool {
+    if !lane_has_only_idle_artifacts(lane_root) {
+        return false;
+    }
+    let current_run_id = current_parallel_run_id(run_root);
+    match (current_run_id.as_deref(), lane_run_id(lane_root).as_deref()) {
+        (Some(current), Some(lane)) => return current == lane,
+        // An explicit old identity is never a startup placeholder.
+        (None, Some(_)) => return false,
+        (_, None) => {}
+    }
+    // tmux creates empty log placeholders before the host can stamp them.
+    // Only that exact empty shape is trusted without a matching run id.
+    let logs_empty = ["stdout.log", "stderr.log"].iter().all(|name| {
+        let path = lane_root.join(name);
+        !path.exists()
+            || path
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+    });
+    if logs_empty {
+        return true;
+    }
+    live_parallel_host && idle_heartbeat_is_from_current_run(run_root, lane_root)
+}
+
+fn lane_has_only_idle_artifacts(lane_root: &Path) -> bool {
+    let Ok(root_metadata) = fs::symlink_metadata(lane_root) else {
+        return false;
+    };
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return false;
+    }
     let Ok(entries) = fs::read_dir(lane_root) else {
         return false;
     };
-    entries.filter_map(|entry| entry.ok()).all(|entry| {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
         let name = entry.file_name();
-        if name != "stdout.log" && name != "stderr.log" {
+        if name != "stdout.log" && name != "stderr.log" && name != LANE_RUN_ID_FILE {
             return false;
         }
-        entry
-            .metadata()
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
-    })
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn idle_heartbeat_is_from_current_run(run_root: &Path, lane_root: &Path) -> bool {
+    let Ok(run_started) = run_root
+        .join(CURRENT_RUN_ID_FILE)
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    let stdout_path = lane_root.join("stdout.log");
+    let Ok(heartbeat_modified) = stdout_path
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    if heartbeat_modified < run_started {
+        return false;
+    }
+    read_last_nonempty_line(&stdout_path)
+        .ok()
+        .flatten()
+        .is_some_and(|line| {
+            line.starts_with("[auto parallel host lane-") && line.contains("] idle:")
+        })
 }
 
 fn current_lane_host_pending_task_id(
@@ -987,6 +1055,71 @@ mod tests {
 
         assert_eq!(host_binary, None);
         assert_eq!(revision_match, None);
+        fs::remove_dir_all(run_root).expect("cleanup run root");
+    }
+
+    #[test]
+    fn live_current_run_heartbeat_identifies_unstamped_idle_capacity() {
+        let run_root = unique_temp_dir("parallel-status-live-idle-heartbeat");
+        let lane_root = run_root.join("lanes/lane-2");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "current-run\n")
+            .expect("write current run id");
+        fs::write(
+            lane_root.join("stdout.log"),
+            "[auto parallel host lane-2 [idle]] idle: waiting on dependencies\n",
+        )
+        .expect("write current idle heartbeat");
+        fs::write(lane_root.join("stderr.log"), "").expect("write stderr log");
+
+        assert!(super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, true
+        ));
+        assert!(!super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, false
+        ));
+        fs::remove_dir_all(run_root).expect("cleanup run root");
+    }
+
+    #[test]
+    fn explicit_previous_run_identity_is_never_idle_even_with_empty_logs() {
+        let run_root = unique_temp_dir("parallel-status-old-empty-idle");
+        let lane_root = run_root.join("lanes/lane-3");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "current-run\n")
+            .expect("write current run id");
+        fs::write(lane_root.join(LANE_RUN_ID_FILE), "previous-run\n")
+            .expect("write previous lane run id");
+        fs::write(lane_root.join("stdout.log"), "").expect("write stdout log");
+        fs::write(lane_root.join("stderr.log"), "").expect("write stderr log");
+
+        assert!(!super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, true
+        ));
+        fs::remove_dir_all(run_root).expect("cleanup run root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_capacity_rejects_symlinked_log_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let run_root = unique_temp_dir("parallel-status-idle-log-symlink");
+        let lane_root = run_root.join("lanes/lane-4");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "current-run\n")
+            .expect("write current run id");
+        let outside = run_root.join("outside.log");
+        fs::write(
+            &outside,
+            "[auto parallel host lane-4 [idle]] idle: forged\n",
+        )
+        .expect("write outside log");
+        symlink(&outside, lane_root.join("stdout.log")).expect("symlink stdout log");
+
+        assert!(!super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, true
+        ));
         fs::remove_dir_all(run_root).expect("cleanup run root");
     }
 

@@ -234,6 +234,7 @@ fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
         .find(|lane| lane["lane"] == 4)
         .expect("unused lane record");
     assert_eq!(unused["task_id"], "[unknown]");
+    assert_eq!(unused["idle"], true);
     assert_eq!(unused["running"], false);
     assert_eq!(unused["stale"], false);
 
@@ -242,8 +243,69 @@ fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
         .find(|lane| lane["lane"] == 5)
         .expect("stale lane record");
     assert_eq!(stale["task_id"], "TASK-OLD");
+    assert_eq!(stale["idle"], false);
     assert_eq!(stale["running"], false);
     assert_eq!(stale["stale"], true);
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&run_root);
+}
+
+#[test]
+fn parallel_status_json_reports_heartbeat_lane_as_current_idle_capacity() {
+    let repo = unique_temp_dir("parallel-status-heartbeat-idle-repo");
+    let run_root = unique_temp_dir("parallel-status-heartbeat-idle-run");
+    init_git_repo(&repo);
+    fs::create_dir_all(&run_root).expect("create run root");
+    fs::write(run_root.join(".current-run-id"), "current-run\n").expect("write run id");
+
+    let idle_lane = run_root.join("lanes/lane-2");
+    fs::create_dir_all(&idle_lane).expect("create idle lane");
+    fs::write(idle_lane.join(".run-id"), "current-run\n").expect("write lane run id");
+    fs::write(
+        idle_lane.join("stdout.log"),
+        "[auto parallel host lane-2 [idle]] idle: waiting on dependencies\n",
+    )
+    .expect("write heartbeat log");
+    fs::write(idle_lane.join("stderr.log"), "").expect("write stderr log");
+
+    let old_idle_lane = run_root.join("lanes/lane-3");
+    fs::create_dir_all(&old_idle_lane).expect("create old idle lane");
+    fs::write(old_idle_lane.join(".run-id"), "previous-run\n").expect("write old run id");
+    fs::write(
+        old_idle_lane.join("stdout.log"),
+        "[auto parallel host lane-3 [idle]] idle: old heartbeat\n",
+    )
+    .expect("write old heartbeat log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("run status json");
+    assert!(output.status.success(), "status command failed");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    let lanes = report["lanes"].as_array().expect("lane records");
+    let current = lanes
+        .iter()
+        .find(|lane| lane["lane"] == 2)
+        .expect("current idle lane");
+    assert_eq!(current["task_id"], "[unknown]");
+    assert_eq!(current["idle"], true);
+    assert_eq!(current["stale"], false);
+    let old = lanes
+        .iter()
+        .find(|lane| lane["lane"] == 3)
+        .expect("old idle lane");
+    assert_eq!(old["task_id"], "[unknown]");
+    assert_eq!(old["idle"], false);
+    assert_eq!(old["stale"], true);
 
     let _ = fs::remove_dir_all(&repo);
     let _ = fs::remove_dir_all(&run_root);
