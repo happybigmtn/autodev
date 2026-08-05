@@ -220,6 +220,39 @@ pub(crate) fn ensure_host_review_handoff(
         default_review_doc()
     };
     if review_contains_task(&review_text, task_id) {
+        if unresolved_review_findings_for_task(&review_text, task_id).is_empty() {
+            return Ok(false);
+        }
+        let unresolved_items = extract_review_items(&review_text)
+            .into_iter()
+            .filter(|item| {
+                review_item_mentions_task(item, task_id) && review_item_has_unresolved_finding(item)
+            })
+            .collect::<Vec<_>>();
+        let only_repaired_host_receipt_findings = !unresolved_items.is_empty()
+            && unresolved_items.iter().all(|item| {
+                item.contains("Source: auto parallel host handoff synthesized after lane landing.")
+                    && (item.contains("stale verification receipt")
+                        || item.contains("verification receipt still missing"))
+            })
+            && evidence.verification_receipt_present
+            && evidence.verification_receipt_status.is_none()
+            && evidence.missing_completion_artifacts.is_empty()
+            && evidence.unresolved_audit_findings.is_empty();
+        if only_repaired_host_receipt_findings {
+            if !review_text.ends_with('\n') {
+                review_text.push('\n');
+            }
+            review_text.push_str(&format!(
+                "\n## `{task_id}`: host receipt evidence refreshed\n\
+- Source: auto parallel inline receipt repair at canonical HEAD.\n\
+- Validation: the required verification receipt is current and passing.\n\
+- Remaining blockers: none.\n"
+            ));
+            atomic_write(&review_path, review_text.as_bytes())
+                .with_context(|| format!("failed to write {}", review_path.display()))?;
+            return Ok(true);
+        }
         return Ok(false);
     }
 
@@ -309,10 +342,10 @@ fn review_item_mentions_task(item: &str, task_id: &str) -> bool {
 }
 
 fn review_item_clears_task(item: &str, task_id: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
     review_item_mentions_task(item, task_id)
-        && item
-            .to_ascii_lowercase()
-            .contains("auto parallel standing-review gate cleared")
+        && (lower.contains("auto parallel standing-review gate cleared")
+            || lower.contains("auto parallel inline receipt repair at canonical head"))
 }
 
 fn review_item_has_unresolved_finding(item: &str) -> bool {
@@ -968,6 +1001,49 @@ mod tests {
             &evidence
         )
         .expect("second write should be skipped"));
+    }
+
+    #[test]
+    fn ensure_host_review_handoff_clears_repaired_host_receipt_drift() {
+        let root = temp_dir("review-repaired-receipt");
+        let stale = TaskCompletionEvidence {
+            has_review_handoff: false,
+            unresolved_review_findings: Vec::new(),
+            verification_receipt_path: Some(PathBuf::from("receipt.json")),
+            verification_receipt_present: false,
+            verification_receipt_status: Some(
+                "stale verification receipt `receipt.json`: commit mismatch".to_string(),
+            ),
+            declared_completion_artifacts: Vec::new(),
+            missing_completion_artifacts: Vec::new(),
+            unresolved_audit_findings: Vec::new(),
+        };
+        assert!(
+            ensure_host_review_handoff(&root, "TASK-REPAIRED", &[], &stale)
+                .expect("stale host handoff should be written")
+        );
+
+        let fresh = TaskCompletionEvidence {
+            has_review_handoff: true,
+            unresolved_review_findings: Vec::new(),
+            verification_receipt_path: Some(PathBuf::from("receipt.json")),
+            verification_receipt_present: true,
+            verification_receipt_status: None,
+            declared_completion_artifacts: Vec::new(),
+            missing_completion_artifacts: Vec::new(),
+            unresolved_audit_findings: Vec::new(),
+        };
+        assert!(
+            ensure_host_review_handoff(&root, "TASK-REPAIRED", &[], &fresh)
+                .expect("fresh receipt should clear the stale host-only finding")
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("review should exist");
+        assert!(review.contains("host receipt evidence refreshed"));
+        assert!(super::unresolved_review_findings_for_task(&review, "TASK-REPAIRED").is_empty());
+        assert!(
+            !ensure_host_review_handoff(&root, "TASK-REPAIRED", &[], &fresh)
+                .expect("the clearance should be idempotent")
+        );
     }
 
     #[test]
