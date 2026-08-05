@@ -60,6 +60,7 @@ mod run_state;
 mod scheduling;
 mod status;
 mod tmux;
+mod validation_lease;
 mod verify_gate;
 mod worker_env;
 
@@ -78,6 +79,7 @@ pub(crate) use run_state::*;
 pub(crate) use scheduling::*;
 pub(crate) use status::*;
 pub(crate) use tmux::*;
+pub(crate) use validation_lease::*;
 pub(crate) use verify_gate::*;
 pub(crate) use worker_env::*;
 

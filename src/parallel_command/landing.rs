@@ -1806,6 +1806,24 @@ async fn apply_workspace_test_gate_mode_in_transaction(
     mode: WorkspaceGateMode,
     cargo_bin: Option<PathBuf>,
 ) -> Result<LoopTaskStatus> {
+    // Production assignments always have `<run_root>/lanes/lane-N`. Ad-hoc
+    // gate fixtures deliberately do not; use their isolated lane root only for
+    // the resource lock and let the existing baseline policy below make the
+    // intended fail-closed decision about the missing production run root.
+    let run_root = workspace_baseline_run_root(&assignment.lane_root)
+        .unwrap_or_else(|| assignment.lane_root.clone());
+    let validation_lease = acquire_exclusive_validation_lease(&run_root).await?;
+    if validation_lease.waited() >= Duration::from_secs(1) {
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            &format!(
+                "canonical-validation-lease: waited {:.1}s for lane Cargo commands to drain",
+                validation_lease.waited().as_secs_f64()
+            ),
+        );
+    }
     match mode {
         WorkspaceGateMode::Strict => {
             let probe = run_workspace_probe_in_canonical_transaction(
@@ -2102,10 +2120,12 @@ async fn run_workspace_probe_in_canonical_transaction(
 /// the first landing.
 async fn run_guarded_workspace_probe_with_cargo(
     repo_root: &Path,
+    run_root: &Path,
     task_id: &str,
     gate_label: &str,
     cargo_bin: Option<PathBuf>,
 ) -> Result<WorkspaceProbe> {
+    let _validation_lease = acquire_exclusive_validation_lease(run_root).await?;
     let transaction = arm_canonical_gate_transaction(repo_root, task_id, gate_label)?;
     let probe = run_workspace_probe_in_canonical_transaction(
         repo_root,
@@ -2155,6 +2175,7 @@ async fn maybe_capture_workspace_baseline_with_cargo(
             if drifted {
                 let probe = match run_guarded_workspace_probe_with_cargo(
                     repo_root,
+                    run_root,
                     "workspace-baseline",
                     "workspace baseline recapture",
                     cargo_bin.clone(),
@@ -2222,6 +2243,7 @@ async fn maybe_capture_workspace_baseline_with_cargo(
         .info("workspace-baseline: capturing pre-existing workspace baseline at run start (one-time; `cargo test --workspace --no-fail-fast`)...");
     let probe = match run_guarded_workspace_probe_with_cargo(
         repo_root,
+        run_root,
         "workspace-baseline",
         "workspace baseline capture",
         cargo_bin,
@@ -6774,6 +6796,7 @@ exec "$@"
 
         let result = super::run_guarded_workspace_probe_with_cargo(
             &root,
+            &root.join("run"),
             "workspace-baseline",
             "startup workspace baseline",
             Some(cargo),

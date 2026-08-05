@@ -3,6 +3,7 @@ use super::*;
 const WORKER_GIT_GUARD_DIR: &str = "worker-bin";
 const WORKER_GIT_GUARD_BLOCKED_VERBS: [&str; 4] = ["push", "pull", "fetch", "rebase"];
 const WORKER_GIT_GUARD_PROTOCOLS: [&str; 4] = ["ssh", "https", "http", "git"];
+const WORKER_CARGO_LEASE_ENV: &str = "AUTO_PARALLEL_VALIDATION_LEASE";
 
 pub(crate) fn parallel_run_root(repo_root: &Path, args: &ParallelArgs) -> PathBuf {
     match args.run_root.as_deref() {
@@ -43,6 +44,9 @@ pub(crate) fn build_loop_worker_env(
         run_root,
     )?;
     install_parallel_worker_git_guard(&mut worker_env.extra_env, run_root)?;
+    if repo_uses_cargo(repo_root) {
+        install_parallel_worker_cargo_lease(&mut worker_env.extra_env, run_root)?;
+    }
     Ok(worker_env)
 }
 
@@ -267,6 +271,49 @@ pub(crate) fn install_parallel_worker_git_guard(
     Ok(())
 }
 
+/// Route every lane-owned Cargo process through a shared validation lease.
+///
+/// Normal lane Cargo commands may overlap one another. The host's canonical
+/// workspace probe takes the matching exclusive lease, which waits for any
+/// already-running lane Cargo commands and prevents new ones from starting
+/// until the canonical result is captured. Agent reasoning, editing, and
+/// non-Cargo checks remain parallel while the host owns the lease.
+fn install_parallel_worker_cargo_lease(
+    extra_env: &mut Vec<(String, String)>,
+    run_root: &Path,
+) -> Result<()> {
+    let guard_dir = run_root.join(WORKER_GIT_GUARD_DIR);
+    fs::create_dir_all(&guard_dir)
+        .with_context(|| format!("failed to create {}", guard_dir.display()))?;
+    let guard_path = guard_dir.join("cargo");
+    atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+        .with_context(|| format!("failed to write {}", guard_path.display()))?;
+    make_executable(&guard_path)?;
+
+    let real_cargo = resolve_real_executable_outside_run_root("cargo", run_root)
+        .context("could not resolve real cargo for the parallel validation lease")?;
+    let flock = resolve_real_executable_outside_run_root("flock", run_root)
+        .context("could not resolve flock for the parallel validation lease")?;
+    upsert_env(extra_env, "AUTO_REAL_CARGO", &real_cargo.to_string_lossy());
+    upsert_env(extra_env, "AUTO_PARALLEL_FLOCK", &flock.to_string_lossy());
+    upsert_env(
+        extra_env,
+        WORKER_CARGO_LEASE_ENV,
+        &validation_lease_path(run_root).to_string_lossy(),
+    );
+    Ok(())
+}
+
+fn worker_cargo_lease_script() -> &'static str {
+    r#"#!/bin/sh
+if [ -z "${AUTO_REAL_CARGO:-}" ] || [ -z "${AUTO_PARALLEL_FLOCK:-}" ] || [ -z "${AUTO_PARALLEL_VALIDATION_LEASE:-}" ]; then
+  echo "AUTO_ENV_BLOCKER: auto parallel cargo lease is missing required host environment" >&2
+  exit 126
+fi
+exec "$AUTO_PARALLEL_FLOCK" --shared "$AUTO_PARALLEL_VALIDATION_LEASE" "$AUTO_REAL_CARGO" "$@"
+"#
+}
+
 fn install_git_protocol_block_config(extra_env: &mut Vec<(String, String)>) {
     upsert_env(
         extra_env,
@@ -361,6 +408,20 @@ fn resolve_real_git_for_worker_guard(run_root: &Path) -> Option<PathBuf> {
     None
 }
 
+fn resolve_real_executable_outside_run_root(name: &str, run_root: &Path) -> Option<PathBuf> {
+    let path_env = env::var_os("PATH")?;
+    for path_dir in env::split_paths(&path_env) {
+        let candidate = path_dir.join(name);
+        if candidate.starts_with(run_root) {
+            continue;
+        }
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -390,7 +451,9 @@ pub(crate) fn default_cargo_build_jobs_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_executable, worker_git_guard_script, WORKER_GIT_GUARD_DIR};
+    use super::{
+        make_executable, worker_cargo_lease_script, worker_git_guard_script, WORKER_GIT_GUARD_DIR,
+    };
     use crate::parallel_command::*;
     use crate::util::output_retrying_etxtbsy;
     use std::time::UNIX_EPOCH;
@@ -552,6 +615,8 @@ mod tests {
         let repo_root = unique_temp_dir("loop-worker-env-git-guard-repo");
         let run_root = unique_temp_dir("loop-worker-env-git-guard-run");
         fs::create_dir_all(&repo_root).expect("failed to create repo root");
+        fs::write(repo_root.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("failed to write Cargo manifest");
         fs::create_dir_all(&run_root).expect("failed to create run root");
         let args = ParallelArgs {
             action: None,
@@ -579,6 +644,7 @@ mod tests {
         let guard_dir = run_root.join(WORKER_GIT_GUARD_DIR);
         let guard_path = guard_dir.join("git");
         assert!(guard_path.exists(), "missing {}", guard_path.display());
+        assert!(guard_dir.join("cargo").exists(), "missing cargo lease shim");
         assert_eq!(
             env.extra_env
                 .iter()
@@ -602,6 +668,14 @@ mod tests {
             .extra_env
             .iter()
             .any(|(key, value)| { key == "GIT_CONFIG_KEY_0" && value == "protocol.ssh.allow" }));
+        assert!(env.extra_env.iter().any(|(key, value)| {
+            key == "AUTO_PARALLEL_VALIDATION_LEASE"
+                && value == &validation_lease_path(&run_root).to_string_lossy()
+        }));
+        assert!(env
+            .extra_env
+            .iter()
+            .any(|(key, value)| key == "AUTO_REAL_CARGO" && Path::new(value).is_absolute()));
 
         fs::remove_dir_all(&repo_root).expect("failed to remove repo root");
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
@@ -636,6 +710,91 @@ mod tests {
         assert!(allowed.status.success());
         assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "status");
 
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[tokio::test]
+    async fn cargo_guard_waits_while_canonical_validation_owns_exclusive_lease() {
+        let run_root = unique_temp_dir("loop-worker-env-cargo-lease");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("cargo");
+        atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+            .expect("failed to write cargo guard");
+        make_executable(&guard_path).expect("failed to chmod cargo guard");
+
+        let lease = acquire_exclusive_validation_lease(&run_root)
+            .await
+            .expect("canonical lease should lock");
+        let mut worker = Command::new(&guard_path)
+            .arg("test")
+            .env("AUTO_REAL_CARGO", "/bin/echo")
+            .env("AUTO_PARALLEL_FLOCK", "/usr/bin/flock")
+            .env(
+                "AUTO_PARALLEL_VALIDATION_LEASE",
+                validation_lease_path(&run_root),
+            )
+            .spawn()
+            .expect("cargo guard should start");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            worker.try_wait().expect("inspect cargo guard").is_none(),
+            "lane cargo must wait while canonical validation owns the lease"
+        );
+
+        drop(lease);
+        let output = worker
+            .wait_with_output()
+            .expect("cargo guard should resume");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "test");
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[tokio::test]
+    async fn canonical_validation_waits_for_running_lane_cargo_to_drain() {
+        let run_root = unique_temp_dir("loop-worker-env-cargo-drain");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("cargo");
+        atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+            .expect("failed to write cargo guard");
+        make_executable(&guard_path).expect("failed to chmod cargo guard");
+        let fake_cargo = run_root.join("fake-real-cargo");
+        atomic_write(
+            &fake_cargo,
+            b"#!/bin/sh\nprintf started > \"$AUTO_TEST_CARGO_MARKER\"\nsleep 0.3\n",
+        )
+        .expect("failed to write fake cargo");
+        make_executable(&fake_cargo).expect("failed to chmod fake cargo");
+        let marker = run_root.join("cargo-started");
+
+        let mut worker = Command::new(&guard_path)
+            .env("AUTO_REAL_CARGO", &fake_cargo)
+            .env("AUTO_PARALLEL_FLOCK", "/usr/bin/flock")
+            .env(
+                "AUTO_PARALLEL_VALIDATION_LEASE",
+                validation_lease_path(&run_root),
+            )
+            .env("AUTO_TEST_CARGO_MARKER", &marker)
+            .spawn()
+            .expect("cargo guard should start");
+        for _ in 0..50 {
+            if marker.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.is_file(), "fake lane cargo never started");
+
+        let started = Instant::now();
+        let lease = acquire_exclusive_validation_lease(&run_root)
+            .await
+            .expect("canonical lease should wait then lock");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "canonical validation must wait for an existing lane cargo command"
+        );
+        drop(lease);
+        assert!(worker.wait().expect("fake cargo should exit").success());
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
 
