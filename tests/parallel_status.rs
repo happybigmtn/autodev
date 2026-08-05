@@ -105,6 +105,60 @@ fn parallel_status_reports_stale_lane_recovery_without_live_host() {
     let _ = fs::remove_dir_all(&run_root);
 }
 
+#[test]
+fn parallel_status_json_reports_canonical_gate_as_staged_active_work() {
+    let repo = unique_temp_dir("parallel-status-canonical-gate-repo");
+    let run_root = unique_temp_dir("parallel-status-canonical-gate-run");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("IMPLEMENTATION_PLAN.md"),
+        "# IMPLEMENTATION_PLAN\n\n- [x] `TASK-GATE` Candidate awaiting closeout\nDependencies: none\n",
+    )
+    .expect("write plan");
+    run_git(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+    run_git(&repo, ["commit", "-m", "add plan"]);
+    let head = git_output(&repo, ["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join(".git/auto-review-input-quarantine.json"),
+        format!(
+            r#"{{"version":1,"phase":"in_progress","scope":"canonical_source","task_id":"TASK-GATE","gate_label":"definition-of-done","reviewed_head":"{head}","reviewed_path_states":{{"/private/path":["secret"]}},"reason":"private"}}"#
+        ),
+    )
+    .expect("write gate marker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run auto parallel status --json");
+    assert!(
+        output.status.success(),
+        "status command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status json");
+    assert_eq!(report["canonical_gate"]["task_id"], "TASK-GATE");
+    assert_eq!(report["staged_task_ids"], serde_json::json!(["TASK-GATE"]));
+    assert_eq!(report["active_task_ids"], serde_json::json!(["TASK-GATE"]));
+    assert!(report["safety_verdict"]
+        .as_str()
+        .expect("safety verdict")
+        .starts_with("MONITOR:"));
+    let serialized = serde_json::to_string(&report).expect("serialize report");
+    assert!(!serialized.contains("/private/path"));
+    assert!(!serialized.contains("secret"));
+    assert!(!serialized.contains("reason"));
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&run_root);
+}
+
 fn init_git_repo(path: &Path) {
     fs::create_dir_all(path).expect("failed to create repo dir");
     run_git(path, ["init", "-q"]);
@@ -128,6 +182,24 @@ fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
         "git command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_output<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        output.status.success(),
+        "git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output utf-8")
+        .trim()
+        .to_string()
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

@@ -1,6 +1,28 @@
 use super::*;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+const CANONICAL_GATE_MARKER_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CanonicalGateStatus {
+    phase: String,
+    scope: String,
+    task_id: String,
+    gate_label: Option<String>,
+    reviewed_head: String,
+}
+
+#[derive(Deserialize)]
+struct CanonicalGateMarker {
+    version: u32,
+    phase: String,
+    scope: String,
+    task_id: String,
+    #[serde(default)]
+    gate_label: Option<String>,
+    reviewed_head: String,
+}
 
 #[derive(Serialize)]
 struct LaneStatusRecord {
@@ -21,6 +43,8 @@ struct ParallelStatusReport {
     tmux_running: bool,
     host_pids: Vec<String>,
     lanes: Vec<LaneStatusRecord>,
+    canonical_gate: Option<CanonicalGateStatus>,
+    staged_task_ids: Vec<String>,
     active_task_ids: Vec<String>,
     frontier: Option<String>,
     safety_verdict: Option<String>,
@@ -121,9 +145,26 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
     let recent_host_warnings = recent_parallel_host_warnings(&run_root, 200);
     let receipt_drift = receipt_drift_status_summary(&repo_root);
     let stop_state = last_parallel_stop_state(&run_root);
+    let canonical_gate = current_canonical_gate_status(&repo_root);
     let mut active_recovery_lanes = Vec::new();
     let mut stale_recovery_lanes = Vec::new();
     let mut active_task_ids = BTreeSet::new();
+    let staged_task_ids = canonical_gate
+        .iter()
+        .map(|gate| gate.task_id.clone())
+        .collect::<Vec<_>>();
+    active_task_ids.extend(staged_task_ids.iter().cloned());
+
+    if !json {
+        if let Some(gate) = &canonical_gate {
+            println!(
+                "canonical gate: {} | {} | {}",
+                gate.task_id,
+                gate.gate_label.as_deref().unwrap_or("unspecified"),
+                gate.phase
+            );
+        }
+    }
 
     if !json {
         println!("lanes:");
@@ -274,6 +315,8 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             tmux_running,
             host_pids: host_processes,
             lanes: lane_records,
+            canonical_gate,
+            staged_task_ids,
             active_task_ids: active_task_ids.into_iter().collect(),
             frontier: report_frontier,
             safety_verdict: report_verdict,
@@ -287,6 +330,71 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn canonical_gate_marker_paths(repo_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = git_path(repo_root, "auto-review-input-quarantine.json") {
+        paths.push(path);
+    }
+    paths.push(repo_root.join(".auto/parallel/review-input-quarantine.json"));
+    paths.push(repo_root.join(".auto-review-input-quarantine.json"));
+    paths
+}
+
+fn safe_status_identifier(value: &str, max_len: usize, allow_space: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | ':')
+                || (allow_space && character == ' ')
+        })
+}
+
+fn current_canonical_gate_status(repo_root: &Path) -> Option<CanonicalGateStatus> {
+    let current_head = git_stdout(repo_root, ["rev-parse", "--verify", "HEAD"])
+        .ok()?
+        .trim()
+        .to_string();
+    for path in canonical_gate_marker_paths(repo_root) {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        let marker: CanonicalGateMarker = match serde_json::from_slice(&bytes) {
+            Ok(marker) => marker,
+            Err(_) => continue,
+        };
+        let gate_label_is_safe = marker
+            .gate_label
+            .as_deref()
+            .is_none_or(|label| safe_status_identifier(label, 128, true));
+        let head_is_safe = matches!(marker.reviewed_head.len(), 40 | 64)
+            && marker
+                .reviewed_head
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        if marker.version != CANONICAL_GATE_MARKER_VERSION
+            || marker.phase != "in_progress"
+            || !matches!(marker.scope.as_str(), "canonical_source" | "canonical_full")
+            || !safe_status_identifier(&marker.task_id, 256, false)
+            || !gate_label_is_safe
+            || !head_is_safe
+            || marker.reviewed_head != current_head
+        {
+            continue;
+        }
+        return Some(CanonicalGateStatus {
+            phase: marker.phase,
+            scope: marker.scope,
+            task_id: marker.task_id,
+            gate_label: marker.gate_label,
+            reviewed_head: marker.reviewed_head,
+        });
+    }
+    None
 }
 
 pub(crate) fn parallel_status_safety_verdict(
@@ -691,6 +799,110 @@ mod tests {
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
     }
 
+    fn init_status_repo(label: &str) -> (PathBuf, String) {
+        let repo = unique_temp_dir(label);
+        fs::create_dir_all(&repo).expect("create status repo");
+        run_git(&repo, ["init", "-q", "-b", "main"]).expect("init status repo");
+        run_git(&repo, ["config", "user.name", "autodev tests"]).expect("set git name");
+        run_git(&repo, ["config", "user.email", "autodev@example.com"]).expect("set git email");
+        fs::write(repo.join("source.txt"), "seed\n").expect("write source");
+        run_git(&repo, ["add", "source.txt"]).expect("stage source");
+        run_git(&repo, ["commit", "-q", "-m", "seed"]).expect("commit source");
+        let head = git_stdout(&repo, ["rev-parse", "HEAD"])
+            .expect("read head")
+            .trim()
+            .to_string();
+        (repo, head)
+    }
+
+    fn write_canonical_gate_marker(repo: &Path, json: &str) {
+        let marker = git_path(repo, "auto-review-input-quarantine.json")
+            .expect("resolve canonical gate marker");
+        fs::write(marker, json).expect("write canonical gate marker");
+    }
+
+    #[test]
+    fn canonical_gate_status_reads_current_marker_without_leaking_internal_paths() {
+        let (repo, head) = init_status_repo("parallel-status-canonical-gate");
+        write_canonical_gate_marker(
+            &repo,
+            &format!(
+                r#"{{
+  "version": 1,
+  "phase": "in_progress",
+  "scope": "canonical_source",
+  "task_id": "TASK-1",
+  "gate_label": "definition-of-done",
+  "reviewed_head": "{head}",
+  "reviewed_path_states": {{"/unsafe/private/path": ["secret-state"]}},
+  "reason": "private reason"
+}}"#
+            ),
+        );
+
+        let gate = super::current_canonical_gate_status(&repo).expect("current gate");
+        assert_eq!(gate.task_id, "TASK-1");
+        assert_eq!(gate.gate_label.as_deref(), Some("definition-of-done"));
+        assert_eq!(gate.reviewed_head, head);
+        let serialized = serde_json::to_string(&gate).expect("serialize sanitized gate");
+        assert!(!serialized.contains("unsafe"));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("reason"));
+        assert!(!serialized.contains("path_states"));
+
+        fs::remove_dir_all(&repo).expect("remove status repo");
+    }
+
+    #[test]
+    fn canonical_gate_status_ignores_absent_malformed_and_stale_markers() {
+        let (repo, head) = init_status_repo("parallel-status-invalid-canonical-gate");
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        write_canonical_gate_marker(&repo, "{not json");
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        write_canonical_gate_marker(
+            &repo,
+            &format!(
+                r#"{{"version":1,"phase":"in_progress","scope":"canonical_source","task_id":"TASK-1","gate_label":"definition-of-done","reviewed_head":"{}"}}"#,
+                "0".repeat(head.len())
+            ),
+        );
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        write_canonical_gate_marker(
+            &repo,
+            &format!(
+                r#"{{"version":1,"phase":"mutation","scope":"canonical_source","task_id":"TASK-1","gate_label":"definition-of-done","reviewed_head":"{head}"}}"#
+            ),
+        );
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        fs::remove_dir_all(&repo).expect("remove status repo");
+    }
+
+    #[test]
+    fn canonical_gate_status_rejects_unsafe_identifiers() {
+        let (repo, head) = init_status_repo("parallel-status-unsafe-canonical-gate");
+        write_canonical_gate_marker(
+            &repo,
+            &format!(
+                r#"{{"version":1,"phase":"in_progress","scope":"canonical_source","task_id":"../../private","gate_label":"definition-of-done","reviewed_head":"{head}"}}"#
+            ),
+        );
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        write_canonical_gate_marker(
+            &repo,
+            &format!(
+                r#"{{"version":1,"phase":"in_progress","scope":"canonical_source","task_id":"TASK-1","gate_label":"/private/path","reviewed_head":"{head}"}}"#
+            ),
+        );
+        assert_eq!(super::current_canonical_gate_status(&repo), None);
+
+        fs::remove_dir_all(&repo).expect("remove status repo");
+    }
+
     #[test]
     fn tmux_status_worker_detection_ignores_parked_shells() {
         assert!(tmux_status_line_has_live_worker("0:host:dead=0:cmd=auto"));
@@ -859,5 +1071,19 @@ mod tests {
             &[],
         );
         assert!(stop.starts_with("STOP:"), "{stop}");
+
+        let monitor = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::from(["TASK-1".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            monitor, "MONITOR: live lane work in progress for TASK-1",
+            "a host-owned canonical gate is active work even after its lane worker exits"
+        );
     }
 }
