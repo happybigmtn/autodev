@@ -3,7 +3,12 @@ use super::*;
 const WORKER_GIT_GUARD_DIR: &str = "worker-bin";
 const WORKER_GIT_GUARD_BLOCKED_VERBS: [&str; 4] = ["push", "pull", "fetch", "rebase"];
 const WORKER_GIT_GUARD_PROTOCOLS: [&str; 4] = ["ssh", "https", "http", "git"];
-const WORKER_CARGO_LEASE_ENV: &str = "AUTO_PARALLEL_VALIDATION_LEASE";
+pub(crate) const WORKER_CARGO_LEASE_ENV: &str = "AUTO_PARALLEL_VALIDATION_LEASE";
+pub(crate) const WORKER_LANE_CARGO_LEASE_ENV: &str = "AUTO_PARALLEL_LANE_CARGO_LEASE";
+
+pub(crate) fn lane_cargo_lease_path(lane_root: &Path) -> PathBuf {
+    lane_root.join("cargo-resource.lock")
+}
 
 pub(crate) fn parallel_run_root(repo_root: &Path, args: &ParallelArgs) -> PathBuf {
     match args.run_root.as_deref() {
@@ -273,11 +278,12 @@ pub(crate) fn install_parallel_worker_git_guard(
 
 /// Route every lane-owned Cargo process through a shared validation lease.
 ///
-/// Normal lane Cargo commands may overlap one another. The host's canonical
-/// workspace probe takes the matching exclusive lease, which waits for any
-/// already-running lane Cargo commands and prevents new ones from starting
-/// until the canonical result is captured. Agent reasoning, editing, and
-/// non-Cargo checks remain parallel while the host owns the lease.
+/// Cargo commands from different lanes may overlap one another. Each lane is
+/// serialized before taking the shared global lease, so duplicate commands in
+/// one lane do not contend on that lane's target artifacts or hold the global
+/// lease while waiting. The host's canonical workspace probe takes the global
+/// exclusive lease. Agent reasoning, editing, and non-Cargo checks remain
+/// parallel while either lease is held.
 fn install_parallel_worker_cargo_lease(
     extra_env: &mut Vec<(String, String)>,
     run_root: &Path,
@@ -306,11 +312,11 @@ fn install_parallel_worker_cargo_lease(
 
 fn worker_cargo_lease_script() -> &'static str {
     r#"#!/bin/sh
-if [ -z "${AUTO_REAL_CARGO:-}" ] || [ -z "${AUTO_PARALLEL_FLOCK:-}" ] || [ -z "${AUTO_PARALLEL_VALIDATION_LEASE:-}" ]; then
+if [ -z "${AUTO_REAL_CARGO:-}" ] || [ -z "${AUTO_PARALLEL_FLOCK:-}" ] || [ -z "${AUTO_PARALLEL_VALIDATION_LEASE:-}" ] || [ -z "${AUTO_PARALLEL_LANE_CARGO_LEASE:-}" ]; then
   echo "AUTO_ENV_BLOCKER: auto parallel cargo lease is missing required host environment" >&2
   exit 126
 fi
-exec "$AUTO_PARALLEL_FLOCK" --shared "$AUTO_PARALLEL_VALIDATION_LEASE" "$AUTO_REAL_CARGO" "$@"
+exec "$AUTO_PARALLEL_FLOCK" --exclusive "$AUTO_PARALLEL_LANE_CARGO_LEASE" "$AUTO_PARALLEL_FLOCK" --shared "$AUTO_PARALLEL_VALIDATION_LEASE" "$AUTO_REAL_CARGO" "$@"
 "#
 }
 
@@ -734,6 +740,10 @@ mod tests {
                 "AUTO_PARALLEL_VALIDATION_LEASE",
                 validation_lease_path(&run_root),
             )
+            .env(
+                WORKER_LANE_CARGO_LEASE_ENV,
+                run_root.join("lane-1-cargo.lock"),
+            )
             .spawn()
             .expect("cargo guard should start");
         std::thread::sleep(Duration::from_millis(100));
@@ -775,6 +785,10 @@ mod tests {
                 "AUTO_PARALLEL_VALIDATION_LEASE",
                 validation_lease_path(&run_root),
             )
+            .env(
+                WORKER_LANE_CARGO_LEASE_ENV,
+                run_root.join("lane-1-cargo.lock"),
+            )
             .env("AUTO_TEST_CARGO_MARKER", &marker)
             .spawn()
             .expect("cargo guard should start");
@@ -797,6 +811,152 @@ mod tests {
         drop(lease);
         assert!(worker.wait().expect("fake cargo should exit").success());
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn cargo_guard_serializes_concurrent_commands_from_the_same_lane() {
+        let run_root = unique_temp_dir("loop-worker-env-cargo-same-lane");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("cargo");
+        atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+            .expect("failed to write cargo guard");
+        make_executable(&guard_path).expect("failed to chmod cargo guard");
+        let fake_cargo = run_root.join("fake-real-cargo");
+        atomic_write(
+            &fake_cargo,
+            b"#!/bin/sh\nmkdir -p \"$AUTO_TEST_STARTED\"\ntouch \"$AUTO_TEST_STARTED/$AUTO_TEST_ID\"\nwhile [ ! -e \"$AUTO_TEST_RELEASE\" ]; do sleep 0.01; done\n",
+        )
+        .expect("failed to write fake cargo");
+        make_executable(&fake_cargo).expect("failed to chmod fake cargo");
+        let started = run_root.join("started");
+        let release = run_root.join("release");
+        let lane_lease = lane_cargo_lease_path(&run_root.join("lanes/lane-1"));
+        fs::create_dir_all(lane_lease.parent().expect("lane lease parent"))
+            .expect("create lane root");
+
+        let mut first = cargo_guard_test_command(
+            &guard_path,
+            &fake_cargo,
+            &run_root,
+            &lane_lease,
+            &started,
+            &release,
+            "first",
+        )
+        .spawn()
+        .expect("first cargo guard should start");
+        wait_for_test_path(&started.join("first"));
+
+        let mut second = cargo_guard_test_command(
+            &guard_path,
+            &fake_cargo,
+            &run_root,
+            &lane_lease,
+            &started,
+            &release,
+            "second",
+        )
+        .spawn()
+        .expect("second cargo guard should start");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !started.join("second").exists(),
+            "same-lane Cargo must wait outside the real Cargo process"
+        );
+
+        fs::write(&release, "go\n").expect("release fake cargo");
+        assert!(first.wait().expect("first cargo should exit").success());
+        assert!(second.wait().expect("second cargo should exit").success());
+        assert!(
+            started.join("second").exists(),
+            "queued same-lane Cargo must run after its predecessor"
+        );
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn cargo_guard_keeps_different_lanes_concurrent() {
+        let run_root = unique_temp_dir("loop-worker-env-cargo-cross-lane");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        let guard_path = run_root.join("cargo");
+        atomic_write(&guard_path, worker_cargo_lease_script().as_bytes())
+            .expect("failed to write cargo guard");
+        make_executable(&guard_path).expect("failed to chmod cargo guard");
+        let fake_cargo = run_root.join("fake-real-cargo");
+        atomic_write(
+            &fake_cargo,
+            b"#!/bin/sh\nmkdir -p \"$AUTO_TEST_STARTED\"\ntouch \"$AUTO_TEST_STARTED/$AUTO_TEST_ID\"\nwhile [ ! -e \"$AUTO_TEST_RELEASE\" ]; do sleep 0.01; done\n",
+        )
+        .expect("failed to write fake cargo");
+        make_executable(&fake_cargo).expect("failed to chmod fake cargo");
+        let started = run_root.join("started");
+        let release = run_root.join("release");
+        fs::create_dir_all(run_root.join("lanes/lane-1")).expect("create lane one root");
+        fs::create_dir_all(run_root.join("lanes/lane-2")).expect("create lane two root");
+
+        let mut first = cargo_guard_test_command(
+            &guard_path,
+            &fake_cargo,
+            &run_root,
+            &lane_cargo_lease_path(&run_root.join("lanes/lane-1")),
+            &started,
+            &release,
+            "first",
+        )
+        .spawn()
+        .expect("first lane cargo should start");
+        let mut second = cargo_guard_test_command(
+            &guard_path,
+            &fake_cargo,
+            &run_root,
+            &lane_cargo_lease_path(&run_root.join("lanes/lane-2")),
+            &started,
+            &release,
+            "second",
+        )
+        .spawn()
+        .expect("second lane cargo should start");
+        wait_for_test_path(&started.join("first"));
+        wait_for_test_path(&started.join("second"));
+
+        fs::write(&release, "go\n").expect("release fake cargo");
+        assert!(first.wait().expect("first cargo should exit").success());
+        assert!(second.wait().expect("second cargo should exit").success());
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    fn cargo_guard_test_command(
+        guard_path: &Path,
+        fake_cargo: &Path,
+        run_root: &Path,
+        lane_lease: &Path,
+        started: &Path,
+        release: &Path,
+        id: &str,
+    ) -> Command {
+        let mut command = Command::new(guard_path);
+        command
+            .env("AUTO_REAL_CARGO", fake_cargo)
+            .env("AUTO_PARALLEL_FLOCK", "/usr/bin/flock")
+            .env(
+                "AUTO_PARALLEL_VALIDATION_LEASE",
+                validation_lease_path(run_root),
+            )
+            .env(WORKER_LANE_CARGO_LEASE_ENV, lane_lease)
+            .env("AUTO_TEST_STARTED", started)
+            .env("AUTO_TEST_RELEASE", release)
+            .env("AUTO_TEST_ID", id);
+        command
+    }
+
+    fn wait_for_test_path(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
     }
 
     #[test]

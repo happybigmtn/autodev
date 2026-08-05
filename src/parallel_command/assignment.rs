@@ -342,6 +342,17 @@ impl LaneRunConfig {
 
     pub(crate) fn env_for_lane(&self, lane_root: &Path) -> Vec<(String, String)> {
         let mut extra_env = self.extra_env.clone();
+        if extra_env
+            .iter()
+            .any(|(key, _)| key == WORKER_CARGO_LEASE_ENV)
+        {
+            extra_env.push((
+                WORKER_LANE_CARGO_LEASE_ENV.to_string(),
+                lane_cargo_lease_path(lane_root)
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         if self.lane_local_cargo_target {
             let target = lane_persistent_cargo_target_for(lane_root)
                 .unwrap_or_else(|| lane_root.join("cargo-target"));
@@ -1570,6 +1581,33 @@ mod tests {
             .env_for_lane(&lane_root)
             .iter()
             .all(|(key, _)| key != "CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn lane_environment_assigns_a_distinct_cargo_serialization_lease() {
+        let mut config = effort_config("high");
+        config.extra_env.push((
+            WORKER_CARGO_LEASE_ENV.to_string(),
+            "/srv/run/validation-resource.lock".to_string(),
+        ));
+        let lane_one = PathBuf::from("/srv/run/lanes/lane-1");
+        let lane_two = PathBuf::from("/srv/run/lanes/lane-2");
+        let lease_for = |lane_root: &Path| {
+            config
+                .env_for_lane(lane_root)
+                .into_iter()
+                .find(|(key, _)| key == WORKER_LANE_CARGO_LEASE_ENV)
+                .map(|(_, value)| value)
+                .expect("Cargo-enabled lane must receive a serialization lease")
+        };
+        assert_eq!(
+            lease_for(&lane_one),
+            "/srv/run/lanes/lane-1/cargo-resource.lock"
+        );
+        assert_eq!(
+            lease_for(&lane_two),
+            "/srv/run/lanes/lane-2/cargo-resource.lock"
+        );
     }
 
     fn sample_worker_metadata() -> LaneWorkerMetadata {
