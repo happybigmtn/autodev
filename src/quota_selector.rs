@@ -42,26 +42,42 @@ impl std::error::Error for AllAccountsInvalid {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PoolFingerprint([u8; 32]);
 
+enum PoolEvaluation {
+    Evaluating(tokio::sync::watch::Sender<PoolEvaluationResult>),
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolEvaluationResult {
+    Pending,
+    Invalid,
+    RetryIndependently,
+}
+
+struct ProviderPoolState {
+    fingerprint: PoolFingerprint,
+    evaluation: PoolEvaluation,
+}
+
 #[derive(Default)]
 struct InvalidPoolCache {
-    claude: Option<PoolFingerprint>,
-    codex: Option<PoolFingerprint>,
+    claude: Option<ProviderPoolState>,
+    codex: Option<ProviderPoolState>,
 }
 
 impl InvalidPoolCache {
-    fn get(&self, provider: Provider) -> Option<PoolFingerprint> {
+    fn get_mut(&mut self, provider: Provider) -> &mut Option<ProviderPoolState> {
         match provider {
-            Provider::Claude => self.claude,
-            Provider::Codex => self.codex,
+            Provider::Claude => &mut self.claude,
+            Provider::Codex => &mut self.codex,
         }
     }
+}
 
-    fn set(&mut self, provider: Provider, fingerprint: Option<PoolFingerprint>) {
-        match provider {
-            Provider::Claude => self.claude = fingerprint,
-            Provider::Codex => self.codex = fingerprint,
-        }
-    }
+enum PoolEvaluationAction {
+    Evaluate,
+    Wait(tokio::sync::watch::Receiver<PoolEvaluationResult>),
+    UseCachedInvalid,
 }
 
 fn invalid_pool_cache() -> &'static Mutex<InvalidPoolCache> {
@@ -136,26 +152,118 @@ fn pool_fingerprint(config: &QuotaConfig, provider: Provider) -> Result<PoolFing
     Ok(PoolFingerprint(hasher.finalize().into()))
 }
 
-fn cached_invalid_pool(provider: Provider, fingerprint: PoolFingerprint) -> bool {
-    invalid_pool_cache()
+/// Join or lead the evaluation for one provider/fingerprint. The mutex is held
+/// only while changing this tiny process-local state; live provider I/O happens
+/// after it is released, and Claude never waits on Codex (or vice versa).
+fn begin_pool_evaluation(provider: Provider, fingerprint: PoolFingerprint) -> PoolEvaluationAction {
+    let mut cache = invalid_pool_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(provider)
-        == Some(fingerprint)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = cache.get_mut(provider);
+
+    if let Some(state) = slot.as_ref() {
+        if state.fingerprint == fingerprint {
+            return match &state.evaluation {
+                PoolEvaluation::Invalid => PoolEvaluationAction::UseCachedInvalid,
+                PoolEvaluation::Evaluating(done) => PoolEvaluationAction::Wait(done.subscribe()),
+            };
+        }
+    }
+
+    // A changed config/credential fingerprint starts a new generation. Wake
+    // waiters for the superseded generation so they can recompute and join it.
+    if let Some(ProviderPoolState {
+        evaluation: PoolEvaluation::Evaluating(done),
+        ..
+    }) = slot.as_ref()
+    {
+        let _ = done.send(PoolEvaluationResult::RetryIndependently);
+    }
+    let (done, _receiver) = tokio::sync::watch::channel(PoolEvaluationResult::Pending);
+    *slot = Some(ProviderPoolState {
+        fingerprint,
+        evaluation: PoolEvaluation::Evaluating(done),
+    });
+    PoolEvaluationAction::Evaluate
 }
 
-fn remember_invalid_pool(provider: Provider, fingerprint: PoolFingerprint) {
-    invalid_pool_cache()
+/// Publish an evaluation outcome only if its fingerprint is still current.
+/// `invalid=false` removes the entry: successful/unknown pools are never cached.
+fn finish_pool_evaluation(provider: Provider, fingerprint: PoolFingerprint, invalid: bool) {
+    let mut cache = invalid_pool_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set(provider, Some(fingerprint));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = cache.get_mut(provider);
+    let Some(state) = slot.as_ref() else {
+        return;
+    };
+    if state.fingerprint != fingerprint {
+        return;
+    }
+    if let PoolEvaluation::Evaluating(done) = &state.evaluation {
+        let outcome = if invalid {
+            PoolEvaluationResult::Invalid
+        } else {
+            PoolEvaluationResult::RetryIndependently
+        };
+        let _ = done.send(outcome);
+    }
+    if invalid {
+        *slot = Some(ProviderPoolState {
+            fingerprint,
+            evaluation: PoolEvaluation::Invalid,
+        });
+    } else {
+        *slot = None;
+    }
 }
 
+/// Cancellation-safe ownership of a live pool evaluation. If the selecting
+/// future is dropped while provider I/O is pending, peers are awakened and a
+/// later caller may retry instead of waiting forever on an abandoned leader.
+struct PoolEvaluationGuard {
+    provider: Provider,
+    fingerprint: PoolFingerprint,
+    finished: bool,
+}
+
+impl PoolEvaluationGuard {
+    fn new(provider: Provider, fingerprint: PoolFingerprint) -> Self {
+        Self {
+            provider,
+            fingerprint,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, invalid: bool) {
+        finish_pool_evaluation(self.provider, self.fingerprint, invalid);
+        self.finished = true;
+    }
+}
+
+impl Drop for PoolEvaluationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            finish_pool_evaluation(self.provider, self.fingerprint, false);
+        }
+    }
+}
+
+#[cfg(test)]
 fn forget_invalid_pool(provider: Provider) {
-    invalid_pool_cache()
+    let mut cache = invalid_pool_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set(provider, None);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = cache.get_mut(provider);
+    if let Some(ProviderPoolState {
+        evaluation: PoolEvaluation::Evaluating(done),
+        ..
+    }) = slot.as_ref()
+    {
+        let _ = done.send(PoolEvaluationResult::RetryIndependently);
+    }
+    *slot = None;
 }
 
 #[derive(Debug)]
@@ -179,18 +287,51 @@ pub(crate) async fn score_accounts(
         return Ok(candidates.into_iter().map(|entry| (entry, None)).collect());
     }
 
-    let fingerprint = pool_fingerprint(config, provider)?;
-    if cached_invalid_pool(provider, fingerprint) {
-        return Err(anyhow::Error::new(AllAccountsInvalid {
-            provider,
-            cached: true,
-        }));
-    }
+    let evaluation_guard = loop {
+        let fingerprint = pool_fingerprint(config, provider)?;
+        match begin_pool_evaluation(provider, fingerprint) {
+            PoolEvaluationAction::Evaluate => {
+                break Some(PoolEvaluationGuard::new(provider, fingerprint));
+            }
+            PoolEvaluationAction::UseCachedInvalid => {
+                return Err(anyhow::Error::new(AllAccountsInvalid {
+                    provider,
+                    cached: true,
+                }));
+            }
+            PoolEvaluationAction::Wait(mut done) => {
+                if *done.borrow() == PoolEvaluationResult::Pending {
+                    let _ = done.changed().await;
+                }
+                match *done.borrow() {
+                    PoolEvaluationResult::Invalid => {
+                        return Err(anyhow::Error::new(AllAccountsInvalid {
+                            provider,
+                            cached: true,
+                        }));
+                    }
+                    PoolEvaluationResult::RetryIndependently => {
+                        // The leader found at least one candidate (or was
+                        // cancelled). Do not serialize healthy selectors: this
+                        // caller may perform its own normal live evaluation.
+                        break None;
+                    }
+                    PoolEvaluationResult::Pending => {
+                        // A superseded/closed generation: recompute its
+                        // fingerprint and join the current generation.
+                    }
+                }
+            }
+        }
+    };
 
     let mut scored: Vec<(&AccountEntry, Option<AccountUsage>)> =
         Vec::with_capacity(candidates.len());
     for entry in candidates {
-        let profile_dir = usage_profile_dir(provider, entry)?;
+        let profile_dir = match usage_profile_dir(provider, entry) {
+            Ok(profile_dir) => profile_dir,
+            Err(error) => return Err(error),
+        };
         match quota_usage::fetch_usage(provider, &profile_dir).await {
             Ok(usage) => scored.push((entry, Some(usage))),
             Err(e) => {
@@ -226,7 +367,9 @@ pub(crate) async fn score_accounts(
     }
 
     if scored.is_empty() {
-        remember_invalid_pool(provider, fingerprint);
+        if let Some(evaluation_guard) = evaluation_guard {
+            evaluation_guard.finish(true);
+        }
         return Err(anyhow::Error::new(AllAccountsInvalid {
             provider,
             cached: false,
@@ -235,7 +378,9 @@ pub(crate) async fn score_accounts(
 
     // This is a negative-only cache. A pool that produces any candidate must
     // leave no remembered failure behind.
-    forget_invalid_pool(provider);
+    if let Some(evaluation_guard) = evaluation_guard {
+        evaluation_guard.finish(false);
+    }
 
     Ok(scored)
 }
@@ -676,17 +821,26 @@ mod tests {
 
         let initial =
             pool_fingerprint(&config, Provider::Codex).expect("failed to fingerprint initial pool");
-        assert!(!cached_invalid_pool(Provider::Codex, initial));
-        remember_invalid_pool(Provider::Codex, initial);
-        assert!(cached_invalid_pool(Provider::Codex, initial));
+        assert!(matches!(
+            begin_pool_evaluation(Provider::Codex, initial),
+            PoolEvaluationAction::Evaluate
+        ));
+        finish_pool_evaluation(Provider::Codex, initial, true);
+        assert!(matches!(
+            begin_pool_evaluation(Provider::Codex, initial),
+            PoolEvaluationAction::UseCachedInvalid
+        ));
 
         fs::write(&auth_path, br#"{"token":"new-login"}"#).expect("failed to update credentials");
         let after_credentials = pool_fingerprint(&config, Provider::Codex)
             .expect("failed to fingerprint updated credentials");
         assert_ne!(initial, after_credentials);
-        assert!(!cached_invalid_pool(Provider::Codex, after_credentials));
+        assert!(matches!(
+            begin_pool_evaluation(Provider::Codex, after_credentials),
+            PoolEvaluationAction::Evaluate
+        ));
 
-        remember_invalid_pool(Provider::Codex, after_credentials);
+        finish_pool_evaluation(Provider::Codex, after_credentials, true);
         config
             .add_account(make_account("config-change", Provider::Claude))
             .expect("failed to update quota config");
@@ -694,11 +848,95 @@ mod tests {
         let after_config = pool_fingerprint(&config, Provider::Codex)
             .expect("failed to fingerprint updated config");
         assert_ne!(after_credentials, after_config);
-        assert!(!cached_invalid_pool(Provider::Codex, after_config));
+        assert!(matches!(
+            begin_pool_evaluation(Provider::Codex, after_config),
+            PoolEvaluationAction::Evaluate
+        ));
 
-        remember_invalid_pool(Provider::Codex, after_config);
+        finish_pool_evaluation(Provider::Codex, after_config, true);
         forget_invalid_pool(Provider::Codex);
-        assert!(!cached_invalid_pool(Provider::Codex, after_config));
+        assert!(matches!(
+            begin_pool_evaluation(Provider::Codex, after_config),
+            PoolEvaluationAction::Evaluate
+        ));
+        finish_pool_evaluation(Provider::Codex, after_config, false);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_selectors_single_flight_one_invalid_pool_evaluation() {
+        const SELECTORS: usize = 8;
+        let fingerprint = PoolFingerprint([0x5a; 32]);
+        forget_invalid_pool(Provider::Claude);
+
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(SELECTORS));
+        let joined_evaluation = std::sync::Arc::new(tokio::sync::Barrier::new(SELECTORS));
+        let evaluations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiters = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut selectors = Vec::with_capacity(SELECTORS);
+        for _ in 0..SELECTORS {
+            let start = std::sync::Arc::clone(&start);
+            let joined_evaluation = std::sync::Arc::clone(&joined_evaluation);
+            let evaluations = std::sync::Arc::clone(&evaluations);
+            let waiters = std::sync::Arc::clone(&waiters);
+            selectors.push(tokio::spawn(async move {
+                start.wait().await;
+                loop {
+                    match begin_pool_evaluation(Provider::Claude, fingerprint) {
+                        PoolEvaluationAction::Evaluate => {
+                            evaluations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // The leader cannot publish until every peer has
+                            // deterministically observed the in-flight state.
+                            joined_evaluation.wait().await;
+                            finish_pool_evaluation(Provider::Claude, fingerprint, true);
+                            break AllAccountsInvalid {
+                                provider: Provider::Claude,
+                                cached: false,
+                            };
+                        }
+                        PoolEvaluationAction::Wait(mut done) => {
+                            waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            joined_evaluation.wait().await;
+                            if *done.borrow() == PoolEvaluationResult::Pending {
+                                let _ = done.changed().await;
+                            }
+                            if *done.borrow() == PoolEvaluationResult::Invalid {
+                                break AllAccountsInvalid {
+                                    provider: Provider::Claude,
+                                    cached: true,
+                                };
+                            }
+                        }
+                        PoolEvaluationAction::UseCachedInvalid => {
+                            break AllAccountsInvalid {
+                                provider: Provider::Claude,
+                                cached: true,
+                            };
+                        }
+                    }
+                }
+            }));
+        }
+
+        let mut fresh_warning_cycles = 0;
+        let mut safe_cached_fallbacks = 0;
+        for selector in selectors {
+            let invalid = selector.await.expect("selector task should join");
+            assert_eq!(invalid.provider, Provider::Claude);
+            if invalid.cached {
+                safe_cached_fallbacks += 1;
+            } else {
+                fresh_warning_cycles += 1;
+            }
+        }
+
+        assert_eq!(evaluations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            waiters.load(std::sync::atomic::Ordering::SeqCst),
+            SELECTORS - 1
+        );
+        assert_eq!(fresh_warning_cycles, 1);
+        assert_eq!(safe_cached_fallbacks, SELECTORS - 1);
+        forget_invalid_pool(Provider::Claude);
     }
 
     fn make_usage(
