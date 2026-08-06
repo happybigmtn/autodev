@@ -82,10 +82,10 @@ footers and keep JSON receipts as a compatibility/staging fallback.
 - Evidence Class: archive -- historical audit/report artifact that is cited as
   context, not as fresh executable proof.
 
-## Task-Owned Inputs Fingerprint (`task-owned-inputs-v1`)
+## Task-Owned Inputs Fingerprint (`task-owned-inputs-v2`)
 
 When `auto parallel` stamps a task's closeout-commit footer it also embeds a
-versioned per-task input fingerprint under the JSON key `task_owned_inputs_v1`.
+versioned per-task input fingerprint under the JSON key `task_owned_inputs_v2`.
 This is the finer of two drift gates. The whole-repo drift-sweep fingerprint
 (HEAD + `git status`) is the first, cheap gate: if nothing in the tree changed
 at all, the sweep is skipped. When that global signal *does* change, the
@@ -99,10 +99,32 @@ paths, (c) its direct dependency task IDs, and (d) the union of each direct
 dependency's `Owns:` paths plus their non-receipt completion-artifact paths. The
 task's own declared completion-artifact paths are content-addressed too so a
 declared-artifact drift is never silently trusted. All paths are content-
-addressed via git enumeration (tracked + untracked, respecting `.gitignore`) so
-file names, contents, executable/symlink modes, deletions, untracked files,
+addressed via git enumeration (tracked + untracked, respecting `.gitignore`).
+V2 uses working-tree lstat data, hashes regular-file bytes and symlink target
+text separately, and reads the actual executable mode rather than the index
+mode. Therefore file names, contents, executable/symlink modes, deletions, untracked files,
 refs, and submodule gitlink commits all fold in, while unrelated repo paths are
 absent from the hash.
+
+Legacy `task_owned_inputs_v1` fields remain readable but cannot match a V2
+recomputation. Their next drift sweep therefore re-runs verification and stamps
+V2 proof instead of silently upgrading historical evidence.
+
+## Derived-path footer
+
+Host closeout commits may carry
+`Auto-Verification-Receipt-Derived-Paths: ["path", ...]` when a trusted
+repository hook deterministically refreshes tracked artifacts during queue
+reconciliation. The value is a compact JSON array of sorted, unique,
+repo-relative canonical paths. Absolute paths, parent traversal, duplicates,
+and unsorted values are rejected.
+
+This field records a host claim; it is not independent proof that arbitrary
+source was generated. Only the host closeout path may stamp it, and readers
+accept the exact stamped set in addition to the static host queue paths. Lane
+workers cannot authorize paths through their task commit. Historical backfill
+must not invent this footer: rerun the verification and host closeout path when
+the original host provenance is unavailable.
 
 Semantics during a drift sweep:
 

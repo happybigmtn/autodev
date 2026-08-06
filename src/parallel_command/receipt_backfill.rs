@@ -15,6 +15,22 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
     ensure_repo_layout(&repo_root)?;
     let run_root = parallel_run_root(&repo_root, args);
     ensure_writable_run_root(&run_root)?;
+    let _repo_handoff_lease = if args.apply_receipt_backfill_handoffs {
+        refuse_live_parallel_host_for_backfill(&repo_root)?;
+        Some(acquire_parallel_repo_lease(&repo_root, "receipt-backfill")?)
+    } else {
+        None
+    };
+    let _run_handoff_lease = if args.apply_receipt_backfill_handoffs {
+        Some(acquire_parallel_host_lease(&run_root, "receipt-backfill")?)
+    } else {
+        None
+    };
+    if args.apply_receipt_backfill_handoffs {
+        // Re-probe after both modern-host leases close the startup race and
+        // continue to detect older installed hosts that do not take leases.
+        refuse_live_parallel_host_for_backfill(&repo_root)?;
+    }
 
     let plan_text = read_loop_plan(&repo_root)?;
     let snapshot = parse_loop_plan(&plan_text);
@@ -22,6 +38,7 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
     let mut applied_handoffs = Vec::new();
 
     if args.apply_receipt_backfill_handoffs {
+        refuse_dirty_review_before_backfill(&repo_root)?;
         for task in snapshot
             .tasks
             .iter()
@@ -73,6 +90,31 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
             );
             println!("receipt backfill: REVIEW.md is staged; commit after review");
         }
+    }
+    Ok(())
+}
+
+fn refuse_live_parallel_host_for_backfill(repo_root: &Path) -> Result<()> {
+    let session = parallel_tmux_session_name(repo_root);
+    let tmux_running = tmux_session_exists(&session)
+        .with_context(|| format!("cannot prove parallel host `{session}` is stopped"))?;
+    let host_processes = parallel_host_processes_for_repo_strict(repo_root)
+        .context("cannot prove no direct parallel host is running")?;
+    if parallel_prune_host_is_active(tmux_running, &host_processes) {
+        bail!(
+            "refusing receipt-backfill handoff apply while a parallel host is active for {}",
+            repo_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn refuse_dirty_review_before_backfill(repo_root: &Path) -> Result<()> {
+    let status = git_stdout(repo_root, ["status", "--porcelain=v1", "--", "REVIEW.md"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "refusing receipt-backfill handoff apply because REVIEW.md already has staged or unstaged changes; commit or stash them first"
+        );
     }
     Ok(())
 }
@@ -268,7 +310,8 @@ fn shell_single_quote(command: &str) -> String {
 mod tests {
     use super::{
         matching_owned_inputs_fingerprint, normalize_receipt_command, receipt_backfill_entries,
-        render_receipt_backfill_report, render_receipt_wrapper_command, ReceiptBackfillEntry,
+        refuse_dirty_review_before_backfill, render_receipt_backfill_report,
+        render_receipt_wrapper_command, ReceiptBackfillEntry,
     };
     use crate::completion_artifacts::{
         current_dirty_state_fingerprint, normalized_plan_hash_bytes,
@@ -318,24 +361,83 @@ mod tests {
     }
 
     #[test]
+    fn backfill_handoff_apply_refuses_preexisting_review_changes() {
+        let root = temp_repo("receipt-backfill-dirty-review");
+        fs::write(root.join("REVIEW.md"), "# Review\n").unwrap();
+        git(&root, &["add", "REVIEW.md"]);
+        git(&root, &["commit", "-q", "-m", "seed review"]);
+
+        fs::write(root.join("REVIEW.md"), "# Review\n\nuser work\n").unwrap();
+        let error = refuse_dirty_review_before_backfill(&root).unwrap_err();
+        assert!(error.to_string().contains("REVIEW.md already has"));
+
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(staged.stdout.is_empty(), "user edits must not be staged");
+
+        git(&root, &["add", "REVIEW.md"]);
+        let staged_error = refuse_dirty_review_before_backfill(&root).unwrap_err();
+        assert!(staged_error.to_string().contains("REVIEW.md already has"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backfill_handoff_apply_refuses_preexisting_untracked_review() {
+        let root = temp_repo("receipt-backfill-untracked-review");
+        fs::write(root.join("REVIEW.md"), "user review\n").unwrap();
+        let error = refuse_dirty_review_before_backfill(&root).unwrap_err();
+        assert!(error.to_string().contains("REVIEW.md already has"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn backfill_trusts_matching_task_owned_inputs_only() {
         let footers = vec![VerificationReceiptFooter {
             task_id: "TASK-1".to_string(),
             commit: "ancestor".to_string(),
-            receipt_text: r#"{"task_owned_inputs_v1":"owned-v1"}"#.to_string(),
+            receipt_text: r#"{"task_owned_inputs_v2":"owned-v2"}"#.to_string(),
         }];
 
         assert_eq!(
-            matching_owned_inputs_fingerprint("TASK-1", &footers, Some("owned-v1")),
-            Some("owned-v1")
+            matching_owned_inputs_fingerprint("TASK-1", &footers, Some("owned-v2")),
+            Some("owned-v2")
         );
         assert_eq!(
             matching_owned_inputs_fingerprint("TASK-1", &footers, Some("changed")),
             None
         );
         assert_eq!(
-            matching_owned_inputs_fingerprint("TASK-2", &footers, Some("owned-v1")),
+            matching_owned_inputs_fingerprint("TASK-2", &footers, Some("owned-v2")),
             None
+        );
+    }
+
+    #[test]
+    fn backfill_prefers_v2_and_does_not_treat_legacy_v1_as_current() {
+        let v1 = VerificationReceiptFooter {
+            task_id: "TASK-1".to_string(),
+            commit: "ancestor".to_string(),
+            receipt_text: r#"{"task_owned_inputs_v1":"legacy-v1"}"#.to_string(),
+        };
+        assert_eq!(
+            matching_owned_inputs_fingerprint("TASK-1", &[v1], Some("current-v2")),
+            None
+        );
+
+        let both = VerificationReceiptFooter {
+            task_id: "TASK-1".to_string(),
+            commit: "ancestor".to_string(),
+            receipt_text:
+                r#"{"task_owned_inputs_v1":"legacy-v1","task_owned_inputs_v2":"current-v2"}"#
+                    .to_string(),
+        };
+        assert_eq!(
+            matching_owned_inputs_fingerprint("TASK-1", &[both], Some("current-v2")),
+            Some("current-v2")
         );
     }
 

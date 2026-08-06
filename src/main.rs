@@ -234,6 +234,14 @@ mod tests {
             panic!("expected parallel command");
         };
         assert!(args.apply);
+
+        let cli = Cli::try_parse_from(["auto", "parallel", "prune", "--include-caches", "--apply"])
+            .expect("cache-inclusive prune should parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+        assert!(args.apply);
+        assert!(args.include_caches);
     }
 
     #[test]

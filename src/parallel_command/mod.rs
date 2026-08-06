@@ -136,6 +136,37 @@ pub(crate) const LANE_ASSIGNMENT_FILE: &str = "assignment.json";
 pub(crate) const LANE_HOST_PENDING_FILE: &str = "host-pending.json";
 pub(crate) const LANE_HOST_PENDING_VERSION: u32 = 1;
 
+fn parallel_plan_check_summary(plan_path: &str, plan: &LoopPlanSnapshot) -> String {
+    let queue = plan.queue_snapshot();
+    let ready = ready_parallel_tasks(plan, &BTreeSet::new(), &BTreeMap::new(), &BTreeSet::new());
+    let operator_ready = ready.iter().filter(|task| is_operator_task(task)).count();
+    let evidence_ready = ready
+        .iter()
+        .filter(|task| !is_operator_task(task) && is_evidence_lane_task(task))
+        .count();
+    let code_ready = ready.len() - operator_ready - evidence_ready;
+    let done = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == LoopTaskStatus::Done)
+        .count();
+    let open = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status != LoopTaskStatus::Done)
+        .count();
+    let historical = open
+        .saturating_sub(queue.pending_ids.len())
+        .saturating_sub(queue.blocked_ids.len());
+    format!(
+        "{plan_path}: {} task(s), {done} done, {open} not done ({} pending/partial, {} explicitly blocked, {historical} historical/non-actionable), {} plan-dependency-ready (lane kinds: code {code_ready}, evidence {evidence_ready}, operator {operator_ready}; runtime holds excluded)",
+        plan.tasks.len(),
+        queue.pending_ids.len(),
+        queue.blocked_ids.len(),
+        ready.len(),
+    )
+}
+
 pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Status) {
         return run_parallel_status(&args);
@@ -144,10 +175,8 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         let repo_root = git_repo_root()?;
         let plan = inspect_loop_plan(&repo_root)?;
         println!(
-            "{}: {} task(s), {} actionable",
-            active_plan_relative(&repo_root),
-            plan.tasks.len(),
-            plan.queue_snapshot().pending_ids.len()
+            "{}",
+            parallel_plan_check_summary(active_plan_relative(&repo_root), &plan)
         );
         return Ok(());
     }
@@ -183,9 +212,11 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     }
     if args.max_concurrent_workers > 1 && should_launch_parallel_tmux(&args) {
         ensure_writable_run_root(&run_root)?;
+        let startup_repo_lease = acquire_parallel_repo_lease(&repo_root, "parallel tmux startup")?;
         let startup_lease = acquire_parallel_host_lease(&run_root, "parallel tmux startup")?;
         purge_previous_parallel_run_artifacts(&repo_root, &run_root);
         drop(startup_lease);
+        drop(startup_repo_lease);
         log_parallel_startup_prep(
             prepare_parallel_startup(&repo_root, target_branch.as_str())?,
             target_branch.as_str(),
@@ -215,6 +246,7 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
         prompt_template.push_str(DIRECT_REVIEW_QUEUE_PARALLEL_CLAUSE);
     }
     ensure_writable_run_root(&run_root)?;
+    let _parallel_repo_lease = acquire_parallel_repo_lease(&repo_root, "parallel host startup")?;
     let _parallel_host_lease = acquire_parallel_host_lease(&run_root, "parallel host startup")?;
     purge_previous_parallel_run_artifacts(&repo_root, &run_root);
     // Reclaim persistent lane-caches for lane indices this run will never use
@@ -322,4 +354,69 @@ pub(crate) async fn run_parallel_inline(args: ParallelArgs) -> Result<()> {
         None => env::remove_var("AUTO_PARALLEL_TMUX_BOOTSTRAPPED"),
     }
     result
+}
+
+#[cfg(test)]
+mod plan_check_tests {
+    use super::*;
+
+    #[test]
+    fn plan_check_distinguishes_unfinished_from_dependency_ready() {
+        let plan = parse_loop_plan(
+            r#"
+- [x] `DONE-1` Completed
+  Dependencies: none
+- [!] `OP-1` External ceremony
+  Lane kind: operator
+  Dependencies: none
+- [ ] `CODE-1` Waits for ceremony
+  Dependencies: `OP-1`
+"#,
+        );
+
+        assert_eq!(
+            parallel_plan_check_summary("PLAN.md", &plan),
+            "PLAN.md: 3 task(s), 1 done, 2 not done (1 pending/partial, 1 explicitly blocked, 0 historical/non-actionable), 0 plan-dependency-ready (lane kinds: code 0, evidence 0, operator 0; runtime holds excluded)"
+        );
+    }
+
+    #[test]
+    fn plan_check_classifies_ready_lane_kinds() {
+        let plan = parse_loop_plan(
+            r#"
+- [ ] `CODE-1` Code
+  Lane kind: code
+  Dependencies: none
+- [ ] `EVIDENCE-1` Evidence
+  Lane kind: evidence
+  Dependencies: none
+- [ ] `OP-1` Operator
+  Lane kind: operator
+  Dependencies: none
+"#,
+        );
+
+        assert_eq!(
+            parallel_plan_check_summary("PLAN.md", &plan),
+            "PLAN.md: 3 task(s), 0 done, 3 not done (3 pending/partial, 0 explicitly blocked, 0 historical/non-actionable), 3 plan-dependency-ready (lane kinds: code 1, evidence 1, operator 1; runtime holds excluded)"
+        );
+    }
+
+    #[test]
+    fn plan_check_counts_completion_path_placeholders_as_not_done_history() {
+        let plan = parse_loop_plan(
+            r#"
+- [~] `OLD-1` Historical gap
+  Completion path: `FIX-1`
+  Dependencies: none
+- [ ] `FIX-1` Active fix
+  Dependencies: none
+"#,
+        );
+
+        assert_eq!(
+            parallel_plan_check_summary("PLAN.md", &plan),
+            "PLAN.md: 2 task(s), 0 done, 2 not done (1 pending/partial, 0 explicitly blocked, 1 historical/non-actionable), 1 plan-dependency-ready (lane kinds: code 1, evidence 0, operator 0; runtime holds excluded)"
+        );
+    }
 }

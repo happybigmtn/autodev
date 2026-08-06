@@ -1238,12 +1238,18 @@ Useful flags:
   the bounded `lane-caches/` build caches, salvage recovery notes, and all semantic evidence files. Unknown tmux or process
   probe results fail closed. Applied deletion currently requires Linux so it can use atomic
   no-replace quarantine moves; other platforms retain the safe dry-run preview.
+- `prune --include-caches` to include regenerable lane build caches in that exact preview. Cache
+  bytes are always reported, even when preserved. Applied cache deletion uses the same stopped-host,
+  lease, run-marker, and absent-ledger interlocks; it never runs implicitly during normal startup.
+  Parallel hosts also hold a repository-wide canonical-mutation lease, so custom run roots cannot
+  race each other while updating shared plan, review, or git state.
 
 Safe periodic cleanup:
 
 ```sh
 auto parallel prune
 auto parallel prune --apply
+auto parallel prune --include-caches --apply
 ```
 
 ### `auto qa`

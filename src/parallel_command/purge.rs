@@ -28,7 +28,9 @@ use std::fs::File;
 
 const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin"];
 const PURGEABLE_LOGS: &[&str] = &["host.stdout.log", "host.stderr.log"];
+const PARALLEL_LANE_CACHES_DIR: &str = "lane-caches";
 const PARALLEL_HOST_LOCK_FILE: &str = ".host.lock";
+const PARALLEL_REPO_LOCK_FILE: &str = ".auto/.parallel-host.lock";
 const PARALLEL_PRUNE_QUARANTINE_DIR: &str = ".prune-quarantine";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,12 +40,14 @@ struct ParallelPrunePlan {
     bytes: u64,
     blocked_by_run_state: bool,
     lanes_preserved_by_salvage: bool,
+    lane_cache_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParallelPruneTarget {
     path: PathBuf,
     identity: FilesystemIdentity,
+    cache_target: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +118,7 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
     let host_processes = parallel_host_processes_for_repo_strict(&repo_root)
         .context("cannot prove no direct parallel host is running")?;
     let host_running = parallel_prune_host_is_active(tmux_running, &host_processes);
-    let plan = parallel_prune_plan(&run_root)?;
+    let plan = parallel_prune_plan_with_options(&run_root, args.include_caches, true)?;
 
     println!("auto parallel prune");
     println!("repo root:   {}", repo_root.display());
@@ -142,7 +146,15 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
             "absent"
         }
     );
-    println!("lane caches: preserved");
+    println!(
+        "lane caches: {} ({})",
+        if args.include_caches {
+            "included"
+        } else {
+            "preserved"
+        },
+        human_bytes(plan.lane_cache_bytes)
+    );
     if plan.lanes_preserved_by_salvage {
         println!("lanes:       preserved (salvage recovery evidence exists)");
     }
@@ -171,7 +183,7 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
         .with_context(|| format!("cannot prove parallel host `{session}` is stopped"))?;
     let apply_host_processes = parallel_host_processes_for_repo_strict(&repo_root)
         .context("cannot prove no direct parallel host is running")?;
-    let apply_plan = parallel_prune_plan(&run_root)?;
+    let apply_plan = parallel_prune_plan_with_options(&run_root, args.include_caches, true)?;
     apply_parallel_prune_plan(
         &run_root,
         &apply_plan,
@@ -209,7 +221,32 @@ pub(crate) fn acquire_parallel_host_lease(run_root: &Path, owner: &str) -> Resul
     Ok(file)
 }
 
-fn parallel_prune_host_is_active(tmux_running: bool, host_processes: &[String]) -> bool {
+/// Serialize canonical-tree mutations across every run-root choice for one
+/// repository. Run-root leases protect lane artifacts; this repository lease
+/// protects shared PLAN/REVIEW/git state.
+pub(crate) fn acquire_parallel_repo_lease(repo_root: &Path, owner: &str) -> Result<File> {
+    let path = repo_root.join(PARALLEL_REPO_LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create repo lease root {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open parallel repo lease {}", path.display()))?;
+    file.try_lock_exclusive().map_err(|err| {
+        anyhow::anyhow!(
+            "refusing {owner}: repository {} is leased by an active parallel host or canonical mutator ({err})",
+            repo_root.display()
+        )
+    })?;
+    Ok(file)
+}
+
+pub(crate) fn parallel_prune_host_is_active(tmux_running: bool, host_processes: &[String]) -> bool {
     tmux_running || !host_processes.is_empty()
 }
 
@@ -300,15 +337,37 @@ fn validate_parallel_prune_root(repo_root: &Path, run_root: &Path) -> Result<()>
 }
 
 fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
+    parallel_prune_plan_with_options(run_root, false, false)
+}
+
+fn parallel_prune_plan_with_options(
+    run_root: &Path,
+    include_caches: bool,
+    measure_cache_bytes: bool,
+) -> Result<ParallelPrunePlan> {
     let mut targets = Vec::new();
     let mut bytes = 0u64;
+    let lane_cache_bytes = if include_caches || measure_cache_bytes {
+        dir_size_bytes(&run_root.join(PARALLEL_LANE_CACHES_DIR))
+    } else {
+        0
+    };
     let lanes_preserved_by_salvage = parallel_salvage_records_present(run_root)?;
-    for name in PURGEABLE_SUBDIRS.iter().chain(PURGEABLE_LOGS.iter()) {
-        if *name == "lanes" && lanes_preserved_by_salvage {
+    let names = PURGEABLE_SUBDIRS
+        .iter()
+        .chain(PURGEABLE_LOGS.iter())
+        .copied()
+        .chain(include_caches.then_some(PARALLEL_LANE_CACHES_DIR));
+    for name in names {
+        if name == "lanes" && lanes_preserved_by_salvage {
             continue;
         }
         let target = run_root.join(name);
-        validate_parallel_prune_target(run_root, &target)?;
+        validate_parallel_prune_target_with_options(
+            run_root,
+            &target,
+            include_caches && name == PARALLEL_LANE_CACHES_DIR,
+        )?;
         let Ok(metadata) = fs::symlink_metadata(&target) else {
             continue;
         };
@@ -319,7 +378,9 @@ fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
             );
         }
         validate_existing_parallel_prune_target(run_root, &target)?;
-        bytes += if metadata.is_dir() {
+        bytes += if name == PARALLEL_LANE_CACHES_DIR {
+            lane_cache_bytes
+        } else if metadata.is_dir() {
             dir_size_bytes(&target)
         } else {
             metadata.len()
@@ -327,6 +388,7 @@ fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
         targets.push(ParallelPruneTarget {
             path: target,
             identity: filesystem_identity(&metadata)?,
+            cache_target: include_caches && name == PARALLEL_LANE_CACHES_DIR,
         });
     }
     if !targets.is_empty() {
@@ -338,6 +400,7 @@ fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
         bytes,
         blocked_by_run_state: run_root.join(".run-state.json").exists(),
         lanes_preserved_by_salvage,
+        lane_cache_bytes,
     })
 }
 
@@ -380,10 +443,22 @@ fn validate_parallel_run_root_identity(run_root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_parallel_prune_target(run_root: &Path, target: &Path) -> Result<()> {
+    validate_parallel_prune_target_with_options(run_root, target, false)
+}
+
+fn validate_parallel_prune_target_with_options(
+    run_root: &Path,
+    target: &Path,
+    include_caches: bool,
+) -> Result<()> {
     let name = target.file_name().and_then(|name| name.to_str());
-    let allowed = name
-        .is_some_and(|name| PURGEABLE_SUBDIRS.contains(&name) || PURGEABLE_LOGS.contains(&name));
+    let allowed = name.is_some_and(|name| {
+        PURGEABLE_SUBDIRS.contains(&name)
+            || PURGEABLE_LOGS.contains(&name)
+            || (include_caches && name == PARALLEL_LANE_CACHES_DIR)
+    });
     if target.parent() != Some(run_root) || !allowed {
         bail!(
             "refusing unexpected parallel prune target: {}",
@@ -408,7 +483,7 @@ fn remove_parallel_prune_target_with_hook(
     target: &ParallelPruneTarget,
     mut hook: impl FnMut(PruneRemovalStage, &Path),
 ) -> Result<()> {
-    validate_parallel_prune_target(run_root, &target.path)?;
+    validate_parallel_prune_target_with_options(run_root, &target.path, target.cache_target)?;
     let metadata = fs::symlink_metadata(&target.path)
         .with_context(|| format!("failed to inspect prune target {}", target.path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -573,6 +648,12 @@ fn validate_existing_parallel_prune_target(run_root: &Path, target: &Path) -> Re
 }
 
 pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(root_metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return 0;
+    }
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -580,13 +661,16 @@ pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            if metadata.is_dir() {
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(entry.path());
-            } else {
-                total += metadata.len();
+            } else if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
             }
         }
     }
@@ -761,6 +845,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cache_prune_includes_and_removes_lane_caches() {
+        let run_root = temp_dir("explicit-cache-apply");
+        seed_run_artifacts(&run_root);
+        let plan = parallel_prune_plan_with_options(&run_root, true, true)
+            .expect("build cache-inclusive prune plan");
+        assert!(plan
+            .targets
+            .iter()
+            .any(|target| target.path.ends_with(PARALLEL_LANE_CACHES_DIR)));
+
+        apply_parallel_prune_plan(&run_root, &plan, false, "test-parallel")
+            .expect("apply cache-inclusive prune plan");
+
+        assert!(!run_root.join(PARALLEL_LANE_CACHES_DIR).exists());
+        assert!(run_root.join("preflight.txt").exists());
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
     fn graceful_terminal_empty_ledger_unblocks_prune_without_discarding_salvage() {
         let run_root = temp_dir("terminal-empty-prune");
         seed_run_artifacts(&run_root);
@@ -830,6 +933,54 @@ mod tests {
         assert!(outside.exists());
 
         std::fs::remove_file(run_root.join("lanes")).ok();
+        std::fs::remove_dir_all(&run_root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_measurement_never_follows_top_level_or_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_dir("cache-symlink-outside");
+        std::fs::write(outside.join("outside.bin"), vec![0u8; 1024]).unwrap();
+        let top_link_parent = temp_dir("cache-top-link");
+        symlink(&outside, top_link_parent.join(PARALLEL_LANE_CACHES_DIR)).unwrap();
+        assert_eq!(
+            dir_size_bytes(&top_link_parent.join(PARALLEL_LANE_CACHES_DIR)),
+            0
+        );
+
+        let cache = temp_dir("cache-nested-cycle");
+        std::fs::write(cache.join("local.bin"), vec![0u8; 7]).unwrap();
+        symlink(&cache, cache.join("cycle")).unwrap();
+        symlink(&outside, cache.join("outside")).unwrap();
+        assert_eq!(dir_size_bytes(&cache), 7);
+
+        std::fs::remove_dir_all(&top_link_parent).ok();
+        std::fs::remove_dir_all(&cache).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_inclusive_prune_refuses_symlinked_cache_root() {
+        use std::os::unix::fs::symlink;
+
+        let run_root = temp_dir("cache-root-symlink");
+        let outside = temp_dir("cache-root-symlink-outside");
+        seed_run_artifacts(&run_root);
+        std::fs::remove_dir_all(run_root.join(PARALLEL_LANE_CACHES_DIR)).unwrap();
+        symlink(&outside, run_root.join(PARALLEL_LANE_CACHES_DIR)).unwrap();
+
+        let error = parallel_prune_plan_with_options(&run_root, true, true)
+            .expect_err("symlinked cache root must fail closed");
+        assert!(error
+            .to_string()
+            .contains("symlinked parallel prune target"));
+        assert!(outside.exists());
+
+        std::fs::remove_file(run_root.join(PARALLEL_LANE_CACHES_DIR)).ok();
         std::fs::remove_dir_all(&run_root).ok();
         std::fs::remove_dir_all(&outside).ok();
     }
@@ -918,6 +1069,18 @@ mod tests {
         acquire_parallel_host_lease(&run_root, "prune").expect("lease after release");
 
         std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn repo_lease_blocks_canonical_mutators_across_different_run_roots() {
+        let repo_root = temp_dir("repo-wide-lease");
+        let _first = acquire_parallel_repo_lease(&repo_root, "host using run root A")
+            .expect("first repo lease");
+        let error = acquire_parallel_repo_lease(&repo_root, "backfill using run root B")
+            .expect_err("different run roots must share the canonical repo lease");
+        assert!(error.to_string().contains("repository"));
+        assert!(error.to_string().contains("canonical mutator"));
+        std::fs::remove_dir_all(&repo_root).ok();
     }
 
     #[test]

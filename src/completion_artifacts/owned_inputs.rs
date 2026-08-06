@@ -1,4 +1,4 @@
-//! Per-task "owned inputs" fingerprint (`task_owned_inputs_v1`).
+//! Per-task "owned inputs" fingerprint (`task_owned_inputs_v2`).
 //!
 //! The whole-repo drift-sweep fingerprint (HEAD + `git status`) is a coarse
 //! gate: it changes whenever *anything* in the tree moves, forcing the drift
@@ -37,7 +37,7 @@ use crate::task_parser::parse_owns_paths;
 
 /// Version tag folded into every fingerprint. Bump only when the hashing scheme
 /// changes in a way that must invalidate previously-stamped fingerprints.
-const OWNED_INPUTS_SCHEME: &str = "task-owned-inputs-v1";
+const OWNED_INPUTS_SCHEME: &str = "task-owned-inputs-v2";
 
 /// Paths that must never contribute to a per-task fingerprint: the receipt /
 /// run-state store (self-reference would make stamping change the hash) and the
@@ -57,7 +57,7 @@ fn path_is_fingerprint_excluded(rel: &str) -> bool {
         || rel.starts_with(".git/")
 }
 
-/// Compute the `task_owned_inputs_v1` fingerprint for `task_id` against the
+/// Compute the `task_owned_inputs_v2` fingerprint for `task_id` against the
 /// current working tree. `all_tasks` is the parsed plan (used to resolve the
 /// task and its direct dependencies). Returns `None` when the task is absent
 /// from the plan or any git enumeration fails — the caller treats `None`
@@ -142,7 +142,10 @@ fn content_address_paths(repo_root: &Path, paths: &BTreeSet<String>) -> Option<S
         }
 
         // Per-declared-path presence marker.
-        let present = repo_root.join(declared).exists();
+        // `Path::exists` follows symlinks and therefore reports a dangling
+        // symlink as absent. Use lstat semantics so the link itself is part of
+        // the declared working-tree state.
+        let present = std::fs::symlink_metadata(repo_root.join(declared)).is_ok();
         entries.insert((
             "declared".to_string(),
             declared.clone(),
@@ -161,8 +164,11 @@ fn content_address_paths(repo_root: &Path, paths: &BTreeSet<String>) -> Option<S
                     git_ls_tracked_object(repo_root, &rel).unwrap_or_else(|| "gitlink".to_string());
                 entries.insert((mode, rel, sub_commit));
             } else {
-                let content = worktree_content_hash(repo_root, &rel);
-                entries.insert((mode, rel, content));
+                // The index mode is stale for unstaged chmod/type changes.
+                // Fingerprint the actual working-tree node without following
+                // symlinks so every change reported by git invalidates proof.
+                let (worktree_mode, content) = worktree_entry(repo_root, &rel)?;
+                entries.insert((worktree_mode, rel, content));
             }
         }
 
@@ -171,8 +177,7 @@ fn content_address_paths(repo_root: &Path, paths: &BTreeSet<String>) -> Option<S
             if path_is_fingerprint_excluded(&rel) {
                 continue;
             }
-            let mode = worktree_mode(repo_root, &rel);
-            let content = worktree_content_hash(repo_root, &rel);
+            let (mode, content) = worktree_entry(repo_root, &rel)?;
             entries.insert((mode, rel, content));
         }
     }
@@ -285,37 +290,47 @@ fn git_rev_parse_ref(repo_root: &Path, reference: &str) -> Option<String> {
     (!resolved.is_empty()).then_some(resolved)
 }
 
-/// Content hash of a working-tree file. Follows symlinks; a missing/unreadable
-/// file (e.g. deleted in the worktree) hashes to a stable `deleted` marker so
-/// the deletion itself is a detectable change.
-fn worktree_content_hash(repo_root: &Path, rel: &str) -> String {
+/// Actual working-tree mode/kind and content. Uses lstat semantics: symlinks
+/// hash their target text rather than the bytes at that target. Missing nodes
+/// receive a stable deletion marker; any other read error returns `None` so
+/// the caller forces re-verification.
+fn worktree_entry(repo_root: &Path, rel: &str) -> Option<(String, String)> {
     let path = repo_root.join(rel);
-    match std::fs::read(&path) {
-        Ok(bytes) => sha256_hex(&bytes),
-        Err(_) => "deleted".to_string(),
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(("missing".to_string(), "deleted".to_string()));
+        }
+        Err(_) => return None,
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&path).ok()?;
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let bytes = target.to_string_lossy().as_bytes().to_vec();
+        return Some(("120000".to_string(), sha256_hex(&bytes)));
     }
-}
-
-/// A coarse mode string for an untracked file: `100755` if any executable bit is
-/// set, else `100644`. (Tracked files take their mode straight from git.)
-fn worktree_mode(repo_root: &Path, rel: &str) -> String {
+    if !metadata.is_file() {
+        return Some(("other".to_string(), "non-file".to_string()));
+    }
+    let content = sha256_hex(&std::fs::read(&path).ok()?);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::symlink_metadata(repo_root.join(rel)) {
-            if meta.file_type().is_symlink() {
-                return "120000".to_string();
-            }
-            if meta.permissions().mode() & 0o111 != 0 {
-                return "100755".to_string();
-            }
-        }
-        "100644".to_string()
+        let mode = if metadata.permissions().mode() & 0o111 != 0 {
+            "100755"
+        } else {
+            "100644"
+        };
+        Some((mode.to_string(), content))
     }
     #[cfg(not(unix))]
     {
-        let _ = (repo_root, rel);
-        "100644".to_string()
+        Some(("100644".to_string(), content))
     }
 }
 
@@ -447,6 +462,49 @@ mod tests {
         assert_ne!(
             before, with_deletion,
             "deleting an owned file must move fingerprint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_changes_when_tracked_executable_bit_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = seed_repo("tracked-chmod");
+        let path = root.join("crates/b/src/lib.rs");
+        let before = fingerprint(&root, "TASK-B");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        assert_ne!(
+            before,
+            fingerprint(&root, "TASK-B"),
+            "an unstaged executable-bit change must invalidate owned-input proof"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_changes_when_tracked_symlink_target_changes_with_equal_contents() {
+        use std::os::unix::fs::symlink;
+
+        let root = seed_repo("tracked-symlink-retarget");
+        let owned = root.join("crates/b/src");
+        fs::write(owned.join("first.txt"), "same bytes\n").unwrap();
+        fs::write(owned.join("second.txt"), "same bytes\n").unwrap();
+        symlink("first.txt", owned.join("current.txt")).unwrap();
+        git(&root, &["add", "crates/b/src"]);
+        git(&root, &["commit", "-q", "-m", "add tracked symlink"]);
+
+        let before = fingerprint(&root, "TASK-B");
+        fs::remove_file(owned.join("current.txt")).unwrap();
+        symlink("second.txt", owned.join("current.txt")).unwrap();
+
+        assert_ne!(
+            before,
+            fingerprint(&root, "TASK-B"),
+            "retargeting a symlink must invalidate proof even when target bytes match"
         );
     }
 

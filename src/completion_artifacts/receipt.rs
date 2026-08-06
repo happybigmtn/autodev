@@ -647,7 +647,7 @@ fn compact_receipt_json_for_footer(
     if let Some(object) = value.as_object_mut() {
         if let Some(fp) = owned_inputs_fp {
             object.insert(
-                "task_owned_inputs_v1".to_string(),
+                "task_owned_inputs_v2".to_string(),
                 Value::String(fp.to_string()),
             );
         }
@@ -658,7 +658,7 @@ fn compact_receipt_json_for_footer(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Compute the `task-owned-inputs-v1` fingerprint for `task_id` by parsing the
+/// Compute the `task-owned-inputs-v2` fingerprint for `task_id` by parsing the
 /// plan currently on disk. Returns `None` (no stamp) when the plan is missing,
 /// the task is absent from it, or git enumeration fails.
 fn task_owned_inputs_fingerprint_for(repo_root: &Path, task_id: &str) -> Option<String> {
@@ -667,13 +667,14 @@ fn task_owned_inputs_fingerprint_for(repo_root: &Path, task_id: &str) -> Option<
     super::owned_inputs::compute_task_owned_inputs_fingerprint(repo_root, task_id, &tasks)
 }
 
-/// Read the stamped `task-owned-inputs-v1` fingerprint out of a footer receipt's
-/// embedded JSON. `None` when the footer predates the field (legacy) or is
-/// unparseable.
+/// Read the stamped task-owned-inputs fingerprint from a footer receipt. V2 is
+/// authoritative; V1 remains readable only so old receipts conservatively
+/// mismatch the newly computed V2 value and re-verify.
 pub(crate) fn footer_task_owned_inputs(footer: &VerificationReceiptFooter) -> Option<String> {
-    serde_json::from_str::<VerificationReceipt>(&footer.receipt_text)
-        .ok()?
-        .task_owned_inputs_v1
+    let receipt = serde_json::from_str::<VerificationReceipt>(&footer.receipt_text).ok()?;
+    receipt
+        .task_owned_inputs_v2
+        .or(receipt.task_owned_inputs_v1)
 }
 
 fn prune_receipt_output_tails(value: &mut Value) {
@@ -733,11 +734,12 @@ struct VerificationReceipt {
     declared_artifacts: Vec<VerificationReceiptArtifact>,
     #[serde(default)]
     commands: Vec<VerificationReceiptCommand>,
-    /// Versioned per-task owned-inputs fingerprint (`task-owned-inputs-v1`),
-    /// stamped by the host into the closeout-commit footer. Absent on legacy
-    /// receipts, which fall back to whole-repo drift behavior.
+    /// Legacy fingerprint retained for conservative compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_owned_inputs_v1: Option<String>,
+    /// Current per-task owned-inputs fingerprint (`task-owned-inputs-v2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_owned_inputs_v2: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -1438,7 +1440,11 @@ fn verification_receipt_freshness_problem_for_source(
                     .to_string(),
             )
         }
-        Some(expected) => match receipt.task_owned_inputs_v1.as_deref() {
+        Some(expected) => match receipt
+            .task_owned_inputs_v2
+            .as_deref()
+            .or(receipt.task_owned_inputs_v1.as_deref())
+        {
             Some(recorded) if recorded == expected => {
                 if receipt.source_state_v2.is_none() {
                     return Some(
@@ -1455,7 +1461,7 @@ fn verification_receipt_freshness_problem_for_source(
             }
             None => {
                 return Some(
-                    "verification footer is missing the matched task_owned_inputs_v1 fingerprint"
+                    "verification footer is missing the matched task_owned_inputs_v2 fingerprint"
                         .to_string(),
                 )
             }
@@ -4314,6 +4320,7 @@ mod tests {
                 sha256: Some(artifact_hash.clone()),
             }],
             task_owned_inputs_v1: None,
+            task_owned_inputs_v2: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 argv: expected_argv.clone(),
@@ -5003,6 +5010,7 @@ mod tests {
             source_state_v2: None,
             declared_artifacts: Vec::new(),
             task_owned_inputs_v1: None,
+            task_owned_inputs_v2: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 argv: vec![
@@ -5074,6 +5082,7 @@ mod tests {
                 sha256: Some("not-the-current-review-hash".to_string()),
             }],
             task_owned_inputs_v1: None,
+            task_owned_inputs_v2: None,
             commands: vec![VerificationReceiptCommand {
                 command: expected_command.clone(),
                 argv: expected_argv.clone(),

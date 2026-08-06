@@ -214,6 +214,11 @@ pub(crate) struct ParallelArgs {
     #[arg(long)]
     pub(crate) apply: bool,
 
+    /// For `auto parallel prune`: also remove regenerable lane build caches.
+    /// Requires the same stopped-host and absent-ledger safety checks.
+    #[arg(long)]
+    pub(crate) include_caches: bool,
+
     /// Stop after this many successful parallel lands. Default is unlimited.
     #[arg(long)]
     pub(crate) max_iterations: Option<usize>,

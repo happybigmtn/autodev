@@ -270,6 +270,9 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
     if args.apply {
         parts.push("--apply".to_string());
     }
+    if args.include_caches {
+        parts.push("--include-caches".to_string());
+    }
     if let Some(action) = args.action {
         parts.push(
             match action {
@@ -484,6 +487,7 @@ mod tests {
             apply_receipt_backfill_handoffs: false,
             json: false,
             apply: false,
+            include_caches: false,
             max_iterations: Some(3),
             max_concurrent_workers: 8,
             cargo_build_jobs: Some(2),
@@ -550,6 +554,7 @@ mod tests {
             apply_receipt_backfill_handoffs: false,
             json: false,
             apply: false,
+            include_caches: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,
@@ -594,6 +599,7 @@ mod tests {
             apply_receipt_backfill_handoffs: false,
             json: false,
             apply: false,
+            include_caches: false,
             max_iterations: None,
             max_concurrent_workers: 2,
             cargo_build_jobs: None,

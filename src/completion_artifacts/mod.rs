@@ -812,7 +812,7 @@ mod tests {
         let landed = latest_verification_receipt_footer(&root, "TASK-OI")
             .expect("footer receipt should be discoverable");
         let stamped = super::footer_task_owned_inputs(&landed)
-            .expect("footer should carry a task_owned_inputs_v1 fingerprint");
+            .expect("footer should carry a task_owned_inputs_v2 fingerprint");
         assert!(!stamped.is_empty());
 
         // Recomputing against the unchanged tree reproduces the stamped value.
