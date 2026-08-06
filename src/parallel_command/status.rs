@@ -823,6 +823,19 @@ pub(crate) fn recent_parallel_host_warnings(run_root: &Path, max_lines: usize) -
     let mut warnings = Vec::new();
     for line in log_text.lines() {
         let trimmed = line.trim();
+        if trimmed.contains("run-state: cleared terminally empty ledger") {
+            warnings.clear();
+            continue;
+        }
+        if trimmed.starts_with("remote sync: rebased onto origin/")
+            || trimmed.starts_with("landed-clean:")
+            || trimmed.contains("removed stale canonical git index lock")
+        {
+            warnings.retain(|warning: &String| {
+                !warning.contains("failed syncing host-owned queue state")
+                    && !warning.contains("active git index lock")
+            });
+        }
         if !trimmed.starts_with("warning:") {
             continue;
         }
@@ -1385,6 +1398,38 @@ mod tests {
         assert!(summary.contains("stale recovery lanes: lane-2 TASK-2"));
         assert!(summary.contains("host binary revision mismatch"));
         assert!(summary.contains("drain active lanes, then restart the parallel host"));
+
+        fs::remove_dir_all(&run_root).expect("failed to remove run root");
+    }
+
+    #[test]
+    fn parallel_health_ignores_host_warnings_superseded_by_later_success() {
+        let run_root = unique_temp_dir("parallel-health-resolved-warning");
+        fs::create_dir_all(&run_root).expect("failed to create run root");
+        fs::write(
+            run_root.join("live.log"),
+            concat!(
+                "warning: failed syncing host-owned queue state: active git index lock\n",
+                "remote sync: rebased onto origin/main\n",
+                "landed-clean: [code] TASK-1 via lane-1\n",
+            ),
+        )
+        .expect("failed to write live log");
+
+        assert!(recent_parallel_host_warnings(&run_root, 50).is_empty());
+
+        fs::write(
+            run_root.join("live.log"),
+            concat!(
+                "warning: first unresolved warning\n",
+                "run-state: cleared terminally empty ledger; disposable lane artifacts are now eligible for safe pruning\n",
+                "warning: later unresolved warning\n",
+            ),
+        )
+        .expect("failed to rewrite live log");
+        let warnings = recent_parallel_host_warnings(&run_root, 50);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("later unresolved warning"));
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
