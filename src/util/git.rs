@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -15,6 +17,15 @@ use crate::util::{active_plan_path, active_plan_relative, repo_name};
 /// explicit branch is requested. Shared by `auto ship` base-branch resolution
 /// and `auto loop` branch selection.
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
+
+const GIT_INDEX_LOCK_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointExcludeRule {
@@ -85,6 +96,11 @@ pub(crate) fn git_stdout<'a>(
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
+        // Read-only Git commands such as `status` may otherwise refresh the
+        // index and briefly create `.git/index.lock`. Status polling is allowed
+        // to run beside the canonical landing host, so those optional writes
+        // must never contend with host-owned queue reconciliation.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
@@ -99,20 +115,32 @@ pub(crate) fn git_stdout<'a>(
 }
 
 pub(crate) fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
-    if output.status.success() {
-        return Ok(());
+    let args = args.into_iter().collect::<Vec<_>>();
+    for attempt in 0..=GIT_INDEX_LOCK_RETRY_DELAYS.len() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(&args)
+            .output()
+            .with_context(|| format!("failed to launch git in {}", repo_root.display()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = git_failure_message(&output);
+        if transient_git_index_lock_failure(&detail) {
+            if let Some(delay) = GIT_INDEX_LOCK_RETRY_DELAYS.get(attempt) {
+                thread::sleep(*delay);
+                continue;
+            }
+        }
+        bail!("git command failed in {}: {}", repo_root.display(), detail);
     }
-    bail!(
-        "git command failed in {}: {}",
-        repo_root.display(),
-        git_failure_message(&output)
-    );
+    unreachable!("bounded Git retry loop always returns or reports its final error")
+}
+
+fn transient_git_index_lock_failure(detail: &str) -> bool {
+    detail.contains("index.lock")
+        && (detail.contains("File exists") || detail.contains("Unable to create"))
 }
 
 pub(crate) fn git_cherry_pick_empty_arg() -> &'static str {
@@ -1224,7 +1252,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         auto_checkpoint_if_needed, capture_validated_task_closeout_tree, checkpoint_status,
@@ -1232,8 +1261,8 @@ mod tests {
         completion_plan_views, git_cherry_pick_empty_arg_from_help, is_checkpoint_excluded_path,
         parse_origin_head_branch, push_branch_with_remote_sync,
         refuse_checkpoint_excluded_staged_paths,
-        refuse_unsealed_task_completion_transitions_except, stage_checkpoint_changes,
-        sync_branch_with_remote,
+        refuse_unsealed_task_completion_transitions_except, run_git, stage_checkpoint_changes,
+        sync_branch_with_remote, transient_git_index_lock_failure,
     };
 
     fn temp_repo_path(name: &str) -> PathBuf {
@@ -1275,6 +1304,41 @@ mod tests {
     fn cherry_pick_empty_arg_prefers_drop_when_supported() {
         let help = "usage: git cherry-pick [--empty <stop|drop|keep>] <commit>...";
         assert_eq!(git_cherry_pick_empty_arg_from_help(help), "--empty=drop");
+    }
+
+    #[test]
+    fn run_git_retries_a_brief_index_lock_without_removing_it() {
+        let repo = init_repo("brief-index-lock-retry");
+        fs::write(repo.join("README.md"), "# changed\n").expect("write changed README");
+        let lock = repo.join(".git/index.lock");
+        fs::write(&lock, "held by another Git process\n").expect("create index lock");
+        let release_lock = lock.clone();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            fs::remove_file(release_lock).expect("release index lock");
+        });
+
+        run_git(&repo, ["add", "README.md"])
+            .expect("brief optional-lock contention should be retried");
+        releaser.join().expect("lock releaser should finish");
+        assert_eq!(
+            run_git_in(&repo, ["diff", "--cached", "--name-only"]),
+            "README.md\n"
+        );
+        fs::remove_dir_all(repo).expect("cleanup repo");
+    }
+
+    #[test]
+    fn index_lock_retry_classifier_rejects_unrelated_git_failures() {
+        assert!(transient_git_index_lock_failure(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists."
+        ));
+        assert!(!transient_git_index_lock_failure(
+            "fatal: pathspec 'missing' did not match any files"
+        ));
+        assert!(!transient_git_index_lock_failure(
+            "fatal: index.lock contains protected recovery data"
+        ));
     }
 
     #[test]
