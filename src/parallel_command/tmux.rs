@@ -77,17 +77,7 @@ pub(crate) fn setup_parallel_tmux_windows(
 
     for lane in 1..=lanes {
         let window_name = format!("parallel-lane-{lane}");
-        let lane_root = run_root.join("lanes").join(format!("lane-{lane}"));
-        let stdout_log = shell_quote(&lane_root.join("stdout.log").display().to_string());
-        let stderr_log = shell_quote(&lane_root.join("stderr.log").display().to_string());
-        let script = format!(
-            "mkdir -p {lane_root}; touch {stdout_log} {stderr_log}; tail -q --pid={host_pid} -n +1 -F {stdout_log} {stderr_log} || true; printf '\\n[auto parallel lane-{lane}] host process {host_pid} exited; log tail stopped.\\n'; exec bash",
-            lane_root = shell_quote(&lane_root.display().to_string()),
-            stdout_log = stdout_log,
-            stderr_log = stderr_log,
-            host_pid = host_pid,
-            lane = lane,
-        );
+        let script = parallel_lane_tail_script(run_root, lane, host_pid);
         let command = format!("bash -lc {}", shell_quote(&script));
         run_tmux([
             "new-window",
@@ -100,6 +90,16 @@ pub(crate) fn setup_parallel_tmux_windows(
     }
 
     Ok(())
+}
+
+fn parallel_lane_tail_script(run_root: &Path, lane: usize, host_pid: u32) -> String {
+    let lane_root = run_root.join("lanes").join(format!("lane-{lane}"));
+    let stdout_log = shell_quote(&lane_root.join("stdout.log").display().to_string());
+    let stderr_log = shell_quote(&lane_root.join("stderr.log").display().to_string());
+    format!(
+        "mkdir -p {lane_root}; touch {stdout_log} {stderr_log}; tail -q --pid={host_pid} -n +1 -F {stdout_log} {stderr_log} || true; printf '\\n[auto parallel lane-{lane}] host process {host_pid} exited; log tail stopped.\\n'; exit 0",
+        lane_root = shell_quote(&lane_root.display().to_string()),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -282,21 +282,25 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         );
     }
     let host_command = parts.join(" ");
+    let script = parallel_tmux_host_script(run_root, &host_command);
+    Ok(format!("bash -lc {}", shell_quote(&script)))
+}
+
+fn parallel_tmux_host_script(run_root: &Path, host_command: &str) -> String {
     let stdout_log_path = parallel_host_stdout_log_path(run_root);
     let stderr_log_path = parallel_host_stderr_log_path(run_root);
     let run_root = shell_quote(&run_root.display().to_string());
     let stdout_log = shell_quote(&stdout_log_path.display().to_string());
     let stderr_log = shell_quote(&stderr_log_path.display().to_string());
-    let script = format!(
-        "mkdir -p {run_root}; touch {stdout_log} {stderr_log}; ({host_command}) > >(tee -a {stdout_log}) 2> >(tee -a {stderr_log} >&2); status=$?; printf '\\n[auto parallel host] exited with status %s. stdout: %s stderr: %s\\n' \"$status\" {stdout_label} {stderr_label} | tee -a {stdout_log}; exec bash",
+    format!(
+        "mkdir -p {run_root}; touch {stdout_log} {stderr_log}; ({host_command}) > >(tee -a {stdout_log}) 2> >(tee -a {stderr_log} >&2); status=$?; printf '\\n[auto parallel host] exited with status %s. stdout: %s stderr: %s\\n' \"$status\" {stdout_label} {stderr_label} | tee -a {stdout_log}; exit \"$status\"",
         run_root = run_root,
         stdout_log = stdout_log,
         stderr_log = stderr_log,
         host_command = host_command,
         stdout_label = shell_quote(&stdout_log_path.display().to_string()),
         stderr_label = shell_quote(&stderr_log_path.display().to_string()),
-    );
-    Ok(format!("bash -lc {}", shell_quote(&script)))
+    )
 }
 
 pub(crate) fn push_optional_usize_arg(parts: &mut Vec<String>, flag: &str, value: Option<usize>) {
@@ -369,7 +373,9 @@ pub(crate) fn shell_quote(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_tmux_has_session_output;
+    use super::{
+        classify_tmux_has_session_output, parallel_lane_tail_script, parallel_tmux_host_script,
+    };
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -472,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tmux_command_persists_host_logs_and_keeps_shell_open() {
+    fn parallel_tmux_command_persists_host_logs_and_exits_with_host_status() {
         let args = ParallelArgs {
             action: None,
             apply_receipt_backfill_handoffs: false,
@@ -500,7 +506,8 @@ mod tests {
         assert!(command.contains("host.stdout.log"));
         assert!(command.contains("host.stderr.log"));
         assert!(command.contains("tee -a"));
-        assert!(command.contains("exec bash"));
+        assert!(command.contains("exit \"$status\""));
+        assert!(!command.contains("exec bash"));
         assert!(command.contains(" parallel "));
         assert!(command.contains("--threads 8"));
         assert!(command.contains("--max-iterations 3"));
@@ -508,6 +515,32 @@ mod tests {
         assert!(command.contains("--reference-repo"));
         assert!(command.contains("--include-siblings"));
         assert!(!command.contains(" super "));
+    }
+
+    #[test]
+    fn parallel_lane_tail_script_exits_after_host_stops() {
+        let script = parallel_lane_tail_script(&PathBuf::from("/tmp/auto-parallel"), 3, 4242);
+
+        assert!(script.contains("tail -q --pid=4242"));
+        assert!(script.contains("host process 4242 exited; log tail stopped"));
+        assert!(script.ends_with("exit 0"));
+        assert!(!script.contains("exec bash"));
+    }
+
+    #[test]
+    fn parallel_tmux_host_script_propagates_nonzero_status() {
+        let run_root = unique_temp_dir("tmux-host-status");
+        let script = parallel_tmux_host_script(&run_root, "printf host-output; exit 23");
+        let output = Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .expect("failed to execute rendered host script");
+
+        assert_eq!(output.status.code(), Some(23));
+        assert!(fs::read_to_string(run_root.join("host.stdout.log"))
+            .expect("read host stdout log")
+            .contains("host-output"));
+        fs::remove_dir_all(run_root).ok();
     }
 
     #[test]

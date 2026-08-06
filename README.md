@@ -1179,7 +1179,8 @@ What it actually does:
 - When run outside tmux, starts a detached `<repo>-parallel` tmux session running the same command
   and prints the `tmux attach` command
 - Inside tmux, creates `parallel-lane-1` through `parallel-lane-N` windows that tail each lane's
-  live stdout/stderr logs
+  live stdout/stderr logs. The host and tail windows exit when the run ends so the tmux session
+  does not falsely block cleanup; the logs remain on disk for inspection.
 - Uses the quota router for Codex workers, including the 10% weekly quota floor
 - Runs a host preflight once per parallel run and injects the report into lane prompts. The
   preflight calls out common shared blockers such as missing `agent-browser`, inactive Docker
@@ -1229,12 +1230,12 @@ Useful flags:
 - `--branch <name>` to lock the executor to a specific branch
 - `--run-root <dir>` to change where parallel logs are stored
 - `status` to print current host/tmux/lane health without starting new work
-- `prune` to preview the exact obsolete lane, worker-shim, salvage, and host-log paths that can be
+- `prune` to preview the exact obsolete lane, worker-shim, and host-log paths that can be
   removed. This is always a read-only dry run unless `--apply` is present. Applied pruning refuses
   to run while a tmux or direct parallel host is active, the run-root lease is held, or a resumable
   `.run-state.json` exists. It accepts only the repo's canonical `.auto/parallel` root or the
   canonical `<AUTO_RUN_ROOT>/<repo>/parallel` root, requires an Autodev run marker, and preserves
-  the bounded `lane-caches/` build caches and all semantic evidence files. Unknown tmux or process
+  the bounded `lane-caches/` build caches, salvage recovery notes, and all semantic evidence files. Unknown tmux or process
   probe results fail closed. Applied deletion currently requires Linux so it can use atomic
   no-replace quarantine moves; other platforms retain the safe dry-run preview.
 

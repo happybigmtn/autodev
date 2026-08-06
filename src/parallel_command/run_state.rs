@@ -450,6 +450,35 @@ pub(crate) fn clear_parallel_run_state(run_root: &Path) {
     }
 }
 
+/// Remove a run ledger after a graceful terminal stop only when it contains no
+/// scheduling decision that a later invocation must restore and no lane repo
+/// remains eligible for resume. This is intentionally narrower than treating a
+/// parseable/empty ledger as disposable in `parallel prune`: a crashed host can
+/// leave an empty ledger alongside live worker results, while this helper is
+/// called only by the host after it has joined every active lane and completed
+/// resume discovery.
+pub(crate) fn clear_parallel_run_state_if_terminally_empty(
+    run_root: &Path,
+    lane_repos_disposable: bool,
+    shelved_tasks: &BTreeMap<String, String>,
+    deferred_partial_tasks: &BTreeSet<String>,
+    unblock_attempt_counts: &BTreeMap<String, usize>,
+    attempted_partial_followups: &BTreeMap<String, usize>,
+) -> bool {
+    if !run_state_path(run_root).exists()
+        || !lane_repos_disposable
+        || !shelved_tasks.is_empty()
+        || !deferred_partial_tasks.is_empty()
+        || !unblock_attempt_counts.is_empty()
+        || !attempted_partial_followups.is_empty()
+    {
+        return false;
+    }
+
+    clear_parallel_run_state(run_root);
+    !run_state_path(run_root).exists()
+}
+
 /// Mint and persist a fresh run id for this host at `<run_root>/.current-run-id`.
 /// Format is `<unix_millis>-<pid>`, unique per host start. Best-effort: on write
 /// failure the returned id is still usable in-process, lanes just won't be able
@@ -609,6 +638,46 @@ mod tests {
 
         clear_parallel_run_state(&dir);
         assert!(load_parallel_run_state(&dir).shelved_tasks.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn terminally_empty_run_state_is_cleared_but_resumable_state_is_preserved() {
+        let dir = temp_dir("terminal-empty-clear");
+        std::fs::write(run_state_path(&dir), b"{}").expect("write empty ledger");
+
+        assert!(clear_parallel_run_state_if_terminally_empty(
+            &dir,
+            true,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        assert!(!run_state_path(&dir).exists());
+
+        std::fs::write(run_state_path(&dir), b"{}").expect("rewrite empty ledger");
+        assert!(!clear_parallel_run_state_if_terminally_empty(
+            &dir,
+            false,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        assert!(run_state_path(&dir).exists());
+
+        let shelved = BTreeMap::from([("TASK-1".to_string(), "task markdown".to_string())]);
+        assert!(!clear_parallel_run_state_if_terminally_empty(
+            &dir,
+            true,
+            &shelved,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        assert!(run_state_path(&dir).exists());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

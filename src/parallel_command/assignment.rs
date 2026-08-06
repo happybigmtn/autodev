@@ -759,29 +759,15 @@ pub(crate) fn discover_resume_candidates(
             continue;
         }
         match read_worker_pid(&worker_pid_path) {
-            Ok(Some(pid)) => match worker_pid_is_alive(pid) {
-                Ok(true) => {
-                    eprintln!(
-                        "warning: skipping resumable lane-{} because worker pid {} is still alive in {}",
-                        lane_index,
-                        pid,
-                        lane_root.display()
-                    );
-                    continue;
-                }
-                // A stale legacy regular file is safe to leave in place: the
-                // next worker atomically replaces it with its lease
-                // publication. Never unlink the shared path after a
-                // check-to-delete window.
-                Ok(false) => {}
-                Err(err) => {
-                    eprintln!(
-                        "warning: skipping resumable lane-{} because worker pid liveness check failed: {err:#}",
-                        lane_index
-                    );
-                    continue;
-                }
-            },
+            Ok(Some(pid)) => {
+                eprintln!(
+                    "warning: skipping resumable lane-{} because identity-verified worker pid {} is still alive in {}",
+                    lane_index,
+                    pid,
+                    lane_root.display()
+                );
+                continue;
+            }
             Ok(None) => {}
             Err(err) => {
                 eprintln!(
@@ -905,9 +891,6 @@ pub(crate) fn live_resume_workers(run_root: &Path) -> Result<Vec<(usize, String,
         let Some(pid) = read_worker_pid(&lane_root.join("worker.pid"))? else {
             continue;
         };
-        if !worker_pid_is_alive(pid)? {
-            continue;
-        }
         let task_id = read_lane_task_id(&lane_root)?.unwrap_or_else(|| "unknown".to_string());
         live.push((lane_index, task_id, pid));
     }
@@ -1448,11 +1431,7 @@ pub(crate) fn lane_worker_status(
 ) -> Result<(bool, String)> {
     let pid_path = lane_root.join("worker.pid");
     let pid_state = match read_worker_pid(&pid_path) {
-        Ok(Some(pid)) => match worker_pid_is_alive(pid) {
-            Ok(true) => return Ok((true, format!("running pid {pid}"))),
-            Ok(false) => Some(format!("stale pid {pid}")),
-            Err(err) => Some(format!("pid liveness unknown: {err:#}")),
-        },
+        Ok(Some(pid)) => return Ok((true, format!("running verified pid {pid}"))),
         Ok(None) => None,
         Err(err) => Some(format!("worker pid unreadable: {err:#}")),
     };
@@ -2250,9 +2229,11 @@ mod tests {
         )
         .expect("write live worker pid");
 
-        assert_eq!(
-            live_resume_workers(&run_root).expect("scan live workers"),
-            vec![(3, "TASK-LIVE".to_string(), std::process::id())]
+        let error = live_resume_workers(&run_root)
+            .expect_err("a live legacy pid-only record must require explicit recovery");
+        assert!(
+            error.to_string().contains("legacy pid-only"),
+            "unexpected legacy recovery error: {error:#}"
         );
 
         fs::write(lane_root.join("worker.pid"), "4294967295\n").expect("write dead worker pid");
@@ -2260,6 +2241,41 @@ mod tests {
             .expect("scan dead workers")
             .is_empty());
 
+        fs::remove_dir_all(run_root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_resume_worker_scan_rejects_a_reused_pid_identity() {
+        let run_root = unique_temp_dir("parallel-reused-worker-pid");
+        let lane_root = run_root.join("lanes/lane-4");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(lane_root.join("task-id"), "TASK-STALE\n").expect("write task id");
+        let pid = std::process::id();
+        let pid_path = lane_root.join("worker.pid");
+        let guard = crate::backend_process::WorkerPidGuard::new(Some(&pid_path), Some(pid))
+            .expect("publish identity-bound worker lease");
+        assert_eq!(
+            live_resume_workers(&run_root).expect("scan verified live worker"),
+            vec![(4, "TASK-STALE".to_string(), pid)]
+        );
+
+        let lease_path = lane_root.join(fs::read_link(&pid_path).expect("read worker pid lease"));
+        let mut record: crate::backend_process::WorkerPidLeaseRecord =
+            serde_json::from_str(&fs::read_to_string(&lease_path).expect("read worker identity"))
+                .expect("parse worker identity");
+        record.linux_start_time_ticks += 1;
+        fs::write(
+            &lease_path,
+            serde_json::to_vec(&record).expect("serialize stale identity"),
+        )
+        .expect("write stale worker identity");
+
+        assert!(live_resume_workers(&run_root)
+            .expect("a reused pid must be treated as stale")
+            .is_empty());
+
+        drop(guard);
         fs::remove_dir_all(run_root).ok();
     }
 }

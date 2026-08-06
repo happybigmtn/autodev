@@ -283,7 +283,11 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         }
         let repo_status = lane_repo_status_summary(&lane_repo_root);
         let (log_age, log_line) = latest_lane_log_line(&lane_root);
-        let task_id = lane_status_task_id(&stored_task_id, worker_running, log_line.as_deref());
+        let task_id = if idle {
+            lane_status_task_id(&stored_task_id, worker_running, log_line.as_deref())
+        } else {
+            stored_task_id.clone()
+        };
         if !json {
             println!(
                 "  lane-{lane_index}: {task_id} | {pid_state} | {repo_status} | last log {log_age}"
@@ -358,6 +362,7 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
             no_live_parallel_host,
             &active_recovery_lanes,
             &stale_recovery_lanes,
+            revision_match,
         );
         if !json {
             println!("safety verdict: {verdict}");
@@ -370,6 +375,7 @@ pub(crate) fn run_parallel_status(args: &ParallelArgs) -> Result<()> {
         receipt_drift.as_deref(),
         &active_recovery_lanes,
         &stale_recovery_lanes,
+        revision_match,
     );
     if !json {
         println!("health:      {health}");
@@ -422,6 +428,12 @@ fn lane_is_current_idle_capacity(
     lane_root: &Path,
     live_parallel_host: bool,
 ) -> bool {
+    // A stopped host has no capacity, even when its final run identity and
+    // idle heartbeat remain on disk. Treat those files as historical status
+    // artifacts rather than advertising a lane that cannot accept work.
+    if !live_parallel_host {
+        return false;
+    }
     if !lane_has_only_idle_artifacts(lane_root) {
         return false;
     }
@@ -600,6 +612,7 @@ fn current_canonical_gate_status(repo_root: &Path) -> Option<CanonicalGateStatus
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel_status_safety_verdict(
     plan: &LoopPlanSnapshot,
     active_tasks: &BTreeSet<String>,
@@ -608,7 +621,11 @@ pub(crate) fn parallel_status_safety_verdict(
     no_live_parallel_host: bool,
     active_recovery_lanes: &[String],
     stale_recovery_lanes: &[String],
+    revision_match: Option<bool>,
 ) -> String {
+    if revision_match == Some(false) {
+        return "STOP: host binary revision mismatch; drain active lanes, then restart the parallel host before dispatching more work".to_string();
+    }
     if !active_recovery_lanes.is_empty() {
         return "STOP: active lane recovery is in progress; do not launch another host".to_string();
     }
@@ -823,6 +840,7 @@ pub(crate) fn render_parallel_health_summary(
     receipt_drift: Option<&str>,
     active_recovery_lanes: &[String],
     stale_recovery_lanes: &[String],
+    revision_match: Option<bool>,
 ) -> String {
     let mut issues = Vec::new();
     if !preflight_warnings.is_empty() {
@@ -851,6 +869,12 @@ pub(crate) fn render_parallel_health_summary(
             "stale recovery lanes: {}",
             stale_recovery_lanes.join(", ")
         ));
+    }
+    if revision_match == Some(false) {
+        issues.push(
+            "host binary revision mismatch: drain active lanes, then restart the parallel host"
+                .to_string(),
+        );
     }
     if issues.is_empty() {
         "healthy".to_string()
@@ -1065,6 +1089,30 @@ mod tests {
         fs::create_dir_all(&lane_root).expect("create lane root");
         fs::write(run_root.join(CURRENT_RUN_ID_FILE), "current-run\n")
             .expect("write current run id");
+        fs::write(
+            lane_root.join("stdout.log"),
+            "[auto parallel host lane-2 [idle]] idle: waiting on dependencies\n",
+        )
+        .expect("write current idle heartbeat");
+        fs::write(lane_root.join("stderr.log"), "").expect("write stderr log");
+
+        assert!(super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, true
+        ));
+        assert!(!super::lane_is_current_idle_capacity(
+            &run_root, &lane_root, false
+        ));
+        fs::remove_dir_all(run_root).expect("cleanup run root");
+    }
+
+    #[test]
+    fn matching_run_identity_is_not_idle_without_a_live_host() {
+        let run_root = unique_temp_dir("parallel-status-stopped-current-idle");
+        let lane_root = run_root.join("lanes/lane-2");
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        fs::write(run_root.join(CURRENT_RUN_ID_FILE), "current-run\n")
+            .expect("write current run id");
+        fs::write(lane_root.join(LANE_RUN_ID_FILE), "current-run\n").expect("write lane run id");
         fs::write(
             lane_root.join("stdout.log"),
             "[auto parallel host lane-2 [idle]] idle: waiting on dependencies\n",
@@ -1314,6 +1362,7 @@ mod tests {
             Some("2 completed task(s); see RECEIPTS-DRIFT.md"),
             &["lane-1 TASK-1".to_string(), "lane-3 TASK-3".to_string()],
             &["lane-2 TASK-2".to_string()],
+            Some(false),
         );
         assert_eq!(
             preflight,
@@ -1334,6 +1383,8 @@ mod tests {
         assert!(summary.contains("receipt drift: 2 completed task(s); see RECEIPTS-DRIFT.md"));
         assert!(summary.contains("active recovery lanes: lane-1 TASK-1, lane-3 TASK-3"));
         assert!(summary.contains("stale recovery lanes: lane-2 TASK-2"));
+        assert!(summary.contains("host binary revision mismatch"));
+        assert!(summary.contains("drain active lanes, then restart the parallel host"));
 
         fs::remove_dir_all(&run_root).expect("failed to remove run root");
     }
@@ -1391,6 +1442,7 @@ mod tests {
             true,
             &[],
             &[],
+            Some(true),
         );
         assert!(go.starts_with("GO:"), "{go}");
         assert!(go.contains("TASK-1"), "{go}");
@@ -1403,6 +1455,7 @@ mod tests {
             true,
             &[],
             &["lane-2 TASK-2".to_string()],
+            Some(true),
         );
         assert!(recover.starts_with("RECOVER:"), "{recover}");
 
@@ -1414,6 +1467,7 @@ mod tests {
             false,
             &["lane-1 TASK-1".to_string()],
             &[],
+            Some(true),
         );
         assert!(stop.starts_with("STOP:"), "{stop}");
 
@@ -1425,10 +1479,31 @@ mod tests {
             false,
             &[],
             &[],
+            Some(true),
         );
         assert_eq!(
             monitor, "MONITOR: live lane work in progress for TASK-1",
             "a host-owned canonical gate is active work even after its lane worker exits"
+        );
+
+        let revision_skew = parallel_status_safety_verdict(
+            &plan,
+            &BTreeSet::from(["TASK-1".to_string()]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            &[],
+            &[],
+            Some(false),
+        );
+        assert!(revision_skew.starts_with("STOP:"), "{revision_skew}");
+        assert!(
+            revision_skew.contains("revision mismatch"),
+            "{revision_skew}"
+        );
+        assert!(
+            revision_skew.contains("drain active lanes, then restart the parallel host"),
+            "{revision_skew}"
         );
     }
 }

@@ -234,9 +234,9 @@ fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
         .find(|lane| lane["lane"] == 4)
         .expect("unused lane record");
     assert_eq!(unused["task_id"], "[unknown]");
-    assert_eq!(unused["idle"], true);
+    assert_eq!(unused["idle"], false);
     assert_eq!(unused["running"], false);
-    assert_eq!(unused["stale"], false);
+    assert_eq!(unused["stale"], true);
 
     let stale = lanes
         .iter()
@@ -252,7 +252,7 @@ fn parallel_status_json_distinguishes_unused_lane_from_genuinely_stale_lane() {
 }
 
 #[test]
-fn parallel_status_json_reports_heartbeat_lane_as_current_idle_capacity() {
+fn parallel_status_json_does_not_report_stopped_heartbeat_lane_as_idle_capacity() {
     let repo = unique_temp_dir("parallel-status-heartbeat-idle-repo");
     let run_root = unique_temp_dir("parallel-status-heartbeat-idle-run");
     init_git_repo(&repo);
@@ -297,7 +297,7 @@ fn parallel_status_json_reports_heartbeat_lane_as_current_idle_capacity() {
         .find(|lane| lane["lane"] == 2)
         .expect("current idle lane");
     assert_eq!(current["task_id"], "[unknown]");
-    assert_eq!(current["idle"], true);
+    assert_eq!(current["idle"], false);
     assert_eq!(current["stale"], false);
     let old = lanes
         .iter()
@@ -306,6 +306,24 @@ fn parallel_status_json_reports_heartbeat_lane_as_current_idle_capacity() {
     assert_eq!(old["task_id"], "[unknown]");
     assert_eq!(old["idle"], false);
     assert_eq!(old["stale"], true);
+
+    let text_output = Command::new(env!("CARGO_BIN_EXE_auto"))
+        .current_dir(&repo)
+        .args([
+            "parallel",
+            "--run-root",
+            run_root.to_str().expect("run root path should be utf-8"),
+            "status",
+        ])
+        .output()
+        .expect("run text status");
+    assert!(text_output.status.success(), "text status command failed");
+    let text = String::from_utf8(text_output.stdout).expect("text status stdout");
+    assert!(text.contains("lane-2: [unknown]"), "{text}");
+    assert!(
+        !text.contains("lane-2: [idle]"),
+        "stopped heartbeat must not be rendered as idle capacity: {text}"
+    );
 
     let _ = fs::remove_dir_all(&repo);
     let _ = fs::remove_dir_all(&run_root);

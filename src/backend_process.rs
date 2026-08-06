@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
 use crate::util::{atomic_write, timestamp_slug};
@@ -16,6 +18,17 @@ use crate::util::{atomic_write, timestamp_slug};
 static WORKER_PID_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 const WORKER_PID_LEASE_PREFIX: &str = ".auto-worker-pid-lease-";
+#[cfg(target_os = "linux")]
+pub(crate) const WORKER_PID_LEASE_VERSION: u32 = 1;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WorkerPidLeaseRecord {
+    pub(crate) version: u32,
+    pub(crate) pid: u32,
+    pub(crate) linux_start_time_ticks: u64,
+    pub(crate) lane_root: String,
+}
 
 #[derive(Debug)]
 pub(crate) struct WorkerPidGuard {
@@ -75,6 +88,21 @@ fn publish_worker_pid_lease(path: &Path, pid: u32) -> Result<PathBuf> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    #[cfg(target_os = "linux")]
+    let lease_bytes = {
+        let linux_start_time_ticks = linux_process_start_time_ticks(pid)?
+            .with_context(|| format!("worker pid {pid} exited before lease publication"))?;
+        let lane_root = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        serde_json::to_vec(&WorkerPidLeaseRecord {
+            version: WORKER_PID_LEASE_VERSION,
+            pid,
+            linux_start_time_ticks,
+            lane_root: lane_root.display().to_string(),
+        })
+        .context("serialize worker pid lease identity")?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let lease_bytes = pid.to_string().into_bytes();
     let nonce_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -98,7 +126,7 @@ fn publish_worker_pid_lease(path: &Path, pid: u32) -> Result<PathBuf> {
                     .with_context(|| format!("failed to create {}", lease_path.display()));
             }
         };
-        if let Err(err) = lease.write_all(pid.to_string().as_bytes()) {
+        if let Err(err) = lease.write_all(&lease_bytes) {
             let _ = fs::remove_file(&lease_path);
             return Err(err).with_context(|| format!("failed to write {}", lease_path.display()));
         }
@@ -131,6 +159,36 @@ fn publish_worker_pid_lease(path: &Path, pid: u32) -> Result<PathBuf> {
         "failed to allocate a unique worker pid lease beside {} after 1024 attempts",
         path.display()
     )
+}
+
+/// Linux process identity is `(pid, start_time)`, not PID alone. PIDs are
+/// recycled; field 22 of `/proc/<pid>/stat` is stable for one process lifetime.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_process_start_time_ticks(pid: u32) -> Result<Option<u64>> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let close_paren = stat
+        .rfind(')')
+        .with_context(|| format!("malformed process stat in {}", path.display()))?;
+    let fields_after_name = stat
+        .get(close_paren + 1..)
+        .with_context(|| format!("malformed process stat in {}", path.display()))?;
+    // After the command name, token zero is field 3 (`state`), so field 22
+    // (`starttime`) is token 19.
+    let raw_start_time = fields_after_name
+        .split_whitespace()
+        .nth(19)
+        .with_context(|| format!("process stat lacks start time in {}", path.display()))?;
+    let start_time = raw_start_time
+        .parse::<u64>()
+        .with_context(|| format!("invalid process start time in {}", path.display()))?;
+    Ok(Some(start_time))
 }
 
 pub(crate) fn retire_worker_pid_lease(path: &Path) -> Result<()> {
@@ -234,12 +292,35 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
+    use super::WorkerPidLeaseRecord;
     use super::{log_stderr, WorkerPidGuard};
     use crate::util::timestamp_slug;
     use anyhow::anyhow;
 
     fn remove_test_publication(path: &Path) {
         let _ = fs::remove_file(path);
+    }
+
+    fn live_test_pid() -> u32 {
+        std::process::id()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn published_pid(path: &Path) -> u32 {
+        serde_json::from_str::<WorkerPidLeaseRecord>(
+            &fs::read_to_string(path).expect("read worker pid lease"),
+        )
+        .expect("parse worker pid lease")
+        .pid
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn published_pid(path: &Path) -> u32 {
+        fs::read_to_string(path)
+            .expect("read worker pid")
+            .parse()
+            .expect("parse worker pid")
     }
 
     #[test]
@@ -257,8 +338,9 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("backend-process-pid-drop-{}", timestamp_slug()));
         {
-            let _guard = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write worker pid");
-            assert_eq!(fs::read_to_string(&path).expect("read worker pid"), "4242");
+            let _guard =
+                WorkerPidGuard::new(Some(&path), Some(live_test_pid())).expect("write worker pid");
+            assert_eq!(published_pid(&path), live_test_pid());
         }
         assert!(!path.exists());
         remove_test_publication(&path);
@@ -268,7 +350,8 @@ mod tests {
     fn worker_pid_guard_explicit_clear_removes_and_disarms() {
         let path =
             std::env::temp_dir().join(format!("backend-process-pid-clear-{}", timestamp_slug()));
-        let guard = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write worker pid");
+        let guard =
+            WorkerPidGuard::new(Some(&path), Some(live_test_pid())).expect("write worker pid");
 
         guard.clear().expect("clear worker pid");
 
@@ -289,7 +372,8 @@ mod tests {
     fn worker_pid_guard_publishes_an_owner_unique_lease() {
         let path =
             std::env::temp_dir().join(format!("backend-process-pid-lease-{}", timestamp_slug()));
-        let guard = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write worker pid");
+        let guard =
+            WorkerPidGuard::new(Some(&path), Some(live_test_pid())).expect("write worker pid");
 
         let lease_name = fs::read_link(&path).expect("worker pid publication should be a symlink");
         assert_eq!(
@@ -297,7 +381,7 @@ mod tests {
             1,
             "lease target should stay in the worker pid directory"
         );
-        assert_eq!(fs::read_to_string(&path).expect("read worker pid"), "4242");
+        assert_eq!(published_pid(&path), live_test_pid());
 
         guard.clear().expect("clear worker pid");
         assert!(!path.exists());
@@ -309,18 +393,17 @@ mod tests {
     fn older_guard_cleanup_cannot_unlink_a_newer_publication() {
         let path =
             std::env::temp_dir().join(format!("backend-process-pid-handoff-{}", timestamp_slug()));
-        let older = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write older worker pid");
+        let older = WorkerPidGuard::new(Some(&path), Some(live_test_pid()))
+            .expect("write older worker pid");
         let older_lease = fs::read_link(&path).expect("read older lease");
-        let newer = WorkerPidGuard::new(Some(&path), Some(9001)).expect("write newer worker pid");
+        let newer = WorkerPidGuard::new(Some(&path), Some(live_test_pid()))
+            .expect("write newer worker pid");
         let newer_lease = fs::read_link(&path).expect("read newer lease");
         assert_ne!(older_lease, newer_lease);
 
         older.clear().expect("clear older worker pid");
 
-        assert_eq!(
-            fs::read_to_string(&path).expect("read newer worker pid"),
-            "9001"
-        );
+        assert_eq!(published_pid(&path), live_test_pid());
         assert!(!path
             .parent()
             .expect("worker pid parent")
@@ -343,7 +426,8 @@ mod tests {
             "backend-process-pid-clear-error-{}",
             timestamp_slug()
         ));
-        let guard = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write worker pid");
+        let guard =
+            WorkerPidGuard::new(Some(&path), Some(live_test_pid())).expect("write worker pid");
         #[cfg(unix)]
         let lease_path = path
             .parent()
@@ -373,7 +457,8 @@ mod tests {
             "backend-process-pid-replacement-{}",
             timestamp_slug()
         ));
-        let guard = WorkerPidGuard::new(Some(&path), Some(4242)).expect("write worker pid");
+        let guard =
+            WorkerPidGuard::new(Some(&path), Some(live_test_pid())).expect("write worker pid");
         let replacement_path = path.with_extension("replacement");
         fs::write(&replacement_path, "9001").expect("write replacement worker pid");
         fs::rename(&replacement_path, &path).expect("publish replacement worker pid ownership");
@@ -394,8 +479,8 @@ mod tests {
         let task_path = path.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let _guard =
-                WorkerPidGuard::new(Some(&task_path), Some(4242)).expect("write worker pid");
+            let _guard = WorkerPidGuard::new(Some(&task_path), Some(live_test_pid()))
+                .expect("write worker pid");
             let _ = ready_tx.send(());
             std::future::pending::<()>().await;
         });

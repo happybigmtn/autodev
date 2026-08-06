@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::backend_process::{
+    linux_process_start_time_ticks, WorkerPidLeaseRecord, WORKER_PID_LEASE_VERSION,
+};
 use crate::backend_process::{retire_worker_pid_lease, worker_pid_lease_target};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,35 +232,125 @@ pub(crate) fn path_modified_elapsed(path: &Path) -> Result<Option<Duration>> {
     ))
 }
 
-pub(crate) fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerPidIdentity {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    linux_start_time_ticks: u64,
+    #[cfg(target_os = "linux")]
+    lane_root: String,
+}
+
+impl WorkerPidIdentity {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerPidState {
+    Absent,
+    Live(WorkerPidIdentity),
+    Stale,
+}
+
+fn inspect_worker_pid(path: &Path) -> Result<WorkerPidState> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkerPidState::Absent);
+        }
         Err(err) => {
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Ok(WorkerPidState::Absent);
     }
+
+    #[cfg(target_os = "linux")]
+    if trimmed.starts_with('{') {
+        let record: WorkerPidLeaseRecord = serde_json::from_str(trimmed)
+            .with_context(|| format!("invalid process identity in {}", path.display()))?;
+        if record.version != WORKER_PID_LEASE_VERSION {
+            bail!(
+                "unsupported worker pid lease version {} in {}",
+                record.version,
+                path.display()
+            );
+        }
+        let parent = path
+            .parent()
+            .with_context(|| format!("{} has no lane root", path.display()))?;
+        let expected_lane_root = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        if record.lane_root != expected_lane_root.display().to_string() {
+            bail!(
+                "worker pid lease lane identity mismatch in {}: recorded `{}`, expected `{}`",
+                path.display(),
+                record.lane_root,
+                expected_lane_root.display()
+            );
+        }
+        let current_start_time = linux_process_start_time_ticks(record.pid)?;
+        return Ok(match current_start_time {
+            Some(start_time) if start_time == record.linux_start_time_ticks => {
+                WorkerPidState::Live(WorkerPidIdentity {
+                    pid: record.pid,
+                    linux_start_time_ticks: record.linux_start_time_ticks,
+                    lane_root: record.lane_root,
+                })
+            }
+            _ => WorkerPidState::Stale,
+        });
+    }
+
     let pid = trimmed
         .parse::<u32>()
         .with_context(|| format!("invalid pid in {}", path.display()))?;
-    Ok(Some(pid))
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Ok(if worker_pid_is_alive(pid)? {
+            WorkerPidState::Live(WorkerPidIdentity { pid })
+        } else {
+            WorkerPidState::Stale
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if worker_pid_is_alive(pid)? {
+            bail!(
+                "legacy pid-only worker lease {} names live pid {pid}, but process identity cannot be proven; retire or replace the legacy lease before resuming",
+                path.display()
+            );
+        }
+        Ok(WorkerPidState::Stale)
+    }
+}
+
+pub(crate) fn read_worker_pid(path: &Path) -> Result<Option<u32>> {
+    Ok(match inspect_worker_pid(path)? {
+        WorkerPidState::Live(identity) => Some(identity.pid()),
+        WorkerPidState::Absent | WorkerPidState::Stale => None,
+    })
+}
+
+pub(crate) fn read_worker_pid_identity(path: &Path) -> Result<Option<WorkerPidIdentity>> {
+    Ok(match inspect_worker_pid(path)? {
+        WorkerPidState::Live(identity) => Some(identity),
+        WorkerPidState::Absent | WorkerPidState::Stale => None,
+    })
 }
 
 pub(crate) fn clear_stale_worker_pid(path: &Path) -> Result<()> {
     let lease_path = worker_pid_lease_target(path)?;
-    let pid_path = lease_path.as_deref().unwrap_or(path);
-    let Some(pid) = read_worker_pid(pid_path)? else {
-        return Ok(());
-    };
-    if worker_pid_is_alive(pid)? {
-        return Ok(());
-    }
-    if let Some(lease_path) = lease_path {
-        retire_worker_pid_lease(&lease_path)?;
+    match inspect_worker_pid(path)? {
+        WorkerPidState::Absent | WorkerPidState::Live(_) => return Ok(()),
+        WorkerPidState::Stale => {
+            if let Some(lease_path) = lease_path {
+                retire_worker_pid_lease(&lease_path)?;
+            }
+        }
     }
     // Legacy regular worker.pid files are intentionally left for the next
     // atomic lease publication to replace. Unlinking the shared path after a
@@ -345,6 +439,106 @@ pub(crate) fn lane_remote_name(lane_repo_root: &Path) -> Result<String> {
     );
 }
 
+/// Prove that deleting the run's lane repositories cannot discard task work.
+/// Every lane must either be an untouched placeholder or a clean clone whose
+/// commits are already reachable from, or patch-equivalent to, canonical HEAD.
+/// Any unknown shape, live worker, host-pending marker, recovery state, dirty
+/// file, foreign remote, fetch failure, or unlanded patch fails closed.
+pub(crate) fn parallel_lane_repos_are_disposable(
+    repo_root: &Path,
+    run_root: &Path,
+    target_branch: &str,
+) -> Result<bool> {
+    let lanes_root = run_root.join("lanes");
+    let lanes_metadata = match fs::symlink_metadata(&lanes_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", lanes_root.display()));
+        }
+    };
+    if lanes_metadata.file_type().is_symlink() || !lanes_metadata.is_dir() {
+        return Ok(false);
+    }
+    let canonical_repo = fs::canonicalize(repo_root)
+        .with_context(|| format!("failed to canonicalize {}", repo_root.display()))?;
+
+    for entry in fs::read_dir(&lanes_root)
+        .with_context(|| format!("failed to read {}", lanes_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", lanes_root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if !file_type.is_dir() || parse_lane_index(&entry.file_name().to_string_lossy()).is_none() {
+            return Ok(false);
+        }
+        let lane_root = entry.path();
+        if lane_root
+            .join(LANE_HOST_PENDING_FILE)
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", lane_root.display()))?
+            || read_worker_pid_identity(&lane_root.join("worker.pid"))?.is_some()
+        {
+            return Ok(false);
+        }
+        let lane_repo_root = lane_root.join("repo");
+        let repo_metadata = match fs::symlink_metadata(&lane_repo_root) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", lane_repo_root.display()));
+            }
+        };
+        if repo_metadata.file_type().is_symlink() || !repo_metadata.is_dir() {
+            return Ok(false);
+        }
+        let git_dir = lane_repo_root.join(".git");
+        let git_metadata = match fs::symlink_metadata(&git_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", git_dir.display()));
+            }
+        };
+        if git_metadata.file_type().is_symlink() || !git_metadata.is_dir() {
+            return Ok(false);
+        }
+        if lane_repo_has_active_cherry_pick(&lane_repo_root)
+            || lane_repo_has_rebase_recovery(&lane_repo_root)
+            || !git_stdout(&lane_repo_root, ["status", "--short"])?
+                .trim()
+                .is_empty()
+        {
+            return Ok(false);
+        }
+
+        let remote_url = git_stdout(&lane_repo_root, ["remote", "get-url", "canonical"])?;
+        let remote_path = PathBuf::from(remote_url.trim());
+        let Ok(remote_repo) = fs::canonicalize(&remote_path) else {
+            return Ok(false);
+        };
+        if remote_repo != canonical_repo {
+            return Ok(false);
+        }
+        run_git(
+            &lane_repo_root,
+            ["fetch", "--quiet", "canonical", target_branch],
+        )?;
+        let unlanded = git_stdout(&lane_repo_root, ["cherry", "FETCH_HEAD", "HEAD"])?;
+        if unlanded
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with('+'))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn worker_pid_is_alive(pid: u32) -> Result<bool> {
     let status = Command::new("kill")
         .arg("-0")
@@ -354,6 +548,7 @@ pub(crate) fn worker_pid_is_alive(pid: u32) -> Result<bool> {
     Ok(status.success())
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn signal_worker(pid: u32, signal: &str) -> Result<()> {
     let status = Command::new("kill")
         .arg(format!("-{signal}"))
@@ -367,6 +562,100 @@ pub(crate) fn signal_worker(pid: u32, signal: &str) -> Result<()> {
         return Ok(());
     }
     Ok(())
+}
+
+/// Revalidate the exact lease owner immediately before sending a signal. A
+/// grace period can outlive the original process and Linux can recycle its PID;
+/// comparing the full token prevents a later process from inheriting the old
+/// lane's TERM/KILL authority.
+pub(crate) fn signal_worker_identity(
+    worker_pid_path: &Path,
+    expected: &WorkerPidIdentity,
+    signal: &str,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let raw_fd = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_open,
+                libc::pid_t::try_from(expected.pid()).context("worker pid exceeds pid_t")?,
+                0_u32,
+            )
+        };
+        if raw_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to open stable process handle for pid {}",
+                    expected.pid()
+                )
+            });
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+
+        // Open the stable handle before re-reading the lease. If the process
+        // exits or its numeric PID is recycled during validation, the handle
+        // continues to name only the original process.
+        let Some(current) = read_worker_pid_identity(worker_pid_path)? else {
+            return Ok(false);
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+
+        let signal_number = match signal {
+            "TERM" => libc::SIGTERM,
+            "KILL" => libc::SIGKILL,
+            _ => bail!("unsupported worker signal SIG{signal}"),
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal_number,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to send SIG{signal} through pidfd for pid {}",
+                    expected.pid()
+                )
+            });
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    signal_worker_identity_with(worker_pid_path, expected, signal, signal_worker)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn signal_worker_identity_with(
+    worker_pid_path: &Path,
+    expected: &WorkerPidIdentity,
+    signal: &str,
+    send: impl FnOnce(u32, &str) -> Result<()>,
+) -> Result<bool> {
+    let Some(current) = read_worker_pid_identity(worker_pid_path)? else {
+        return Ok(false);
+    };
+    if current != *expected {
+        return Ok(false);
+    }
+    send(expected.pid(), signal)?;
+    Ok(true)
 }
 
 pub(crate) fn inspect_lane_repo_progress(
@@ -536,6 +825,8 @@ pub(crate) fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::backend_process::WorkerPidGuard;
+    #[cfg(target_os = "linux")]
+    use crate::backend_process::WorkerPidLeaseRecord;
     use crate::parallel_command::*;
     use std::time::UNIX_EPOCH;
 
@@ -588,15 +879,27 @@ mod tests {
         std::env::temp_dir().join(format!("autodev-{label}-{nanos}"))
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn stale_worker_cleanup_retires_the_lease_without_unlinking_its_publication() {
         let root = unique_temp_dir("stale-worker-lease");
         fs::create_dir_all(&root).expect("create worker pid root");
         let path = root.join("worker.pid");
-        let guard =
-            WorkerPidGuard::new(Some(&path), Some(999_999)).expect("publish stale worker pid");
+        let pid = std::process::id();
+        let guard = WorkerPidGuard::new(Some(&path), Some(pid)).expect("publish worker pid");
         let lease_path = root.join(fs::read_link(&path).expect("read worker pid lease"));
+        #[cfg(target_os = "linux")]
+        {
+            let mut record: WorkerPidLeaseRecord =
+                serde_json::from_str(&fs::read_to_string(&lease_path).expect("read worker lease"))
+                    .expect("parse worker lease");
+            record.linux_start_time_ticks += 1;
+            fs::write(
+                &lease_path,
+                serde_json::to_vec(&record).expect("serialize stale worker lease"),
+            )
+            .expect("write stale worker lease");
+        }
 
         clear_stale_worker_pid(&path).expect("clear stale worker pid");
 
@@ -612,6 +915,143 @@ mod tests {
 
         drop(guard);
         fs::remove_dir_all(&root).expect("remove worker pid root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_boundary_rejects_a_changed_worker_identity() {
+        let root = unique_temp_dir("worker-signal-identity");
+        fs::create_dir_all(&root).expect("create worker pid root");
+        let path = root.join("worker.pid");
+        let guard = WorkerPidGuard::new(Some(&path), Some(std::process::id()))
+            .expect("publish worker identity");
+        let expected = read_worker_pid_identity(&path)
+            .expect("read worker identity")
+            .expect("worker must be live");
+        let lease_path = root.join(fs::read_link(&path).expect("read worker pid lease"));
+        let mut replacement: WorkerPidLeaseRecord =
+            serde_json::from_str(&fs::read_to_string(&lease_path).expect("read worker lease"))
+                .expect("parse worker lease");
+        replacement.linux_start_time_ticks += 1;
+        fs::write(
+            &lease_path,
+            serde_json::to_vec(&replacement).expect("serialize replacement identity"),
+        )
+        .expect("replace worker identity");
+        let called = std::cell::Cell::new(false);
+
+        let signaled = super::signal_worker_identity_with(&path, &expected, "TERM", |_, _| {
+            called.set(true);
+            Ok(())
+        })
+        .expect("identity rejection should not error");
+
+        assert!(!signaled);
+        assert!(
+            !called.get(),
+            "signal callback must not run after identity drift"
+        );
+        drop(guard);
+        fs::remove_dir_all(&root).expect("remove worker pid root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_worker_identity_uses_live_pidfd_handle() {
+        let root = unique_temp_dir("worker-pidfd-signal");
+        fs::create_dir_all(&root).expect("create worker pid root");
+        let path = root.join("worker.pid");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn signal target");
+        let guard = WorkerPidGuard::new(Some(&path), Some(child.id()))
+            .expect("publish child worker identity");
+        let expected = read_worker_pid_identity(&path)
+            .expect("read child worker identity")
+            .expect("child worker must be live");
+
+        assert!(signal_worker_identity(&path, &expected, "TERM")
+            .expect("signal through stable process handle"));
+        let status = child.wait().expect("reap signal target");
+        assert!(!status.success(), "TERM should stop the signal target");
+
+        drop(guard);
+        fs::remove_dir_all(&root).expect("remove worker pid root");
+    }
+
+    #[test]
+    fn terminal_disposal_preserves_unlanded_or_dirty_lane_work_before_clearing_ledger() {
+        let root = unique_temp_dir("terminal-lane-disposal");
+        let canonical = root.join("canonical");
+        let run_root = canonical.join(".auto/parallel");
+        let lane_root = run_root.join("lanes/lane-1");
+        let lane_repo = lane_root.join("repo");
+        init_git_repo(&canonical);
+        git_ok(&canonical, ["checkout", "-q", "-b", "main"]);
+        fs::write(canonical.join("source.txt"), "base\n").expect("write canonical source");
+        git_ok(&canonical, ["add", "source.txt"]);
+        git_ok(&canonical, ["commit", "-q", "-m", "base"]);
+        fs::create_dir_all(&lane_root).expect("create lane root");
+        clone_loop_lane_repo(&canonical, "main", &lane_repo).expect("clone lane repo");
+        git_ok(&lane_repo, ["config", "user.email", "test@example.com"]);
+        git_ok(&lane_repo, ["config", "user.name", "Autodev Test"]);
+        fs::write(lane_repo.join("source.txt"), "task work\n").expect("write lane work");
+        git_ok(&lane_repo, ["add", "source.txt"]);
+        git_ok(
+            &lane_repo,
+            ["commit", "-q", "-m", "TASK-BLOCKED implementation"],
+        );
+        fs::write(run_root.join(".run-state.json"), b"{}").expect("write run ledger");
+
+        assert!(
+            !parallel_lane_repos_are_disposable(&canonical, &run_root, "main")
+                .expect("inspect unlanded lane")
+        );
+        assert!(!clear_parallel_run_state_if_terminally_empty(
+            &run_root,
+            false,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        assert!(run_root.join(".run-state.json").exists());
+
+        let lane_commit = git_output(&lane_repo, ["rev-parse", "HEAD"]);
+        git_ok(
+            &canonical,
+            [
+                "fetch",
+                "-q",
+                lane_repo.to_str().expect("UTF-8 lane path"),
+                &lane_commit,
+            ],
+        );
+        git_ok(&canonical, ["cherry-pick", "FETCH_HEAD"]);
+        assert!(
+            parallel_lane_repos_are_disposable(&canonical, &run_root, "main")
+                .expect("inspect landed lane")
+        );
+
+        fs::write(lane_repo.join("dirty.txt"), "uncommitted\n").expect("write dirty lane file");
+        assert!(
+            !parallel_lane_repos_are_disposable(&canonical, &run_root, "main")
+                .expect("inspect dirty lane")
+        );
+        fs::remove_file(lane_repo.join("dirty.txt")).expect("remove dirty lane file");
+        assert!(clear_parallel_run_state_if_terminally_empty(
+            &run_root,
+            parallel_lane_repos_are_disposable(&canonical, &run_root, "main")
+                .expect("prove terminal lanes"),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        assert!(!run_root.join(".run-state.json").exists());
+
+        fs::remove_dir_all(&root).expect("remove terminal disposal fixture");
     }
 
     #[test]

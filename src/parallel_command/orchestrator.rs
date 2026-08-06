@@ -883,18 +883,55 @@ pub(crate) async fn run_parallel_loop(
             if queue.pending_ids.is_empty() {
                 if queue.blocked_ids.is_empty() {
                     parallel_logger.info("no unfinished `- [ ]` / `- [~]` tasks remain; stopping.");
-                    // Clean completion: drop the ledger so a later run on this
-                    // run_root starts fresh instead of reloading finished state.
-                    clear_parallel_run_state(run_root);
-                    // Drop the workspace baseline too, so a fresh run recaptures
-                    // its own pre-existing snapshot rather than inheriting this
-                    // run's best-observed sets.
-                    clear_workspace_baseline(run_root);
+                    // A completed plan does not prove every lane artifact is
+                    // disposable: a stale/done lane can still contain dirty or
+                    // unlanded work. Keep the ledger as the prune interlock until
+                    // the same full lane inventory proof used by every other
+                    // graceful terminal path succeeds.
+                    let lanes_disposable = terminal_lane_repos_are_disposable(
+                        repo_root,
+                        run_root,
+                        target_branch,
+                        parallel_logger,
+                    );
+                    if clear_parallel_run_state_if_terminally_empty(
+                        run_root,
+                        lanes_disposable,
+                        &shelved_tasks,
+                        &deferred_partial_tasks,
+                        &unblock_attempt_counts,
+                        &attempted_partial_followups,
+                    ) {
+                        parallel_logger.info(
+                            "run-state: cleared terminally empty ledger; disposable lane artifacts are now eligible for safe pruning",
+                        );
+                        // Drop the workspace baseline only with the ledger, so
+                        // a preserved recovery run retains its original snapshot.
+                        clear_workspace_baseline(run_root);
+                    }
                 } else {
                     parallel_logger.info(format!(
                         "all remaining tasks are blocked `[!]`; stopping. blocked: {}",
                         queue.blocked_ids.join(", ")
                     ));
+                    let lanes_disposable = terminal_lane_repos_are_disposable(
+                        repo_root,
+                        run_root,
+                        target_branch,
+                        parallel_logger,
+                    );
+                    if clear_parallel_run_state_if_terminally_empty(
+                        run_root,
+                        lanes_disposable,
+                        &shelved_tasks,
+                        &deferred_partial_tasks,
+                        &unblock_attempt_counts,
+                        &attempted_partial_followups,
+                    ) {
+                        parallel_logger.info(
+                            "run-state: cleared terminally empty ledger; disposable lane artifacts are now eligible for safe pruning",
+                        );
+                    }
                 }
                 break;
             }
@@ -938,6 +975,24 @@ pub(crate) async fn run_parallel_loop(
                 &unblock_attempt_counts,
                 max_autonomous_unblock_attempts,
             ));
+            let lanes_disposable = terminal_lane_repos_are_disposable(
+                repo_root,
+                run_root,
+                target_branch,
+                parallel_logger,
+            );
+            if clear_parallel_run_state_if_terminally_empty(
+                run_root,
+                lanes_disposable,
+                &shelved_tasks,
+                &deferred_partial_tasks,
+                &unblock_attempt_counts,
+                &attempted_partial_followups,
+            ) {
+                parallel_logger.info(
+                    "run-state: cleared terminally empty ledger; disposable lane artifacts are now eligible for safe pruning",
+                );
+            }
             break;
         }
 
@@ -2118,6 +2173,23 @@ fn detect_forbidden_worker_remote_git_command_lines(
     })
 }
 
+fn terminal_lane_repos_are_disposable(
+    repo_root: &Path,
+    run_root: &Path,
+    target_branch: &str,
+    parallel_logger: &ParallelEventLogger,
+) -> bool {
+    match parallel_lane_repos_are_disposable(repo_root, run_root, target_branch) {
+        Ok(disposable) => disposable,
+        Err(err) => {
+            parallel_logger.warn(format!(
+                "warning: preserving terminal run-state ledger because lane disposal proof failed: {err:#}"
+            ));
+            false
+        }
+    }
+}
+
 fn forbidden_remote_git_verb(command: &str) -> Option<String> {
     forbidden_remote_git_verb_with_depth(command, 0)
 }
@@ -2514,8 +2586,8 @@ pub(crate) fn nudge_lingering_committed_lanes(
         };
         match progress {
             LaneRepoProgress::NewCommits => {
-                let pid = match read_worker_pid(&assignment.worker_pid_path) {
-                    Ok(pid) => pid,
+                let identity = match read_worker_pid_identity(&assignment.worker_pid_path) {
+                    Ok(identity) => identity,
                     Err(err) => {
                         eprintln!(
                             "warning: failed reading worker pid for lane-{} `{}`: {err:#}",
@@ -2526,52 +2598,45 @@ pub(crate) fn nudge_lingering_committed_lanes(
                         continue;
                     }
                 };
-                let Some(pid) = pid else {
+                let Some(identity) = identity else {
                     assignment.clean_commit_since = None;
                     assignment.terminate_requested_at = None;
                     continue;
                 };
-                let alive = match worker_pid_is_alive(pid) {
-                    Ok(alive) => alive,
-                    Err(err) => {
-                        eprintln!(
-                            "warning: failed checking worker liveness for lane-{} `{}` pid {}: {err:#}",
-                            assignment.lane_index, assignment.task.id, pid
-                        );
-                        assignment.clean_commit_since = None;
-                        assignment.terminate_requested_at = None;
-                        continue;
-                    }
-                };
-                if !alive {
-                    assignment.clean_commit_since = None;
-                    assignment.terminate_requested_at = None;
-                    continue;
-                }
+                let pid = identity.pid();
 
                 let commit_since = assignment
                     .clean_commit_since
                     .get_or_insert_with(Instant::now);
                 if let Some(requested_at) = assignment.terminate_requested_at {
                     if requested_at.elapsed() >= CLEAN_COMMIT_KILL_GRACE {
-                        if let Err(err) = signal_worker(pid, "KILL") {
-                            eprintln!(
+                        match signal_worker_identity(
+                            &assignment.worker_pid_path,
+                            &identity,
+                            "KILL",
+                        ) {
+                            Err(err) => eprintln!(
                                 "warning: failed sending SIGKILL to lingering worker pid {} for lane-{} `{}`: {err:#}",
                                 pid, assignment.lane_index, assignment.task.id
-                            );
-                        } else {
-                            println!(
-                                "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                            ),
+                            Ok(false) => eprintln!(
+                                "warning: skipped SIGKILL for lane-{} `{}` because worker pid {} no longer owns the same identity-bound lease",
                                 assignment.lane_index, assignment.task.id, pid
-                            );
-                            append_lane_host_event(
-                                &assignment.stdout_log_path,
-                                assignment.lane_index,
-                                &assignment.task.id,
-                                &format!(
-                                    "harvest: sent SIGKILL to lingering worker pid {pid} after clean commit"
-                                ),
-                            );
+                            ),
+                            Ok(true) => {
+                                println!(
+                                    "harvest:     lane-{} `{}` still lingered after clean commit; sent SIGKILL to pid {}",
+                                    assignment.lane_index, assignment.task.id, pid
+                                );
+                                append_lane_host_event(
+                                    &assignment.stdout_log_path,
+                                    assignment.lane_index,
+                                    &assignment.task.id,
+                                    &format!(
+                                        "harvest: sent SIGKILL to lingering worker pid {pid} after clean commit"
+                                    ),
+                                );
+                            }
                         }
                         assignment.terminate_requested_at = None;
                     }
@@ -2587,26 +2652,35 @@ pub(crate) fn nudge_lingering_committed_lanes(
                     continue;
                 }
 
-                {
-                    if let Err(err) = signal_worker(pid, "TERM") {
+                match signal_worker_identity(&assignment.worker_pid_path, &identity, "TERM") {
+                    Err(err) => {
                         eprintln!(
-                            "warning: failed sending SIGTERM to lingering worker pid {} for lane-{} `{}`: {err:#}",
-                            pid, assignment.lane_index, assignment.task.id
-                        );
+                                "warning: failed sending SIGTERM to lingering worker pid {} for lane-{} `{}`: {err:#}",
+                                pid, assignment.lane_index, assignment.task.id
+                            );
                         assignment.terminate_requested_at = None;
-                    } else {
+                    }
+                    Ok(false) => {
+                        eprintln!(
+                                "warning: skipped SIGTERM for lane-{} `{}` because worker pid {} no longer owns the same identity-bound lease",
+                                assignment.lane_index, assignment.task.id, pid
+                            );
+                        assignment.clean_commit_since = None;
+                        assignment.terminate_requested_at = None;
+                    }
+                    Ok(true) => {
                         println!(
-                            "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
-                            assignment.lane_index, assignment.task.id, pid
-                        );
+                                "harvest:     lane-{} `{}` has a clean local commit; sent SIGTERM to lingering pid {}",
+                                assignment.lane_index, assignment.task.id, pid
+                            );
                         append_lane_host_event(
-                            &assignment.stdout_log_path,
-                            assignment.lane_index,
-                            &assignment.task.id,
-                            &format!(
-                                "harvest: sent SIGTERM to lingering worker pid {pid} after clean commit"
-                            ),
-                        );
+                                &assignment.stdout_log_path,
+                                assignment.lane_index,
+                                &assignment.task.id,
+                                &format!(
+                                    "harvest: sent SIGTERM to lingering worker pid {pid} after clean commit"
+                                ),
+                            );
                         assignment.terminate_requested_at = Some(Instant::now());
                     }
                 }

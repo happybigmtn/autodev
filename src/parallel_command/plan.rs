@@ -570,6 +570,7 @@ mod tests {
             true,
             &[],
             &[],
+            Some(true),
         );
         assert_eq!(
             verdict,
@@ -624,6 +625,7 @@ mod tests {
             true,
             &[],
             &[],
+            Some(true),
         );
         assert_eq!(
             verdict,

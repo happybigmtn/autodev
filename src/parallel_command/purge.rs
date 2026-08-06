@@ -1,6 +1,6 @@
 //! Safe automatic purge of the PREVIOUS parallel run's heavy artifacts.
 //!
-//! Lane worktrees, per-run worker shims, and salvage/host logs dominate the
+//! Lane worktrees, per-run worker shims, and host logs dominate the
 //! disk footprint of a parallel run (hundreds of MB per repo), but none of
 //! them carry completion truth: receipts live in
 //! `.auto/symphony/verification-receipts/` and in
@@ -11,7 +11,11 @@
 //! - the repo's parallel tmux session is not running (a live host owns the
 //!   lane directories), and
 //! - the run root has no `.run-state.json` ledger (an unfinished run keeps
-//!   its lanes and salvage records for resume and forensics).
+//!   its lanes for resume and forensics).
+//!
+//! Salvage records are semantic recovery evidence for clean commits that did
+//! not land. They remain preserved until an exact landing/retirement path can
+//! remove the corresponding note.
 //!
 //! Persistent `lane-caches/` are deliberately excluded. They are bounded at
 //! assignment time and make subsequent Rust lanes materially faster.
@@ -22,7 +26,7 @@ use super::*;
 use fs2::FileExt;
 use std::fs::File;
 
-const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin", "salvage"];
+const PURGEABLE_SUBDIRS: &[&str] = &["lanes", "worker-bin"];
 const PURGEABLE_LOGS: &[&str] = &["host.stdout.log", "host.stderr.log"];
 const PARALLEL_HOST_LOCK_FILE: &str = ".host.lock";
 const PARALLEL_PRUNE_QUARANTINE_DIR: &str = ".prune-quarantine";
@@ -33,6 +37,7 @@ struct ParallelPrunePlan {
     targets: Vec<ParallelPruneTarget>,
     bytes: u64,
     blocked_by_run_state: bool,
+    lanes_preserved_by_salvage: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +143,9 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
         }
     );
     println!("lane caches: preserved");
+    if plan.lanes_preserved_by_salvage {
+        println!("lanes:       preserved (salvage recovery evidence exists)");
+    }
     if plan.targets.is_empty() {
         println!("targets:     none (0 B)");
     } else {
@@ -294,7 +302,11 @@ fn validate_parallel_prune_root(repo_root: &Path, run_root: &Path) -> Result<()>
 fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
     let mut targets = Vec::new();
     let mut bytes = 0u64;
+    let lanes_preserved_by_salvage = parallel_salvage_records_present(run_root)?;
     for name in PURGEABLE_SUBDIRS.iter().chain(PURGEABLE_LOGS.iter()) {
+        if *name == "lanes" && lanes_preserved_by_salvage {
+            continue;
+        }
         let target = run_root.join(name);
         validate_parallel_prune_target(run_root, &target)?;
         let Ok(metadata) = fs::symlink_metadata(&target) else {
@@ -325,7 +337,26 @@ fn parallel_prune_plan(run_root: &Path) -> Result<ParallelPrunePlan> {
         targets,
         bytes,
         blocked_by_run_state: run_root.join(".run-state.json").exists(),
+        lanes_preserved_by_salvage,
     })
+}
+
+fn parallel_salvage_records_present(run_root: &Path) -> Result<bool> {
+    let path = run_root.join(SALVAGE_DIR);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ok(false);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing invalid parallel salvage evidence root: {}",
+            path.display()
+        );
+    }
+    Ok(fs::read_dir(&path)
+        .with_context(|| format!("failed reading salvage evidence {}", path.display()))?
+        .next()
+        .transpose()?
+        .is_some())
 }
 
 fn validate_parallel_run_root_identity(run_root: &Path) -> Result<()> {
@@ -613,21 +644,32 @@ mod tests {
             .expect("write cache");
     }
 
+    fn seed_salvage_evidence(root: &Path) {
+        let salvage = root.join("salvage/nested");
+        std::fs::create_dir_all(&salvage).expect("create salvage evidence dir");
+        std::fs::write(salvage.join("recovery.md"), b"unlanded commit\n")
+            .expect("write salvage evidence");
+    }
+
     #[test]
     fn purge_removes_previous_run_artifacts_but_keeps_semantic_files() {
         let repo = temp_dir("repo");
         let run_root = repo.join(".auto/parallel");
         std::fs::create_dir_all(&run_root).expect("create run root");
         seed_run_artifacts(&run_root);
+        seed_salvage_evidence(&run_root);
 
         purge_previous_parallel_run_artifacts(&repo, &run_root);
 
-        for sub in PURGEABLE_SUBDIRS {
-            assert!(!run_root.join(sub).exists(), "{sub} should be purged");
-        }
+        assert!(
+            run_root.join("lanes").exists(),
+            "salvage must preserve lanes"
+        );
+        assert!(!run_root.join("worker-bin").exists());
         for log in PURGEABLE_LOGS {
             assert!(!run_root.join(log).exists(), "{log} should be purged");
         }
+        assert!(run_root.join("salvage/nested/recovery.md").exists());
         assert!(run_root.join("preflight.txt").exists());
         assert!(run_root.join("gate-holds").exists());
         assert!(run_root.join("lane-caches/lane-1/cache.bin").exists());
@@ -687,13 +729,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![
-                "lanes",
-                "worker-bin",
-                "salvage",
-                "host.stdout.log",
-                "host.stderr.log"
-            ]
+            vec!["lanes", "worker-bin", "host.stdout.log", "host.stderr.log"]
         );
         assert!(!plan.blocked_by_run_state);
         assert!(plan.bytes > 0);
@@ -721,6 +757,32 @@ mod tests {
         assert!(run_root.join("lane-caches/lane-1/cache.bin").exists());
         assert!(run_root.join("preflight.txt").exists());
 
+        std::fs::remove_dir_all(&run_root).ok();
+    }
+
+    #[test]
+    fn graceful_terminal_empty_ledger_unblocks_prune_without_discarding_salvage() {
+        let run_root = temp_dir("terminal-empty-prune");
+        seed_run_artifacts(&run_root);
+        seed_salvage_evidence(&run_root);
+        std::fs::write(run_root.join(".run-state.json"), b"{}").expect("write ledger");
+
+        assert!(clear_parallel_run_state_if_terminally_empty(
+            &run_root,
+            true,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        ));
+        let plan = parallel_prune_plan(&run_root).expect("plan after graceful stop");
+        assert!(!plan.blocked_by_run_state);
+        apply_parallel_prune_plan(&run_root, &plan, false, "test-parallel")
+            .expect("prune terminal artifacts");
+
+        assert!(run_root.join("lanes").exists());
+        assert!(!run_root.join("worker-bin").exists());
+        assert!(run_root.join("salvage/nested/recovery.md").exists());
         std::fs::remove_dir_all(&run_root).ok();
     }
 
