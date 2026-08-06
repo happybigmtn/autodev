@@ -631,6 +631,8 @@ pub(crate) async fn run_parallel_loop(
                             continue;
                         }
                     };
+                    assignment.attempts =
+                        seed_unblock_lane_attempts(assignment.attempts, *attempt_count);
                     attach_partial_follow_up_note(
                         repo_root,
                         &mut assignment,

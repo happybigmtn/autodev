@@ -770,6 +770,22 @@ pub(crate) fn unblock_candidate_priority(kind: ParallelUnblockCandidateKind) -> 
     }
 }
 
+/// Seed the lane-local attempt counter for a host-directed unblock retry.
+///
+/// Fresh lane preparation starts `attempts` at zero, even when the host has
+/// already consumed one or more autonomous unblock attempts for this task.
+/// Leaving that zero in place makes every recreated closeout worker look like
+/// attempt one, which defeats retry effort escalation and can also reuse an
+/// earlier prompt filename. Preserve a larger resumed-lane counter, otherwise
+/// carry the host retry count into the lane before `spawn_parallel_lane_attempt`
+/// increments it.
+pub(crate) fn seed_unblock_lane_attempts(
+    prepared_attempts: usize,
+    unblock_attempt_count: usize,
+) -> usize {
+    prepared_attempts.max(unblock_attempt_count)
+}
+
 pub(crate) fn render_parallel_unblock_note(candidate: &ParallelUnblockCandidate) -> String {
     let downstream = if candidate.downstream.is_empty() {
         "no direct unfinished dependents recorded in the plan".to_string()
@@ -1070,6 +1086,19 @@ mod tests {
         .expect("expected an unblock candidate");
         assert_eq!(candidate.task.id, "TASK-S");
         assert_eq!(candidate.kind, ParallelUnblockCandidateKind::ShelvedResume);
+    }
+
+    #[test]
+    fn unblock_lane_attempt_seed_preserves_retry_escalation() {
+        // The first host-directed closeout follows the original worker, so the
+        // next spawn must become lane attempt two rather than another attempt
+        // one. Later closeouts advance in the same way.
+        assert_eq!(seed_unblock_lane_attempts(0, 1), 1);
+        assert_eq!(seed_unblock_lane_attempts(0, 3), 3);
+
+        // A genuinely resumed lane may already have a larger local counter;
+        // never move it backwards.
+        assert_eq!(seed_unblock_lane_attempts(4, 2), 4);
     }
 
     #[test]
