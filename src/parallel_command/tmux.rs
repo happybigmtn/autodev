@@ -290,6 +290,7 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
                 ParallelAction::PlanCheck => "plan-check",
                 ParallelAction::ReceiptBackfill => "receipt-backfill",
                 ParallelAction::Prune => "prune",
+                ParallelAction::QuarantineClear => "quarantine-clear",
             }
             .to_string(),
         );

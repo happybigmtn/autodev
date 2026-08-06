@@ -327,4 +327,22 @@ mod tests {
         assert!(help.contains("--symphony-root <PATH>"));
         assert!(help.contains("AUTODEV_SYMPHONY_ROOT"));
     }
+
+    #[test]
+    fn parallel_quarantine_clear_is_dry_run_unless_apply_is_explicit() {
+        let cli = Cli::try_parse_from(["auto", "parallel", "quarantine-clear"])
+            .expect("dry-run quarantine clear should parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+        assert_eq!(args.action, Some(ParallelAction::QuarantineClear));
+        assert!(!args.apply);
+
+        let cli = Cli::try_parse_from(["auto", "parallel", "quarantine-clear", "--apply"])
+            .expect("applied quarantine clear should parse");
+        let Command::Parallel(args) = cli.command else {
+            panic!("expected parallel command");
+        };
+        assert!(args.apply);
+    }
 }

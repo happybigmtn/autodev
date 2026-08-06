@@ -186,6 +186,9 @@ pub(crate) async fn run_parallel(args: ParallelArgs) -> Result<()> {
     if args.action == Some(ParallelAction::Prune) {
         return run_parallel_prune(&args);
     }
+    if args.action == Some(ParallelAction::QuarantineClear) {
+        return run_parallel_quarantine_clear(&args);
+    }
 
     if args.max_concurrent_workers == 0 {
         bail!("--max-concurrent-workers must be greater than 0");

@@ -294,6 +294,8 @@ pub(crate) enum ParallelAction {
     ReceiptBackfill,
     /// Preview or remove obsolete lane artifacts while preserving lane caches.
     Prune,
+    /// Preview or clear a stale review quarantine after proving canonical state is durable.
+    QuarantineClear,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

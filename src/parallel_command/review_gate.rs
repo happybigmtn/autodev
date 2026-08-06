@@ -1435,6 +1435,136 @@ pub(crate) fn enforce_review_input_quarantine_before_dispatch(repo_root: &Path) 
     Ok(())
 }
 
+/// Explicitly retire a stale mutation quarantine after the intended canonical
+/// state has been committed and pushed. This is deliberately an operator
+/// action rather than an automatic escape hatch: an active gate, live host,
+/// dirty tree, detached branch, or unpushed commit all fail closed.
+pub(crate) fn run_parallel_quarantine_clear(args: &ParallelArgs) -> Result<()> {
+    let repo_root = git_repo_root()?;
+    let run_root = parallel_run_root(&repo_root, args);
+    clear_review_input_quarantine(&repo_root, &run_root, args.apply)
+}
+
+fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool) -> Result<()> {
+    let existing = review_input_quarantine_paths(repo_root)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        println!("auto parallel quarantine-clear: no quarantine marker found");
+        return Ok(());
+    }
+
+    let session = parallel_tmux_session_name(repo_root);
+    if tmux_session_exists(&session)
+        .with_context(|| format!("cannot prove parallel host `{session}` is stopped"))?
+    {
+        bail!("refusing quarantine recovery while parallel host `{session}` is running");
+    }
+    let hosts = parallel_host_processes_for_repo_strict(repo_root)
+        .context("cannot prove no direct parallel host is running")?;
+    if !hosts.is_empty() {
+        bail!(
+            "refusing quarantine recovery while {} direct parallel host process(es) are running",
+            hosts.len()
+        );
+    }
+
+    let mut markers = Vec::with_capacity(existing.len());
+    for path in &existing {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect quarantine marker {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "quarantine marker is not a regular file: {}",
+                path.display()
+            );
+        }
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read quarantine marker {}", path.display()))?;
+        let marker: ReviewInputQuarantine = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid dispatch quarantine at {}", path.display()))?;
+        if marker.version != REVIEW_INPUT_QUARANTINE_VERSION {
+            bail!(
+                "unsupported independent-review dispatch quarantine version {} at {}",
+                marker.version,
+                path.display()
+            );
+        }
+        if marker.phase == GateTransactionPhase::InProgress {
+            bail!(
+                "refusing to clear in-progress gate transaction for `{}`; first prove the gate process ended and restore its captured state",
+                marker.task_id
+            );
+        }
+        markers.push((path.clone(), bytes, marker));
+    }
+
+    let dirty = git_stdout(
+        repo_root,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !dirty.trim().is_empty() {
+        bail!("refusing quarantine recovery from a dirty canonical worktree/index");
+    }
+    let branch = git_stdout(repo_root, ["branch", "--show-current"])?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        bail!("refusing quarantine recovery from detached HEAD");
+    }
+    let head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let remote = git_stdout(repo_root, ["rev-parse", remote_ref.as_str()])?;
+    if head.trim() != remote.trim() {
+        bail!(
+            "refusing quarantine recovery until `{branch}` exactly matches local `origin/{branch}`"
+        );
+    }
+
+    println!("auto parallel quarantine-clear");
+    println!("repo root:   {}", repo_root.display());
+    println!("branch/head: {branch} {}", head.trim());
+    println!("markers:     {}", markers.len());
+    println!("mode:        {}", if apply { "apply" } else { "dry-run" });
+    for (path, _, marker) in &markers {
+        println!(
+            "candidate:   {} task={} reviewed_head={}",
+            path.display(),
+            marker.task_id,
+            marker.reviewed_head
+        );
+    }
+    if !apply {
+        println!("no markers cleared; rerun with `--apply` after reviewing this proof");
+        return Ok(());
+    }
+
+    ensure_writable_run_root(run_root)?;
+    let archive_dir = run_root.join("quarantine-archive");
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("failed to create {}", archive_dir.display()))?;
+    for (index, (path, bytes, marker)) in markers.iter().enumerate() {
+        let archive = archive_dir.join(format!(
+            "review-input-quarantine-{}-{}-{}.json",
+            timestamp_slug(),
+            index + 1,
+            marker
+                .task_id
+                .replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-', "_")
+        ));
+        atomic_write(&archive, bytes)
+            .with_context(|| format!("failed to archive quarantine at {}", archive.display()))?;
+        fs::remove_file(path)
+            .with_context(|| format!("failed to clear quarantine marker {}", path.display()))?;
+        println!(
+            "cleared:     {} (archive: {})",
+            path.display(),
+            archive.display()
+        );
+    }
+    Ok(())
+}
+
 /// Run the bounded independent review gate for one lane.
 ///
 /// This is the public entry wired into the landing seam. It runs a real Codex
@@ -1733,6 +1863,77 @@ mod tests {
             terminate_requested_at: None,
             host_recovery_note: None,
         }
+    }
+
+    fn prepare_quarantine_clear_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        init_git_repo(root);
+        let branch = git_stdout(root, ["branch", "--show-current"])
+            .expect("read fixture branch")
+            .trim()
+            .to_string();
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git(root, ["update-ref", remote_ref.as_str(), "HEAD"])
+            .expect("record pushed fixture head");
+        let head = current_head_commit(root).expect("read fixture head");
+        let marker = record_review_input_quarantine(
+            root,
+            "TASK-RECOVERY",
+            &head,
+            None,
+            &BTreeMap::new(),
+            "fixture mutation",
+        )
+        .expect("record fixture quarantine");
+        (marker, root.join(".auto/parallel"))
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_is_dry_run_first_and_archives_on_apply() {
+        let root = temp_dir("explicit-quarantine-clear");
+        let (marker, run_root) = prepare_quarantine_clear_fixture(&root);
+
+        clear_review_input_quarantine(&root, &run_root, false)
+            .expect("clean pushed state should pass dry-run proof");
+        assert!(marker.exists(), "dry-run must retain the quarantine marker");
+
+        clear_review_input_quarantine(&root, &run_root, true)
+            .expect("explicit apply should archive and clear stale marker");
+        assert!(!marker.exists(), "apply must clear the stale marker");
+        let archives = fs::read_dir(run_root.join("quarantine-archive"))
+            .expect("read quarantine archive")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read archive entries");
+        assert_eq!(archives.len(), 1);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_rejects_dirty_or_in_progress_state() {
+        let root = temp_dir("explicit-quarantine-clear-dirty");
+        let (marker, run_root) = prepare_quarantine_clear_fixture(&root);
+        fs::write(root.join("operator-edit.txt"), "not durable\n").expect("dirty fixture");
+        let dirty_error = clear_review_input_quarantine(&root, &run_root, true)
+            .expect_err("dirty canonical state must fail closed");
+        assert!(format!("{dirty_error:#}").contains("dirty canonical"));
+        assert!(marker.exists());
+        fs::remove_file(root.join("operator-edit.txt")).expect("restore clean fixture");
+
+        let mut live_marker: ReviewInputQuarantine =
+            serde_json::from_slice(&fs::read(&marker).expect("read mutation marker"))
+                .expect("decode mutation marker");
+        live_marker.phase = GateTransactionPhase::InProgress;
+        atomic_write(
+            &marker,
+            &serde_json::to_vec_pretty(&live_marker).expect("encode live marker"),
+        )
+        .expect("write in-progress marker");
+        let gate_error = clear_review_input_quarantine(&root, &run_root, true)
+            .expect_err("in-progress gate must fail closed");
+        assert!(format!("{gate_error:#}").contains("in-progress"));
+        assert!(marker.exists());
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
