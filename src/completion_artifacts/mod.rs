@@ -31,7 +31,7 @@ pub(crate) use receipt::{
     direct_verification_receipt_problem, footer_task_owned_inputs,
     git_verification_receipt_footers, normalized_plan_hash_bytes,
     record_verified_source_attestation, verification_receipt_commit_footer,
-    VerificationReceiptFooter,
+    verification_receipt_footer_with_derived_paths, VerificationReceiptFooter,
 };
 pub(crate) use verification::verification_plan;
 

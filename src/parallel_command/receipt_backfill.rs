@@ -18,7 +18,7 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
 
     let plan_text = read_loop_plan(&repo_root)?;
     let snapshot = parse_loop_plan(&plan_text);
-    let mut entries = receipt_backfill_entries(&repo_root, &snapshot);
+    let mut entries = receipt_backfill_entries(&repo_root, &plan_text, &snapshot);
     let mut applied_handoffs = Vec::new();
 
     if args.apply_receipt_backfill_handoffs {
@@ -44,7 +44,7 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
         }
         if !applied_handoffs.is_empty() {
             run_git(&repo_root, ["add", "REVIEW.md"])?;
-            entries = receipt_backfill_entries(&repo_root, &snapshot);
+            entries = receipt_backfill_entries(&repo_root, &plan_text, &snapshot);
         }
     }
 
@@ -79,14 +79,29 @@ pub(crate) fn run_parallel_receipt_backfill(args: &ParallelArgs) -> Result<()> {
 
 pub(crate) fn receipt_backfill_entries(
     repo_root: &Path,
+    plan_text: &str,
     snapshot: &LoopPlanSnapshot,
 ) -> Vec<ReceiptBackfillEntry> {
+    let all_plan_tasks = parse_shared_tasks(plan_text);
+    let receipt_footers = git_verification_receipt_footers(repo_root);
     snapshot
         .tasks
         .iter()
         .filter(|task| task.status == LoopTaskStatus::Done)
         .filter_map(|task| {
-            let evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+            let current_fingerprint =
+                compute_task_owned_inputs_fingerprint(repo_root, &task.id, &all_plan_tasks);
+            let unchanged_owned_inputs = matching_owned_inputs_fingerprint(
+                &task.id,
+                &receipt_footers,
+                current_fingerprint.as_deref(),
+            );
+            let evidence = inspect_task_completion_evidence_with_owned_inputs(
+                repo_root,
+                &task.id,
+                &task.markdown,
+                unchanged_owned_inputs,
+            );
             if evidence.is_fully_evidenced() {
                 return None;
             }
@@ -106,6 +121,19 @@ pub(crate) fn receipt_backfill_entries(
             })
         })
         .collect()
+}
+
+fn matching_owned_inputs_fingerprint<'a>(
+    task_id: &str,
+    receipt_footers: &[VerificationReceiptFooter],
+    current_fingerprint: Option<&'a str>,
+) -> Option<&'a str> {
+    let current = current_fingerprint?;
+    let stored = receipt_footers
+        .iter()
+        .find(|footer| footer.task_id == task_id)
+        .and_then(footer_task_owned_inputs)?;
+    (stored == current).then_some(current)
 }
 
 pub(crate) fn render_receipt_backfill_report(
@@ -239,9 +267,43 @@ fn shell_single_quote(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_receipt_command, render_receipt_backfill_report, render_receipt_wrapper_command,
-        ReceiptBackfillEntry,
+        matching_owned_inputs_fingerprint, normalize_receipt_command, receipt_backfill_entries,
+        render_receipt_backfill_report, render_receipt_wrapper_command, ReceiptBackfillEntry,
     };
+    use crate::completion_artifacts::{
+        current_dirty_state_fingerprint, normalized_plan_hash_bytes,
+        record_verified_source_attestation, verification_receipt_commit_footer,
+        VerificationReceiptFooter,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "autodev-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp repo");
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "autodev@example.invalid"]);
+        git(&root, &["config", "user.name", "Autodev Test"]);
+        root
+    }
 
     #[test]
     fn wrapper_command_normalizes_shell_operators() {
@@ -253,6 +315,106 @@ mod tests {
             normalize_receipt_command("bash -lc 'rg -n \"secret\" src || true'"),
             "bash -lc 'rg -n \"secret\" src || true'"
         );
+    }
+
+    #[test]
+    fn backfill_trusts_matching_task_owned_inputs_only() {
+        let footers = vec![VerificationReceiptFooter {
+            task_id: "TASK-1".to_string(),
+            commit: "ancestor".to_string(),
+            receipt_text: r#"{"task_owned_inputs_v1":"owned-v1"}"#.to_string(),
+        }];
+
+        assert_eq!(
+            matching_owned_inputs_fingerprint("TASK-1", &footers, Some("owned-v1")),
+            Some("owned-v1")
+        );
+        assert_eq!(
+            matching_owned_inputs_fingerprint("TASK-1", &footers, Some("changed")),
+            None
+        );
+        assert_eq!(
+            matching_owned_inputs_fingerprint("TASK-2", &footers, Some("owned-v1")),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_head_advance_does_not_backfill_task_scoped_receipt() {
+        let root = temp_repo("receipt-backfill-owned-inputs");
+        let partial_plan = "- [~] `TASK-1` Task scoped proof\n  Owns: `src/task.rs`\n  Verification: `cargo test task_one`\n  Completion artifacts: none\n  Dependencies: none\n";
+        let done_plan = partial_plan.replacen("- [~]", "- [x]", 1);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::write(root.join("src/task.rs"), "pub fn task() {}\n").expect("write source");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("write wrapper");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-1`\n",
+        )
+        .expect("write review");
+        fs::write(root.join("PLAN.md"), partial_plan).expect("write plan");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "seed partial task"]);
+
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read head");
+        let commit = String::from_utf8(commit.stdout)
+            .expect("utf8 head")
+            .trim()
+            .to_string();
+        let dirty = current_dirty_state_fingerprint(&root).expect("dirty fingerprint");
+        let plan_hash = normalized_plan_hash_bytes(partial_plan.as_bytes());
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("create receipt dir");
+        fs::write(
+            root.join(".auto/symphony/verification-receipts/TASK-1.json"),
+            format!(
+                r#"{{"task_id":"TASK-1","commit":"{commit}","dirty_state":{{"fingerprint":"{dirty}"}},"plan_hash":"{plan_hash}","commands":[{{"command":"cargo test task_one","argv":["cargo","test","task_one"],"expected_argv":["cargo","test","task_one"],"exit_code":0,"status":"passed"}}]}}"#
+            ),
+        )
+        .expect("write receipt");
+        record_verified_source_attestation(&root, "TASK-1").expect("attest source");
+        fs::write(root.join("PLAN.md"), &done_plan).expect("mark done");
+        let footer = verification_receipt_commit_footer(&root, "TASK-1")
+            .expect("prepare footer")
+            .expect("footer present");
+        git(&root, &["add", "PLAN.md"]);
+        git(
+            &root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "repo: TASK-1 queue sync",
+                "-m",
+                &footer,
+            ],
+        );
+        fs::remove_file(root.join(".auto/symphony/verification-receipts/TASK-1.json"))
+            .expect("remove staging receipt");
+
+        fs::write(root.join("unrelated.txt"), "unrelated\n").expect("write unrelated");
+        git(&root, &["add", "unrelated.txt"]);
+        git(&root, &["commit", "-q", "-m", "unrelated change"]);
+        let snapshot = super::parse_loop_plan(&done_plan);
+        assert!(receipt_backfill_entries(&root, &done_plan, &snapshot).is_empty());
+
+        fs::write(
+            root.join("src/task.rs"),
+            "pub fn task() { /* changed */ }\n",
+        )
+        .expect("change owned source");
+        assert_eq!(
+            receipt_backfill_entries(&root, &done_plan, &snapshot).len(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

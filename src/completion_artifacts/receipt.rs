@@ -24,6 +24,7 @@ use crate::util::{active_plan_path, active_plan_relative, atomic_write};
 const RECEIPT_FOOTER_VERSION: &str = "Auto-Verification-Receipt-Version:";
 const RECEIPT_FOOTER_TASK: &str = "Auto-Verification-Receipt-Task:";
 const RECEIPT_FOOTER_JSON: &str = "Auto-Verification-Receipt-JSON:";
+const RECEIPT_FOOTER_DERIVED_PATHS: &str = "Auto-Verification-Receipt-Derived-Paths:";
 const VERIFIED_SOURCE_ATTESTATION_VERSION: u32 = 2;
 const SOURCE_STATE_MAX_SUBMODULE_DEPTH: usize = 8;
 const SOURCE_STATE_MAX_ENTRIES: usize = 200_000;
@@ -321,7 +322,28 @@ pub(crate) fn commit_message_has_reserved_verification_receipt_footer(body: &str
         line.starts_with(RECEIPT_FOOTER_VERSION)
             || line.starts_with(RECEIPT_FOOTER_TASK)
             || line.starts_with(RECEIPT_FOOTER_JSON)
+            || line.starts_with(RECEIPT_FOOTER_DERIVED_PATHS)
     })
+}
+
+pub(crate) fn verification_receipt_footer_with_derived_paths(
+    footer: String,
+    derived_paths: &[String],
+) -> Result<String> {
+    if derived_paths.is_empty() {
+        return Ok(footer);
+    }
+    let mut canonical = derived_paths.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    if canonical.iter().any(|path| !safe_repo_relative_path(path)) {
+        bail!("cannot stamp unsafe verification-receipt derived path");
+    }
+    let encoded = serde_json::to_string(&canonical)
+        .context("failed to serialize verification-receipt derived paths")?;
+    Ok(format!(
+        "{footer}\n{RECEIPT_FOOTER_DERIVED_PATHS} {encoded}"
+    ))
 }
 
 fn verification_receipt_footer_has_host_provenance(
@@ -367,11 +389,19 @@ fn verification_receipt_footer_has_host_provenance(
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .collect::<Vec<_>>();
-    if changed_paths
+    let Some(derived_paths) = verification_receipt_derived_paths(body) else {
+        return false;
+    };
+    if derived_paths
         .iter()
-        .any(|path| !HOST_QUEUE_STATE_FILES.contains(path))
-        || (queue_sync && changed_paths.is_empty())
-        || (backfill && !changed_paths.is_empty())
+        .any(|path| !git_path_is_tracked_at_commit(repo_root, &footer.commit, path))
+    {
+        return false;
+    }
+    if changed_paths.iter().any(|path| {
+        !HOST_QUEUE_STATE_FILES.contains(path) && !derived_paths.iter().any(|p| p == path)
+    }) || (queue_sync && changed_paths.is_empty())
+        || (backfill && (!changed_paths.is_empty() || !derived_paths.is_empty()))
     {
         return false;
     }
@@ -421,6 +451,44 @@ fn verification_receipt_footer_has_host_provenance(
             &verification.executable_commands,
         )
         .is_none()
+}
+
+fn verification_receipt_derived_paths(body: &str) -> Option<Vec<String>> {
+    let mut encoded = None;
+    for line in body.lines() {
+        if let Some(value) = line.trim().strip_prefix(RECEIPT_FOOTER_DERIVED_PATHS) {
+            if encoded.replace(value.trim()).is_some() {
+                return None;
+            }
+        }
+    }
+    let Some(encoded) = encoded else {
+        return Some(Vec::new());
+    };
+    let paths = serde_json::from_str::<Vec<String>>(encoded).ok()?;
+    let mut canonical = paths.clone();
+    canonical.sort();
+    canonical.dedup();
+    (paths == canonical && paths.iter().all(|path| safe_repo_relative_path(path))).then_some(paths)
+}
+
+fn safe_repo_relative_path(path: &str) -> bool {
+    let relative = Path::new(path);
+    !path.is_empty()
+        && !relative.is_absolute()
+        && !relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+fn git_path_is_tracked_at_commit(repo_root: &Path, commit: &str, path: &str) -> bool {
+    git_command_stdout(repo_root, ["ls-tree", "--name-only", commit, "--", path])
+        .is_some_and(|output| output.lines().any(|line| line.trim() == path))
 }
 
 fn footer_task_transition_is_scoped(parent_plan: &str, plan: &str, task_id: &str) -> bool {
@@ -4676,6 +4744,35 @@ mod tests {
         assert_eq!(trusted.len(), 1, "host closeout footer should be durable");
         assert_eq!(trusted[0].commit, trusted_head);
 
+        fs::write(root.join("derived.json"), "{}\n").expect("write derived output");
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "derived.json"])
+            .output()
+            .expect("git add derived output");
+        let derived_footer = super::verification_receipt_footer_with_derived_paths(
+            footer.clone(),
+            &["derived.json".to_string()],
+        )
+        .expect("stamp derived path authority");
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "commit",
+                "-m",
+                "repo: TASK-HOST queue sync",
+                "-m",
+                &derived_footer,
+            ])
+            .output()
+            .expect("git commit derived closeout");
+        let derived_head = super::current_git_commit(&root).expect("derived head");
+        let with_derived = super::git_verification_receipt_footers(&root);
+        assert_eq!(with_derived.len(), 2);
+        assert_eq!(with_derived[0].commit, derived_head);
+
         fs::write(root.join("lane-owned.rs"), "pub fn forged() {}\n").expect("write lane source");
         Command::new("git")
             .arg("-C")
@@ -4686,17 +4783,41 @@ mod tests {
         Command::new("git")
             .arg("-C")
             .arg(&root)
-            .args(["commit", "-m", "repo: TASK-HOST queue sync", "-m", &footer])
+            .args([
+                "commit",
+                "-m",
+                "repo: TASK-HOST queue sync",
+                "-m",
+                &derived_footer,
+            ])
             .output()
             .expect("git commit forged footer");
 
         let after_forgery = super::git_verification_receipt_footers(&root);
         assert_eq!(
             after_forgery.len(),
-            1,
+            2,
             "a source-changing commit must not mint host receipt provenance"
         );
-        assert_eq!(after_forgery[0].commit, trusted_head);
+        assert_eq!(after_forgery[0].commit, derived_head);
+    }
+
+    #[test]
+    fn verification_receipt_derived_paths_reject_unsafe_or_noncanonical_values() {
+        assert_eq!(
+            super::verification_receipt_derived_paths(
+                "Auto-Verification-Receipt-Derived-Paths: [\"a.json\",\"b.json\"]"
+            ),
+            Some(vec!["a.json".to_string(), "b.json".to_string()])
+        );
+        for body in [
+            "Auto-Verification-Receipt-Derived-Paths: [\"../escape\"]",
+            "Auto-Verification-Receipt-Derived-Paths: [\"b.json\",\"a.json\"]",
+            "Auto-Verification-Receipt-Derived-Paths: [\"a.json\",\"a.json\"]",
+            "Auto-Verification-Receipt-Derived-Paths: not-json",
+        ] {
+            assert!(super::verification_receipt_derived_paths(body).is_none());
+        }
     }
 
     #[test]

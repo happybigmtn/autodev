@@ -26,7 +26,8 @@ pub(crate) use crate::completion_artifacts::{
     inspect_task_completion_evidence, inspect_task_completion_evidence_with_owned_inputs,
     record_verified_source_attestation, unresolved_review_findings_for_task,
     unresolved_workspace_review_findings_for_task, verification_plan,
-    verification_receipt_commit_footer, CompletionGapKind, VerificationReceiptFooter,
+    verification_receipt_commit_footer, verification_receipt_footer_with_derived_paths,
+    CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;

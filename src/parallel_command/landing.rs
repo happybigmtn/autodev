@@ -3383,7 +3383,7 @@ pub(crate) fn commit_task_closeout(
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    queue_files.extend(derived_files);
+    queue_files.extend(derived_files.iter().cloned());
     queue_files.sort();
     queue_files.dedup();
     let allowed_paths = queue_files.iter().map(String::as_str).collect::<Vec<_>>();
@@ -3393,7 +3393,9 @@ pub(crate) fn commit_task_closeout(
             capture_validated_task_closeout_tree(repo_root, task_id, &allowed_paths, allow_empty)
         })
         .transpose()?;
-    let footer = verification_receipt_commit_footer(repo_root, task_id)?;
+    let footer = verification_receipt_commit_footer(repo_root, task_id)?
+        .map(|footer| verification_receipt_footer_with_derived_paths(footer, &derived_files))
+        .transpose()?;
     if expected_status == LoopTaskStatus::Done && footer.is_none() {
         bail!(
             "refusing Done closeout for `{task_id}` without a durable verification receipt footer"
@@ -8566,11 +8568,17 @@ exec "$@"
         let partial_plan = "# Plan\n\n- [~] `TASK-HOOK-DONE` refresh derived plan\n  Verification: `cargo test hook_done`\n  Dependencies: none\n";
         fs::write(root.join("IMPLEMENTATION_PLAN.md"), partial_plan).expect("write seed plan");
         fs::write(root.join("derived-plan.txt"), partial_plan).expect("write derived plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\n## `TASK-HOOK-DONE`\n\nIndependent review: CLEAR\n",
+        )
+        .expect("write review");
         git_ok(
             &root,
             [
                 "add",
                 ".gitignore",
+                "REVIEW.md",
                 "scripts/run-task-verification.sh",
                 "scripts/autodev-after-plan-update.sh",
                 "derived-plan.txt",
@@ -8615,6 +8623,16 @@ exec "$@"
         assert!(
             message.contains("Auto-Verification-Receipt-Task: TASK-HOOK-DONE"),
             "{message}"
+        );
+        assert!(
+            message.contains("Auto-Verification-Receipt-Derived-Paths: [\"derived-plan.txt\"]"),
+            "{message}"
+        );
+        assert_eq!(
+            git_verification_receipt_footers(&root)
+                .first()
+                .map(|footer| footer.task_id.as_str()),
+            Some("TASK-HOOK-DONE")
         );
         fs::remove_dir_all(&root).expect("cleanup");
     }
