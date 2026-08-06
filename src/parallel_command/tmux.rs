@@ -225,9 +225,19 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
             .map_err(|_| anyhow::anyhow!("AUTO_SKIP_REMOTE_SYNC contained invalid UTF-8"))?,
         _ => String::new(),
     };
+    let workspace_gate_mode = match env::var_os("AUTO_PARALLEL_WORKSPACE_GATE_MODE") {
+        Some(value) if !value.is_empty() => value.into_string().map_err(|_| {
+            anyhow::anyhow!("AUTO_PARALLEL_WORKSPACE_GATE_MODE contained invalid UTF-8")
+        })?,
+        _ => String::new(),
+    };
     let mut parts = vec![
         "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
         format!("AUTO_SKIP_REMOTE_SYNC={}", shell_quote(&skip_remote_sync)),
+        format!(
+            "AUTO_PARALLEL_WORKSPACE_GATE_MODE={}",
+            shell_quote(&workspace_gate_mode)
+        ),
         shell_quote(&executable),
         "parallel".to_string(),
     ];
@@ -584,6 +594,7 @@ mod tests {
             .lock()
             .expect("failed to lock process env");
         let previous = std::env::var_os("AUTO_SKIP_REMOTE_SYNC");
+        let previous_workspace_gate = std::env::var_os("AUTO_PARALLEL_WORKSPACE_GATE_MODE");
         struct RestoreSkipRemoteSync(Option<std::ffi::OsString>);
         impl Drop for RestoreSkipRemoteSync {
             fn drop(&mut self) {
@@ -594,6 +605,16 @@ mod tests {
             }
         }
         let _restore = RestoreSkipRemoteSync(previous);
+        struct RestoreWorkspaceGate(Option<std::ffi::OsString>);
+        impl Drop for RestoreWorkspaceGate {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("AUTO_PARALLEL_WORKSPACE_GATE_MODE", value),
+                    None => std::env::remove_var("AUTO_PARALLEL_WORKSPACE_GATE_MODE"),
+                }
+            }
+        }
+        let _restore_workspace_gate = RestoreWorkspaceGate(previous_workspace_gate);
         let args = ParallelArgs {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
@@ -657,6 +678,20 @@ mod tests {
         assert!(
             unset.contains("AUTO_SKIP_REMOTE_SYNC=''"),
             "an existing tmux server must not leak a stale local-only value: {unset}"
+        );
+
+        std::env::set_var("AUTO_PARALLEL_WORKSPACE_GATE_MODE", "off");
+        let workspace_off = render_script();
+        assert!(
+            workspace_off.contains("AUTO_PARALLEL_WORKSPACE_GATE_MODE='off'"),
+            "{workspace_off}"
+        );
+
+        std::env::remove_var("AUTO_PARALLEL_WORKSPACE_GATE_MODE");
+        let workspace_unset = render_script();
+        assert!(
+            workspace_unset.contains("AUTO_PARALLEL_WORKSPACE_GATE_MODE=''"),
+            "an existing tmux server must not leak a stale workspace mode: {workspace_unset}"
         );
     }
 
