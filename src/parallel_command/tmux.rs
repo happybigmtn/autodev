@@ -231,12 +231,22 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         })?,
         _ => String::new(),
     };
+    let retry_shelved = match env::var_os("AUTO_PARALLEL_RETRY_SHELVED") {
+        Some(value) if !value.is_empty() => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("AUTO_PARALLEL_RETRY_SHELVED contained invalid UTF-8"))?,
+        _ => String::new(),
+    };
     let mut parts = vec![
         "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
         format!("AUTO_SKIP_REMOTE_SYNC={}", shell_quote(&skip_remote_sync)),
         format!(
             "AUTO_PARALLEL_WORKSPACE_GATE_MODE={}",
             shell_quote(&workspace_gate_mode)
+        ),
+        format!(
+            "AUTO_PARALLEL_RETRY_SHELVED={}",
+            shell_quote(&retry_shelved)
         ),
         shell_quote(&executable),
         "parallel".to_string(),
@@ -596,6 +606,7 @@ mod tests {
             .expect("failed to lock process env");
         let previous = std::env::var_os("AUTO_SKIP_REMOTE_SYNC");
         let previous_workspace_gate = std::env::var_os("AUTO_PARALLEL_WORKSPACE_GATE_MODE");
+        let previous_retry_shelved = std::env::var_os("AUTO_PARALLEL_RETRY_SHELVED");
         struct RestoreSkipRemoteSync(Option<std::ffi::OsString>);
         impl Drop for RestoreSkipRemoteSync {
             fn drop(&mut self) {
@@ -616,6 +627,16 @@ mod tests {
             }
         }
         let _restore_workspace_gate = RestoreWorkspaceGate(previous_workspace_gate);
+        struct RestoreRetryShelved(Option<std::ffi::OsString>);
+        impl Drop for RestoreRetryShelved {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("AUTO_PARALLEL_RETRY_SHELVED", value),
+                    None => std::env::remove_var("AUTO_PARALLEL_RETRY_SHELVED"),
+                }
+            }
+        }
+        let _restore_retry_shelved = RestoreRetryShelved(previous_retry_shelved);
         let args = ParallelArgs {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
@@ -693,6 +714,20 @@ mod tests {
         assert!(
             workspace_unset.contains("AUTO_PARALLEL_WORKSPACE_GATE_MODE=''"),
             "an existing tmux server must not leak a stale workspace mode: {workspace_unset}"
+        );
+
+        std::env::set_var("AUTO_PARALLEL_RETRY_SHELVED", "1");
+        let retry_shelved = render_script();
+        assert!(
+            retry_shelved.contains("AUTO_PARALLEL_RETRY_SHELVED='1'"),
+            "{retry_shelved}"
+        );
+
+        std::env::remove_var("AUTO_PARALLEL_RETRY_SHELVED");
+        let retry_unset = render_script();
+        assert!(
+            retry_unset.contains("AUTO_PARALLEL_RETRY_SHELVED=''"),
+            "an existing tmux server must not leak a stale retry override: {retry_unset}"
         );
     }
 
