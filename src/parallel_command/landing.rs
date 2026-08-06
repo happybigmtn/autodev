@@ -1759,7 +1759,9 @@ pub(crate) fn apply_lane_verify_outcome(
 /// previously-compiling crate the task touched now failing to compile) — a
 /// pre-existing failure elsewhere in the shared workspace no longer blocks every
 /// task's promotion. `AUTO_PARALLEL_WORKSPACE_GATE_MODE=strict` restores the
-/// legacy "whole workspace must be green" bar.
+/// legacy "whole workspace must be green" bar. An operator may explicitly use
+/// `off` when the repository supplies equivalent task gates plus a terminal
+/// full-workspace fan-in; task verification and review gates still run.
 #[cfg(test)]
 async fn apply_workspace_test_gate(
     repo_root: &Path,
@@ -1806,6 +1808,16 @@ async fn apply_workspace_test_gate_mode_in_transaction(
     mode: WorkspaceGateMode,
     cargo_bin: Option<PathBuf>,
 ) -> Result<LoopTaskStatus> {
+    if matches!(mode, WorkspaceGateMode::Off) {
+        append_lane_host_event(
+            &assignment.stdout_log_path,
+            assignment.lane_index,
+            &assignment.task.id,
+            "workspace-gate: explicitly disabled by AUTO_PARALLEL_WORKSPACE_GATE_MODE=off; task verification, review, and repository fan-in gates remain authoritative",
+        );
+        return Ok(incoming_status);
+    }
+
     // Production assignments always have `<run_root>/lanes/lane-N`. Ad-hoc
     // gate fixtures deliberately do not; use their isolated lane root only for
     // the resource lock and let the existing baseline policy below make the
@@ -1846,6 +1858,9 @@ async fn apply_workspace_test_gate_mode_in_transaction(
                 cargo_bin,
             )
             .await
+        }
+        WorkspaceGateMode::Off => {
+            unreachable!("off mode returns before acquiring the validation lease")
         }
     }
 }
@@ -2152,7 +2167,10 @@ async fn maybe_capture_workspace_baseline_with_cargo(
     parallel_logger: &ParallelEventLogger,
     cargo_bin: Option<PathBuf>,
 ) -> Result<()> {
-    if matches!(workspace_gate_mode(), WorkspaceGateMode::Strict) {
+    if matches!(
+        workspace_gate_mode(),
+        WorkspaceGateMode::Strict | WorkspaceGateMode::Off
+    ) {
         return Ok(());
     }
     if !repo_root.join("Cargo.toml").is_file() {
@@ -7245,6 +7263,47 @@ exec "$@"
             format!("{restart_error:#}").contains(REVIEW_INPUT_MUTATION_FATAL_MARKER),
             "{restart_error:#}"
         );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn explicitly_disabled_workspace_gate_never_spawns_cargo() {
+        let root = unique_temp_dir("workspace-gate-off");
+        init_git_repo(&root);
+        let task_id = "TASK-WORKSPACE-OFF";
+        let title = "repository fan-in owns the broad regression gate";
+        let task_markdown = format!("- [x] `{task_id}` {title}\n");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!("# IMPLEMENTATION_PLAN\n\n{task_markdown}"),
+        )
+        .expect("write plan");
+        git_ok(&root, ["add", "."]);
+        git_ok(&root, ["commit", "-q", "-m", "seed workspace-off fixture"]);
+
+        let mut assignment =
+            review_gate_assignment_with_markdown(&root, task_id, title, task_markdown);
+        let status = super::apply_workspace_test_gate_mode_in_transaction(
+            &root,
+            &mut assignment,
+            &[],
+            LoopTaskStatus::Done,
+            None,
+            WorkspaceGateMode::Off,
+            Some(root.join("cargo-must-not-run")),
+        )
+        .await
+        .expect("explicit off mode passes through");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert_eq!(assignment.task.status, LoopTaskStatus::Done);
+        let events = fs::read_to_string(&assignment.stdout_log_path).expect("read lane events");
+        assert!(
+            events.contains("workspace-gate: explicitly disabled"),
+            "{events}"
+        );
+        assert!(!root.join("cargo-must-not-run").exists());
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

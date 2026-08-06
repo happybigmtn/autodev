@@ -588,9 +588,13 @@ fn tail_lines(text: &str) -> String {
 
 /// Which workspace gate the operator selected. Baseline (the default) narrows the
 /// gate to NEW regressions; strict restores the legacy whole-workspace-green bar.
+/// Off is an explicit throughput escape hatch for repositories that enforce
+/// task-scoped verification on every landing and a separate full-workspace fan-in
+/// gate. It is never selected implicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceGateMode {
     Baseline,
+    Off,
     Strict,
 }
 
@@ -603,6 +607,7 @@ pub(crate) fn workspace_gate_mode() -> WorkspaceGateMode {
         .map(str::trim)
     {
         Some("strict") => WorkspaceGateMode::Strict,
+        Some("off") | Some("disabled") => WorkspaceGateMode::Off,
         Some("baseline") | Some("") | None => WorkspaceGateMode::Baseline,
         Some(other) => {
             eprintln!(
@@ -1634,6 +1639,10 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
         assert_eq!(workspace_gate_mode(), WorkspaceGateMode::Strict);
         std::env::set_var(WORKSPACE_GATE_MODE_ENV, "baseline");
         assert_eq!(workspace_gate_mode(), WorkspaceGateMode::Baseline);
+        std::env::set_var(WORKSPACE_GATE_MODE_ENV, "off");
+        assert_eq!(workspace_gate_mode(), WorkspaceGateMode::Off);
+        std::env::set_var(WORKSPACE_GATE_MODE_ENV, "disabled");
+        assert_eq!(workspace_gate_mode(), WorkspaceGateMode::Off);
         std::env::set_var(WORKSPACE_GATE_MODE_ENV, "nonsense");
         assert_eq!(workspace_gate_mode(), WorkspaceGateMode::Baseline);
         match prev {
