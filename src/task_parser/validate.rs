@@ -514,4 +514,18 @@ mod tests {
         let err = validate_execution_row(&tasks[0], &ids).expect_err("prose rejected");
         assert!(format!("{err:#}").contains("machine-readable"));
     }
+
+    #[test]
+    fn execution_row_dependency_field_stops_at_optional_blocker_metadata() {
+        let plan = rich_execution_row_plan().replace(
+            "  Dependencies: none\n  Estimated scope: S\n",
+            "  Lane kind: operator\n  Dependencies: none\n  Blocker: External authority evidence remains pending.\n  Estimated scope: S\n",
+        );
+        let tasks = parse_tasks(&plan);
+        let ids = tasks.iter().map(|task| task.id.as_str()).collect();
+
+        validate_execution_row(&tasks[0], &ids)
+            .expect("blocker prose after dependencies must not enter scheduler input");
+        assert!(tasks[0].dependencies.is_empty());
+    }
 }
