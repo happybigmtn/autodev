@@ -622,7 +622,7 @@ pub(crate) fn attach_partial_follow_up_note(
             .join("\n")
     };
     let follow_up_note = format!(
-        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nUnresolved independent-review findings that MUST be addressed before `AUTO_ALREADY_COMPLETE` is valid:\n{standing_review_clause}\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
+        "{pass_label}\n\nHost evidence summary:\n- Remaining gaps: {missing}\n- Guidance: {gap_kind}\n- Re-run the executable verification commands below through the repo wrapper when required.\n- If Remaining gaps reports an unsuperseded failed command, rerun every named command exactly as recorded, including flags and argument order, through the wrapper. An equivalent command spelling does not supersede the failed receipt entry.\n- Do not treat narrative verification prose as literal shell input; if no executable commands were parsed, derive the narrowest truthful proof yourself instead of patching the wrapper.\n- If the only remaining blocker is genuinely external/live proof, print `AUTO_ENV_BLOCKER: <short reason>` before exiting non-zero.\n\nUnresolved independent-review findings that MUST be addressed before `AUTO_ALREADY_COMPLETE` is valid:\n{standing_review_clause}\n\nExecutable verification commands parsed by the host:\n{verification_commands}\n\nNarrative verification guidance preserved from the task:\n{verification_guidance}"
     );
     prepend_host_recovery_note(assignment, &follow_up_note);
 }
@@ -918,6 +918,8 @@ mod tests {
         assert!(note.contains("host restart found a clean lane receipt"));
         assert!(note.contains("add the missing runtime case"));
         assert!(note.contains("already marked `- [~]`"));
+        assert!(note.contains("rerun every named command exactly as recorded"));
+        assert!(note.contains("including flags and argument order"));
         let _ = fs::remove_dir_all(repo);
     }
 
