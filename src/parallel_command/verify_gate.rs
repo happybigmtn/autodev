@@ -924,6 +924,9 @@ pub(crate) fn recapture_workspace_baseline_on_drift(
 ) -> BaselineRecapture {
     let mut baseline = old.clone();
     baseline.head_at_capture = Some(new_head.to_string());
+    if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
+        baseline.last_fully_green_head = Some(new_head.to_string());
+    }
     if obs.compiled {
         for id in &obs.passing_tests {
             baseline.ever_passed_tests.insert(id.clone());
@@ -1347,6 +1350,7 @@ mod tests {
             ever_compiled_crates: ever_compiled.iter().map(|s| s.to_string()).collect(),
             compile_error_excerpt: Vec::new(),
             head_at_capture: None,
+            last_fully_green_head: None,
         }
     }
 
@@ -1882,6 +1886,10 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             recapture.baseline.head_at_capture.as_deref(),
             Some("newhead")
         );
+        assert_eq!(
+            recapture.baseline.last_fully_green_head, None,
+            "a red recapture must not authorize same-HEAD reuse"
+        );
         // Crucially: the surfaced non-env red was NOT folded into tolerance, so
         // the strict gate still blocks on it after recapture.
         assert!(
@@ -1896,6 +1904,25 @@ error: could not compile `ludii-core` (lib test) due to 1 previous error\n";
             &obs,
             &patterns
         ));
+    }
+
+    #[test]
+    fn fully_green_recapture_records_reusable_head() {
+        let old = baseline_with(&["c::old_green"], &["c"], &[]);
+        let obs = WorkspaceObservation {
+            compiled: true,
+            passing_tests: set_of(&["c::old_green", "c::new_green"]),
+            compiled_targets: set_of(&["c"]),
+            ..Default::default()
+        };
+
+        let recapture = recapture_workspace_baseline_on_drift(&old, &obs, &[], "fully-green-head");
+
+        assert_eq!(
+            recapture.baseline.last_fully_green_head.as_deref(),
+            Some("fully-green-head")
+        );
+        assert!(recapture.surfaced_nonenvironmental.is_empty());
     }
 
     fn env_failure_patterns_defaults() -> Vec<String> {

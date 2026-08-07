@@ -1904,6 +1904,28 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     transaction: Option<&ArmedCanonicalGateTransaction>,
     cargo_bin: Option<PathBuf>,
 ) -> Result<LoopTaskStatus> {
+    let run_root = workspace_baseline_run_root(&assignment.lane_root);
+    if let (Some(run_root), Some(current_head)) = (run_root.as_ref(), current_repo_head(repo_root))
+    {
+        let baseline = load_workspace_baseline(run_root);
+        if baseline.last_fully_green_head.as_deref() == Some(current_head.as_str()) {
+            if let Some(transaction) = transaction {
+                revalidate_canonical_gate_transaction(
+                    repo_root,
+                    transaction,
+                    "same-HEAD workspace baseline reuse",
+                )?;
+            }
+            append_lane_host_event(
+                &assignment.stdout_log_path,
+                assignment.lane_index,
+                &assignment.task.id,
+                "workspace-baseline: reused fully-green canonical probe at identical HEAD",
+            );
+            return persist_prior_workspace_test_clearance(repo_root, assignment, incoming_status);
+        }
+    }
+
     let probe = run_workspace_probe_in_canonical_transaction(
         repo_root,
         transaction,
@@ -1936,7 +1958,7 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
         WorkspaceProbe::Ran(obs) => obs,
     };
 
-    let Some(run_root) = workspace_baseline_run_root(&assignment.lane_root) else {
+    let Some(run_root) = run_root else {
         return apply_workspace_test_outcome(
             repo_root,
             assignment,
@@ -1999,6 +2021,9 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     // so a demote/redispatch cycle still records this run's passes/compiles.
     let mut advanced = baseline;
     advance_workspace_baseline(&mut advanced, &obs);
+    if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
+        advanced.last_fully_green_head = current_repo_head(repo_root);
+    }
     save_workspace_baseline(&run_root, &advanced);
 
     // Environmental failures tolerated by pattern are surfaced (not swallowed) so
@@ -2284,6 +2309,9 @@ async fn maybe_capture_workspace_baseline_with_cargo(
             // Stamp the capture HEAD so a later restart on an advanced HEAD can
             // recapture-on-drift instead of reusing a stale snapshot.
             baseline.head_at_capture = current_repo_head(repo_root);
+            if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
+                baseline.last_fully_green_head = baseline.head_at_capture.clone();
+            }
             save_workspace_baseline(run_root, &baseline);
             parallel_logger.info(format!(
                 "workspace-baseline: captured — compiles={}, {} pre-existing failing test(s), {} broken crate(s), {} passing test(s) recorded as best-observed",
@@ -8374,6 +8402,76 @@ exec "$@"
         assert!(unresolved_review_findings_for_task(&review, task_id).is_empty());
         let staged = run_git_in(&root, ["diff", "--cached", "--name-only"]);
         assert!(staged.contains("REVIEW.md"), "REVIEW.md staged: {staged}");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn same_head_green_baseline_is_reused_without_running_cargo_again() {
+        let root = unique_temp_dir("workspace-baseline-same-head-reuse");
+        init_git_repo(&root);
+        let task_id = "TASK-WBASE-REUSE";
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            format!("# IMPLEMENTATION_PLAN\n\n- [x] `{task_id}` reuse same-head green baseline\n"),
+        )
+        .expect("write plan");
+        fs::write(
+            root.join("REVIEW.md"),
+            format!(
+                "# REVIEW\n\n## `{task_id}`: workspace cargo test failed\n- Source: auto parallel workspace definition-of-done gate (held at `[~]`).\n- Gate result: stale failure.\n"
+            ),
+        )
+        .expect("write review");
+        git_ok(&root, ["add", "."]);
+        git_ok(
+            &root,
+            ["commit", "-q", "-m", "seed same-head baseline reuse"],
+        );
+
+        let run_root = root.join("run");
+        let mut assignment =
+            review_gate_assignment(&root, task_id, "reuse same-head green baseline");
+        assignment.lane_root = run_root.join("lanes/lane-1");
+        fs::create_dir_all(&assignment.lane_root).expect("create lane root");
+        let head = current_repo_head(&root).expect("current HEAD");
+        save_workspace_baseline(
+            &run_root,
+            &WorkspaceBaseline {
+                captured: true,
+                head_at_capture: Some(head.clone()),
+                last_fully_green_head: Some(head),
+                ..WorkspaceBaseline::default()
+            },
+        );
+        let marker = root.join("cargo-must-not-run");
+        let fake_cargo = write_fake_workspace_cargo(
+            &root,
+            "fake-workspace-cargo-must-not-run.sh",
+            "touch cargo-must-not-run\nexit 99",
+        );
+
+        let status = super::apply_workspace_baseline_gate_in_transaction_with_cargo(
+            &root,
+            &mut assignment,
+            &[],
+            LoopTaskStatus::Done,
+            None,
+            Some(fake_cargo),
+        )
+        .await
+        .expect("reuse green baseline");
+
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert!(!marker.exists(), "same-HEAD reuse must not spawn cargo");
+        let log = fs::read_to_string(&assignment.stdout_log_path).expect("read lane log");
+        assert!(
+            log.contains("reused fully-green canonical probe at identical HEAD"),
+            "{log}"
+        );
+        let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
+        assert!(review.contains("workspace validation cleared"), "{review}");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

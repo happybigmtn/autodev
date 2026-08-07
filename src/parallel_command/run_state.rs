@@ -73,6 +73,11 @@ pub(crate) struct WorkspaceBaseline {
     /// never recapture (behave as before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) head_at_capture: Option<String>,
+    /// Canonical HEAD of the most recent fully-green workspace probe. A
+    /// definition-of-done gate may reuse this only while HEAD is byte-identical;
+    /// any source landing changes HEAD and forces a fresh probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_fully_green_head: Option<String>,
 }
 
 fn workspace_baseline_path(run_root: &Path) -> PathBuf {
@@ -807,6 +812,7 @@ mod tests {
                 "error: couldn't read a.lud: No such file or directory (os error 2)".to_string(),
             ],
             head_at_capture: Some("deadbeef".to_string()),
+            last_fully_green_head: Some("deadbeef".to_string()),
         };
 
         save_workspace_baseline(&dir, &baseline);
@@ -826,6 +832,11 @@ mod tests {
             restored.head_at_capture.as_deref(),
             Some("deadbeef"),
             "head_at_capture round-trips through the persisted baseline"
+        );
+        assert_eq!(
+            restored.last_fully_green_head.as_deref(),
+            Some("deadbeef"),
+            "last_fully_green_head round-trips through the persisted baseline"
         );
 
         clear_workspace_baseline(&dir);
