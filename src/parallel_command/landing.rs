@@ -2670,8 +2670,22 @@ pub(crate) fn propagate_lane_receipts(
 ) -> Result<()> {
     let receipt_rel = std::path::PathBuf::from(".auto/symphony/verification-receipts")
         .join(format!("{task_id}.json"));
-    let src_receipt = lane_repo_root.join(&receipt_rel);
     let dst_receipt = canonical_root.join(&receipt_rel);
+    let lane_receipt = lane_repo_root.join(&receipt_rel);
+    // Some repositories deliberately route the verification wrapper's `.auto`
+    // output to the canonical checkout even while the command runs inside a
+    // lane repo. In that layout the lane path is absent, but the canonical
+    // staging receipt contains the worker's complete proof at the pre-landing
+    // commit. Treat it as the propagation source so the host can rebind its
+    // metadata to the just-landed canonical HEAD instead of demoting the task
+    // and dispatching a redundant evidence-only worker pass.
+    let src_receipt = if lane_receipt.is_file() {
+        lane_receipt
+    } else if lane_repo_root != canonical_root && dst_receipt.is_file() {
+        dst_receipt.clone()
+    } else {
+        lane_receipt
+    };
     if src_receipt.is_file() {
         let canonical_receipt_before = std::fs::read(&dst_receipt).ok();
         let evidence = inspect_task_completion_evidence(canonical_root, task_id, task_markdown);
@@ -4350,6 +4364,79 @@ Current-tree verification failed.\n",
         // since the plan-hash gate only runs once the commit reads as current).
         let head = git_output(&canonical, ["rev-parse", "HEAD"]);
         assert_eq!(propagated["commit"].as_str(), Some(head.as_str()));
+
+        fs::remove_dir_all(&root).expect("failed to remove temp root");
+    }
+
+    #[test]
+    fn propagate_lane_receipts_refreshes_canonical_staging_when_lane_receipt_is_absent() {
+        let root = unique_temp_dir("parallel-propagate-shared-receipt");
+        let lane = root.join("lane");
+        let canonical = root.join("canonical");
+        init_git_repo(&lane);
+        init_git_repo(&canonical);
+
+        let task_markdown = "- [~] `TASK-1` Shared receipt output\n\
+Verification:\n\
+  - `cargo test -p demo task_1`\n\
+Dependencies: none\n";
+        fs::write(
+            canonical.join("IMPLEMENTATION_PLAN.md"),
+            format!("# Plan\n\n{task_markdown}"),
+        )
+        .expect("write canonical plan");
+        fs::create_dir_all(canonical.join("scripts")).expect("create scripts directory");
+        fs::write(
+            canonical.join("scripts/run-task-verification.sh"),
+            "#!/bin/sh\n",
+        )
+        .expect("write verification wrapper");
+        fs::write(canonical.join(".gitignore"), ".auto/\n").expect("write gitignore");
+        git_ok(&canonical, ["add", "."]);
+        git_ok(&canonical, ["commit", "-m", "land task source"]);
+
+        // The wrapper wrote to canonical `.auto` while running in the lane.
+        // There is intentionally no receipt under the lane checkout.
+        let receipt_dir = canonical.join(".auto/symphony/verification-receipts");
+        fs::create_dir_all(&receipt_dir).expect("create canonical receipt dir");
+        let receipt_path = receipt_dir.join("TASK-1.json");
+        fs::write(
+            &receipt_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task_id": "TASK-1",
+                "commit": "pre-landing-worker-commit",
+                "commands": [{
+                    "command": "cargo test -p demo task_1",
+                    "argv": ["cargo", "test", "-p", "demo", "task_1"],
+                    "expected_argv": ["cargo", "test", "-p", "demo", "task_1"],
+                    "exit_code": 0,
+                    "status": "passed"
+                }]
+            }))
+            .expect("serialize shared receipt"),
+        )
+        .expect("write shared canonical receipt");
+
+        propagate_lane_receipts(&lane, &canonical, "TASK-1", task_markdown)
+            .expect("shared canonical receipt metadata should refresh");
+
+        let refreshed: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&receipt_path).expect("read refreshed receipt"),
+        )
+        .expect("parse refreshed receipt");
+        let head = git_output(&canonical, ["rev-parse", "HEAD"]);
+        assert_eq!(refreshed["commit"].as_str(), Some(head.as_str()));
+        assert_eq!(
+            refreshed["commands"][0]["command"].as_str(),
+            Some("cargo test -p demo task_1"),
+            "refresh must preserve the worker's passing command evidence"
+        );
+        assert!(
+            !lane
+                .join(".auto/symphony/verification-receipts/TASK-1.json")
+                .exists(),
+            "the regression requires an absent lane-local receipt"
+        );
 
         fs::remove_dir_all(&root).expect("failed to remove temp root");
     }
