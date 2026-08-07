@@ -27,9 +27,9 @@ pub(crate) use crate::completion_artifacts::verification::verification_step_look
 pub(crate) use owned_inputs::compute_task_owned_inputs_fingerprint;
 pub(crate) use receipt::{
     clear_verified_source_attestation, commit_message_has_reserved_verification_receipt_footer,
-    current_dirty_state_fingerprint, direct_verification_receipt_freshness_problem,
-    direct_verification_receipt_problem, footer_task_owned_inputs,
-    git_verification_receipt_footers, normalized_plan_hash_bytes,
+    current_dirty_state_fingerprint, current_source_state_fingerprint,
+    direct_verification_receipt_freshness_problem, direct_verification_receipt_problem,
+    footer_task_owned_inputs, git_verification_receipt_footers, normalized_plan_hash_bytes,
     record_verified_source_attestation, verification_receipt_commit_footer,
     verification_receipt_footer_with_derived_paths, VerificationReceiptFooter,
 };

@@ -21,13 +21,13 @@ pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
     assess_task_completion_gap, clear_verified_source_attestation,
     commit_message_has_reserved_verification_receipt_footer, compute_task_owned_inputs_fingerprint,
-    current_dirty_state_fingerprint, direct_verification_receipt_problem,
-    ensure_host_review_handoff, footer_task_owned_inputs, git_verification_receipt_footers,
-    inspect_task_completion_evidence, inspect_task_completion_evidence_with_owned_inputs,
-    record_verified_source_attestation, unresolved_review_findings_for_task,
-    unresolved_workspace_review_findings_for_task, verification_plan,
-    verification_receipt_commit_footer, verification_receipt_footer_with_derived_paths,
-    CompletionGapKind, VerificationReceiptFooter,
+    current_dirty_state_fingerprint, current_source_state_fingerprint,
+    direct_verification_receipt_problem, ensure_host_review_handoff, footer_task_owned_inputs,
+    git_verification_receipt_footers, inspect_task_completion_evidence,
+    inspect_task_completion_evidence_with_owned_inputs, record_verified_source_attestation,
+    unresolved_review_findings_for_task, unresolved_workspace_review_findings_for_task,
+    verification_plan, verification_receipt_commit_footer,
+    verification_receipt_footer_with_derived_paths, CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;

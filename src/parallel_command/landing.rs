@@ -1905,22 +1905,25 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     cargo_bin: Option<PathBuf>,
 ) -> Result<LoopTaskStatus> {
     let run_root = workspace_baseline_run_root(&assignment.lane_root);
-    if let (Some(run_root), Some(current_head)) = (run_root.as_ref(), current_repo_head(repo_root))
-    {
+    if let (Some(run_root), Ok(current_source_state)) = (
+        run_root.as_ref(),
+        current_source_state_fingerprint(repo_root),
+    ) {
         let baseline = load_workspace_baseline(run_root);
-        if baseline.last_fully_green_head.as_deref() == Some(current_head.as_str()) {
+        if baseline.last_fully_green_source_state.as_deref() == Some(current_source_state.as_str())
+        {
             if let Some(transaction) = transaction {
                 revalidate_canonical_gate_transaction(
                     repo_root,
                     transaction,
-                    "same-HEAD workspace baseline reuse",
+                    "same-source workspace baseline reuse",
                 )?;
             }
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
                 &assignment.task.id,
-                "workspace-baseline: reused fully-green canonical probe at identical HEAD",
+                "workspace-baseline: reused fully-green canonical probe for identical normalized source state",
             );
             return persist_prior_workspace_test_clearance(repo_root, assignment, incoming_status);
         }
@@ -2023,6 +2026,7 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     advance_workspace_baseline(&mut advanced, &obs);
     if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
         advanced.last_fully_green_head = current_repo_head(repo_root);
+        advanced.last_fully_green_source_state = current_source_state_fingerprint(repo_root).ok();
     }
     save_workspace_baseline(&run_root, &advanced);
 
@@ -2238,8 +2242,13 @@ async fn maybe_capture_workspace_baseline_with_cargo(
                 };
                 if let (Some(now), WorkspaceProbe::Ran(obs)) = (current_head.as_deref(), probe) {
                     let env_patterns = env_failure_patterns();
-                    let recapture =
+                    let mut recapture =
                         recapture_workspace_baseline_on_drift(&existing, &obs, &env_patterns, now);
+                    if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty()
+                    {
+                        recapture.baseline.last_fully_green_source_state =
+                            current_source_state_fingerprint(repo_root).ok();
+                    }
                     save_workspace_baseline(run_root, &recapture.baseline);
                     parallel_logger.info(format!(
                         "workspace-baseline: HEAD advanced since capture ({} -> {}); recaptured on drift ({} newly-tolerated environmental failure(s))",
@@ -2311,6 +2320,8 @@ async fn maybe_capture_workspace_baseline_with_cargo(
             baseline.head_at_capture = current_repo_head(repo_root);
             if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
                 baseline.last_fully_green_head = baseline.head_at_capture.clone();
+                baseline.last_fully_green_source_state =
+                    current_source_state_fingerprint(repo_root).ok();
             }
             save_workspace_baseline(run_root, &baseline);
             parallel_logger.info(format!(
@@ -8387,7 +8398,7 @@ exec "$@"
             &[],
             LoopTaskStatus::Done,
             None,
-            Some(fake_cargo),
+            Some(fake_cargo.clone()),
         )
         .await
         .expect("apply passing baseline workspace gate");
@@ -8430,26 +8441,42 @@ exec "$@"
             ["commit", "-q", "-m", "seed same-head baseline reuse"],
         );
 
-        let run_root = root.join("run");
+        let run_root = root.join(".auto/parallel");
         let mut assignment =
             review_gate_assignment(&root, task_id, "reuse same-head green baseline");
         assignment.lane_root = run_root.join("lanes/lane-1");
         fs::create_dir_all(&assignment.lane_root).expect("create lane root");
+        let marker = root.join("cargo-must-not-run");
+        let fake_cargo = write_fake_workspace_cargo(
+            &root,
+            "fake-workspace-cargo-must-not-run.sh",
+            "touch cargo-must-not-run\nexit 99",
+        );
         let head = current_repo_head(&root).expect("current HEAD");
         save_workspace_baseline(
             &run_root,
             &WorkspaceBaseline {
                 captured: true,
                 head_at_capture: Some(head.clone()),
-                last_fully_green_head: Some(head),
+                last_fully_green_head: Some(head.clone()),
+                last_fully_green_source_state: Some(
+                    current_source_state_fingerprint(&root).expect("source fingerprint"),
+                ),
                 ..WorkspaceBaseline::default()
             },
         );
-        let marker = root.join("cargo-must-not-run");
-        let fake_cargo = write_fake_workspace_cargo(
-            &root,
-            "fake-workspace-cargo-must-not-run.sh",
-            "touch cargo-must-not-run\nexit 99",
+        fs::write(
+            root.join("REVIEW.md"),
+            fs::read_to_string(root.join("REVIEW.md")).expect("read review")
+                + "\nHost-only queue note.\n",
+        )
+        .expect("write host-only queue note");
+        git_ok(&root, ["add", "REVIEW.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "host-only queue sync"]);
+        assert_ne!(
+            current_repo_head(&root).as_deref(),
+            Some(head.as_str()),
+            "fixture must advance raw HEAD without changing source state"
         );
 
         let status = super::apply_workspace_baseline_gate_in_transaction_with_cargo(
@@ -8458,7 +8485,7 @@ exec "$@"
             &[],
             LoopTaskStatus::Done,
             None,
-            Some(fake_cargo),
+            Some(fake_cargo.clone()),
         )
         .await
         .expect("reuse green baseline");
@@ -8467,11 +8494,31 @@ exec "$@"
         assert!(!marker.exists(), "same-HEAD reuse must not spawn cargo");
         let log = fs::read_to_string(&assignment.stdout_log_path).expect("read lane log");
         assert!(
-            log.contains("reused fully-green canonical probe at identical HEAD"),
+            log.contains(
+                "reused fully-green canonical probe for identical normalized source state"
+            ),
             "{log}"
         );
         let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
         assert!(review.contains("workspace validation cleared"), "{review}");
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n# substantive source change\n",
+        )
+        .expect("change source contract");
+        let changed_status = super::apply_workspace_baseline_gate_in_transaction_with_cargo(
+            &root,
+            &mut assignment,
+            &[],
+            LoopTaskStatus::Done,
+            None,
+            Some(fake_cargo),
+        )
+        .await
+        .expect("changed source runs workspace probe");
+        assert_eq!(changed_status, LoopTaskStatus::Partial);
+        assert!(marker.exists(), "source drift must force cargo to run");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

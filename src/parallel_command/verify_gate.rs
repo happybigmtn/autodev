@@ -1351,6 +1351,7 @@ mod tests {
             compile_error_excerpt: Vec::new(),
             head_at_capture: None,
             last_fully_green_head: None,
+            last_fully_green_source_state: None,
         }
     }
 

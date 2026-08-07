@@ -1945,7 +1945,7 @@ impl SourceStateBudget {
     }
 }
 
-fn current_source_state_fingerprint(repo_root: &Path) -> Result<String> {
+pub(crate) fn current_source_state_fingerprint(repo_root: &Path) -> Result<String> {
     current_source_state_fingerprint_with_limits(repo_root, SourceStateLimits::default())
 }
 

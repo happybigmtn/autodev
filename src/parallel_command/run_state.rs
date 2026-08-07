@@ -78,6 +78,12 @@ pub(crate) struct WorkspaceBaseline {
     /// any source landing changes HEAD and forces a fresh probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_fully_green_head: Option<String>,
+    /// Normalized source-state fingerprint of the most recent fully-green
+    /// workspace probe. Unlike raw HEAD, this ignores host-only queue/review
+    /// commits while still binding code, tests, manifests, untracked source,
+    /// and substantive task-contract text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_fully_green_source_state: Option<String>,
 }
 
 fn workspace_baseline_path(run_root: &Path) -> PathBuf {
@@ -813,6 +819,7 @@ mod tests {
             ],
             head_at_capture: Some("deadbeef".to_string()),
             last_fully_green_head: Some("deadbeef".to_string()),
+            last_fully_green_source_state: Some("feedface".to_string()),
         };
 
         save_workspace_baseline(&dir, &baseline);
@@ -837,6 +844,11 @@ mod tests {
             restored.last_fully_green_head.as_deref(),
             Some("deadbeef"),
             "last_fully_green_head round-trips through the persisted baseline"
+        );
+        assert_eq!(
+            restored.last_fully_green_source_state.as_deref(),
+            Some("feedface"),
+            "last_fully_green_source_state round-trips through the persisted baseline"
         );
 
         clear_workspace_baseline(&dir);
