@@ -33,6 +33,49 @@ use crate::completion_artifacts::verification_step_looks_external;
 use crate::process_group::ContainedChild;
 use shlex::split as shell_split;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DependencyBootstrap {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+/// Select the lockfile-owned JavaScript dependency bootstrap for the canonical
+/// checkout. Workers may add a dependency and pass in their prepared lane, but
+/// the host checkout can still have an older `node_modules`; verifying before
+/// synchronizing it produces a false integration failure.
+fn dependency_bootstrap(repo_root: &Path) -> Option<DependencyBootstrap> {
+    if !repo_root.join("package.json").is_file() {
+        return None;
+    }
+    if repo_root.join("pnpm-lock.yaml").is_file() {
+        return Some(DependencyBootstrap {
+            program: "pnpm",
+            args: &["install", "--frozen-lockfile"],
+        });
+    }
+    if repo_root.join("package-lock.json").is_file()
+        || repo_root.join("npm-shrinkwrap.json").is_file()
+    {
+        return Some(DependencyBootstrap {
+            program: "npm",
+            args: &["ci"],
+        });
+    }
+    if repo_root.join("yarn.lock").is_file() {
+        return Some(DependencyBootstrap {
+            program: "yarn",
+            args: &["install", "--frozen-lockfile"],
+        });
+    }
+    if repo_root.join("bun.lock").is_file() || repo_root.join("bun.lockb").is_file() {
+        return Some(DependencyBootstrap {
+            program: "bun",
+            args: &["install", "--frozen-lockfile"],
+        });
+    }
+    None
+}
+
 /// Env toggle. `"0"` skips the gate entirely (legacy behavior: trust the receipt).
 const VERIFY_ENABLED_ENV: &str = "AUTO_PARALLEL_VERIFY_LANDINGS";
 /// Env bound. Hard-cap the total re-execution time across all of a task's
@@ -139,6 +182,46 @@ async fn run_verify_commands(
     task_id: String,
     commands: Vec<String>,
 ) -> LaneVerifyOutcome {
+    if let Some(bootstrap) = dependency_bootstrap(&repo_root) {
+        let mut process = tokio::process::Command::new(bootstrap.program);
+        process
+            .args(bootstrap.args)
+            .current_dir(&repo_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let result = match ContainedChild::spawn(&mut process) {
+            Ok(child) => child.output().await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let status = output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                return LaneVerifyOutcome::Failed {
+                    detail: format!(
+                        "canonical dependency bootstrap `{} {}` exited with status {status}\n{}",
+                        bootstrap.program,
+                        bootstrap.args.join(" "),
+                        output_tail(&output.stdout, &output.stderr)
+                    ),
+                };
+            }
+            Err(err) => {
+                return LaneVerifyOutcome::Failed {
+                    detail: format!(
+                        "could not run canonical dependency bootstrap `{} {}`: {err}",
+                        bootstrap.program,
+                        bootstrap.args.join(" ")
+                    ),
+                };
+            }
+        }
+    }
     let wrapper = repo_root.join("scripts/run-task-verification.sh");
     let wrapper_present = wrapper.is_file();
     for command in &commands {
@@ -1121,6 +1204,48 @@ mod tests {
             commands.iter().any(|c| c.starts_with("ssh")),
             "external executable command is not silently dropped, got {commands:?}"
         );
+    }
+
+    #[test]
+    fn dependency_bootstrap_requires_package_manifest_and_prefers_pnpm_lock() {
+        let dir = unique_test_dir("verify-dependency-bootstrap");
+        fs::create_dir_all(&dir).expect("create repo dir");
+        fs::write(dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("write pnpm lock");
+        assert_eq!(dependency_bootstrap(&dir), None);
+
+        fs::write(dir.join("package.json"), "{}\n").expect("write package manifest");
+        fs::write(dir.join("package-lock.json"), "{}\n").expect("write npm lock");
+        assert_eq!(
+            dependency_bootstrap(&dir),
+            Some(DependencyBootstrap {
+                program: "pnpm",
+                args: &["install", "--frozen-lockfile"],
+            })
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dependency_bootstrap_supports_other_committed_javascript_lockfiles() {
+        let cases = [
+            ("package-lock.json", "npm", &["ci"][..]),
+            ("npm-shrinkwrap.json", "npm", &["ci"][..]),
+            ("yarn.lock", "yarn", &["install", "--frozen-lockfile"][..]),
+            ("bun.lock", "bun", &["install", "--frozen-lockfile"][..]),
+            ("bun.lockb", "bun", &["install", "--frozen-lockfile"][..]),
+        ];
+        for (lockfile, program, args) in cases {
+            let dir = unique_test_dir(&format!("verify-dependency-bootstrap-{program}"));
+            fs::create_dir_all(&dir).expect("create repo dir");
+            fs::write(dir.join("package.json"), "{}\n").expect("write package manifest");
+            fs::write(dir.join(lockfile), "\n").expect("write lockfile");
+            assert_eq!(
+                dependency_bootstrap(&dir),
+                Some(DependencyBootstrap { program, args }),
+                "wrong bootstrap for {lockfile}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]
