@@ -35,6 +35,39 @@ for declared build outputs, but mutable `.git/info/exclude`,
 Mutable host queue files remain excluded only at the root, allowing the scoped
 closeout transition without allowing source drift. Plan input, Git inventories,
 paths, metadata, and file contents share one streaming collection budget.
+Verification receipts always use this exact source fingerprint. A narrower
+workspace-baseline optimization is available for deterministic post-plan hooks
+that refresh a JSON string containing the SHA-256 of a host queue file. The
+repository tracks `.autodev-source-state.json`, for example:
+
+```json
+{
+  "version": 1,
+  "queue_sha256": [
+    {
+      "target_path": "evidence/document-inventory.json",
+      "target_pointer": "/documents/3/sha256",
+      "source_path": "PLAN.md"
+    }
+  ]
+}
+```
+
+This policy does not exempt the field from receipt freshness. During the one
+host hook invocation immediately preceding the definition-of-done gates,
+Autodev verifies that the old value equals the digest of the `HEAD` queue file,
+the new value equals the digest of the worktree queue file, and the hook reports
+the target path. It then compares fingerprints that replace only the unique raw
+64-character digest token while preserving every other byte in the JSON. Reuse
+requires the exact pre-hook fingerprint to equal the fully-green baseline, the
+exact post-hook fingerprint to equal the current tree, and the normalized
+pre/post fingerprints to match. The proof is in-memory and landing-scoped.
+
+The config, source, and target must be regular tracked files. Sources are
+restricted to host queue files; targets are bounded to 16 MiB; rules must be
+sorted and unique; missing or non-string pointers, duplicate raw digest values,
+unsafe paths, unreported targets, hash mismatches, and any sibling/source drift
+fail closed to an ordinary workspace probe.
 The public host-attestation and footer-generation paths apply that budget
 before parsing their plan, receipt, or verified-source-attestation inputs and
 carry it through freshness HEAD/status/diff collection and source hashing; an

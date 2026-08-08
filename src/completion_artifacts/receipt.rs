@@ -29,6 +29,8 @@ const VERIFIED_SOURCE_ATTESTATION_VERSION: u32 = 2;
 const SOURCE_STATE_MAX_SUBMODULE_DEPTH: usize = 8;
 const SOURCE_STATE_MAX_ENTRIES: usize = 200_000;
 const SOURCE_STATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const QUEUE_DERIVED_JSON_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const QUEUE_DERIVED_JSON_MAX_POINTERS: usize = 16;
 const LEGACY_CLEAN_PORCELAIN_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HOST_QUEUE_STATE_FILES: [&str; 8] = [
@@ -130,6 +132,7 @@ fn record_verified_source_attestation_with_source_limits(
             plan_text.as_bytes(),
             source_limits,
             bounded_freshness.budget,
+            &[],
         )
         .with_context(|| {
             format!("cannot compute source-state fingerprint while attesting `{task_id}`")
@@ -1631,6 +1634,7 @@ fn verification_receipt_freshness_problem_for_source(
                         context.plan_input,
                         context.limits,
                         context.budget,
+                        &[],
                     );
                     if let Ok(fingerprint) = &current {
                         context.source_state = Some(fingerprint.clone());
@@ -1914,6 +1918,72 @@ struct SourceStateBudget {
     visited_repositories: BTreeSet<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceStateJsonScalarNormalization {
+    pub(crate) path: String,
+    pub(crate) pointer: String,
+}
+
+fn normalize_json_scalar_fields(path: &str, bytes: &[u8], pointers: &[String]) -> Result<Vec<u8>> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > QUEUE_DERIVED_JSON_MAX_BYTES {
+        bail!(
+            "queue-derived JSON `{path}` exceeds the {} byte normalization bound",
+            QUEUE_DERIVED_JSON_MAX_BYTES
+        );
+    }
+    if pointers.is_empty() || pointers.len() > QUEUE_DERIVED_JSON_MAX_POINTERS {
+        bail!(
+            "queue-derived JSON `{path}` must declare between 1 and {} scalar pointers",
+            QUEUE_DERIVED_JSON_MAX_POINTERS
+        );
+    }
+    let value = serde_json::from_slice::<Value>(bytes)
+        .with_context(|| format!("failed to parse queue-derived JSON `{path}`"))?;
+    let mut replacements = Vec::<(usize, usize)>::new();
+    for pointer in pointers {
+        let selected = value
+            .pointer(pointer)
+            .with_context(|| format!("queue-derived pointer `{pointer}` is absent in `{path}`"))?;
+        let hash = selected.as_str().with_context(|| {
+            format!("queue-derived pointer `{pointer}` in `{path}` must select a string")
+        })?;
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!(
+                "queue-derived pointer `{pointer}` in `{path}` must contain a lowercase SHA-256 hex digest"
+            );
+        }
+        let encoded = serde_json::to_vec(hash).context("failed encoding queue-derived hash")?;
+        let matches = bytes
+            .windows(encoded.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == encoded).then_some(offset))
+            .collect::<Vec<_>>();
+        let [offset] = matches.as_slice() else {
+            bail!(
+                "queue-derived hash selected by `{pointer}` in `{path}` must have exactly one raw JSON occurrence"
+            );
+        };
+        replacements.push((*offset, offset + encoded.len()));
+    }
+    replacements.sort_unstable();
+    if replacements.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        bail!("queue-derived JSON `{path}` contains overlapping normalized scalars");
+    }
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    for (start, end) in replacements {
+        normalized.extend_from_slice(&bytes[cursor..start]);
+        normalized.extend_from_slice(b"\"<autodev-queue-sha256>\"");
+        cursor = end;
+    }
+    normalized.extend_from_slice(&bytes[cursor..]);
+    Ok(normalized)
+}
+
 impl SourceStateBudget {
     fn consume_bytes(
         &mut self,
@@ -1946,12 +2016,36 @@ impl SourceStateBudget {
 }
 
 pub(crate) fn current_source_state_fingerprint(repo_root: &Path) -> Result<String> {
-    current_source_state_fingerprint_with_limits(repo_root, SourceStateLimits::default())
+    current_source_state_fingerprint_with_limits_and_normalizations(
+        repo_root,
+        SourceStateLimits::default(),
+        &[],
+    )
 }
 
+#[cfg(test)]
 fn current_source_state_fingerprint_with_limits(
     repo_root: &Path,
     limits: SourceStateLimits,
+) -> Result<String> {
+    current_source_state_fingerprint_with_limits_and_normalizations(repo_root, limits, &[])
+}
+
+pub(crate) fn current_source_state_fingerprint_with_json_scalar_normalizations(
+    repo_root: &Path,
+    normalizations: &[SourceStateJsonScalarNormalization],
+) -> Result<String> {
+    current_source_state_fingerprint_with_limits_and_normalizations(
+        repo_root,
+        SourceStateLimits::default(),
+        normalizations,
+    )
+}
+
+fn current_source_state_fingerprint_with_limits_and_normalizations(
+    repo_root: &Path,
+    limits: SourceStateLimits,
+    normalizations: &[SourceStateJsonScalarNormalization],
 ) -> Result<String> {
     let mut budget = SourceStateBudget::default();
     let plan_path = active_plan_path(repo_root);
@@ -1982,6 +2076,7 @@ fn current_source_state_fingerprint_with_limits(
         &plan_input,
         limits,
         &mut budget,
+        normalizations,
     )
 }
 
@@ -1990,6 +2085,7 @@ fn current_source_state_fingerprint_with_budget_and_plan(
     plan_input: &[u8],
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
+    normalizations: &[SourceStateJsonScalarNormalization],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"autodev-source-state-v2\0");
@@ -1998,7 +2094,18 @@ fn current_source_state_fingerprint_with_budget_and_plan(
     let plan = normalize_plan_status_markers(plan_text).into_bytes();
     hash_fingerprint_field(&mut hasher, b"normalized-plan", &plan);
 
-    collect_repository_source_state(repo_root, "", 0, limits, budget, &mut hasher)?;
+    let mut by_path = BTreeMap::<String, Vec<String>>::new();
+    for normalization in normalizations {
+        by_path
+            .entry(normalization.path.clone())
+            .or_default()
+            .push(normalization.pointer.clone());
+    }
+    for pointers in by_path.values_mut() {
+        pointers.sort();
+        pointers.dedup();
+    }
+    collect_repository_source_state(repo_root, "", 0, limits, budget, &by_path, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -2008,6 +2115,7 @@ fn collect_repository_source_state(
     depth: usize,
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
+    normalizations: &BTreeMap<String, Vec<String>>,
     hasher: &mut Sha256,
 ) -> Result<()> {
     if depth > limits.max_submodule_depth {
@@ -2039,7 +2147,7 @@ fn collect_repository_source_state(
         limits,
         budget,
     )?;
-    let mut index_records = Vec::<(String, String, String)>::new();
+    let mut index_records = Vec::<(String, String, String, String, String)>::new();
     for raw_record in index {
         let record = std::str::from_utf8(&raw_record)
             .context("source-state git index entry was not UTF-8")?;
@@ -2049,20 +2157,74 @@ fn collect_repository_source_state(
         if source_state_path_is_excluded_at_depth(path, depth) {
             continue;
         }
-        let mode = metadata
-            .split_whitespace()
-            .next()
-            .context("source-state git index entry lacked a mode")?;
-        index_records.push((path.to_string(), metadata.to_string(), mode.to_string()));
+        let fields = metadata.split_whitespace().collect::<Vec<_>>();
+        let [mode, object_id, stage] = fields.as_slice() else {
+            bail!("source-state git index entry had malformed metadata");
+        };
+        index_records.push((
+            path.to_string(),
+            metadata.to_string(),
+            (*mode).to_string(),
+            (*object_id).to_string(),
+            (*stage).to_string(),
+        ));
     }
     index_records.sort();
 
     let mut index_modes = BTreeMap::<String, Vec<String>>::new();
-    for (path, metadata, mode) in index_records {
+    for (path, metadata, mode, object_id, stage) in index_records {
         let state_path = prefixed_source_state_path(state_prefix, &path);
         budget.consume_entry(limits, &state_path)?;
-        budget.consume_bytes(metadata.len(), limits, "git index metadata")?;
-        hash_source_state_record(hasher, &state_path, b"index", metadata.as_bytes());
+        let normalization = (depth == 0).then(|| normalizations.get(&path)).flatten();
+        if let Some(pointers) = normalization {
+            let normalized_metadata = format!("{mode} <queue-derived-json> {stage}");
+            budget.consume_bytes(
+                normalized_metadata.len(),
+                limits,
+                "queue-derived git index metadata",
+            )?;
+            hash_source_state_record(
+                hasher,
+                &state_path,
+                b"index",
+                normalized_metadata.as_bytes(),
+            );
+            let blob_size = required_git_output_bounded(
+                repo_root,
+                &["cat-file", "-s", object_id.as_str()],
+                &format!("queue-derived index JSON size `{state_path}`"),
+                limits,
+                budget,
+            )?;
+            let blob_size = std::str::from_utf8(&blob_size)
+                .context("queue-derived index JSON size was not UTF-8")?
+                .trim()
+                .parse::<u64>()
+                .context("queue-derived index JSON size was not an integer")?;
+            if blob_size > QUEUE_DERIVED_JSON_MAX_BYTES {
+                bail!(
+                    "queue-derived index JSON `{state_path}` exceeds the {} byte normalization bound",
+                    QUEUE_DERIVED_JSON_MAX_BYTES
+                );
+            }
+            let blob = required_git_output_bounded(
+                repo_root,
+                &["cat-file", "blob", object_id.as_str()],
+                &format!("queue-derived index JSON `{state_path}`"),
+                limits,
+                budget,
+            )?;
+            let normalized = normalize_json_scalar_fields(&state_path, &blob, pointers)?;
+            hash_source_state_record(
+                hasher,
+                &state_path,
+                b"queue-derived-index-json-sha256",
+                &Sha256::digest(&normalized),
+            );
+        } else {
+            budget.consume_bytes(metadata.len(), limits, "git index metadata")?;
+            hash_source_state_record(hasher, &state_path, b"index", metadata.as_bytes());
+        }
         index_modes.entry(path).or_default().push(mode);
     }
 
@@ -2081,10 +2243,20 @@ fn collect_repository_source_state(
                 depth,
                 limits,
                 budget,
+                normalizations,
                 hasher,
             )?;
         } else {
-            hash_source_worktree_path(&absolute, &state_path, b"worktree", limits, budget, hasher)?;
+            let normalization = (depth == 0).then(|| normalizations.get(path)).flatten();
+            hash_source_worktree_path(
+                &absolute,
+                &state_path,
+                b"worktree",
+                limits,
+                budget,
+                normalization,
+                hasher,
+            )?;
         }
     }
 
@@ -2165,6 +2337,7 @@ fn collect_repository_source_state(
             b"untracked",
             limits,
             budget,
+            None,
             hasher,
         )?;
     }
@@ -2177,6 +2350,7 @@ fn collect_checked_out_submodule_state(
     parent_depth: usize,
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
+    normalizations: &BTreeMap<String, Vec<String>>,
     hasher: &mut Sha256,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(submodule_root).with_context(|| {
@@ -2224,6 +2398,7 @@ fn collect_checked_out_submodule_state(
         parent_depth + 1,
         limits,
         budget,
+        normalizations,
         hasher,
     )
     .with_context(|| format!("failed to capture recursive source state for `{state_path}`"))
@@ -2235,6 +2410,7 @@ fn hash_source_worktree_path(
     namespace: &[u8],
     limits: SourceStateLimits,
     budget: &mut SourceStateBudget,
+    normalization: Option<&Vec<String>>,
     hasher: &mut Sha256,
 ) -> Result<()> {
     let metadata = match fs::symlink_metadata(absolute) {
@@ -2262,8 +2438,23 @@ fn hash_source_worktree_path(
     if !metadata.is_file() {
         bail!("unsupported source-state filesystem type at `{state_path}`");
     }
-    let content_hash =
-        bounded_source_file_hash(absolute, state_path, metadata.len(), limits, budget)?;
+    let content_hash = if let Some(pointers) = normalization {
+        if metadata.len() > QUEUE_DERIVED_JSON_MAX_BYTES {
+            bail!(
+                "queue-derived worktree JSON `{state_path}` exceeds the {} byte normalization bound",
+                QUEUE_DERIVED_JSON_MAX_BYTES
+            );
+        }
+        let bytes = read_bounded_file_bytes(
+            absolute,
+            limits,
+            budget,
+            &format!("queue-derived worktree JSON `{state_path}`"),
+        )?;
+        Sha256::digest(normalize_json_scalar_fields(state_path, &bytes, pointers)?)
+    } else {
+        bounded_source_file_hash(absolute, state_path, metadata.len(), limits, budget)?
+    };
     hash_source_state_record(hasher, state_path, namespace, b"file");
     hash_source_state_record(hasher, state_path, b"content-sha256", &content_hash);
     Ok(())
@@ -2599,6 +2790,7 @@ fn require_current_source_attestation_for_footer(
         source_context.plan_input,
         source_context.limits,
         source_context.budget,
+        &[],
     )
     .with_context(|| {
             format!(
@@ -3387,6 +3579,59 @@ mod tests {
     }
 
     #[test]
+    fn queue_derived_json_normalization_preserves_every_nonselected_raw_byte() {
+        let before_hash = "1".repeat(64);
+        let after_hash = "2".repeat(64);
+        let before = format!(
+            "{{\n  \"queue_hash\": \"{before_hash}\",\n  \"precise\": 1.0000000000000001\n}}\n"
+        );
+        let after = format!(
+            "{{\n  \"queue_hash\": \"{after_hash}\",\n  \"precise\": 1.0000000000000001\n}}\n"
+        );
+        let pointers = vec!["/queue_hash".to_string()];
+        assert_eq!(
+            super::normalize_json_scalar_fields("derived.json", before.as_bytes(), &pointers)
+                .expect("normalize before hash"),
+            super::normalize_json_scalar_fields("derived.json", after.as_bytes(), &pointers)
+                .expect("normalize after hash"),
+            "only the selected raw digest token may differ"
+        );
+
+        let sibling_changed = after.replace("1.0000000000000001", "1.0000000000000002");
+        assert_ne!(
+            super::normalize_json_scalar_fields(
+                "derived.json",
+                sibling_changed.as_bytes(),
+                &pointers,
+            )
+            .expect("normalize changed precise sibling"),
+            super::normalize_json_scalar_fields("derived.json", after.as_bytes(), &pointers)
+                .expect("normalize unchanged precise sibling"),
+            "decimal precision outside the selected token must remain byte-bound"
+        );
+    }
+
+    #[test]
+    fn queue_derived_json_normalization_rejects_duplicate_raw_digest_and_oversize_input() {
+        let hash = "a".repeat(64);
+        let duplicate = format!("{{\"queue_hash\":\"{hash}\",\"unrelated_copy\":\"{hash}\"}}");
+        let pointers = vec!["/queue_hash".to_string()];
+        let duplicate_error =
+            super::normalize_json_scalar_fields("duplicate.json", duplicate.as_bytes(), &pointers)
+                .expect_err("ambiguous raw digest must fail closed");
+        assert!(
+            format!("{duplicate_error:#}").contains("exactly one raw JSON occurrence"),
+            "{duplicate_error:#}"
+        );
+
+        let oversized = vec![b' '; super::QUEUE_DERIVED_JSON_MAX_BYTES as usize + 1];
+        let size_error =
+            super::normalize_json_scalar_fields("oversized.json", &oversized, &pointers)
+                .expect_err("oversized normalization input must fail before parsing");
+        assert!(format!("{size_error:#}").contains("normalization bound"));
+    }
+
+    #[test]
     fn footer_generation_rejects_untracked_source_hidden_by_git_info_exclude() {
         let root = source_bound_root_footer_fixture("source-bound-info-exclude");
         fs::write(root.join(".git/info/exclude"), "hidden-source.rs\n")
@@ -4081,6 +4326,7 @@ mod tests {
         let canonical = fs::canonicalize(&root).expect("canonicalize source fixture");
         let mut budget = super::SourceStateBudget::default();
         budget.visited_repositories.insert(canonical);
+        let normalizations = std::collections::BTreeMap::new();
         let mut hasher = sha2::Sha256::new();
 
         let error = super::collect_repository_source_state(
@@ -4089,6 +4335,7 @@ mod tests {
             0,
             super::SourceStateLimits::default(),
             &mut budget,
+            &normalizations,
             &mut hasher,
         )
         .expect_err("revisiting a canonical repository must fail closed");

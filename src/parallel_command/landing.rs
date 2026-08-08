@@ -931,7 +931,7 @@ pub(crate) async fn land_parallel_lane_result(
     // final safety net, but that second run must be a no-op; otherwise a
     // deterministic manifest update after verification invalidates the source
     // fingerprint and needlessly queues a recovery model lane.
-    run_after_plan_update_hook(repo_root)?;
+    let plan_update = run_after_plan_update_hook_with_source_transition(repo_root)?;
     // A worker can finish useful, committed scaffolding and still report that
     // the task's final proof is blocked on external infrastructure. That is a
     // successful *code landing*, not successful task completion. Historically
@@ -1009,6 +1009,7 @@ pub(crate) async fn land_parallel_lane_result(
         canonical_review_range.as_ref(),
         completion_status,
         review_config,
+        plan_update.source_transition.as_ref(),
     )
     .await?;
     if completion_status == LoopTaskStatus::Done {
@@ -1259,6 +1260,7 @@ async fn apply_definition_of_done_gates(
     review_range: Option<&LaneReviewRange>,
     mut status: LoopTaskStatus,
     review_config: &LaneReviewConfig,
+    source_transition: Option<&QueueDerivedSourceTransition>,
 ) -> Result<LoopTaskStatus> {
     if status != LoopTaskStatus::Done {
         return Ok(status);
@@ -1274,12 +1276,13 @@ async fn apply_definition_of_done_gates(
         )
         .await?;
         if status == LoopTaskStatus::Done {
-            status = apply_workspace_test_gate_in_transaction(
+            status = apply_workspace_test_gate_in_transaction_with_source_transition(
                 repo_root,
                 assignment,
                 changed_files,
                 status,
                 Some(&transaction),
+                source_transition,
             )
             .await?;
         }
@@ -1779,12 +1782,32 @@ async fn apply_workspace_test_gate(
     .await
 }
 
+#[cfg(test)]
 async fn apply_workspace_test_gate_in_transaction(
     repo_root: &Path,
     assignment: &mut ActiveLaneAssignment,
     changed_files: &[String],
     incoming_status: LoopTaskStatus,
     transaction: Option<&ArmedCanonicalGateTransaction>,
+) -> Result<LoopTaskStatus> {
+    apply_workspace_test_gate_in_transaction_with_source_transition(
+        repo_root,
+        assignment,
+        changed_files,
+        incoming_status,
+        transaction,
+        None,
+    )
+    .await
+}
+
+async fn apply_workspace_test_gate_in_transaction_with_source_transition(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    changed_files: &[String],
+    incoming_status: LoopTaskStatus,
+    transaction: Option<&ArmedCanonicalGateTransaction>,
+    source_transition: Option<&QueueDerivedSourceTransition>,
 ) -> Result<LoopTaskStatus> {
     apply_workspace_test_gate_mode_in_transaction(
         repo_root,
@@ -1794,6 +1817,7 @@ async fn apply_workspace_test_gate_in_transaction(
         transaction,
         workspace_gate_mode(),
         None,
+        source_transition,
     )
     .await
 }
@@ -1807,6 +1831,7 @@ async fn apply_workspace_test_gate_mode_in_transaction(
     transaction: Option<&ArmedCanonicalGateTransaction>,
     mode: WorkspaceGateMode,
     cargo_bin: Option<PathBuf>,
+    source_transition: Option<&QueueDerivedSourceTransition>,
 ) -> Result<LoopTaskStatus> {
     if matches!(mode, WorkspaceGateMode::Off) {
         append_lane_host_event(
@@ -1849,13 +1874,14 @@ async fn apply_workspace_test_gate_mode_in_transaction(
             apply_workspace_test_outcome(repo_root, assignment, incoming_status, outcome)
         }
         WorkspaceGateMode::Baseline => {
-            apply_workspace_baseline_gate_in_transaction_with_cargo(
+            apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_transition(
                 repo_root,
                 assignment,
                 changed_files,
                 incoming_status,
                 transaction,
                 cargo_bin,
+                source_transition,
             )
             .await
         }
@@ -1896,6 +1922,7 @@ async fn apply_workspace_baseline_gate(
     .await
 }
 
+#[cfg(test)]
 async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     repo_root: &Path,
     assignment: &mut ActiveLaneAssignment,
@@ -1904,14 +1931,42 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
     transaction: Option<&ArmedCanonicalGateTransaction>,
     cargo_bin: Option<PathBuf>,
 ) -> Result<LoopTaskStatus> {
+    apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_transition(
+        repo_root,
+        assignment,
+        changed_files,
+        incoming_status,
+        transaction,
+        cargo_bin,
+        None,
+    )
+    .await
+}
+
+async fn apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_transition(
+    repo_root: &Path,
+    assignment: &mut ActiveLaneAssignment,
+    changed_files: &[String],
+    incoming_status: LoopTaskStatus,
+    transaction: Option<&ArmedCanonicalGateTransaction>,
+    cargo_bin: Option<PathBuf>,
+    source_transition: Option<&QueueDerivedSourceTransition>,
+) -> Result<LoopTaskStatus> {
     let run_root = workspace_baseline_run_root(&assignment.lane_root);
     if let (Some(run_root), Ok(current_source_state)) = (
         run_root.as_ref(),
         current_source_state_fingerprint(repo_root),
     ) {
         let baseline = load_workspace_baseline(run_root);
-        if baseline.last_fully_green_source_state.as_deref() == Some(current_source_state.as_str())
-        {
+        let direct_reuse = baseline.last_fully_green_source_state.as_deref()
+            == Some(current_source_state.as_str());
+        let queue_derived_reuse = source_transition.is_some_and(|transition| {
+            transition.matches_green_transition(
+                baseline.last_fully_green_source_state.as_deref(),
+                &current_source_state,
+            )
+        });
+        if direct_reuse || queue_derived_reuse {
             if let Some(transaction) = transaction {
                 revalidate_canonical_gate_transaction(
                     repo_root,
@@ -1923,7 +1978,11 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
                 &assignment.task.id,
-                "workspace-baseline: reused fully-green canonical probe for identical normalized source state",
+                if queue_derived_reuse {
+                    "workspace-baseline: reused fully-green canonical probe across verified host queue-derived SHA-256 refresh"
+                } else {
+                    "workspace-baseline: reused fully-green canonical probe for identical normalized source state"
+                },
             );
             return persist_prior_workspace_test_clearance(repo_root, assignment, incoming_status);
         }
@@ -2912,6 +2971,7 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
         None,
         completion_status,
         review_config,
+        None,
     )
     .await?;
 
@@ -3560,6 +3620,36 @@ pub(crate) fn run_after_plan_update_hook(repo_root: &Path) -> Result<Vec<String>
         run_git(repo_root, add_args)?;
     }
     Ok(paths)
+}
+
+struct PlanUpdateHookResult {
+    source_transition: Option<QueueDerivedSourceTransition>,
+}
+
+fn run_after_plan_update_hook_with_source_transition(
+    repo_root: &Path,
+) -> Result<PlanUpdateHookResult> {
+    let before = match capture_queue_derived_source_before_hook(repo_root) {
+        Ok(before) => before,
+        Err(err) => {
+            eprintln!(
+                "warning: queue-derived source reuse disabled before post-plan hook: {err:#}"
+            );
+            None
+        }
+    };
+    let derived_files = run_after_plan_update_hook(repo_root)?;
+    let source_transition =
+        match finish_queue_derived_source_after_hook(repo_root, before, &derived_files) {
+            Ok(transition) => transition,
+            Err(err) => {
+                eprintln!(
+                    "warning: queue-derived source reuse disabled after post-plan hook: {err:#}"
+                );
+                None
+            }
+        };
+    Ok(PlanUpdateHookResult { source_transition })
 }
 
 pub(crate) fn prepare_lane_landing_recovery(
@@ -7418,6 +7508,7 @@ exec "$@"
             None,
             WorkspaceGateMode::Off,
             Some(root.join("cargo-must-not-run")),
+            None,
         )
         .await
         .expect("explicit off mode passes through");
@@ -7469,6 +7560,7 @@ exec "$@"
             Some(&transaction),
             WorkspaceGateMode::Strict,
             Some(cargo),
+            None,
         )
         .await
         .expect_err("passing strict workspace queue mutation must abort before outcome handling");
@@ -7529,6 +7621,7 @@ exec "$@"
             Some(&transaction),
             WorkspaceGateMode::Baseline,
             Some(cargo),
+            None,
         )
         .await
         .expect_err("passing baseline workspace queue mutation must abort before baseline update");
@@ -8606,6 +8699,197 @@ exec "$@"
         .expect("changed source runs workspace probe");
         assert_eq!(changed_status, LoopTaskStatus::Partial);
         assert!(marker.exists(), "source drift must force cargo to run");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn hook_verified_queue_hash_transition_reuses_green_workspace_probe_once() {
+        use sha2::{Digest, Sha256};
+
+        let root = unique_temp_dir("workspace-baseline-hook-queue-hash-reuse");
+        init_git_repo(&root);
+        let task_id = "TASK-WBASE-QUEUE-HASH";
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("write manifest");
+        let partial_plan =
+            format!("# IMPLEMENTATION_PLAN\n\n- [~] `{task_id}` reuse queue digest\n");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), &partial_plan).expect("write plan");
+        let plan_hash = format!("{:x}", Sha256::digest(partial_plan.as_bytes()));
+        fs::write(
+            root.join("derived.json"),
+            format!(
+                r#"{{"plan_hash":"{plan_hash}","source_contract":"stable"}}
+"#
+            ),
+        )
+        .expect("write queue-derived manifest");
+        fs::write(
+            root.join(".autodev-source-state.json"),
+            r#"{
+  "version": 1,
+  "queue_sha256": [
+    {
+      "target_path": "derived.json",
+      "target_pointer": "/plan_hash",
+      "source_path": "IMPLEMENTATION_PLAN.md"
+    }
+  ]
+}
+"#,
+        )
+        .expect("write queue-derived policy");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        let hook = root.join("scripts/autodev-after-plan-update.sh");
+        fs::write(
+            &hook,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+plan_hash="$(sha256sum IMPLEMENTATION_PLAN.md | cut -d ' ' -f 1)"
+printf '{"plan_hash":"%s","source_contract":"stable"}\n' "$plan_hash" > derived.json
+printf '%s\n' derived.json
+"#,
+        )
+        .expect("write post-plan hook");
+        let mut permissions = fs::metadata(&hook).expect("stat hook").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).expect("chmod hook");
+        git_ok(&root, ["add", "."]);
+        git_ok(&root, ["commit", "-q", "-m", "seed queue-derived baseline"]);
+
+        let run_root = root.join(".auto/parallel");
+        let mut assignment = review_gate_assignment(&root, task_id, "reuse queue digest");
+        assignment.lane_root = run_root.join("lanes/lane-1");
+        fs::create_dir_all(&assignment.lane_root).expect("create lane root");
+        let marker = root.join("cargo-must-not-run");
+        let fake_cargo = write_fake_workspace_cargo(
+            &root,
+            "fake-workspace-cargo-must-not-run-queue-hash.sh",
+            "touch cargo-must-not-run\nexit 99",
+        );
+        let baseline_source = current_source_state_fingerprint(&root).expect("baseline source");
+        let head = current_repo_head(&root).expect("current HEAD");
+        save_workspace_baseline(
+            &run_root,
+            &WorkspaceBaseline {
+                captured: true,
+                head_at_capture: Some(head.clone()),
+                last_fully_green_head: Some(head),
+                last_fully_green_source_state: Some(baseline_source),
+                ..WorkspaceBaseline::default()
+            },
+        );
+
+        let done_plan = partial_plan.replace("- [~]", "- [x]");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), done_plan).expect("flip task status");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        let hook_result = super::run_after_plan_update_hook_with_source_transition(&root)
+            .expect("run queue-derived hook transition");
+        let transition = hook_result
+            .source_transition
+            .expect("hook should prove a narrow source transition");
+        let exact_after_hook =
+            current_source_state_fingerprint(&root).expect("exact post-hook source state");
+        let status =
+            super::apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_transition(
+                &root,
+                &mut assignment,
+                &[],
+                LoopTaskStatus::Done,
+                None,
+                Some(fake_cargo.clone()),
+                Some(&transition),
+            )
+            .await
+            .expect("reuse green workspace probe across verified hook transition");
+        assert_eq!(status, LoopTaskStatus::Done);
+        assert!(
+            !marker.exists(),
+            "verified hook digest must not rerun cargo"
+        );
+
+        fs::write(
+            &hook,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+plan_hash="$(sha256sum IMPLEMENTATION_PLAN.md | cut -d ' ' -f 1)"
+printf '{"plan_hash":"%s","source_contract":"changed"}\n' "$plan_hash" > derived.json
+printf '%s\n' derived.json
+"#,
+        )
+        .expect("make hook mutate a substantive sibling");
+        fs::write(
+            root.join("derived.json"),
+            format!(
+                r#"{{"plan_hash":"{plan_hash}","source_contract":"stable"}}
+"#
+            ),
+        )
+        .expect("restore HEAD-derived pre-hook manifest");
+        let unsafe_hook_result = super::run_after_plan_update_hook_with_source_transition(&root)
+            .expect("run hook that also changes substantive source");
+        assert!(
+            unsafe_hook_result.source_transition.is_none(),
+            "a correct queue digest must not conceal a sibling mutation"
+        );
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), &partial_plan)
+            .expect("prepare failed-gate queue state");
+        git_ok(&root, ["add", "IMPLEMENTATION_PLAN.md"]);
+        let changed_status =
+            super::apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_transition(
+                &root,
+                &mut assignment,
+                &[],
+                LoopTaskStatus::Done,
+                None,
+                Some(fake_cargo.clone()),
+                unsafe_hook_result.source_transition.as_ref(),
+            )
+            .await
+            .expect("substantive hook drift must run workspace probe");
+        assert_eq!(changed_status, LoopTaskStatus::Partial);
+        assert!(marker.exists(), "substantive hook drift must force cargo");
+
+        fs::write(
+            root.join("derived.json"),
+            format!(
+                r#"{{"plan_hash":"{}","source_contract":"stable"}}"#,
+                "0".repeat(64)
+            ),
+        )
+        .expect("directly change declared scalar outside hook transition");
+        assert_ne!(
+            current_source_state_fingerprint(&root).expect("exact receipt source state"),
+            exact_after_hook,
+            "ordinary receipt freshness must remain exact after a direct scalar edit"
+        );
+
+        fs::write(
+            root.join("IMPLEMENTATION_PLAN.md"),
+            partial_plan.replace("- [~]", "- [x]"),
+        )
+        .expect("restore post-plan queue view");
+        fs::write(
+            root.join("derived.json"),
+            format!(
+                r#"{{"plan_hash":"{plan_hash}","source_contract":"stable"}}
+"#
+            ),
+        )
+        .expect("restore valid pre-hook queue digest");
+        fs::write(
+            &hook,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{{\"plan_hash\":\"{}\",\"source_contract\":\"stable\"}}' > derived.json\nprintf '%s\\n' derived.json\n",
+                "f".repeat(64)
+            ),
+        )
+        .expect("make hook publish mismatched queue digest");
+        let mismatched = super::run_after_plan_update_hook_with_source_transition(&root)
+            .expect("hash mismatch must degrade to ordinary verification");
+        assert!(
+            mismatched.source_transition.is_none(),
+            "a hook-reported target with the wrong queue digest must not authorize reuse"
+        );
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

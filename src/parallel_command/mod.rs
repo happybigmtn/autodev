@@ -48,6 +48,7 @@ pub(crate) use crate::util::{
 pub(crate) use crate::{ParallelAction, ParallelArgs, ParallelCargoTarget, SymphonySyncArgs};
 
 mod assignment;
+mod derived_source_transition;
 mod landing;
 mod lane_repo;
 mod orchestrator;
@@ -68,6 +69,7 @@ mod verify_gate;
 mod worker_env;
 
 pub(crate) use assignment::*;
+pub(crate) use derived_source_transition::*;
 pub(crate) use landing::*;
 pub(crate) use lane_repo::*;
 pub(crate) use orchestrator::*;

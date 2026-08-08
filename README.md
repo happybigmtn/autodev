@@ -1201,6 +1201,12 @@ What it actually does:
   work. If a repo has executable verification but no `scripts/run-task-verification.sh` and no
   reachable footer receipt, the host leaves the task `[~]` instead of marking it complete from a
   prose handoff alone.
+- Repositories whose deterministic `scripts/autodev-after-plan-update.sh` refreshes a JSON
+  SHA-256 of `PLAN.md`, `IMPLEMENTATION_PLAN.md`, or another host queue file may declare the exact
+  mapping in tracked `.autodev-source-state.json`. A landing-scoped pre/post-hook proof can then reuse
+  an already-green workspace probe when no other source changed. Receipt freshness remains exact;
+  direct edits and stale/mismatched hook output still force verification. See
+  `docs/verification-receipt-schema.md` for the schema and interlocks.
 - Receipt drift is warning-only during sync. If a completed row's repo-local receipt, review
   handoff, or declared artifact evidence no longer matches, the host writes `RECEIPTS-DRIFT.md`
   with exact task IDs and reasons, but it does not demote `[x]` rows back to `[~]`. If a partial
