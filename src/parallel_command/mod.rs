@@ -67,6 +67,7 @@ mod tmux;
 mod validation_lease;
 mod verify_gate;
 mod worker_env;
+mod workspace_inputs;
 
 pub(crate) use assignment::*;
 pub(crate) use derived_source_transition::*;
@@ -88,6 +89,7 @@ pub(crate) use tmux::*;
 pub(crate) use validation_lease::*;
 pub(crate) use verify_gate::*;
 pub(crate) use worker_env::*;
+pub(crate) use workspace_inputs::*;
 
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 

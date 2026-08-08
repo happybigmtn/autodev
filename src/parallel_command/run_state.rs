@@ -84,6 +84,13 @@ pub(crate) struct WorkspaceBaseline {
     /// and substantive task-contract text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_fully_green_source_state: Option<String>,
+    /// Cargo-workspace input fingerprint at the most recent fully-green probe.
+    /// This deliberately covers every file below each workspace member/local
+    /// path dependency plus root Cargo/toolchain configuration. It lets a gate
+    /// reuse a green probe after unrelated docs/operator artifacts change while
+    /// failing closed on any crate-local runtime fixture or build input change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_fully_green_workspace_probe_state: Option<String>,
 }
 
 fn workspace_baseline_path(run_root: &Path) -> PathBuf {
@@ -820,6 +827,7 @@ mod tests {
             head_at_capture: Some("deadbeef".to_string()),
             last_fully_green_head: Some("deadbeef".to_string()),
             last_fully_green_source_state: Some("feedface".to_string()),
+            last_fully_green_workspace_probe_state: Some("cargoface".to_string()),
         };
 
         save_workspace_baseline(&dir, &baseline);
@@ -849,6 +857,11 @@ mod tests {
             restored.last_fully_green_source_state.as_deref(),
             Some("feedface"),
             "last_fully_green_source_state round-trips through the persisted baseline"
+        );
+        assert_eq!(
+            restored.last_fully_green_workspace_probe_state.as_deref(),
+            Some("cargoface"),
+            "last_fully_green_workspace_probe_state round-trips through the persisted baseline"
         );
 
         clear_workspace_baseline(&dir);

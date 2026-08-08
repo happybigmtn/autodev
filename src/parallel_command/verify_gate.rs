@@ -1477,6 +1477,7 @@ mod tests {
             head_at_capture: None,
             last_fully_green_head: None,
             last_fully_green_source_state: None,
+            last_fully_green_workspace_probe_state: None,
         }
     }
 

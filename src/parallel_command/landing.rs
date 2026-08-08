@@ -1962,11 +1962,15 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_tran
     source_transition: Option<&QueueDerivedSourceTransition>,
 ) -> Result<LoopTaskStatus> {
     let run_root = workspace_baseline_run_root(&assignment.lane_root);
+    let current_workspace_probe_state = current_workspace_probe_input_fingerprint(repo_root).ok();
     if let (Some(run_root), Ok(current_source_state)) = (
         run_root.as_ref(),
         current_source_state_fingerprint(repo_root),
     ) {
         let baseline = load_workspace_baseline(run_root);
+        let workspace_input_reuse = current_workspace_probe_state.as_deref().is_some_and(|now| {
+            baseline.last_fully_green_workspace_probe_state.as_deref() == Some(now)
+        });
         let direct_reuse = baseline.last_fully_green_source_state.as_deref()
             == Some(current_source_state.as_str());
         let queue_derived_reuse = source_transition.is_some_and(|transition| {
@@ -1975,19 +1979,21 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_tran
                 &current_source_state,
             )
         });
-        if direct_reuse || queue_derived_reuse {
+        if workspace_input_reuse || direct_reuse || queue_derived_reuse {
             if let Some(transaction) = transaction {
                 revalidate_canonical_gate_transaction(
                     repo_root,
                     transaction,
-                    "same-source workspace baseline reuse",
+                    "workspace baseline reuse",
                 )?;
             }
             append_lane_host_event(
                 &assignment.stdout_log_path,
                 assignment.lane_index,
                 &assignment.task.id,
-                if queue_derived_reuse {
+                if workspace_input_reuse && !direct_reuse {
+                    "workspace-baseline: reused fully-green canonical probe because Cargo workspace inputs are unchanged"
+                } else if queue_derived_reuse {
                     "workspace-baseline: reused fully-green canonical probe across verified host queue-derived SHA-256 refresh"
                 } else {
                     "workspace-baseline: reused fully-green canonical probe for identical normalized source state"
@@ -2095,6 +2101,8 @@ async fn apply_workspace_baseline_gate_in_transaction_with_cargo_and_source_tran
     if obs.compiled && obs.failing_tests.is_empty() && obs.broken_crates.is_empty() {
         advanced.last_fully_green_head = current_repo_head(repo_root);
         advanced.last_fully_green_source_state = current_source_state_fingerprint(repo_root).ok();
+        advanced.last_fully_green_workspace_probe_state = current_workspace_probe_state
+            .or_else(|| current_workspace_probe_input_fingerprint(repo_root).ok());
     }
     save_workspace_baseline(&run_root, &advanced);
 
@@ -2287,6 +2295,24 @@ async fn maybe_capture_workspace_baseline_with_cargo(
                 (existing.head_at_capture.as_deref(), current_head.as_deref()),
                 (Some(prev), Some(now)) if prev != now
             );
+            let current_workspace_probe_state =
+                current_workspace_probe_input_fingerprint(repo_root).ok();
+            let workspace_inputs_unchanged =
+                current_workspace_probe_state.as_deref().is_some_and(|now| {
+                    existing.last_fully_green_workspace_probe_state.as_deref() == Some(now)
+                });
+            if drifted && workspace_inputs_unchanged {
+                let mut reused = existing.clone();
+                reused.head_at_capture = current_head.clone();
+                reused.last_fully_green_head = current_head.clone();
+                save_workspace_baseline(run_root, &reused);
+                parallel_logger.info(format!(
+                    "workspace-baseline: HEAD advanced since capture ({} -> {}) but Cargo workspace inputs are unchanged; reused fully-green probe",
+                    existing.head_at_capture.as_deref().unwrap_or("?"),
+                    current_head.as_deref().unwrap_or("?"),
+                ));
+                return Ok(());
+            }
             if drifted {
                 let probe = match run_guarded_workspace_probe_with_cargo(
                     repo_root,
@@ -2316,6 +2342,8 @@ async fn maybe_capture_workspace_baseline_with_cargo(
                     {
                         recapture.baseline.last_fully_green_source_state =
                             current_source_state_fingerprint(repo_root).ok();
+                        recapture.baseline.last_fully_green_workspace_probe_state =
+                            current_workspace_probe_input_fingerprint(repo_root).ok();
                     }
                     save_workspace_baseline(run_root, &recapture.baseline);
                     parallel_logger.info(format!(
@@ -2390,6 +2418,8 @@ async fn maybe_capture_workspace_baseline_with_cargo(
                 baseline.last_fully_green_head = baseline.head_at_capture.clone();
                 baseline.last_fully_green_source_state =
                     current_source_state_fingerprint(repo_root).ok();
+                baseline.last_fully_green_workspace_probe_state =
+                    current_workspace_probe_input_fingerprint(repo_root).ok();
             }
             save_workspace_baseline(run_root, &baseline);
             parallel_logger.info(format!(
@@ -8653,6 +8683,10 @@ exec "$@"
                 last_fully_green_source_state: Some(
                     current_source_state_fingerprint(&root).expect("source fingerprint"),
                 ),
+                last_fully_green_workspace_probe_state: Some(
+                    current_workspace_probe_input_fingerprint(&root)
+                        .expect("workspace probe fingerprint"),
+                ),
                 ..WorkspaceBaseline::default()
             },
         );
@@ -8664,6 +8698,11 @@ exec "$@"
         .expect("write host-only queue note");
         git_ok(&root, ["add", "REVIEW.md"]);
         git_ok(&root, ["commit", "-q", "-m", "host-only queue sync"]);
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+        fs::write(root.join("docs/operator.md"), "operator-only change\n")
+            .expect("write unrelated operator doc");
+        git_ok(&root, ["add", "docs/operator.md"]);
+        git_ok(&root, ["commit", "-q", "-m", "operator docs"]);
         assert_ne!(
             current_repo_head(&root).as_deref(),
             Some(head.as_str()),
@@ -8685,9 +8724,7 @@ exec "$@"
         assert!(!marker.exists(), "same-HEAD reuse must not spawn cargo");
         let log = fs::read_to_string(&assignment.stdout_log_path).expect("read lane log");
         assert!(
-            log.contains(
-                "reused fully-green canonical probe for identical normalized source state"
-            ),
+            log.contains("Cargo workspace inputs are unchanged"),
             "{log}"
         );
         let review = fs::read_to_string(root.join("REVIEW.md")).expect("read review");
