@@ -1490,6 +1490,7 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
     }
 
     let mut markers = Vec::with_capacity(existing.len());
+    let mut recovering_in_progress = false;
     for path in &existing {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to inspect quarantine marker {}", path.display()))?;
@@ -1511,33 +1512,63 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
             );
         }
         if marker.phase == GateTransactionPhase::InProgress {
-            bail!(
-                "refusing to clear in-progress gate transaction for `{}`; first prove the gate process ended and restore its captured state",
-                marker.task_id
-            );
+            let current_head = current_head_commit(repo_root)
+                .context("cannot validate crashed canonical gate HEAD")?;
+            let current_states = match marker.scope {
+                GateTransactionScope::ReviewInputs => {
+                    review_input_path_states(repo_root, &marker.task_id)
+                        .context("cannot validate crashed gate review inputs")?
+                }
+                GateTransactionScope::CanonicalSource => {
+                    canonical_gate_source_path_states(repo_root)
+                        .context("cannot validate crashed gate source/index state")?
+                }
+                GateTransactionScope::CanonicalFull => {
+                    canonical_gate_full_path_states(repo_root)
+                        .context("cannot validate crashed exact gate state")?
+                }
+            };
+            if current_head != marker.reviewed_head || current_states != marker.reviewed_path_states
+            {
+                bail!(
+                    "refusing to clear in-progress gate transaction for `{}` until HEAD `{}` and its exact captured source/index state are restored",
+                    marker.task_id,
+                    marker.reviewed_head
+                );
+            }
+            recovering_in_progress = true;
         }
         markers.push((path.clone(), bytes, marker));
     }
-
-    let dirty = git_stdout(
-        repo_root,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
-    if !dirty.trim().is_empty() {
-        bail!("refusing quarantine recovery from a dirty canonical worktree/index");
+    if recovering_in_progress
+        && markers
+            .iter()
+            .any(|(_, _, marker)| marker.phase != GateTransactionPhase::InProgress)
+    {
+        bail!("refusing quarantine recovery from mixed in-progress and mutation markers");
     }
+
     let branch = git_stdout(repo_root, ["branch", "--show-current"])?;
     let branch = branch.trim();
     if branch.is_empty() {
         bail!("refusing quarantine recovery from detached HEAD");
     }
     let head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
-    let remote_ref = format!("refs/remotes/origin/{branch}");
-    let remote = git_stdout(repo_root, ["rev-parse", remote_ref.as_str()])?;
-    if head.trim() != remote.trim() {
-        bail!(
-            "refusing quarantine recovery until `{branch}` exactly matches local `origin/{branch}`"
-        );
+    if !recovering_in_progress {
+        let dirty = git_stdout(
+            repo_root,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        if !dirty.trim().is_empty() {
+            bail!("refusing quarantine recovery from a dirty canonical worktree/index");
+        }
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let remote = git_stdout(repo_root, ["rev-parse", remote_ref.as_str()])?;
+        if head.trim() != remote.trim() {
+            bail!(
+                "refusing quarantine recovery until `{branch}` exactly matches local `origin/{branch}`"
+            );
+        }
     }
 
     println!("auto parallel quarantine-clear");
@@ -1547,9 +1578,10 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
     println!("mode:        {}", if apply { "apply" } else { "dry-run" });
     for (path, _, marker) in &markers {
         println!(
-            "candidate:   {} task={} reviewed_head={}",
+            "candidate:   {} task={} phase={:?} reviewed_head={}",
             path.display(),
             marker.task_id,
+            marker.phase,
             marker.reviewed_head
         );
     }
@@ -1931,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_quarantine_clear_rejects_dirty_or_in_progress_state() {
+    fn explicit_quarantine_clear_rejects_dirty_or_changed_in_progress_state() {
         let root = temp_dir("explicit-quarantine-clear-dirty");
         let (marker, run_root) = prepare_quarantine_clear_fixture(&root);
         fs::write(root.join("operator-edit.txt"), "not durable\n").expect("dirty fixture");
@@ -1941,19 +1973,42 @@ mod tests {
         assert!(marker.exists());
         fs::remove_file(root.join("operator-edit.txt")).expect("restore clean fixture");
 
-        let mut live_marker: ReviewInputQuarantine =
-            serde_json::from_slice(&fs::read(&marker).expect("read mutation marker"))
-                .expect("decode mutation marker");
-        live_marker.phase = GateTransactionPhase::InProgress;
-        atomic_write(
-            &marker,
-            &serde_json::to_vec_pretty(&live_marker).expect("encode live marker"),
-        )
-        .expect("write in-progress marker");
+        fs::remove_file(&marker).expect("remove mutation marker");
+        let transaction = arm_canonical_gate_transaction(&root, "TASK-GATE", "host verification")
+            .expect("arm live gate marker");
+        fs::write(root.join("seed.txt"), "changed after gate arm\n")
+            .expect("mutate captured source state");
         let gate_error = clear_review_input_quarantine(&root, &run_root, true)
-            .expect_err("in-progress gate must fail closed");
-        assert!(format!("{gate_error:#}").contains("in-progress"));
-        assert!(marker.exists());
+            .expect_err("changed in-progress gate must fail closed");
+        assert!(format!("{gate_error:#}").contains("exact captured source/index state"));
+        assert!(transaction.marker_path.exists());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_recovers_exact_stopped_in_progress_gate() {
+        let root = temp_dir("explicit-in-progress-quarantine-clear");
+        init_git_repo(&root);
+        let run_root = root.join(".auto/parallel");
+        let transaction = arm_canonical_gate_transaction(&root, "TASK-GATE", "host verification")
+            .expect("arm live gate marker");
+
+        clear_review_input_quarantine(&root, &run_root, false)
+            .expect("exact stopped in-progress gate should pass dry-run proof");
+        assert!(
+            transaction.marker_path.exists(),
+            "dry-run must retain marker"
+        );
+
+        clear_review_input_quarantine(&root, &run_root, true)
+            .expect("exact stopped in-progress gate should be recoverable explicitly");
+        assert!(!transaction.marker_path.exists(), "apply must clear marker");
+        let archives = fs::read_dir(run_root.join("quarantine-archive"))
+            .expect("read recovery archive")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read archive entries");
+        assert_eq!(archives.len(), 1);
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
