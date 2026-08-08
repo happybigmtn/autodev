@@ -1002,14 +1002,16 @@ pub(crate) async fn land_parallel_lane_result(
     // produces a positive pass on the current integrated tree. Once any gate
     // holds it at `[~]`, later gates are skipped for this landing.
     completion_status = apply_definition_of_done_gates(
-        repo_root,
-        target_branch,
+        DefinitionOfDoneGateContext {
+            repo_root,
+            target_branch,
+            changed_files: &changed_files,
+            review_range: canonical_review_range.as_ref(),
+            review_config,
+            source_transition: plan_update.source_transition.as_ref(),
+        },
         assignment,
-        &changed_files,
-        canonical_review_range.as_ref(),
         completion_status,
-        review_config,
-        plan_update.source_transition.as_ref(),
     )
     .await?;
     if completion_status == LoopTaskStatus::Done {
@@ -1252,24 +1254,31 @@ async fn apply_lane_review_gate_in_transaction(
     apply_lane_review_outcome(repo_root, assignment, incoming_status, outcome)
 }
 
+struct DefinitionOfDoneGateContext<'a> {
+    repo_root: &'a Path,
+    target_branch: &'a str,
+    changed_files: &'a [String],
+    review_range: Option<&'a LaneReviewRange>,
+    review_config: &'a LaneReviewConfig,
+    source_transition: Option<&'a QueueDerivedSourceTransition>,
+}
+
 async fn apply_definition_of_done_gates(
-    repo_root: &Path,
-    target_branch: &str,
+    context: DefinitionOfDoneGateContext<'_>,
     assignment: &mut ActiveLaneAssignment,
-    changed_files: &[String],
-    review_range: Option<&LaneReviewRange>,
     mut status: LoopTaskStatus,
-    review_config: &LaneReviewConfig,
-    source_transition: Option<&QueueDerivedSourceTransition>,
 ) -> Result<LoopTaskStatus> {
     if status != LoopTaskStatus::Done {
         return Ok(status);
     }
-    let transaction =
-        arm_canonical_gate_transaction(repo_root, &assignment.task.id, "definition-of-done")?;
+    let transaction = arm_canonical_gate_transaction(
+        context.repo_root,
+        &assignment.task.id,
+        "definition-of-done",
+    )?;
     let gate_result = async {
         status = apply_lane_verify_gate_in_transaction(
-            repo_root,
+            context.repo_root,
             assignment,
             status,
             Some(&transaction),
@@ -1277,37 +1286,37 @@ async fn apply_definition_of_done_gates(
         .await?;
         if status == LoopTaskStatus::Done {
             status = apply_workspace_test_gate_in_transaction_with_source_transition(
-                repo_root,
+                context.repo_root,
                 assignment,
-                changed_files,
+                context.changed_files,
                 status,
                 Some(&transaction),
-                source_transition,
+                context.source_transition,
             )
             .await?;
         }
         if status == LoopTaskStatus::Done {
             status = apply_lane_review_gate_in_transaction(
-                repo_root,
-                target_branch,
+                context.repo_root,
+                context.target_branch,
                 assignment,
-                changed_files,
+                context.changed_files,
                 status,
-                review_config,
-                review_range,
+                context.review_config,
+                context.review_range,
                 Some(&transaction),
             )
             .await?;
         }
         if status == LoopTaskStatus::Done {
-            clear_gate_hold(repo_root, &assignment.task.id)?;
+            clear_gate_hold(context.repo_root, &assignment.task.id)?;
         }
         Result::<LoopTaskStatus>::Ok(status)
     }
     .await;
     match gate_result {
         Ok(status) => {
-            clear_canonical_gate_transaction(repo_root, &transaction)?;
+            clear_canonical_gate_transaction(context.repo_root, &transaction)?;
             Ok(status)
         }
         Err(err) => Err(err),
@@ -2964,14 +2973,16 @@ pub(crate) async fn reconcile_parallel_clean_no_commit(
     // cannot leave a generic startup checkpoint able to commit an unearned [x].
     let mut completion_status = LoopTaskStatus::Done;
     completion_status = apply_definition_of_done_gates(
-        repo_root,
-        target_branch,
+        DefinitionOfDoneGateContext {
+            repo_root,
+            target_branch,
+            changed_files: &[],
+            review_range: None,
+            review_config,
+            source_transition: None,
+        },
         assignment,
-        &[],
-        None,
         completion_status,
-        review_config,
-        None,
     )
     .await?;
 
