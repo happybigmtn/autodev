@@ -1494,6 +1494,40 @@ mod tests {
     }
 
     #[test]
+    fn inspect_task_completion_evidence_accepts_broader_test_superseding_malformed_test() {
+        let root = temp_dir("broad-test-supersedes-malformed-test");
+        fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");
+        fs::write(root.join("scripts/run-task-verification.sh"), "#!/bin/sh\n")
+            .expect("failed to write wrapper");
+        fs::create_dir_all(root.join(".auto/symphony/verification-receipts"))
+            .expect("failed to create receipts dir");
+        fs::write(
+            root.join("REVIEW.md"),
+            "# REVIEW\n\nAwaiting auto review:\n## `TASK-BROAD-SUPERSEDES`\n",
+        )
+        .expect("failed to write review");
+        fs::write(
+            root.join(
+                ".auto/symphony/verification-receipts/TASK-BROAD-SUPERSEDES.json",
+            ),
+            receipt_with_current_metadata(
+                &root,
+                r#"{"task_id":"TASK-BROAD-SUPERSEDES","commands":[{"command":"bash scripts/verify.sh","argv":["bash","scripts/verify.sh"],"expected_argv":["bash","scripts/verify.sh"],"exit_code":0,"status":"passed"},{"command":"cargo test -p demo first second","argv":["cargo","test","-p","demo","first","second"],"expected_argv":["cargo","test","-p","demo","first","second"],"exit_code":1,"status":"failed"},{"command":"cargo test -p demo","argv":["cargo","test","-p","demo"],"expected_argv":["cargo","test","-p","demo"],"exit_code":0,"status":"passed","supersedes":["cargo test -p demo first second"]}]}"#,
+            ),
+        )
+        .expect("failed to write receipt");
+
+        let evidence = inspect_task_completion_evidence(
+            &root,
+            "TASK-BROAD-SUPERSEDES",
+            "- [ ] `TASK-BROAD-SUPERSEDES` Example\nVerification:\n  - `bash scripts/verify.sh`\nDependencies: none\n",
+        );
+
+        assert!(evidence.verification_receipt_present);
+        assert!(evidence.missing_reasons().is_empty());
+    }
+
+    #[test]
     fn inspect_task_completion_evidence_accepts_later_pass_for_same_failed_command() {
         let root = temp_dir("later-pass-same-command-receipt");
         fs::create_dir_all(root.join("scripts")).expect("failed to create scripts dir");

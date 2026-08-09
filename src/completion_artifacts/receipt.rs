@@ -1347,9 +1347,13 @@ fn verification_receipt_failed_entry_is_superseded(
             )
     }) || all_entries.iter().any(|entry| {
         verification_receipt_command_passed(entry)
-            && expected_commands
-                .iter()
-                .any(|expected| verification_receipt_command_matches(entry, expected))
+            // An explicit supersession is also valid when the replacement is
+            // a real compile/test-family command even if it is broader than
+            // the task's declared wrapper. This is needed for repairing a
+            // malformed historical test invocation with a passing full suite.
+            // Auxiliary commands such as `true` or `rg` still cannot erase a
+            // failed compile/test receipt.
+            && receipt_command_hard_gates(entry, expected_commands)
             && entry
                 .supersedes
                 .iter()
