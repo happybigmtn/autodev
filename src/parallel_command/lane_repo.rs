@@ -644,7 +644,7 @@ pub(crate) fn worker_identity_has_active_verification(
             return Ok(false);
         }
         let output = Command::new("ps")
-            .args(["-eo", "pid=,ppid=,stat=,args="])
+            .args(["-ww", "-eo", "pid=,ppid=,stat=,args="])
             .output()
             .context("failed to inspect worker process tree before clean-commit harvest")?;
         if !output.status.success() {
