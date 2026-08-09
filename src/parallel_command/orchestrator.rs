@@ -2669,6 +2669,29 @@ pub(crate) fn nudge_lingering_committed_lanes(
                     continue;
                 }
 
+                match worker_identity_has_active_verification(
+                    &assignment.worker_pid_path,
+                    &identity,
+                ) {
+                    Ok(true)
+                        if commit_since.elapsed() < CLEAN_COMMIT_ACTIVE_VERIFICATION_GRACE =>
+                    {
+                        continue;
+                    }
+                    Ok(true) => eprintln!(
+                        "warning: lane-{} `{}` verification remained active for the full clean-commit grace; harvesting the committed worker",
+                        assignment.lane_index, assignment.task.id
+                    ),
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed inspecting active verification for lane-{} `{}` before clean-commit harvest; deferring termination: {err:#}",
+                            assignment.lane_index, assignment.task.id
+                        );
+                        continue;
+                    }
+                }
+
                 match signal_worker_identity(&assignment.worker_pid_path, &identity, "TERM") {
                     Err(err) => {
                         eprintln!(

@@ -1431,4 +1431,42 @@ mod tests {
             None,
         ));
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_commit_harvest_distinguishes_silent_verifier_from_agent_plumbing() {
+        let silent_verifier = r#"
+100 1 Sl /opt/codex --yolo
+101 100 Sl /opt/codex-code-mode-host
+102 100 Sl npm exec @playwright/mcp@latest
+103 102 Sl node /tmp/playwright-mcp
+104 100 S /usr/bin/bash scripts/run-task-verification.sh TASK-1
+105 104 Sl /usr/bin/cargo test --locked --workspace
+"#;
+        assert!(process_table_has_active_worker_verification(
+            100,
+            silent_verifier
+        ));
+
+        let plumbing_only = r#"
+100 1 Sl /opt/codex --yolo
+101 100 Sl /opt/codex-code-mode-host
+102 100 Sl npm exec @playwright/mcp@latest
+103 102 Sl /usr/bin/chromium --headless
+104 100 Sl /venv/bin/python -m agent.transports.hermes_tools_mcp_server
+"#;
+        assert!(!process_table_has_active_worker_verification(
+            100,
+            plumbing_only
+        ));
+
+        let unrelated_lingering_process = r#"
+100 1 Sl /opt/codex --yolo
+101 100 S sleep 2147483647
+"#;
+        assert!(!process_table_has_active_worker_verification(
+            100,
+            unrelated_lingering_process
+        ));
+    }
 }

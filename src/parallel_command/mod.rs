@@ -110,6 +110,8 @@ pub(crate) const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(30);
 
 pub(crate) const CLEAN_COMMIT_QUIET_GRACE: Duration = Duration::from_secs(120);
 
+pub(crate) const CLEAN_COMMIT_ACTIVE_VERIFICATION_GRACE: Duration = Duration::from_secs(45 * 60);
+
 pub(crate) const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) const STALE_GIT_INDEX_LOCK_GRACE: Duration = Duration::from_secs(30);

@@ -548,6 +548,126 @@ pub(crate) fn worker_pid_is_alive(pid: u32) -> Result<bool> {
     Ok(status.success())
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerProcessRow {
+    pid: u32,
+    parent_pid: u32,
+    state: char,
+    command: String,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_worker_process_table(table: &str) -> Vec<WorkerProcessRow> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let parent_pid = fields.next()?.parse::<u32>().ok()?;
+            let state = fields.next()?.chars().next()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            Some(WorkerProcessRow {
+                pid,
+                parent_pid,
+                state,
+                command,
+            })
+        })
+        .collect()
+}
+
+/// Agent backends keep a small set of MCP/code-mode children alive for their
+/// whole session. Those plumbing subtrees do not mean task work is active.
+#[cfg(target_os = "linux")]
+fn is_agent_plumbing_process(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    command.contains("codex-code-mode-host")
+        || command.contains("@playwright/mcp")
+        || command.contains("playwright-mcp")
+        || command.contains("mcp_server")
+        || command.contains("mcp-server")
+        || command.contains(" mcp ")
+        || command.ends_with(" mcp")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_table_has_active_worker_verification(worker_pid: u32, table: &str) -> bool {
+    parse_worker_process_table(table).into_iter().any(|row| {
+        row.parent_pid == worker_pid
+            && row.state != 'Z'
+            && !is_agent_plumbing_process(&row.command)
+            && is_verification_process(&row.command)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_verification_process(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    [
+        "run-task-verification",
+        "scripts/ci/",
+        "cargo test",
+        "cargo nextest",
+        "cargo check",
+        "cargo clippy",
+        "cargo build",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "bun test",
+        "pytest",
+        "playwright test",
+        "vitest",
+        "jest",
+        "go test",
+        "make test",
+        "gradlew test",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+/// Return whether the identity-bound worker currently owns a non-plumbing
+/// verification child. The lease is revalidated after the process-table
+/// snapshot so PID recycling cannot turn an unrelated process into harvest
+/// authority.
+pub(crate) fn worker_identity_has_active_verification(
+    worker_pid_path: &Path,
+    expected: &WorkerPidIdentity,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let before = read_worker_pid_identity(worker_pid_path)?;
+        if before.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        let output = Command::new("ps")
+            .args(["-eo", "pid=,ppid=,stat=,args="])
+            .output()
+            .context("failed to inspect worker process tree before clean-commit harvest")?;
+        if !output.status.success() {
+            bail!("process-table inspection failed before clean-commit harvest");
+        }
+        let active = process_table_has_active_worker_verification(
+            expected.pid(),
+            &String::from_utf8_lossy(&output.stdout),
+        );
+        let after = read_worker_pid_identity(worker_pid_path)?;
+        if after.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        Ok(active)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (worker_pid_path, expected);
+        Ok(false)
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn signal_worker(pid: u32, signal: &str) -> Result<()> {
     let status = Command::new("kill")
