@@ -238,20 +238,28 @@ pub(crate) fn append_idle_status_to_free_lanes(
     }
 }
 
-fn partition_ready_tasks_with_operator_closeout(
+fn partition_ready_tasks_with_operator_worker_work(
     ready: Vec<LoopTask>,
-    mut operator_has_closeout_evidence: impl FnMut(&LoopTask) -> bool,
+    mut operator_has_worker_work: impl FnMut(&LoopTask) -> bool,
 ) -> (Vec<LoopTask>, Vec<LoopTask>) {
     ready
         .into_iter()
-        .partition(|task| is_operator_task(task) && !operator_has_closeout_evidence(task))
+        .partition(|task| is_operator_task(task) && !operator_has_worker_work(task))
 }
 
-fn operator_task_has_closeout_evidence(repo_root: &Path, task: &LoopTask) -> bool {
+fn operator_task_has_worker_work(repo_root: &Path, task: &LoopTask) -> bool {
     if !is_operator_task(task) {
         return false;
     }
     let mut evidence = inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
+    // Once independent review has identified a source or integration defect,
+    // the remaining work is code repair rather than another privileged live
+    // action. Route that task through an isolated worker even when the old
+    // receipt or captured artifact is now stale. The worker prompt below still
+    // forbids repeating the external action.
+    if !evidence.unresolved_review_findings.is_empty() {
+        return true;
+    }
     // A review handoff is produced by the ordinary closeout pipeline. The
     // operator must already have supplied every immutable input: a current
     // passing receipt, declared artifacts, and clean owned-audit scope.
@@ -264,8 +272,8 @@ fn partition_ready_tasks_for_worker_dispatch(
     repo_root: &Path,
     ready: Vec<LoopTask>,
 ) -> (Vec<LoopTask>, Vec<LoopTask>) {
-    partition_ready_tasks_with_operator_closeout(ready, |task| {
-        operator_task_has_closeout_evidence(repo_root, task)
+    partition_ready_tasks_with_operator_worker_work(ready, |task| {
+        operator_task_has_worker_work(repo_root, task)
     })
 }
 
@@ -816,10 +824,17 @@ pub(crate) async fn run_parallel_loop(
             };
             attach_partial_follow_up_note(repo_root, &mut assignment, &attempted_partial_followups);
             if is_operator_task(&assignment.task) {
-                prepend_host_recovery_note(
-                    &mut assignment,
-                    "The operator action is already represented by current canonical artifacts and a passing receipt. Treat this as verification-only closeout: do not repeat the external action, change its captured inputs, or invent provenance. Inspect the existing evidence and return AUTO_ALREADY_COMPLETE when it satisfies the task contract.",
+                let evidence = inspect_task_completion_evidence(
+                    repo_root,
+                    &assignment.task.id,
+                    &assignment.task.markdown,
                 );
+                let note = if evidence.unresolved_review_findings.is_empty() {
+                    "The operator action is already represented by current canonical artifacts and a passing receipt. Treat this as verification-only closeout: do not repeat the external action, change its captured inputs, or invent provenance. Inspect the existing evidence and return AUTO_ALREADY_COMPLETE when it satisfies the task contract."
+                } else {
+                    "Independent review found code or integration defects after the operator action. Repair the standing review findings in source and tests, but do not repeat the privileged external action or invent replacement live evidence. Preserve captured inputs when they remain truthful. If source changes invalidate activation evidence, leave the task partial and report the exact operator refresh required instead of claiming completion."
+                };
+                prepend_host_recovery_note(&mut assignment, note);
             }
             if let Err(err) = spawn_parallel_lane_attempt(
                 &mut join_set,
@@ -3011,7 +3026,7 @@ mod tests {
         ];
 
         let (operator, worker) =
-            partition_ready_tasks_with_operator_closeout(ready.clone(), |_| false);
+            partition_ready_tasks_with_operator_worker_work(ready.clone(), |_| false);
 
         assert_eq!(
             operator
@@ -3030,7 +3045,7 @@ mod tests {
         );
 
         let (operator, worker) =
-            partition_ready_tasks_with_operator_closeout(ready, |task| task.id == "OPERATOR");
+            partition_ready_tasks_with_operator_worker_work(ready, |task| task.id == "OPERATOR");
         assert!(operator.is_empty());
         assert_eq!(
             worker
@@ -3119,7 +3134,7 @@ mod tests {
             .clone();
         let evidence = inspect_task_completion_evidence(&repo, &task.id, &task.markdown);
         assert!(
-            operator_task_has_closeout_evidence(&repo, &task),
+            operator_task_has_worker_work(&repo, &task),
             "operator evidence should be closeout-ready: {:?}",
             evidence.missing_reasons()
         );
@@ -3136,8 +3151,40 @@ mod tests {
 
         fs::write(repo.join("evidence/identity.json"), "drifted\n")
             .expect("mutate identity artifact");
-        assert!(!operator_task_has_closeout_evidence(&repo, &task));
+        assert!(!operator_task_has_worker_work(&repo, &task));
         fs::remove_dir_all(repo).expect("clean operator closeout fixture");
+    }
+
+    #[test]
+    fn operator_with_review_findings_enters_code_repair_worker_queue() {
+        let plan_text = "\
+- [~] `OPERATOR` Capture external identity
+  Lane kind: operator
+  Verification: `bash scripts/verify-operator.sh`
+  Completion artifacts: `evidence/identity.json`
+  Dependencies: none
+";
+        let repo = init_parallel_scheduler_repo("operator-review-repair", plan_text);
+        fs::write(
+            repo.join("REVIEW.md"),
+            "# REVIEW\n\n## `OPERATOR`: independent review findings\n\n1. `src/client.rs` appends the route twice; repair the URL constructor.\n",
+        )
+        .expect("write standing operator review finding");
+
+        let task = parse_loop_plan(plan_text)
+            .task("OPERATOR")
+            .expect("operator repair task should parse")
+            .clone();
+        assert!(
+            operator_task_has_worker_work(&repo, &task),
+            "standing source findings must be worker-repairable even when live evidence is stale"
+        );
+        let (operator, worker) = partition_ready_tasks_for_worker_dispatch(&repo, vec![task]);
+        assert!(operator.is_empty());
+        assert_eq!(worker.len(), 1);
+        assert_eq!(worker[0].id, "OPERATOR");
+
+        fs::remove_dir_all(repo).expect("clean operator repair fixture");
     }
 
     #[test]
