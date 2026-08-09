@@ -1491,6 +1491,7 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
 
     let mut markers = Vec::with_capacity(existing.len());
     let mut recovering_in_progress = false;
+    let mut recovering_superseded_in_progress = false;
     for path in &existing {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to inspect quarantine marker {}", path.display()))?;
@@ -1514,25 +1515,41 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
         if marker.phase == GateTransactionPhase::InProgress {
             let current_head = current_head_commit(repo_root)
                 .context("cannot validate crashed canonical gate HEAD")?;
-            let current_states = match marker.scope {
-                GateTransactionScope::ReviewInputs => {
-                    review_input_path_states(repo_root, &marker.task_id)
-                        .context("cannot validate crashed gate review inputs")?
+            if current_head == marker.reviewed_head {
+                let current_states = match marker.scope {
+                    GateTransactionScope::ReviewInputs => {
+                        review_input_path_states(repo_root, &marker.task_id)
+                            .context("cannot validate crashed gate review inputs")?
+                    }
+                    GateTransactionScope::CanonicalSource => {
+                        canonical_gate_source_path_states(repo_root)
+                            .context("cannot validate crashed gate source/index state")?
+                    }
+                    GateTransactionScope::CanonicalFull => {
+                        canonical_gate_full_path_states(repo_root)
+                            .context("cannot validate crashed exact gate state")?
+                    }
+                };
+                if current_states != marker.reviewed_path_states {
+                    bail!(
+                        "refusing to clear in-progress gate transaction for `{}` until HEAD `{}` and its exact captured source/index state are restored",
+                        marker.task_id,
+                        marker.reviewed_head
+                    );
                 }
-                GateTransactionScope::CanonicalSource => {
-                    canonical_gate_source_path_states(repo_root)
-                        .context("cannot validate crashed gate source/index state")?
-                }
-                GateTransactionScope::CanonicalFull => {
-                    canonical_gate_full_path_states(repo_root)
-                        .context("cannot validate crashed exact gate state")?
-                }
-            };
-            if current_head != marker.reviewed_head || current_states != marker.reviewed_path_states
+            } else if git_ref_is_ancestor(repo_root, &marker.reviewed_head, &current_head)
+                .context("cannot prove crashed gate HEAD ancestry")?
             {
+                // A stopped operator may intentionally commit a correction after
+                // the gate crashed. This path is accepted only after the common
+                // clean-worktree and exact-origin checks below prove that the
+                // descendant is durable. Divergent history still fails closed.
+                recovering_superseded_in_progress = true;
+            } else {
                 bail!(
-                    "refusing to clear in-progress gate transaction for `{}` until HEAD `{}` and its exact captured source/index state are restored",
+                    "refusing to clear in-progress gate transaction for `{}` because current HEAD `{}` is not the reviewed HEAD `{}` or its descendant",
                     marker.task_id,
+                    current_head,
                     marker.reviewed_head
                 );
             }
@@ -1554,7 +1571,7 @@ fn clear_review_input_quarantine(repo_root: &Path, run_root: &Path, apply: bool)
         bail!("refusing quarantine recovery from detached HEAD");
     }
     let head = git_stdout(repo_root, ["rev-parse", "HEAD"])?;
-    if !recovering_in_progress {
+    if !recovering_in_progress || recovering_superseded_in_progress {
         let dirty = git_stdout(
             repo_root,
             ["status", "--porcelain=v1", "--untracked-files=all"],
@@ -2009,6 +2026,95 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("read archive entries");
         assert_eq!(archives.len(), 1);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_recovers_clean_pushed_descendant_of_stopped_gate() {
+        let root = temp_dir("explicit-descendant-in-progress-quarantine-clear");
+        init_git_repo(&root);
+        let run_root = root.join(".auto/parallel");
+        let transaction = arm_canonical_gate_transaction(&root, "TASK-GATE", "host verification")
+            .expect("arm live gate marker");
+        fs::write(root.join("operator-fix.txt"), "durable correction\n")
+            .expect("write operator correction");
+        run_git(&root, ["add", "operator-fix.txt"]).expect("stage correction");
+        run_git(&root, ["commit", "-q", "-m", "operator correction"]).expect("commit correction");
+        let branch = git_stdout(&root, ["branch", "--show-current"])
+            .expect("read fixture branch")
+            .trim()
+            .to_string();
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git(&root, ["update-ref", remote_ref.as_str(), "HEAD"])
+            .expect("record pushed correction");
+
+        clear_review_input_quarantine(&root, &run_root, false)
+            .expect("clean pushed descendant should pass dry-run proof");
+        assert!(
+            transaction.marker_path.exists(),
+            "dry-run must retain marker"
+        );
+        clear_review_input_quarantine(&root, &run_root, true)
+            .expect("clean pushed descendant should be recoverable explicitly");
+        assert!(!transaction.marker_path.exists(), "apply must clear marker");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_rejects_dirty_or_unpushed_descendant_of_stopped_gate() {
+        let root = temp_dir("explicit-unsafe-descendant-in-progress-quarantine-clear");
+        init_git_repo(&root);
+        let branch = git_stdout(&root, ["branch", "--show-current"])
+            .expect("read fixture branch")
+            .trim()
+            .to_string();
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git(&root, ["update-ref", remote_ref.as_str(), "HEAD"])
+            .expect("record original pushed head");
+        let run_root = root.join(".auto/parallel");
+        let transaction = arm_canonical_gate_transaction(&root, "TASK-GATE", "host verification")
+            .expect("arm live gate marker");
+        fs::write(root.join("operator-fix.txt"), "not pushed yet\n")
+            .expect("write operator correction");
+        run_git(&root, ["add", "operator-fix.txt"]).expect("stage correction");
+        run_git(&root, ["commit", "-q", "-m", "operator correction"]).expect("commit correction");
+
+        let unpushed_error = clear_review_input_quarantine(&root, &run_root, true)
+            .expect_err("unpushed descendant must fail closed");
+        assert!(format!("{unpushed_error:#}").contains("exactly matches local `origin/"));
+        assert!(transaction.marker_path.exists());
+
+        run_git(&root, ["update-ref", remote_ref.as_str(), "HEAD"])
+            .expect("record pushed correction");
+        fs::write(root.join("dirty.txt"), "not committed\n").expect("dirty fixture");
+        let dirty_error = clear_review_input_quarantine(&root, &run_root, true)
+            .expect_err("dirty descendant must fail closed");
+        assert!(format!("{dirty_error:#}").contains("dirty canonical"));
+        assert!(transaction.marker_path.exists());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn explicit_quarantine_clear_rejects_divergent_head_from_stopped_gate() {
+        let root = temp_dir("explicit-divergent-in-progress-quarantine-clear");
+        init_git_repo(&root);
+        let run_root = root.join(".auto/parallel");
+        let transaction = arm_canonical_gate_transaction(&root, "TASK-GATE", "host verification")
+            .expect("arm live gate marker");
+        run_git(&root, ["checkout", "-q", "--orphan", "divergent"])
+            .expect("create unrelated history");
+        run_git(&root, ["rm", "-q", "-f", "seed.txt"]).expect("remove inherited seed");
+        fs::write(root.join("divergent.txt"), "different history\n").expect("write divergence");
+        run_git(&root, ["add", "divergent.txt"]).expect("stage divergence");
+        run_git(&root, ["commit", "-q", "-m", "divergent correction"]).expect("commit divergence");
+
+        let error = clear_review_input_quarantine(&root, &run_root, true)
+            .expect_err("divergent history must fail closed");
+        assert!(format!("{error:#}").contains("or its descendant"));
+        assert!(transaction.marker_path.exists());
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
