@@ -172,7 +172,10 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
     }
 
     if !args.apply {
-        println!("dry-run: no files removed; pass --apply to remove listed targets");
+        println!(
+            "{}",
+            parallel_prune_dry_run_guidance(host_running, plan.blocked_by_run_state)
+        );
         return Ok(());
     }
     let _prune_lease = acquire_parallel_host_lease(&run_root, "prune")?;
@@ -196,6 +199,16 @@ pub(crate) fn run_parallel_prune(args: &ParallelArgs) -> Result<()> {
         human_bytes(apply_plan.bytes)
     );
     Ok(())
+}
+
+fn parallel_prune_dry_run_guidance(host_running: bool, blocked_by_run_state: bool) -> &'static str {
+    if host_running {
+        "blocked: no files removed; stop the parallel host before applying this prune"
+    } else if blocked_by_run_state {
+        "blocked: no files removed; a resumable run ledger protects these artifacts until the run completes cleanly"
+    } else {
+        "dry-run: no files removed; pass --apply to remove listed targets"
+    }
 }
 
 /// Serialize destructive pruning against hosts built from this version. The
@@ -917,6 +930,22 @@ mod tests {
         assert!(parallel_prune_host_is_active(false, &direct_hosts));
         assert!(parallel_prune_host_is_active(true, &[]));
         assert!(!parallel_prune_host_is_active(false, &[]));
+    }
+
+    #[test]
+    fn explicit_prune_dry_run_never_promises_apply_while_protected() {
+        assert_eq!(
+            parallel_prune_dry_run_guidance(true, false),
+            "blocked: no files removed; stop the parallel host before applying this prune"
+        );
+        assert_eq!(
+            parallel_prune_dry_run_guidance(false, true),
+            "blocked: no files removed; a resumable run ledger protects these artifacts until the run completes cleanly"
+        );
+        assert_eq!(
+            parallel_prune_dry_run_guidance(false, false),
+            "dry-run: no files removed; pass --apply to remove listed targets"
+        );
     }
 
     #[cfg(unix)]
