@@ -74,6 +74,7 @@ fn ensure_executable(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -101,6 +102,75 @@ mod tests {
 
         let status = scaffold_verification_wrapper(&repo).expect("second scaffold should succeed");
         assert_eq!(status, VerificationWrapperScaffold::Present);
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn rerunning_command_preserves_explicit_supersession_history() {
+        let repo = temp_dir("preserve-supersedes");
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("initialize test repository");
+        Command::new("git")
+            .args(["config", "user.email", "autodev-test@example.invalid"])
+            .current_dir(&repo)
+            .status()
+            .expect("configure test email");
+        Command::new("git")
+            .args(["config", "user.name", "AutoDev Test"])
+            .current_dir(&repo)
+            .status()
+            .expect("configure test name");
+        fs::write(repo.join("tracked.txt"), "receipt fixture\n").expect("write fixture");
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&repo)
+            .status()
+            .expect("stage fixture");
+        Command::new("git")
+            .args(["commit", "-qm", "test fixture"])
+            .current_dir(&repo)
+            .status()
+            .expect("commit fixture");
+
+        scaffold_verification_wrapper(&repo).expect("install wrapper");
+        let wrapper = repo.join(VERIFICATION_WRAPPER_RELATIVE);
+        let first = Command::new(&wrapper)
+            .args(["TASK-PRESERVE", "--", "bash", "-c", "true"])
+            .env("AUTO_SUPERSEDES", "legacy failing command")
+            .current_dir(&repo)
+            .status()
+            .expect("record superseding verification");
+        assert!(first.success());
+
+        let second = Command::new(&wrapper)
+            .args(["TASK-PRESERVE", "--", "bash", "-c", "true"])
+            .env_remove("AUTO_SUPERSEDES")
+            .current_dir(&repo)
+            .status()
+            .expect("rerun verification");
+        assert!(second.success());
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(repo.join(".auto/symphony/verification-receipts/TASK-PRESERVE.json"))
+                .expect("read receipt"),
+        )
+        .expect("parse receipt");
+        let command = receipt["commands"]
+            .as_array()
+            .and_then(|commands| {
+                commands
+                    .iter()
+                    .find(|entry| entry["command"] == "bash -c true")
+            })
+            .expect("recorded command");
+        assert_eq!(
+            command["supersedes"],
+            serde_json::json!(["legacy failing command"])
+        );
 
         fs::remove_dir_all(&repo).ok();
     }

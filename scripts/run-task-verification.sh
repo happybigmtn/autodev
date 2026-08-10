@@ -549,6 +549,12 @@ def record() -> None:
     supersedes = split_supersedes(os.environ.get("AUTO_SUPERSEDES"))
     if supersedes:
         command_entry["supersedes"] = supersedes
+    else:
+        previous_supersedes = entries.get(command, {}).get("supersedes")
+        if isinstance(previous_supersedes, list) and all(
+            isinstance(item, str) and item.strip() for item in previous_supersedes
+        ):
+            command_entry["supersedes"] = previous_supersedes
     captured_runner = runner_summary(command, argv, captured_output)
     if captured_runner is not None:
         command_entry["runner_summary"] = captured_runner
