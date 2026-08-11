@@ -101,9 +101,20 @@ impl LoopPlanSnapshot {
             .filter(|task| self.is_actionable_unfinished(task))
             .filter(|task| !inflight.contains(&task.id))
             .filter(|task| {
-                task.dependencies
-                    .iter()
-                    .all(|dep| !unresolved.contains(dep))
+                task.dependencies.iter().all(|dep| {
+                    if !unresolved.contains(dep) {
+                        return true;
+                    }
+                    // A partial placeholder aliases its explicit completion
+                    // path for downstream scheduling. The completion-path
+                    // task itself may name that historical placeholder as a
+                    // dependency: it consumes the landed partial work and is
+                    // the only task allowed to close the remaining gap. Do
+                    // not let the alias create a self-blocking cycle here.
+                    self.task(dep).is_some_and(|dependency| {
+                        self.completion_path_target(dependency) == Some(task.id.as_str())
+                    })
+                })
             })
             .cloned()
             .collect()
@@ -964,6 +975,31 @@ mod tests {
                 .map(|task| task.id)
                 .collect::<Vec<_>>(),
             vec!["TASK-020"]
+        );
+    }
+
+    #[test]
+    fn completion_path_target_can_depend_on_its_partial_placeholder() {
+        let plan = r#"
+- [~] `TASK-001` Historical evidence gap. Completion path: `TASK-010`.
+  Dependencies: none
+  Estimated scope: S
+- [ ] `TASK-010` Complete the historical gap
+  Dependencies: `TASK-001`
+  Estimated scope: M
+- [ ] `TASK-020` Depends on the historical task
+  Dependencies: `TASK-001`
+  Estimated scope: S
+"#;
+
+        let snapshot = parse_loop_plan(plan);
+        assert_eq!(
+            snapshot
+                .ready_tasks(&Default::default())
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec!["TASK-010"]
         );
     }
 
