@@ -183,6 +183,7 @@ pub(crate) fn can_reuse_local_verification_cache(
     task_id: &str,
     expected_commands: &[String],
     current_task_owned_inputs: &str,
+    current_cargo_workspace_inputs: Option<&str>,
 ) -> Result<bool> {
     let mut budget = SourceStateBudget::default();
     let limits = SourceStateLimits::default();
@@ -195,10 +196,11 @@ pub(crate) fn can_reuse_local_verification_cache(
     )?;
     let attestation = serde_json::from_str::<VerifiedSourceAttestation>(&attestation_text)
         .with_context(|| format!("invalid host attestation `{}`", attestation_path.display()))?;
-    let current_verification_inputs = local_verification_inputs_fingerprint(
+    let current_verification_inputs = local_verification_inputs_fingerprint_with_workspace(
         repo_root,
         current_task_owned_inputs,
         expected_commands,
+        current_cargo_workspace_inputs,
     )?;
     if attestation.version != VERIFIED_SOURCE_ATTESTATION_VERSION
         || attestation.task_id != task_id
@@ -239,6 +241,28 @@ fn local_verification_inputs_fingerprint(
     task_owned_inputs_v2: &str,
     expected_commands: &[String],
 ) -> Result<String> {
+    let cargo_workspace_inputs = if repo_root.join("Cargo.toml").is_file() {
+        Some(
+            current_workspace_probe_input_fingerprint(repo_root)
+                .context("cannot fingerprint Cargo verification inputs")?,
+        )
+    } else {
+        None
+    };
+    local_verification_inputs_fingerprint_with_workspace(
+        repo_root,
+        task_owned_inputs_v2,
+        expected_commands,
+        cargo_workspace_inputs.as_deref(),
+    )
+}
+
+fn local_verification_inputs_fingerprint_with_workspace(
+    repo_root: &Path,
+    task_owned_inputs_v2: &str,
+    expected_commands: &[String],
+    current_cargo_workspace_inputs: Option<&str>,
+) -> Result<String> {
     let mut direct_paths = BTreeSet::from(["scripts/run-task-verification.sh".to_string()]);
     for command in expected_commands {
         collect_direct_verification_paths(repo_root, command, 0, &mut direct_paths)?;
@@ -246,8 +270,8 @@ fn local_verification_inputs_fingerprint(
     let direct_inputs = exact_direct_verification_inputs_fingerprint(repo_root, &direct_paths)?;
     let cargo_workspace_inputs = if repo_root.join("Cargo.toml").is_file() {
         Some(
-            current_workspace_probe_input_fingerprint(repo_root)
-                .context("cannot fingerprint Cargo verification inputs")?,
+            current_cargo_workspace_inputs
+                .context("Cargo verification inputs were unavailable for local cache reuse")?,
         )
     } else {
         None
@@ -259,10 +283,7 @@ fn local_verification_inputs_fingerprint(
     hash_length_prefixed(&mut digest, direct_inputs.as_bytes());
     hash_length_prefixed(
         &mut digest,
-        cargo_workspace_inputs
-            .as_deref()
-            .unwrap_or("no-cargo")
-            .as_bytes(),
+        cargo_workspace_inputs.unwrap_or("no-cargo").as_bytes(),
     );
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -3934,16 +3955,21 @@ mod tests {
         )
         .expect("compute owned inputs");
         let expected = vec!["cargo test source_binding".to_string()];
-        assert!(
-            super::can_reuse_local_verification_cache(&root, "TASK-SOURCE", &expected, &owned)
-                .expect("inspect matching cache")
-        );
+        assert!(super::can_reuse_local_verification_cache(
+            &root,
+            "TASK-SOURCE",
+            &expected,
+            &owned,
+            None,
+        )
+        .expect("inspect matching cache"));
         assert!(
             !super::can_reuse_local_verification_cache(
                 &root,
                 "TASK-SOURCE",
                 &["cargo test different_command".to_string()],
                 &owned,
+                None,
             )
             .expect("inspect command mismatch"),
             "a changed verification command must invalidate cache reuse"
@@ -3963,6 +3989,7 @@ mod tests {
                 "TASK-SOURCE",
                 &expected,
                 &changed_owned,
+                None,
             )
             .expect("inspect source mismatch"),
             "task-owned source drift must invalidate cache reuse"

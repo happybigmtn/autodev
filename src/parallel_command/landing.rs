@@ -440,6 +440,14 @@ pub(crate) async fn audit_parallel_completion_drift(
     // footers once so the per-task gate below does not rescan git history per row.
     let all_plan_tasks = parse_shared_tasks(plan_text);
     let receipt_footers = git_verification_receipt_footers(repo_root);
+    // The Cargo verification closure is identical for every completed task in
+    // this sweep. Compute it once rather than re-running metadata and hashing
+    // the workspace for every local-cache candidate.
+    let cargo_workspace_inputs = if repo_root.join("Cargo.toml").is_file() {
+        current_workspace_probe_input_fingerprint(repo_root).ok()
+    } else {
+        None
+    };
     let forced_full_reverify = force_full_reverify_enabled();
     let mut completed_drift = Vec::new();
     let mut locally_refreshed_done = Vec::new();
@@ -501,6 +509,7 @@ pub(crate) async fn audit_parallel_completion_drift(
                     &task.id,
                     &verification.executable_commands,
                     current,
+                    cargo_workspace_inputs.as_deref(),
                 )
                 .unwrap_or(false)
             });
