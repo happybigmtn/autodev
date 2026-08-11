@@ -1430,6 +1430,10 @@ mod tests {
             CLEAN_COMMIT_GRACE + Duration::from_secs(1),
             None,
         ));
+        assert!(clean_commit_harvest_ready(
+            CLEAN_COMMIT_CHATTER_GRACE,
+            Some(Duration::from_secs(0)),
+        ));
     }
 
     #[cfg(target_os = "linux")]

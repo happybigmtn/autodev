@@ -2740,7 +2740,8 @@ pub(crate) fn clean_commit_harvest_ready(
     last_output_elapsed: Option<Duration>,
 ) -> bool {
     clean_commit_elapsed >= CLEAN_COMMIT_GRACE
-        && last_output_elapsed.is_none_or(|elapsed| elapsed >= CLEAN_COMMIT_QUIET_GRACE)
+        && (clean_commit_elapsed >= CLEAN_COMMIT_CHATTER_GRACE
+            || last_output_elapsed.is_none_or(|elapsed| elapsed >= CLEAN_COMMIT_QUIET_GRACE))
 }
 
 #[cfg(test)]

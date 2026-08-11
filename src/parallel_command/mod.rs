@@ -110,6 +110,12 @@ pub(crate) const CLEAN_COMMIT_GRACE: Duration = Duration::from_secs(30);
 
 pub(crate) const CLEAN_COMMIT_QUIET_GRACE: Duration = Duration::from_secs(120);
 
+/// Bound non-verification chatter after a worker has produced a clean commit.
+/// Some agent runtimes emit periodic collaboration/tool heartbeats after their
+/// work and receipt are complete, so log mtime alone cannot be an unbounded
+/// harvest veto.
+pub(crate) const CLEAN_COMMIT_CHATTER_GRACE: Duration = Duration::from_secs(10 * 60);
+
 pub(crate) const CLEAN_COMMIT_ACTIVE_VERIFICATION_GRACE: Duration = Duration::from_secs(45 * 60);
 
 pub(crate) const CLEAN_COMMIT_KILL_GRACE: Duration = Duration::from_secs(5);
