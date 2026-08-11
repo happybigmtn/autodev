@@ -23,7 +23,8 @@ the command, argv, exit status, runner summary, artifact hashes, plan hash, and
 dirty-state metadata. Before creating that footer, the host writes
 `.auto/parallel/verified-source/<TASK>.json` only after host verification
 passes. This local attestation binds the task, exact proof payload, command set,
-and a content-addressed source-state fingerprint. `source_state_v2` binds the
+the task-owned-inputs-v2 fingerprint, and a content-addressed source-state
+fingerprint. `source_state_v2` binds the
 root index identity and working tree plus every initialized submodule's gitlink
 index object, checked-out HEAD, child index, tracked and untracked contents,
 filesystem modes, and symlink targets recursively. The collector uses direct
@@ -80,9 +81,12 @@ cycle, an uninitialized or misdirected gitlink, nesting deeper than 8, more
 than 200,000 state entries, or more than 1 GiB of inventory/content.
 The footer embeds the fingerprint as `source_state_v2`; project-owned staging
 receipt schemas do not need to accept the field. Attestation schema version 2
-is required, so version-1 attestations and `source_state_v1` footers are
-historical-only and require host re-execution. Readers prefer reachable commit
-footers and keep JSON receipts as a compatibility/staging fallback.
+is historical-only; version 3 is required for new host verification because it
+also binds `task_owned_inputs_v2` and, when the command is statically
+cacheable, the shared verification-input closure. Version-1 attestations and
+`source_state_v1` footers are likewise historical-only and require host
+re-execution. Readers prefer reachable commit footers and keep JSON receipts as
+a compatibility/staging fallback.
 
 ## Required Metadata
 
@@ -174,6 +178,23 @@ Semantics during a drift sweep:
 - Any git/hash failure computing the fingerprint is treated as "changed" (force
   re-verify), never as "unchanged".
 
+When a completed row lacks a current durable footer, a drift sweep may still
+have rerun its commands successfully and written a version-3 host
+verified-source attestation. On later global `HEAD` movement, AutoDev may reuse
+that local result only to avoid executing the same commands again, and only
+when the attestation's exact receipt proof payload, command set,
+`task_owned_inputs_v2`, directly invoked repository files (including ignored
+files and nested static shell commands), host verification runner, and Cargo
+workspace verification inputs all still match. Direct inputs are read with the
+same 200,000-entry/1-GiB fail-closed bounds. Dynamic or compound shell payloads
+and direct symlinks are not cacheable. This does not make staging JSON durable
+authority: the row remains eligible for `RECEIPTS-DRIFT.md` until a normal
+closeout path runs the complete definition-of-done gates and commits a footer.
+Changes to owned/dependency source, declared artifacts, verification commands,
+the normalized task contract, directly invoked scripts, the host runner, or
+Cargo build/test inputs invalidate the local cache and rerun proof. If the
+input closure cannot be computed, AutoDev reruns proof rather than reusing it.
+
 ### `[sweep-excluded]`
 
 A task may carry a discoverable `[sweep-excluded]` marker anywhere in its plan
@@ -210,7 +231,7 @@ guards, superseded failures, declared artifact hashes, and the embedded
 `source_state_v2` without requiring the embedded pre-closeout `commit` to equal
 the current `HEAD`. A legacy footer with only `source_state_v1` (or no
 source-state field) remains historical audit evidence, but it cannot authorize
-a new `Done` transition; host re-execution must create a fresh version-2
+a new `Done` transition; host re-execution must create a fresh version-3
 verified-source attestation and footer.
 
 ## Parallel Drift Triage

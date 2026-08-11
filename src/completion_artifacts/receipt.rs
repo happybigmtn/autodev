@@ -20,17 +20,21 @@ use crate::completion_artifacts::review_contains_task;
 use crate::completion_artifacts::verification::verification_plan;
 use crate::task_parser::{parse_tasks, TaskStatus};
 use crate::util::{active_plan_path, active_plan_relative, atomic_write};
+use crate::workspace_inputs::current_workspace_probe_input_fingerprint;
 
 const RECEIPT_FOOTER_VERSION: &str = "Auto-Verification-Receipt-Version:";
 const RECEIPT_FOOTER_TASK: &str = "Auto-Verification-Receipt-Task:";
 const RECEIPT_FOOTER_JSON: &str = "Auto-Verification-Receipt-JSON:";
 const RECEIPT_FOOTER_DERIVED_PATHS: &str = "Auto-Verification-Receipt-Derived-Paths:";
-const VERIFIED_SOURCE_ATTESTATION_VERSION: u32 = 2;
+const VERIFIED_SOURCE_ATTESTATION_VERSION: u32 = 3;
 const SOURCE_STATE_MAX_SUBMODULE_DEPTH: usize = 8;
 const SOURCE_STATE_MAX_ENTRIES: usize = 200_000;
 const SOURCE_STATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const QUEUE_DERIVED_JSON_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const QUEUE_DERIVED_JSON_MAX_POINTERS: usize = 16;
+const DIRECT_VERIFICATION_INPUT_MAX_ENTRIES: usize = 200_000;
+const DIRECT_VERIFICATION_INPUT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DIRECT_VERIFICATION_SHELL_DEPTH: usize = 4;
 const LEGACY_CLEAN_PORCELAIN_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HOST_QUEUE_STATE_FILES: [&str; 8] = [
@@ -85,8 +89,9 @@ fn record_verified_source_attestation_with_source_limits(
         "attestation IMPLEMENTATION_PLAN.md input",
     )
     .context("cannot attest verified source without IMPLEMENTATION_PLAN.md")?;
-    let matching_tasks = parse_tasks(&plan_text)
-        .into_iter()
+    let tasks = parse_tasks(&plan_text);
+    let matching_tasks = tasks
+        .iter()
         .filter(|task| task.id == task_id)
         .collect::<Vec<_>>();
     let [task] = matching_tasks.as_slice() else {
@@ -140,10 +145,26 @@ fn record_verified_source_attestation_with_source_limits(
     };
     let receipt = serde_json::from_str::<VerificationReceipt>(&receipt_text)
         .with_context(|| format!("invalid verification receipt `{}`", receipt_path.display()))?;
+    let task_owned_inputs_v2 =
+        super::owned_inputs::compute_task_owned_inputs_fingerprint(repo_root, task_id, &tasks)
+            .with_context(|| {
+                format!("cannot compute task-owned inputs while attesting `{task_id}`")
+            })?;
+    // This closure only authorizes local command-cache reuse. Dynamic or
+    // unreadable inputs deliberately leave it absent (cache miss) without
+    // blocking the exact source-state attestation used by durable closeout.
+    let verification_inputs_v1 = local_verification_inputs_fingerprint(
+        repo_root,
+        &task_owned_inputs_v2,
+        &verification.executable_commands,
+    )
+    .ok();
     let attestation = VerifiedSourceAttestation {
         version: VERIFIED_SOURCE_ATTESTATION_VERSION,
         task_id: task_id.to_string(),
         source_state_v2,
+        task_owned_inputs_v2,
+        verification_inputs_v1,
         receipt_proof_sha256: verification_proof_payload_sha256(&receipt)?,
         expected_commands: verification.executable_commands,
     };
@@ -151,6 +172,322 @@ fn record_verified_source_attestation_with_source_limits(
         .context("failed to serialize verified-source attestation")?;
     let path = verified_source_attestation_path(repo_root, task_id);
     atomic_write(&path, &rendered).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Return whether the latest host verification still covers this task's exact
+/// scoped inputs. This is only a re-execution cache: callers must continue to
+/// report stale staging JSON and may not treat this as durable completion
+/// authority. A committed host footer remains the only cross-HEAD receipt.
+pub(crate) fn can_reuse_local_verification_cache(
+    repo_root: &Path,
+    task_id: &str,
+    expected_commands: &[String],
+    current_task_owned_inputs: &str,
+) -> Result<bool> {
+    let mut budget = SourceStateBudget::default();
+    let limits = SourceStateLimits::default();
+    let attestation_path = verified_source_attestation_path(repo_root, task_id);
+    let attestation_text = read_bounded_utf8_file(
+        &attestation_path,
+        limits,
+        &mut budget,
+        "verified task-input cache attestation",
+    )?;
+    let attestation = serde_json::from_str::<VerifiedSourceAttestation>(&attestation_text)
+        .with_context(|| format!("invalid host attestation `{}`", attestation_path.display()))?;
+    let current_verification_inputs = local_verification_inputs_fingerprint(
+        repo_root,
+        current_task_owned_inputs,
+        expected_commands,
+    )?;
+    if attestation.version != VERIFIED_SOURCE_ATTESTATION_VERSION
+        || attestation.task_id != task_id
+        || attestation.expected_commands != expected_commands
+        || attestation.task_owned_inputs_v2 != current_task_owned_inputs
+        || attestation.verification_inputs_v1.as_deref()
+            != Some(current_verification_inputs.as_str())
+    {
+        return Ok(false);
+    }
+
+    let receipt_path = verification_receipt_path(repo_root, task_id);
+    let receipt_text = read_bounded_utf8_file(
+        &receipt_path,
+        limits,
+        &mut budget,
+        "verified task-input cache receipt",
+    )?;
+    let receipt = serde_json::from_str::<VerificationReceipt>(&receipt_text)
+        .with_context(|| format!("invalid verification receipt `{}`", receipt_path.display()))?;
+    if receipt.task_id.as_deref() != Some(task_id)
+        || verification_proof_payload_sha256(&receipt)? != attestation.receipt_proof_sha256
+        || verification_receipt_content_problem(&receipt_path, &receipt, expected_commands)
+            .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Fingerprint inputs shared by a task's verification command. The task's
+/// own/dependency closure remains the narrow core. In addition, bind the host
+/// runner, repo-relative files named directly by command argv, and (for Cargo
+/// repositories) the conservative workspace build/test closure. Ambiguity is
+/// an error so cache reuse fails closed.
+fn local_verification_inputs_fingerprint(
+    repo_root: &Path,
+    task_owned_inputs_v2: &str,
+    expected_commands: &[String],
+) -> Result<String> {
+    let mut direct_paths = BTreeSet::from(["scripts/run-task-verification.sh".to_string()]);
+    for command in expected_commands {
+        collect_direct_verification_paths(repo_root, command, 0, &mut direct_paths)?;
+    }
+    let direct_inputs = exact_direct_verification_inputs_fingerprint(repo_root, &direct_paths)?;
+    let cargo_workspace_inputs = if repo_root.join("Cargo.toml").is_file() {
+        Some(
+            current_workspace_probe_input_fingerprint(repo_root)
+                .context("cannot fingerprint Cargo verification inputs")?,
+        )
+    } else {
+        None
+    };
+
+    let mut digest = Sha256::new();
+    digest.update(b"autodev-local-verification-inputs-v1\0");
+    hash_length_prefixed(&mut digest, task_owned_inputs_v2.as_bytes());
+    hash_length_prefixed(&mut digest, direct_inputs.as_bytes());
+    hash_length_prefixed(
+        &mut digest,
+        cargo_workspace_inputs
+            .as_deref()
+            .unwrap_or("no-cargo")
+            .as_bytes(),
+    );
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn collect_direct_verification_paths(
+    repo_root: &Path,
+    command: &str,
+    shell_depth: usize,
+    direct_paths: &mut BTreeSet<String>,
+) -> Result<()> {
+    if shell_depth > DIRECT_VERIFICATION_SHELL_DEPTH {
+        bail!("verification shell nesting exceeded {DIRECT_VERIFICATION_SHELL_DEPTH}");
+    }
+    let argv = shell_split(command)
+        .with_context(|| format!("cannot parse verification command `{command}`"))?;
+    for argument in &argv {
+        let candidates = std::iter::once(argument.as_str())
+            .chain(argument.split_once('=').map(|(_, value)| value));
+        for candidate in candidates {
+            let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
+            let relative = Path::new(candidate);
+            if candidate.is_empty()
+                || candidate.starts_with('-')
+                || candidate == "."
+                || relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+                || candidate == ".git"
+                || candidate.starts_with(".git/")
+                || candidate == ".auto"
+                || candidate.starts_with(".auto/")
+            {
+                continue;
+            }
+            if fs::symlink_metadata(repo_root.join(relative)).is_ok() {
+                direct_paths.insert(candidate.to_string());
+            }
+        }
+    }
+
+    let mut command_index = 0;
+    if argv.first().map(String::as_str) == Some("env") {
+        command_index = argv
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, argument)| !argument.starts_with('-') && !argument.contains('='))
+            .map(|(index, _)| index)
+            .context("env verification launcher did not contain a command")?;
+    }
+    let launcher = argv
+        .get(command_index)
+        .and_then(|argument| Path::new(argument).file_name())
+        .and_then(|name| name.to_str());
+    if matches!(launcher, Some("bash" | "sh" | "zsh" | "dash")) {
+        let flag = argv.get(command_index + 1).map(String::as_str);
+        if matches!(flag, Some("-c" | "-lc" | "-cl")) {
+            let payload = argv
+                .get(command_index + 2)
+                .context("shell verification launcher omitted its command payload")?;
+            if payload.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '$' | '`'
+                        | '*'
+                        | '?'
+                        | '['
+                        | '<'
+                        | '>'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                )
+            }) {
+                bail!(
+                    "dynamic shell verification payload cannot be fingerprinted safely: `{payload}`"
+                );
+            }
+            collect_direct_verification_paths(repo_root, payload, shell_depth + 1, direct_paths)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct DirectVerificationInputBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+fn exact_direct_verification_inputs_fingerprint(
+    repo_root: &Path,
+    direct_paths: &BTreeSet<String>,
+) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"autodev-exact-direct-verification-inputs-v1\0");
+    let mut budget = DirectVerificationInputBudget::default();
+    for relative in direct_paths {
+        hash_exact_direct_verification_input(
+            repo_root,
+            Path::new(relative),
+            &mut digest,
+            &mut budget,
+        )?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn hash_exact_direct_verification_input(
+    repo_root: &Path,
+    relative: &Path,
+    digest: &mut Sha256,
+    budget: &mut DirectVerificationInputBudget,
+) -> Result<()> {
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > DIRECT_VERIFICATION_INPUT_MAX_ENTRIES {
+        bail!(
+            "direct verification inputs exceeded {DIRECT_VERIFICATION_INPUT_MAX_ENTRIES} entries"
+        );
+    }
+    hash_length_prefixed(digest, relative.as_os_str().as_encoded_bytes());
+    let absolute = repo_root.join(relative);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            hash_length_prefixed(digest, b"missing");
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect direct input `{}`", relative.display())
+            })
+        }
+    };
+    hash_length_prefixed(digest, &direct_input_file_mode(&metadata).to_be_bytes());
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "direct verification input symlink `{}` is not cacheable",
+            relative.display()
+        );
+    } else if metadata.is_file() {
+        hash_length_prefixed(digest, b"file");
+        let mut file = fs::File::open(&absolute).with_context(|| {
+            format!(
+                "failed to open direct verification input `{}`",
+                relative.display()
+            )
+        })?;
+        let mut content = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).with_context(|| {
+                format!(
+                    "failed to read direct verification input `{}`",
+                    relative.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            budget.bytes = budget.bytes.saturating_add(read as u64);
+            if budget.bytes > DIRECT_VERIFICATION_INPUT_MAX_BYTES {
+                bail!(
+                    "direct verification inputs exceeded {DIRECT_VERIFICATION_INPUT_MAX_BYTES} bytes"
+                );
+            }
+            content.update(&buffer[..read]);
+        }
+        hash_length_prefixed(digest, &content.finalize());
+    } else if metadata.is_dir() {
+        hash_length_prefixed(digest, b"directory");
+        let mut children = Vec::new();
+        for child in fs::read_dir(&absolute)
+            .with_context(|| format!("failed to list direct input `{}`", relative.display()))?
+        {
+            children.push(child.with_context(|| {
+                format!("failed to inspect direct input `{}`", relative.display())
+            })?);
+            if budget.entries.saturating_add(children.len()) > DIRECT_VERIFICATION_INPUT_MAX_ENTRIES
+            {
+                bail!(
+                    "direct verification inputs exceeded {DIRECT_VERIFICATION_INPUT_MAX_ENTRIES} entries"
+                );
+            }
+        }
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            hash_exact_direct_verification_input(
+                repo_root,
+                &relative.join(child.file_name()),
+                digest,
+                budget,
+            )?;
+        }
+    } else {
+        bail!(
+            "unsupported direct verification input `{}`",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn direct_input_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn direct_input_file_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+fn hash_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 pub(crate) fn verification_receipt_commit_footer(
@@ -750,6 +1087,9 @@ struct VerifiedSourceAttestation {
     version: u32,
     task_id: String,
     source_state_v2: String,
+    task_owned_inputs_v2: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_inputs_v1: Option<String>,
     receipt_proof_sha256: String,
     expected_commands: Vec<String>,
 }
@@ -3583,6 +3923,140 @@ mod tests {
     }
 
     #[test]
+    fn host_verified_task_input_cache_binds_commands_and_owned_source() {
+        let root = source_bound_root_footer_fixture("host-verified-task-input-cache");
+        let plan = fs::read_to_string(root.join("IMPLEMENTATION_PLAN.md")).expect("read plan");
+        let tasks = super::parse_tasks(&plan);
+        let owned = super::super::owned_inputs::compute_task_owned_inputs_fingerprint(
+            &root,
+            "TASK-SOURCE",
+            &tasks,
+        )
+        .expect("compute owned inputs");
+        let expected = vec!["cargo test source_binding".to_string()];
+        assert!(
+            super::can_reuse_local_verification_cache(&root, "TASK-SOURCE", &expected, &owned)
+                .expect("inspect matching cache")
+        );
+        assert!(
+            !super::can_reuse_local_verification_cache(
+                &root,
+                "TASK-SOURCE",
+                &["cargo test different_command".to_string()],
+                &owned,
+            )
+            .expect("inspect command mismatch"),
+            "a changed verification command must invalidate cache reuse"
+        );
+
+        fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").expect("change owned source");
+        let changed_owned = super::super::owned_inputs::compute_task_owned_inputs_fingerprint(
+            &root,
+            "TASK-SOURCE",
+            &tasks,
+        )
+        .expect("compute changed owned inputs");
+        assert_ne!(owned, changed_owned);
+        assert!(
+            !super::can_reuse_local_verification_cache(
+                &root,
+                "TASK-SOURCE",
+                &expected,
+                &changed_owned,
+            )
+            .expect("inspect source mismatch"),
+            "task-owned source drift must invalidate cache reuse"
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn local_verification_inputs_bind_nested_script_ignored_fixture_and_plan() {
+        let root = temp_dir("local-verification-exact-direct-inputs");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::create_dir_all(root.join("private")).expect("create private inputs");
+        fs::write(root.join(".gitignore"), "private/\n").expect("write gitignore");
+        fs::write(root.join("scripts/check.sh"), "#!/bin/sh\nexit 0\n")
+            .expect("write nested script");
+        fs::write(root.join("private/input.txt"), "ignored one\n")
+            .expect("write ignored verification input");
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "plan one\n").expect("write plan input");
+        let commands =
+            vec!["bash -c 'scripts/check.sh private/input.txt IMPLEMENTATION_PLAN.md'".to_string()];
+
+        let original = super::local_verification_inputs_fingerprint(&root, "owned", &commands)
+            .expect("fingerprint initial direct inputs");
+        fs::write(root.join("scripts/check.sh"), "#!/bin/sh\nexit 1\n")
+            .expect("change nested script");
+        let nested_script = super::local_verification_inputs_fingerprint(&root, "owned", &commands)
+            .expect("fingerprint changed nested script");
+        assert_ne!(original, nested_script);
+
+        fs::write(root.join("private/input.txt"), "ignored two\n")
+            .expect("change ignored verification input");
+        let ignored_fixture =
+            super::local_verification_inputs_fingerprint(&root, "owned", &commands)
+                .expect("fingerprint changed ignored input");
+        assert_ne!(nested_script, ignored_fixture);
+
+        fs::write(root.join("IMPLEMENTATION_PLAN.md"), "plan two\n").expect("change plan input");
+        let plan = super::local_verification_inputs_fingerprint(&root, "owned", &commands)
+            .expect("fingerprint changed plan input");
+        assert_ne!(ignored_fixture, plan);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn local_verification_inputs_fail_closed_on_compound_shell_payload() {
+        let root = temp_dir("local-verification-compound-shell");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::write(root.join("scripts/check.sh"), "#!/bin/sh\nexit 0\n")
+            .expect("write nested script");
+        let commands = vec!["bash -c 'scripts/check.sh; true'".to_string()];
+        assert!(
+            super::local_verification_inputs_fingerprint(&root, "owned", &commands).is_err(),
+            "compound shell syntax must disable cache reuse unless parsed by a real shell AST"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_verification_inputs_fail_closed_on_direct_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("local-verification-direct-symlink");
+        init_git_repo(&root);
+        fs::create_dir_all(root.join("scripts/implementations")).expect("create scripts");
+        fs::write(
+            root.join("scripts/implementations/check-v1.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("write symlink target");
+        symlink("implementations/check-v1.sh", root.join("scripts/check.sh"))
+            .expect("create direct symlink");
+        let commands = vec!["scripts/check.sh".to_string()];
+        assert!(
+            super::local_verification_inputs_fingerprint(&root, "owned", &commands).is_err(),
+            "direct symlinks must disable cache reuse rather than omit target content"
+        );
+        fs::write(
+            root.join("scripts/implementations/check-v1.sh"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .expect("change symlink target");
+        assert!(
+            super::local_verification_inputs_fingerprint(&root, "owned", &commands).is_err(),
+            "changing a symlink target must never make the direct input cacheable"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn queue_derived_json_normalization_preserves_every_nonselected_raw_byte() {
         let before_hash = "1".repeat(64);
         let after_hash = "2".repeat(64);
@@ -4238,7 +4712,7 @@ mod tests {
         object.insert("version".to_string(), serde_json::json!(1));
         let source_state = object
             .remove("source_state_v2")
-            .expect("version 2 attestation should carry source_state_v2");
+            .expect("current attestation should carry source_state_v2");
         object.insert("source_state_v1".to_string(), source_state);
         fs::write(
             &attestation_path,

@@ -19,15 +19,16 @@ pub(crate) use crate::claude_exec::{
 };
 pub(crate) use crate::codex_exec::run_codex_exec_with_env;
 pub(crate) use crate::completion_artifacts::{
-    assess_task_completion_gap, clear_verified_source_attestation,
-    commit_message_has_reserved_verification_receipt_footer, compute_task_owned_inputs_fingerprint,
-    current_dirty_state_fingerprint, current_source_state_fingerprint,
-    direct_verification_receipt_problem, ensure_host_review_handoff, footer_task_owned_inputs,
-    git_verification_receipt_footers, inspect_task_completion_evidence,
-    inspect_task_completion_evidence_with_owned_inputs, record_verified_source_attestation,
-    unresolved_review_findings_for_task, unresolved_workspace_review_findings_for_task,
-    verification_plan, verification_receipt_commit_footer,
-    verification_receipt_footer_with_derived_paths, CompletionGapKind, VerificationReceiptFooter,
+    assess_task_completion_gap, can_reuse_local_verification_cache,
+    clear_verified_source_attestation, commit_message_has_reserved_verification_receipt_footer,
+    compute_task_owned_inputs_fingerprint, current_dirty_state_fingerprint,
+    current_source_state_fingerprint, direct_verification_receipt_problem,
+    ensure_host_review_handoff, footer_task_owned_inputs, git_verification_receipt_footers,
+    inspect_task_completion_evidence, inspect_task_completion_evidence_with_owned_inputs,
+    record_verified_source_attestation, unresolved_review_findings_for_task,
+    unresolved_workspace_review_findings_for_task, verification_plan,
+    verification_receipt_commit_footer, verification_receipt_footer_with_derived_paths,
+    CompletionGapKind, VerificationReceiptFooter,
 };
 pub(crate) use crate::linear_tracker::LinearTracker;
 pub(crate) use crate::symphony_command::run_sync;
@@ -67,8 +68,8 @@ mod tmux;
 mod validation_lease;
 mod verify_gate;
 mod worker_env;
-mod workspace_inputs;
 
+pub(crate) use crate::workspace_inputs::*;
 pub(crate) use assignment::*;
 pub(crate) use derived_source_transition::*;
 pub(crate) use landing::*;
@@ -89,7 +90,6 @@ pub(crate) use tmux::*;
 pub(crate) use validation_lease::*;
 pub(crate) use verify_gate::*;
 pub(crate) use worker_env::*;
-pub(crate) use workspace_inputs::*;
 
 pub(crate) const KNOWN_PRIMARY_BRANCHES: [&str; 3] = ["main", "master", "trunk"];
 

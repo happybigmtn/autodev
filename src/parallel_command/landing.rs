@@ -443,6 +443,7 @@ pub(crate) async fn audit_parallel_completion_drift(
     let forced_full_reverify = force_full_reverify_enabled();
     let mut completed_drift = Vec::new();
     let mut locally_refreshed_done = Vec::new();
+    let mut locally_reused_done = Vec::new();
     let mut locally_refreshed_partial = Vec::new();
     let mut manual_closeout_candidates = Vec::new();
     let reverify_budget = drift_reverify_budget();
@@ -487,11 +488,25 @@ pub(crate) async fn audit_parallel_completion_drift(
         if !must_reverify && evidence.is_fully_evidenced() {
             continue;
         }
-        if reverify_active
-            && (must_reverify
-                || assess_task_completion_gap(&task.markdown, &evidence).kind
-                    == CompletionGapKind::LocalRepairable)
-        {
+        let locally_repairable = must_reverify
+            || assess_task_completion_gap(&task.markdown, &evidence).kind
+                == CompletionGapKind::LocalRepairable;
+        let verification = verification_plan(&task.markdown);
+        let mut refreshed_host_verification = false;
+        let reused_host_verification = !forced_full_reverify
+            && locally_repairable
+            && current_fp.as_deref().is_some_and(|current| {
+                can_reuse_local_verification_cache(
+                    repo_root,
+                    &task.id,
+                    &verification.executable_commands,
+                    current,
+                )
+                .unwrap_or(false)
+            });
+        if reused_host_verification {
+            locally_reused_done.push(task.id.clone());
+        } else if reverify_active && locally_repairable {
             if reverify_spent >= reverify_budget {
                 // Budget spent: preserve queue truth and report the stale proof
                 // in triage for a later sweep.
@@ -521,15 +536,21 @@ pub(crate) async fn audit_parallel_completion_drift(
                             inspect_task_completion_evidence(repo_root, &task.id, &task.markdown);
                     }
                     if refreshed.is_fully_evidenced() {
+                        refreshed_host_verification = true;
                         locally_refreshed_done.push(task.id.clone());
-                        continue;
                     }
                     evidence = refreshed;
                 }
             }
         }
         let mut reasons = evidence.missing_reasons();
-        if reasons.is_empty() && must_reverify {
+        if reasons.is_empty() && (reused_host_verification || refreshed_host_verification) {
+            reasons.push(
+                "host verification is locally current, but durable completion footer repair remains pending"
+                    .to_string(),
+            );
+        }
+        if reasons.is_empty() && must_reverify && !reused_host_verification {
             // A changed task-owned fingerprint is itself actionable drift even
             // when the older receipt remains content-valid.
             reasons.push(
@@ -646,6 +667,13 @@ pub(crate) async fn audit_parallel_completion_drift(
             "drift-reverify: refreshed receipt evidence for {} completed task(s) while preserving [x] queue status ({})",
             locally_refreshed_done.len(),
             locally_refreshed_done.join(", ")
+        ));
+    }
+    if !locally_reused_done.is_empty() {
+        parallel_logger.info(format!(
+            "drift-reverify: reused host-verified scoped inputs for {} completed task(s) without re-running commands; durable footer repair remains pending ({})",
+            locally_reused_done.len(),
+            locally_reused_done.join(", ")
         ));
     }
     if !locally_refreshed_partial.is_empty() {
@@ -6869,8 +6897,10 @@ Dependencies: none\n";
         let task_id = "TASK-DOD-DONE";
         let command = "bash -c true";
         let plan = format!(
-            "- [x] `{task_id}` Stale evidence requires complete reproof\n  Verification: `{command}`\n  Dependencies: none\n  Estimated scope: S\n"
+            "- [x] `{task_id}` Stale evidence requires complete reproof\n  Owns: `src/task.rs`\n  Verification: `{command}`\n  Dependencies: none\n  Estimated scope: S\n"
         );
+        fs::create_dir_all(repo.join("src")).expect("create task source directory");
+        fs::write(repo.join("src/task.rs"), "pub fn task() {}\n").expect("write task source");
         fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &plan).expect("write plan");
         fs::write(
             repo.join("REVIEW.md"),
@@ -6892,6 +6922,7 @@ Dependencies: none\n";
 task="$1"
 shift
 if [ "${{1:-}}" = "--" ]; then shift; fi
+printf 'verified\n' >> .auto/verify-count
 printf '%s\n' '{{"task_id":"{task_id}","commands":[{{"command":"{command}","argv":["bash","-c","true"],"expected_argv":["bash","-c","true"],"exit_code":0,"status":"passed"}}]}}' > ".auto/symphony/verification-receipts/$task.json"
 exec "$@"
 "#
@@ -6907,6 +6938,7 @@ exec "$@"
                 "add",
                 "IMPLEMENTATION_PLAN.md",
                 "REVIEW.md",
+                "src/task.rs",
                 "scripts/run-task-verification.sh",
             ],
         );
@@ -6926,8 +6958,76 @@ exec "$@"
         );
         let triage = fs::read_to_string(repo.join("RECEIPTS-DRIFT.md")).unwrap_or_default();
         assert!(
-            !triage.contains(task_id),
-            "successfully refreshed evidence should leave no drift entry: {triage}"
+            triage.contains(task_id)
+                && triage.contains("durable completion footer repair remains pending"),
+            "local refresh must remain visible until durable footer repair: {triage}"
+        );
+
+        fs::write(repo.join("unrelated-book-manifest.json"), "{}\n")
+            .expect("write unrelated source");
+        git_ok(&repo, ["add", "unrelated-book-manifest.json"]);
+        git_ok(&repo, ["commit", "-q", "-m", "map unrelated book chapter"]);
+        let (restarted, _) = audit_parallel_completion_drift(&repo, "main", &plan, &logger)
+            .await
+            .expect("unrelated HEAD advance should reuse host-verified task inputs");
+        assert_eq!(restarted, plan);
+        assert_eq!(
+            fs::read_to_string(repo.join(".auto/verify-count")).expect("read verify counter"),
+            "verified\n",
+            "unchanged task-owned inputs must not re-run verification after unrelated HEAD movement"
+        );
+
+        let mut revised_wrapper = fs::read_to_string(&wrapper).expect("read verification runner");
+        revised_wrapper.push_str("# shared runner changed\n");
+        fs::write(&wrapper, revised_wrapper).expect("change verification runner");
+        git_ok(&repo, ["add", "scripts/run-task-verification.sh"]);
+        git_ok(
+            &repo,
+            ["commit", "-q", "-m", "change shared verification runner"],
+        );
+        audit_parallel_completion_drift(&repo, "main", &plan, &logger)
+            .await
+            .expect("shared verification runner drift must re-run verification");
+        assert_eq!(
+            fs::read_to_string(repo.join(".auto/verify-count")).expect("read verify counter"),
+            "verified\nverified\n",
+            "shared verification infrastructure drift must invalidate cache reuse"
+        );
+
+        fs::write(
+            repo.join("src/task.rs"),
+            "pub fn task() { /* changed */ }\n",
+        )
+        .expect("change owned source");
+        git_ok(&repo, ["add", "src/task.rs"]);
+        git_ok(&repo, ["commit", "-q", "-m", "change task-owned source"]);
+        audit_parallel_completion_drift(&repo, "main", &plan, &logger)
+            .await
+            .expect("owned source drift must re-run verification");
+        assert_eq!(
+            fs::read_to_string(repo.join(".auto/verify-count")).expect("read verify counter"),
+            "verified\nverified\nverified\n",
+            "task-owned source drift must invalidate the scoped verification cache"
+        );
+
+        let revised_plan = plan.replace(
+            "Stale evidence requires complete reproof",
+            "Revised task contract requires complete reproof",
+        );
+        fs::write(repo.join("IMPLEMENTATION_PLAN.md"), &revised_plan)
+            .expect("revise task contract");
+        git_ok(&repo, ["add", "IMPLEMENTATION_PLAN.md"]);
+        git_ok(
+            &repo,
+            ["commit", "-q", "-m", "revise task verification contract"],
+        );
+        audit_parallel_completion_drift(&repo, "main", &revised_plan, &logger)
+            .await
+            .expect("task contract drift must re-run verification");
+        assert_eq!(
+            fs::read_to_string(repo.join(".auto/verify-count")).expect("read verify counter"),
+            "verified\nverified\nverified\nverified\n",
+            "task plan-contract drift must invalidate the scoped verification cache"
         );
 
         fs::remove_dir_all(&repo).expect("remove repo");

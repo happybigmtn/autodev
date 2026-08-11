@@ -1,4 +1,4 @@
-//! Conservative Cargo-workspace input fingerprinting for baseline reuse.
+//! Conservative Cargo-workspace input fingerprinting for verification reuse.
 //!
 //! A full source fingerprint correctly invalidates on every repository change,
 //! but that makes Python operator evidence and curriculum edits rerun an entire
@@ -7,10 +7,17 @@
 //! fixtures/assets), together with root Cargo and toolchain configuration.
 //! Metadata or inventory ambiguity returns an error so callers run Cargo.
 
-use super::*;
-
+use anyhow::{bail, Context, Result};
+use regex::Regex;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(test)]
+use std::time::SystemTime;
 
 const MAX_WORKSPACE_INPUT_ENTRIES: usize = 200_000;
 const MAX_WORKSPACE_INPUT_BYTES: u64 = 1_073_741_824;
