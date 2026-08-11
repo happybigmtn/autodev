@@ -148,8 +148,93 @@ pub(crate) fn clone_loop_lane_repo(
         run_git(lane_repo_root, ["remote", "rename", "origin", "canonical"])?;
     }
 
+    preserve_tracked_worktree_timestamps(repo_root, lane_repo_root)?;
     share_lean_dependency_cache(repo_root, lane_repo_root);
     share_configured_lane_paths(repo_root, lane_repo_root);
+    Ok(())
+}
+
+/// Preserve the canonical checkout's timestamps for tracked regular files.
+///
+/// `git clone` materializes every path with the current time. Parallel lanes
+/// intentionally keep their Cargo target directories across task worktrees, so
+/// those fresh timestamps make Cargo treat an otherwise unchanged workspace as
+/// newly modified and rebuild it. The canonical checkout already has the right
+/// distinction: files changed by a landed commit have fresh timestamps while
+/// untouched files retain their earlier ones. Copying that metadata into the
+/// byte-identical clone lets Cargo reuse unchanged artifacts without hiding a
+/// real source edit.
+fn preserve_tracked_worktree_timestamps(repo_root: &Path, lane_repo_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--cached", "-z"])
+        .output()
+        .context("failed to enumerate tracked files for lane timestamp preservation")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-files failed while preserving lane timestamps: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw_path)
+            .context("tracked path is not UTF-8 while preserving lane timestamps")?;
+        let relative = Path::new(relative);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!(
+                "refusing unsafe tracked path `{}` while preserving lane timestamps",
+                relative.display()
+            );
+        }
+
+        let source = repo_root.join(relative);
+        let destination = lane_repo_root.join(relative);
+        let source_metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", source.display()))
+            }
+        };
+        let destination_metadata = fs::symlink_metadata(&destination)
+            .with_context(|| format!("failed to stat cloned path {}", destination.display()))?;
+        if !destination_metadata.file_type().is_file() {
+            continue;
+        }
+
+        let times = fs::FileTimes::new()
+            .set_accessed(
+                source_metadata
+                    .accessed()
+                    .with_context(|| format!("failed to read atime for {}", source.display()))?,
+            )
+            .set_modified(
+                source_metadata
+                    .modified()
+                    .with_context(|| format!("failed to read mtime for {}", source.display()))?,
+            );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .with_context(|| format!("failed to open cloned path {}", destination.display()))?
+            .set_times(times)
+            .with_context(|| {
+                format!(
+                    "failed to preserve timestamps for {}",
+                    destination.display()
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -1098,6 +1183,40 @@ mod tests {
 
         drop(guard);
         fs::remove_dir_all(&root).expect("remove worker pid root");
+    }
+
+    #[test]
+    fn lane_clone_preserves_tracked_mtime_for_persistent_cargo_cache_reuse() {
+        let root = unique_temp_dir("lane-clone-mtime");
+        let canonical = root.join("canonical");
+        let lane = root.join("lane");
+        init_git_repo(&canonical);
+        git_ok(&canonical, ["checkout", "-q", "-b", "main"]);
+        fs::create_dir_all(canonical.join("src")).expect("create source directory");
+        let canonical_source = canonical.join("src/lib.rs");
+        fs::write(&canonical_source, "pub fn cached() {}\n").expect("write source");
+        git_ok(&canonical, ["add", "src/lib.rs"]);
+        git_ok(&canonical, ["commit", "-q", "-m", "base"]);
+
+        let expected = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&canonical_source)
+            .expect("open canonical source")
+            .set_times(fs::FileTimes::new().set_modified(expected))
+            .expect("set canonical source mtime");
+
+        clone_loop_lane_repo(&canonical, "main", &lane).expect("clone lane repo");
+
+        assert_eq!(
+            fs::metadata(lane.join("src/lib.rs"))
+                .expect("stat lane source")
+                .modified()
+                .expect("read lane source mtime"),
+            expected,
+            "fresh lane clones must not make unchanged Cargo inputs look newly modified"
+        );
+        fs::remove_dir_all(&root).expect("remove lane timestamp fixture");
     }
 
     #[test]
