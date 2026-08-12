@@ -428,6 +428,26 @@ fn stored_owned_inputs(
     }
 }
 
+/// A receipt's commit field is intentionally whole-HEAD scoped, while the
+/// committed footer's `task_owned_inputs_v2` stamp is task scoped. Once those
+/// owned inputs still match, a commit-only staging-receipt mismatch says only
+/// that an unrelated path advanced HEAD; re-running the task cannot add safety.
+/// Every other evidence defect continues through normal repair/triage.
+fn only_unrelated_head_receipt_drift(
+    has_receipt_footer: bool,
+    unchanged_owned_inputs: Option<&str>,
+    evidence: &TaskCompletionEvidence,
+) -> bool {
+    if !has_receipt_footer || unchanged_owned_inputs.is_none() {
+        return false;
+    }
+    let reasons = evidence.missing_reasons();
+    !reasons.is_empty()
+        && reasons.iter().all(|reason| {
+            reason.contains("stale verification receipt") && reason.contains("commit mismatch")
+        })
+}
+
 pub(crate) async fn audit_parallel_completion_drift(
     repo_root: &Path,
     _target_branch: &str,
@@ -513,6 +533,17 @@ pub(crate) async fn audit_parallel_completion_drift(
                 )
                 .unwrap_or(false)
             });
+        if !must_reverify
+            && reused_host_verification
+            && only_unrelated_head_receipt_drift(
+                has_receipt_footer,
+                unchanged_owned_inputs,
+                &evidence,
+            )
+        {
+            locally_reused_done.push(task.id.clone());
+            continue;
+        }
         if reused_host_verification {
             locally_reused_done.push(task.id.clone());
         } else if reverify_active && locally_repairable {
@@ -6485,6 +6516,39 @@ Dependencies: none\n";
         std::env::set_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS", "0");
         assert!(super::drift_reverify_budget().is_zero());
         std::env::remove_var("AUTO_PARALLEL_DRIFT_REVERIFY_BUDGET_SECS");
+    }
+
+    #[test]
+    fn unrelated_head_only_receipt_drift_reuses_scoped_footer() {
+        let mut evidence = TaskCompletionEvidence {
+            has_review_handoff: true,
+            verification_receipt_present: false,
+            verification_receipt_status: Some(
+                "stale verification receipt `receipt.json`: commit mismatch, recorded `old` is not current HEAD `new`"
+                    .to_string(),
+            ),
+            ..TaskCompletionEvidence::default()
+        };
+        assert!(super::only_unrelated_head_receipt_drift(
+            true,
+            Some("unchanged"),
+            &evidence
+        ));
+        assert!(!super::only_unrelated_head_receipt_drift(
+            false,
+            Some("unchanged"),
+            &evidence
+        ));
+        assert!(!super::only_unrelated_head_receipt_drift(
+            true, None, &evidence
+        ));
+
+        evidence.unresolved_review_findings = vec!["unresolved reviewer finding".to_string()];
+        assert!(!super::only_unrelated_head_receipt_drift(
+            true,
+            Some("unchanged"),
+            &evidence
+        ));
     }
 
     #[test]
