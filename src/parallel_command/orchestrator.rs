@@ -1905,6 +1905,19 @@ fn drift_sweep_input_fingerprint(repo_root: &Path) -> Option<String> {
     current_dirty_state_fingerprint(repo_root)
 }
 
+/// Delivery runs may defer the historical completed-row audit so dependency-
+/// ready implementation work is not starved by a large proof backlog. This
+/// never repairs evidence or changes queue truth; a later normal run performs
+/// the audit. The default remains the full fail-closed sweep.
+fn completed_drift_audit_deferred() -> bool {
+    std::env::var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) async fn refresh_parallel_plan(
     repo_root: &Path,
     target_branch: &str,
@@ -1932,7 +1945,11 @@ pub(crate) async fn refresh_parallel_plan(
     // The skipped branch runs on every idle host refresh. The persisted sweep
     // fingerprint is already the evidence that no work is needed; do not log
     // the same no-op decision every poll and bury actionable worker events.
-    if !already_swept {
+    if completed_drift_audit_deferred() {
+        parallel_logger.info(
+            "drift-reverify: completed-proof audit deferred for delivery; queue truth and stale evidence remain unchanged",
+        );
+    } else if !already_swept {
         let (audited, exhaustive) =
             audit_parallel_completion_drift(repo_root, target_branch, &plan_text, parallel_logger)
                 .await?;
@@ -2952,6 +2969,24 @@ mod tests {
         );
 
         fs::remove_dir_all(repo).expect("failed to remove fingerprint fixture");
+    }
+
+    #[test]
+    fn completed_drift_audit_defer_flag_is_explicit_and_defaults_off() {
+        let _env_lock = crate::util::test_process_env_lock()
+            .lock()
+            .expect("lock process environment");
+        let previous = std::env::var_os("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT");
+        std::env::remove_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT");
+        assert!(!completed_drift_audit_deferred());
+        std::env::set_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT", "1");
+        assert!(completed_drift_audit_deferred());
+        std::env::set_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT", "0");
+        assert!(!completed_drift_audit_deferred());
+        match previous {
+            Some(value) => std::env::set_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT", value),
+            None => std::env::remove_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT"),
+        }
     }
 
     #[test]

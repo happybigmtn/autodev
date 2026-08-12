@@ -237,6 +237,12 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
             .map_err(|_| anyhow::anyhow!("AUTO_PARALLEL_RETRY_SHELVED contained invalid UTF-8"))?,
         _ => String::new(),
     };
+    let defer_completed_drift = match env::var_os("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT") {
+        Some(value) if !value.is_empty() => value.into_string().map_err(|_| {
+            anyhow::anyhow!("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT contained invalid UTF-8")
+        })?,
+        _ => String::new(),
+    };
     let mut parts = vec![
         "AUTO_PARALLEL_TMUX_BOOTSTRAPPED=1".to_string(),
         format!("AUTO_SKIP_REMOTE_SYNC={}", shell_quote(&skip_remote_sync)),
@@ -247,6 +253,10 @@ pub(crate) fn parallel_tmux_command(run_root: &Path, args: &ParallelArgs) -> Res
         format!(
             "AUTO_PARALLEL_RETRY_SHELVED={}",
             shell_quote(&retry_shelved)
+        ),
+        format!(
+            "AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT={}",
+            shell_quote(&defer_completed_drift)
         ),
         shell_quote(&executable),
         "parallel".to_string(),
@@ -607,6 +617,8 @@ mod tests {
         let previous = std::env::var_os("AUTO_SKIP_REMOTE_SYNC");
         let previous_workspace_gate = std::env::var_os("AUTO_PARALLEL_WORKSPACE_GATE_MODE");
         let previous_retry_shelved = std::env::var_os("AUTO_PARALLEL_RETRY_SHELVED");
+        let previous_defer_completed_drift =
+            std::env::var_os("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT");
         struct RestoreSkipRemoteSync(Option<std::ffi::OsString>);
         impl Drop for RestoreSkipRemoteSync {
             fn drop(&mut self) {
@@ -637,6 +649,19 @@ mod tests {
             }
         }
         let _restore_retry_shelved = RestoreRetryShelved(previous_retry_shelved);
+        struct RestoreDeferCompletedDrift(Option<std::ffi::OsString>);
+        impl Drop for RestoreDeferCompletedDrift {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => {
+                        std::env::set_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT", value)
+                    }
+                    None => std::env::remove_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT"),
+                }
+            }
+        }
+        let _restore_defer_completed_drift =
+            RestoreDeferCompletedDrift(previous_defer_completed_drift);
         let args = ParallelArgs {
             action: Some(ParallelAction::Status),
             apply_receipt_backfill_handoffs: false,
@@ -728,6 +753,20 @@ mod tests {
         assert!(
             retry_unset.contains("AUTO_PARALLEL_RETRY_SHELVED=''"),
             "an existing tmux server must not leak a stale retry override: {retry_unset}"
+        );
+
+        std::env::set_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT", "1");
+        let defer_drift = render_script();
+        assert!(
+            defer_drift.contains("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT='1'"),
+            "{defer_drift}"
+        );
+
+        std::env::remove_var("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT");
+        let defer_unset = render_script();
+        assert!(
+            defer_unset.contains("AUTO_PARALLEL_DEFER_COMPLETED_DRIFT_AUDIT=''"),
+            "an existing tmux server must not leak a stale drift-audit override: {defer_unset}"
         );
     }
 
