@@ -540,6 +540,7 @@ fn artifact_paths_from_line(line: &str) -> Vec<String> {
 fn looks_like_repo_relative_path(candidate: &str) -> bool {
     !candidate.is_empty()
         && !candidate.starts_with('/')
+        && !candidate.chars().any(char::is_whitespace)
         && (candidate.contains('/')
             || candidate.starts_with('.')
             || candidate.ends_with(".md")
@@ -571,6 +572,13 @@ mod tests {
                 "crates/rsociety-app/tests/action_core.rs"
             ]
         );
+    }
+
+    #[test]
+    fn completion_artifact_prose_with_a_slash_is_not_a_path() {
+        let plan = "- [~] `AD-778` Prose artifact label\n\n    Completion artifacts: Current-main all-wager browser/gateway evidence\n    Dependencies: none\n";
+        let tasks = parse_tasks(plan);
+        assert!(tasks[0].completion_artifacts.is_empty());
     }
 
     #[test]
